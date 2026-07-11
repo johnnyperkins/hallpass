@@ -2,11 +2,11 @@
 # Drop files like this into /etc/sentinel/rules.d/ to load them at startup.
 
 name = "allow-dns"
-action = "Allow"
-duration = "Forever"
+action = "allow"
+duration = "forever"
 priority = 100
 enabled = true
 
 [match]
 port = 53
-proto = "Udp"
+proto = "udp"

@@ -20,6 +20,7 @@ pub const PROTOCOL_VERSION: u32 = 1;
 
 /// Transport-layer protocol of a connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Proto {
     /// Transmission Control Protocol.
     Tcp,
@@ -67,6 +68,7 @@ pub struct Connection {
 
 /// What a rule does when it matches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Action {
     /// Permit the connection.
     Allow,
@@ -78,6 +80,7 @@ pub enum Action {
 
 /// How long a rule remains in effect.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum RuleDuration {
     /// Applies to a single connection only.
     Once,
@@ -129,6 +132,7 @@ pub struct Rule {
 
 /// Final decision for a connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Verdict {
     /// Permit the connection.
     Allow,
@@ -171,6 +175,7 @@ pub struct Stats {
 
 /// Scope of the rule generated from an interactive prompt reply.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum PromptScope {
     /// Match this executable to this destination host and port.
     ThisPort,
