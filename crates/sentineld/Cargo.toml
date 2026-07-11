@@ -34,7 +34,7 @@ ipnet = "2"
 globset = "0.4"
 notify = "8"
 arc-swap = "1"
-lru = "0.12"
+lru = "0.16"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

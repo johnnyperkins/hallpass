@@ -18,7 +18,8 @@ license = "GPL-3.0-only"
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
-postcard = { version = "1", features = ["use-std"] }
+# default-features off drops heapless and its unmaintained atomic-polyfill.
+postcard = { version = "1", default-features = false, features = ["use-std"] }
 tokio = { version = "1", default-features = false }
 tracing = "0.1"
 thiserror = "2"

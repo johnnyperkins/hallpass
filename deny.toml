@@ -1,0 +1,54 @@
+# cargo-deny configuration. Run with: cargo deny check
+# https://embarkstudios.github.io/cargo-deny/
+
+[graph]
+all-features = false
+
+[advisories]
+version = 2
+yanked = "deny"
+ignore = [
+    # ttf-parser is unmaintained; pulled in via winit -> sctk-adwaita ->
+    # ab_glyph. No safe upgrade exists; waiting on the egui/winit stack to
+    # migrate to skrifa.
+    "RUSTSEC-2026-0192",
+    # quick-xml DoS issues in wayland-scanner (build-time code generator for
+    # the wayland crates, parses trusted protocol XML only). Fixed in
+    # quick-xml >= 0.41 but wayland-scanner pins an older major.
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
+]
+
+[licenses]
+version = 2
+# Workspace crates are GPL-3.0-only; every dependency license below is
+# GPL-compatible.
+allow = [
+    "GPL-3.0-only",
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "ISC",
+    "Zlib",
+    "CC0-1.0",
+    "Unicode-3.0",
+    "Unlicense",
+]
+confidence-threshold = 0.8
+
+# epaint's embedded default fonts carry font licenses alongside the code
+# license; they apply to the bundled font data only.
+[[licenses.exceptions]]
+name = "epaint_default_fonts"
+allow = ["Ubuntu-font-1.0", "OFL-1.1", "MIT", "Apache-2.0"]
+
+[bans]
+multiple-versions = "allow"
+wildcards = "allow"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
