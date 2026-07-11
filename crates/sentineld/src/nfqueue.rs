@@ -20,6 +20,7 @@ use sentinel_types::{Connection, Verdict};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 use crate::attribution::AttributionChain;
+use crate::dns::IpDomainCache;
 use crate::events::EventBus;
 use crate::packet;
 use crate::rules::store::RuleStore;
@@ -45,8 +46,10 @@ pub struct QueueDeps {
     pub prompt_tx: UnboundedSender<PromptTask>,
     /// Decided verdicts back for held packets.
     pub verdict_rx: UnboundedReceiver<(u64, Verdict)>,
-    /// Raw DNS reply payloads for the (future) DNS snoop parser.
+    /// Raw DNS reply payloads out to the DNS snoop consumer.
     pub dns_tx: UnboundedSender<Vec<u8>>,
+    /// IP -> domain cache filled by the DNS snoop consumer.
+    pub dns_cache: Arc<IpDomainCache>,
     pub shutdown: Arc<AtomicBool>,
 }
 
@@ -73,7 +76,12 @@ enum Decision {
 /// Decision logic, separated from nfq plumbing for testability. Reads
 /// attribution and rules but has no channel or verdict side effects;
 /// `run` commits the decision.
-fn decide(payload: &[u8], attribution: &AttributionChain, rules: &RuleStore) -> Decision {
+fn decide(
+    payload: &[u8],
+    attribution: &AttributionChain,
+    rules: &RuleStore,
+    dns_cache: &IpDomainCache,
+) -> Decision {
     let Some(tuple) = packet::parse_tuple(payload) else {
         // Non-TCP/UDP or malformed: not ours to police.
         return Decision::Accept;
@@ -81,7 +89,8 @@ fn decide(payload: &[u8], attribution: &AttributionChain, rules: &RuleStore) -> 
     if packet::is_dns_response(&tuple) {
         return Decision::Dns;
     }
-    let conn = attribution.connection(tuple);
+    let mut conn = attribution.connection(tuple);
+    conn.domain = dns_cache.lookup(&conn.tuple.dst.ip());
     match rules.match_verdict(&conn) {
         Some((rule_name, verdict)) => Decision::Verdict(verdict, rule_name, conn),
         None => Decision::Prompt(conn),
@@ -114,7 +123,12 @@ pub fn run(queue_num: u16, mut deps: QueueDeps) -> std::io::Result<()> {
         match queue.recv() {
             Ok(mut msg) => {
                 busy = true;
-                match decide(msg.get_payload(), &deps.attribution, &deps.rules) {
+                match decide(
+                    msg.get_payload(),
+                    &deps.attribution,
+                    &deps.rules,
+                    &deps.dns_cache,
+                ) {
                     Decision::Accept => {
                         msg.set_verdict(NfqVerdict::Accept);
                         queue.verdict(msg)?;
@@ -189,14 +203,17 @@ mod tests {
         }
     }
 
-    fn setup(tag: &str, rules: Vec<Rule>) -> (AttributionChain, Arc<RuleStore>, TestDir) {
+    fn setup(
+        tag: &str,
+        rules: Vec<Rule>,
+    ) -> (AttributionChain, Arc<RuleStore>, IpDomainCache, TestDir) {
         let dir = TestDir::new(&format!("nfq-{tag}"));
         let store = Arc::new(RuleStore::new(dir.path().to_path_buf()));
         for r in rules {
             store.add(r).unwrap();
         }
         let chain = AttributionChain::new(vec![Box::new(NoAttr)]);
-        (chain, store, dir)
+        (chain, store, IpDomainCache::new(16), dir)
     }
 
     fn tcp_packet(dst: [u8; 4], dport: u16) -> Vec<u8> {
@@ -210,13 +227,13 @@ mod tests {
 
     #[test]
     fn dns_response_is_recognized() {
-        let (chain, store, _dir) = setup("dns", vec![]);
+        let (chain, store, dns, _dir) = setup("dns", vec![]);
         let mut buf = Vec::new();
         PacketBuilder::ipv4([9, 9, 9, 9], [10, 0, 0, 1], 64)
             .udp(53, 51000)
             .write(&mut buf, &[1, 2, 3])
             .unwrap();
-        assert!(matches!(decide(&buf, &chain, &store), Decision::Dns));
+        assert!(matches!(decide(&buf, &chain, &store, &dns), Decision::Dns));
     }
 
     #[test]
@@ -232,8 +249,8 @@ mod tests {
                 ..Default::default()
             },
         };
-        let (chain, store, _dir) = setup("rule", vec![deny]);
-        match decide(&tcp_packet([1, 1, 1, 1], 443), &chain, &store) {
+        let (chain, store, dns, _dir) = setup("rule", vec![deny]);
+        match decide(&tcp_packet([1, 1, 1, 1], 443), &chain, &store, &dns) {
             Decision::Verdict(Verdict::Deny, name, conn) => {
                 assert_eq!(name, "deny-443");
                 assert_eq!(conn.tuple.dst.port(), 443);
@@ -244,14 +261,31 @@ mod tests {
 
     #[test]
     fn unmatched_goes_to_prompt_and_unparsable_accepts() {
-        let (chain, store, _dir) = setup("prompt", vec![]);
-        match decide(&tcp_packet([1, 1, 1, 1], 8443), &chain, &store) {
+        let (chain, store, dns, _dir) = setup("prompt", vec![]);
+        match decide(&tcp_packet([1, 1, 1, 1], 8443), &chain, &store, &dns) {
             Decision::Prompt(conn) => {
                 assert_eq!(conn.tuple.dst.port(), 8443);
                 assert_eq!(conn.exe_path, None);
+                assert_eq!(conn.domain, None);
             }
             _ => panic!("expected prompt"),
         }
-        assert!(matches!(decide(&[0u8; 4], &chain, &store), Decision::Accept));
+        assert!(matches!(
+            decide(&[0u8; 4], &chain, &store, &dns),
+            Decision::Accept
+        ));
+    }
+
+    #[test]
+    fn domain_enrichment_from_dns_cache() {
+        let (chain, store, dns, _dir) = setup("domain", vec![]);
+        dns.absorb(&crate::dns::SnoopedResponse {
+            query_name: "example.com".into(),
+            addrs: vec![("1.1.1.1".parse().unwrap(), 300)],
+        });
+        match decide(&tcp_packet([1, 1, 1, 1], 443), &chain, &store, &dns) {
+            Decision::Prompt(conn) => assert_eq!(conn.domain.as_deref(), Some("example.com")),
+            _ => panic!("expected prompt"),
+        }
     }
 }

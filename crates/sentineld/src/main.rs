@@ -9,6 +9,7 @@
 
 mod attribution;
 mod config;
+mod dns;
 mod events;
 mod ipc;
 mod nfqueue;
@@ -108,9 +109,23 @@ async fn main() {
         cfg.default_verdict,
     ));
 
-    // Stub DNS consumer: the snoop parser lands here later; until then the
-    // payloads are drained and dropped so the channel never backs up.
-    tokio::spawn(async move { while dns_rx.recv().await.is_some() {} });
+    // DNS snoop consumer: parse each captured reply and record every
+    // resolved IP under the name the application originally asked for.
+    // The queue thread reads the cache when it builds a Connection.
+    let dns_cache = Arc::new(dns::IpDomainCache::new(dns::CACHE_CAPACITY));
+    let snoop_cache = Arc::clone(&dns_cache);
+    tokio::spawn(async move {
+        while let Some(pkt) = dns_rx.recv().await {
+            if let Some(resp) = packet::udp_payload(&pkt).and_then(dns::parse_response) {
+                tracing::debug!(
+                    domain = %resp.query_name,
+                    addrs = resp.addrs.len(),
+                    "dns response snooped"
+                );
+                snoop_cache.absorb(&resp);
+            }
+        }
+    });
 
     // Prompt dispatcher: unmatched connections from the queue thread.
     let dispatcher_prompts = Arc::clone(&prompts);
@@ -132,6 +147,7 @@ async fn main() {
             prompt_tx,
             verdict_rx,
             dns_tx,
+            dns_cache,
             shutdown: Arc::clone(&shutdown),
         },
     );

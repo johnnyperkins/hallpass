@@ -38,6 +38,15 @@ pub fn is_dns_response(tuple: &FlowTuple) -> bool {
     tuple.proto == Proto::Udp && tuple.src.port() == 53
 }
 
+/// Extract the UDP payload (e.g. a DNS message) from a raw IP packet as
+/// delivered by the nfqueue snoop rule.
+pub fn udp_payload(packet: &[u8]) -> Option<&[u8]> {
+    match SlicedPacket::from_ip(packet).ok()?.transport? {
+        TransportSlice::Udp(u) => Some(u.payload()),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -87,5 +96,24 @@ mod tests {
     fn garbage_is_none() {
         assert!(parse_tuple(&[0u8; 3]).is_none());
         assert!(parse_tuple(&[]).is_none());
+        assert!(udp_payload(&[0u8; 3]).is_none());
+    }
+
+    #[test]
+    fn udp_payload_extraction() {
+        let payload = [0xde, 0xad, 0xbe, 0xef];
+        let mut buf = Vec::new();
+        PacketBuilder::ipv4([9, 9, 9, 9], [10, 0, 0, 1], 64)
+            .udp(53, 51000)
+            .write(&mut buf, &payload)
+            .unwrap();
+        assert_eq!(udp_payload(&buf), Some(payload.as_slice()));
+        // TCP is not ours.
+        let mut tcp = Vec::new();
+        PacketBuilder::ipv4([9, 9, 9, 9], [10, 0, 0, 1], 64)
+            .tcp(53, 51000, 1, 64240)
+            .write(&mut tcp, &payload)
+            .unwrap();
+        assert!(udp_payload(&tcp).is_none());
     }
 }
