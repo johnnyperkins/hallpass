@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Sentinel Firewall
+GenericName=Application Firewall
+Comment=Interactive firewall connection prompts and rule management
+Exec=sentinel-ui
+Icon=security-high
+Terminal=false
+Categories=System;Security;Network;
+X-GNOME-Autostart-enabled=true
