@@ -5,8 +5,16 @@ edition.workspace = true
 license.workspace = true
 description = "Sentinel application firewall daemon"
 
+[features]
+# eBPF attribution. Requires a prior `cargo xtask build-ebpf` so the
+# object exists at target/bpfel-unknown-none/release/sentinel-ebpf; the
+# default build works without it (procfs attribution only).
+ebpf = ["dep:aya", "dep:sentinel-ebpf-common"]
+
 [dependencies]
 sentinel-types = { path = "../sentinel-types" }
+sentinel-ebpf-common = { path = "../sentinel-ebpf-common", features = ["user"], optional = true }
+aya = { version = "0.14", optional = true }
 serde = { workspace = true }
 tokio = { workspace = true, features = [
     "rt-multi-thread",

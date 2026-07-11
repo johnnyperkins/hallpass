@@ -1,0 +1,17 @@
+[package]
+name = "sentinel-ebpf-common"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Shared map key/value types between sentinel-ebpf and sentineld"
+
+[features]
+# Enable on the userspace side to get aya::Pod impls for the map types.
+user = ["dep:aya"]
+
+[dependencies]
+aya = { version = "0.14", optional = true }
+
+# NOTE: no [lints] workspace inheritance here. The workspace denies
+# unsafe_code, but this crate needs exactly two `unsafe impl aya::Pod`
+# blocks behind the "user" feature. Everything else stays safe.

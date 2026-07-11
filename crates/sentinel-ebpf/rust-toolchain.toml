@@ -1,0 +1,5 @@
+# The bpfel-unknown-none target is tier 3: it needs nightly and a
+# build-std of core (see .cargo/config.toml).
+[toolchain]
+channel = "nightly"
+components = ["rust-src"]

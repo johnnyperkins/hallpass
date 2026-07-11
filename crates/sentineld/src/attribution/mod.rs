@@ -1,6 +1,8 @@
 //! Map network flows to the local process that owns them.
 
 pub mod cache;
+#[cfg(feature = "ebpf")]
+pub mod ebpf;
 pub mod procfs;
 
 use std::path::PathBuf;
@@ -43,9 +45,15 @@ impl AttributionChain {
         }
     }
 
-    /// Chain with the default procfs attributor only.
+    /// Default chain: eBPF first when built with the `ebpf` feature and
+    /// loadable on this system, then procfs.
     pub fn default_chain() -> Arc<Self> {
-        Arc::new(Self::new(vec![Box::new(procfs::ProcfsAttributor)]))
+        let procfs: Box<dyn Attributor> = Box::new(procfs::ProcfsAttributor);
+        #[cfg(feature = "ebpf")]
+        if let Some(e) = ebpf::EbpfAttributor::new() {
+            return Arc::new(Self::new(vec![Box::new(e), procfs]));
+        }
+        Arc::new(Self::new(vec![procfs]))
     }
 
     /// Resolve `tuple`, consulting the cache first. Misses (including

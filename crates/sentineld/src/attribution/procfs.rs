@@ -165,8 +165,9 @@ fn find_pid_for_inode(proc_root: &Path, inode: u64) -> Option<u32> {
     None
 }
 
-/// Best-effort read of exe symlink and cmdline for a PID.
-fn read_proc_details(proc_root: &Path, pid: u32) -> (Option<PathBuf>, Option<String>) {
+/// Best-effort read of exe symlink and cmdline for a PID. Also used by
+/// the eBPF attributor to snapshot details on exec events.
+pub(super) fn read_proc_details(proc_root: &Path, pid: u32) -> (Option<PathBuf>, Option<String>) {
     let base = proc_root.join(pid.to_string());
     let exe = std::fs::read_link(base.join("exe")).ok();
     let cmdline = std::fs::read(base.join("cmdline")).ok().and_then(|raw| {

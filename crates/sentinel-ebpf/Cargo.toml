@@ -1,0 +1,34 @@
+[package]
+name = "sentinel-ebpf"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-only"
+description = "Sentinel eBPF kernel programs (built via cargo xtask build-ebpf)"
+
+# Intentionally NOT a member of the parent workspace: this crate needs
+# nightly + build-std for the bpfel-unknown-none target (see
+# rust-toolchain.toml and .cargo/config.toml). Requires bpf-linker:
+#   cargo install bpf-linker
+[workspace]
+
+[dependencies]
+aya-ebpf = "0.2"
+sentinel-ebpf-common = { path = "../sentinel-ebpf-common" }
+
+[[bin]]
+name = "sentinel-ebpf"
+path = "src/main.rs"
+
+[profile.dev]
+opt-level = 3
+debug = false
+debug-assertions = false
+overflow-checks = false
+panic = "abort"
+incremental = false
+codegen-units = 1
+
+[profile.release]
+lto = true
+panic = "abort"
+codegen-units = 1
