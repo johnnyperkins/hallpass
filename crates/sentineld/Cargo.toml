@@ -7,6 +7,29 @@ description = "Sentinel application firewall daemon"
 
 [dependencies]
 sentinel-types = { path = "../sentinel-types" }
+serde = { workspace = true }
+tokio = { workspace = true, features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "signal",
+    "sync",
+    "time",
+    "io-util",
+] }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+toml = "0.8"
+nfq = "0.2"
+etherparse = "0.16"
+ipnet = "2"
+globset = "0.4"
+notify = "8"
+arc-swap = "1"
+lru = "0.12"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true
