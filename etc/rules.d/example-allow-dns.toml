@@ -1,0 +1,12 @@
+# Example rule: allow all outbound DNS queries over UDP.
+# Drop files like this into /etc/sentinel/rules.d/ to load them at startup.
+
+name = "allow-dns"
+action = "Allow"
+duration = "Forever"
+priority = 100
+enabled = true
+
+[match]
+port = 53
+proto = "Udp"

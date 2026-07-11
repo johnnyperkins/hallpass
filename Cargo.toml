@@ -1,0 +1,26 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/sentinel-types",
+    "crates/sentineld",
+    "crates/sentinel-cli",
+    "crates/sentinel-ui",
+    "xtask",
+]
+# NOTE: crates/sentinel-ebpf is intentionally NOT a workspace member.
+# Following the aya convention, it is a separate no_std crate built via xtask.
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-only"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+postcard = { version = "1", features = ["use-std"] }
+tokio = { version = "1", default-features = false }
+tracing = "0.1"
+thiserror = "2"
+
+[workspace.lints.rust]
+unsafe_code = "deny"

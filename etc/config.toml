@@ -1,0 +1,18 @@
+# Sentinel daemon configuration.
+
+# Verdict applied when no rule matches and no client answers the prompt
+# in time: "allow", "deny", or "reject".
+default_verdict = "allow"
+
+# Seconds to wait for an interactive prompt reply before applying the
+# default verdict.
+prompt_timeout_secs = 15
+
+# NFQUEUE queue number the daemon binds to.
+queue_num = 0
+
+# Unix socket for CLI/UI clients.
+socket_path = "/run/sentinel/sentinel.sock"
+
+# Maximum number of connections held waiting for a prompt reply.
+max_pending_prompts = 64

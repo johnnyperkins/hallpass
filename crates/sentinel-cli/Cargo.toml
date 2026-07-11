@@ -1,0 +1,12 @@
+[package]
+name = "sentinel-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Sentinel application firewall CLI"
+
+[dependencies]
+sentinel-types = { path = "../sentinel-types" }
+
+[lints]
+workspace = true
