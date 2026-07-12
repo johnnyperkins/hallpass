@@ -80,6 +80,25 @@ kernel accepts it; otherwise it silently falls back to procfs attribution.
 
 ## Installing
 
+One command builds, installs, and starts everything:
+
+```sh
+./install.sh                    # procfs attribution (stable Rust)
+HALLPASS_EBPF=1 ./install.sh    # also build the eBPF attribution programs
+```
+
+It builds the release binaries as your user, then uses `sudo` (prompting
+once) to install them to `/usr/bin`, drop the config and example rule into
+`/etc/hallpass` (an existing `config.toml` is never overwritten), install the
+systemd unit and desktop entry, autostart the UI, add you to the `hallpass`
+group, and `systemctl enable --now hallpassd`. Log out and back in once so the
+group membership and UI autostart take effect.
+
+Remove it again with `./uninstall.sh` (add `HALLPASS_PURGE=1` to also delete
+`/etc/hallpass`).
+
+<details><summary>Manual install (what the script does)</summary>
+
 ```sh
 install -Dm755 target/release/hallpassd  /usr/bin/hallpassd
 install -Dm755 target/release/hallpass-cli /usr/bin/hallpass-cli
@@ -95,6 +114,8 @@ groupadd -f hallpass && usermod -aG hallpass "$USER"
 systemctl daemon-reload
 systemctl enable --now hallpassd
 ```
+
+</details>
 
 Configuration lives in `/etc/hallpass/config.toml` (default verdict, prompt
 timeout, queue number, socket path, rules directory). Persistent rules are
