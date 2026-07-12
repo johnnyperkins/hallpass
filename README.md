@@ -145,7 +145,13 @@ hold the prompt-handler role.
   daemon (root) can bypass it anyway.
 - **IPC socket**: `/run/hallpass/hallpass.sock`, directory 0750, socket 0660
   root:hallpass. Only root and the `hallpass` group can manage rules or answer
-  prompts. Peer UIDs are logged for every mutating request.
+  prompts. Peer UIDs are logged for every mutating request. Per-client
+  outbound queues are bounded; a client that stops reading loses events
+  instead of growing daemon memory.
+- **DNS snoop validation**: outbound queries are observed alongside replies,
+  and a reply only enters the IP-domain cache when its source/destination
+  addresses, transaction ID, and question name match a recorded query.
+  Spoofed packets from source port 53 cannot poison domain rules.
 - **Rule files**: files in `rules.d` are ignored (with a warning) unless owned
   by root (or the daemon's own euid) and not group/other writable.
 - **systemd hardening**: `ProtectSystem=strict`, `ProtectHome`,
