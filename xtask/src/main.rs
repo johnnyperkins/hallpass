@@ -8,6 +8,8 @@ fn main() -> ExitCode {
     let result = match task.as_deref() {
         Some("build-ebpf") => build_ebpf(),
         Some("build") => build_ebpf().and_then(|()| build_workspace()),
+        Some("test") => test_workspace(),
+        Some("e2e") => test_e2e(),
         Some(other) => {
             eprintln!("unknown task: {other}");
             print_usage();
@@ -32,6 +34,15 @@ fn print_usage() {
     eprintln!("tasks:");
     eprintln!("  build-ebpf    build the hallpass-ebpf kernel programs");
     eprintln!("  build         build-ebpf, then the whole workspace (with the ebpf feature)");
+    eprintln!("  test          run the workspace unit/integration tests (no privileges)");
+    eprintln!("  e2e           run the hallpassd e2e tests (compiles as you, runs the");
+    eprintln!("                test binary under sudo -E; will prompt for your password)");
+}
+
+/// The cargo binary that invoked xtask. Cargo sets $CARGO to its own
+/// absolute path; fall back to plain "cargo" if it is somehow unset.
+fn cargo() -> String {
+    std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string())
 }
 
 fn workspace_root() -> PathBuf {
@@ -64,6 +75,34 @@ fn build_ebpf() -> Result<(), String> {
 fn build_workspace() -> Result<(), String> {
     run(Command::new("cargo")
         .args(["build", "--workspace", "--features", "hallpassd/ebpf"])
+        .current_dir(workspace_root()))
+}
+
+fn test_workspace() -> Result<(), String> {
+    run(Command::new(cargo())
+        .args(["test", "--workspace"])
+        .current_dir(workspace_root()))
+}
+
+/// Run the privileged hallpassd e2e tests. Compilation happens as the
+/// current user (so target/ and the registry cache stay user-owned);
+/// only the finished test binary runs under sudo, via cargo's per-target
+/// `runner`. `cfg(all())` matches every host triple, so no triple is
+/// hard-coded here.
+fn test_e2e() -> Result<(), String> {
+    run(Command::new(cargo())
+        .args([
+            "test",
+            "-p",
+            "hallpassd",
+            "--test",
+            "e2e",
+            "--config",
+            "target.'cfg(all())'.runner=\"sudo -E\"",
+            "--",
+            "--ignored",
+            "--test-threads=1",
+        ])
         .current_dir(workspace_root()))
 }
 
