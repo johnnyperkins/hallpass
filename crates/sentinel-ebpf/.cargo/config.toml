@@ -1,8 +1,0 @@
-[build]
-target = "bpfel-unknown-none"
-# Land the object in the shared workspace target dir so sentineld can
-# embed it from target/bpfel-unknown-none/release/sentinel-ebpf.
-target-dir = "../../target"
-
-[unstable]
-build-std = ["core"]

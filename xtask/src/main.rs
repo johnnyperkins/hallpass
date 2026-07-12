@@ -30,7 +30,7 @@ fn main() -> ExitCode {
 fn print_usage() {
     eprintln!("usage: cargo xtask <task>");
     eprintln!("tasks:");
-    eprintln!("  build-ebpf    build the sentinel-ebpf kernel programs");
+    eprintln!("  build-ebpf    build the hallpass-ebpf kernel programs");
     eprintln!("  build         build-ebpf, then the whole workspace (with the ebpf feature)");
 }
 
@@ -43,7 +43,7 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
-/// Build crates/sentinel-ebpf for bpfel-unknown-none. Target, build-std,
+/// Build crates/hallpass-ebpf for bpfel-unknown-none. Target, build-std,
 /// and the shared target dir come from the crate's own .cargo/config.toml;
 /// nightly + rust-src come from its rust-toolchain.toml.
 fn build_ebpf() -> Result<(), String> {
@@ -51,19 +51,19 @@ fn build_ebpf() -> Result<(), String> {
         return Err("bpf-linker not found in PATH; install it with: cargo install bpf-linker"
             .to_string());
     }
-    let dir = workspace_root().join("crates/sentinel-ebpf");
+    let dir = workspace_root().join("crates/hallpass-ebpf");
     run(Command::new("cargo")
         .args(["build", "--release"])
         .current_dir(dir)
         // cargo xtask runs under the workspace toolchain; drop that so
-        // sentinel-ebpf's rust-toolchain.toml (nightly) takes effect.
+        // hallpass-ebpf's rust-toolchain.toml (nightly) takes effect.
         .env_remove("RUSTUP_TOOLCHAIN")
         .env_remove("CARGO"))
 }
 
 fn build_workspace() -> Result<(), String> {
     run(Command::new("cargo")
-        .args(["build", "--workspace", "--features", "sentineld/ebpf"])
+        .args(["build", "--workspace", "--features", "hallpassd/ebpf"])
         .current_dir(workspace_root()))
 }
 

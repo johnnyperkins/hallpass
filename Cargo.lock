@@ -1502,6 +1502,64 @@ dependencies = [
 ]
 
 [[package]]
+name = "hallpass-cli"
+version = "0.1.0"
+dependencies = [
+ "hallpass-types",
+ "tokio",
+]
+
+[[package]]
+name = "hallpass-ebpf-common"
+version = "0.1.0"
+dependencies = [
+ "aya",
+]
+
+[[package]]
+name = "hallpass-types"
+version = "0.1.0"
+dependencies = [
+ "postcard",
+ "serde",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
+name = "hallpass-ui"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "eframe",
+ "hallpass-types",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "hallpassd"
+version = "0.1.0"
+dependencies = [
+ "arc-swap",
+ "aya",
+ "etherparse",
+ "globset",
+ "hallpass-ebpf-common",
+ "hallpass-types",
+ "ipnet",
+ "lru",
+ "nfq",
+ "notify",
+ "serde",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "harfrust"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3010,64 +3068,6 @@ name = "semver"
 version = "1.0.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd"
-
-[[package]]
-name = "sentinel-cli"
-version = "0.1.0"
-dependencies = [
- "sentinel-types",
- "tokio",
-]
-
-[[package]]
-name = "sentinel-ebpf-common"
-version = "0.1.0"
-dependencies = [
- "aya",
-]
-
-[[package]]
-name = "sentinel-types"
-version = "0.1.0"
-dependencies = [
- "postcard",
- "serde",
- "thiserror 2.0.18",
- "tokio",
-]
-
-[[package]]
-name = "sentinel-ui"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "eframe",
- "sentinel-types",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "sentineld"
-version = "0.1.0"
-dependencies = [
- "arc-swap",
- "aya",
- "etherparse",
- "globset",
- "ipnet",
- "lru",
- "nfq",
- "notify",
- "sentinel-ebpf-common",
- "sentinel-types",
- "serde",
- "tokio",
- "toml",
- "tracing",
- "tracing-subscriber",
-]
 
 [[package]]
 name = "serde"

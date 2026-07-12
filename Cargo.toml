@@ -1,14 +1,14 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/sentinel-types",
-    "crates/sentinel-ebpf-common",
-    "crates/sentineld",
-    "crates/sentinel-cli",
-    "crates/sentinel-ui",
+    "crates/hallpass-types",
+    "crates/hallpass-ebpf-common",
+    "crates/hallpassd",
+    "crates/hallpass-cli",
+    "crates/hallpass-ui",
     "xtask",
 ]
-# NOTE: crates/sentinel-ebpf is intentionally NOT a workspace member.
+# NOTE: crates/hallpass-ebpf is intentionally NOT a workspace member.
 # Following the aya convention, it is a separate no_std crate built via xtask.
 
 [workspace.package]

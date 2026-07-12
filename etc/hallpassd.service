@@ -1,0 +1,30 @@
+[Unit]
+Description=Hallpass interactive application firewall daemon
+Documentation=https://github.com/hallpass/hallpass
+After=network-pre.target
+Wants=network-pre.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/hallpassd --config /etc/hallpass/config.toml
+Restart=on-failure
+RestartSec=2
+
+# Runtime directory for the client socket.
+RuntimeDirectory=hallpass
+RuntimeDirectoryMode=0755
+
+# Hardening
+ProtectSystem=strict
+ReadWritePaths=/etc/hallpass /run/hallpass
+ProtectHome=yes
+NoNewPrivileges=yes
+RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6
+MemoryDenyWriteExecute=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictRealtime=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target

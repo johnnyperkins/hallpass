@@ -1,4 +1,4 @@
-# Sentinel daemon configuration.
+# Hallpass daemon configuration.
 
 # Verdict applied when no rule matches and no client answers the prompt
 # in time: "allow", "deny", or "reject".
@@ -12,7 +12,7 @@ prompt_timeout_secs = 15
 queue_num = 0
 
 # Unix socket for CLI/UI clients.
-socket_path = "/run/sentinel/sentinel.sock"
+socket_path = "/run/hallpass/hallpass.sock"
 
 # Maximum number of connections held waiting for a prompt reply.
 max_pending_prompts = 64

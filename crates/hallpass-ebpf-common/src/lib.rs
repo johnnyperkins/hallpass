@@ -1,0 +1,178 @@
+//! Types shared between the hallpass-ebpf kernel programs and the
+//! hallpassd userspace loader. Both sides must agree on layout and byte
+//! order, so the conventions live here:
+//!
+//! - Addresses are stored as raw network-order bytes. IPv4 occupies the
+//!   first 4 bytes of the 16-byte array, the rest is zero, and `family`
+//!   distinguishes the two (AF_INET / AF_INET6).
+//! - Ports are stored in HOST byte order. The eBPF side converts
+//!   big-endian kernel fields (skc_dport, sin_port) with u16::from_be;
+//!   skc_num is already host order. eBPF target is bpfel, so host order
+//!   matches the little-endian userspace on every supported platform.
+
+#![cfg_attr(not(test), no_std)]
+
+/// IPPROTO_TCP.
+pub const PROTO_TCP: u8 = 6;
+/// IPPROTO_UDP.
+pub const PROTO_UDP: u8 = 17;
+/// AF_INET.
+pub const AF_INET: u8 = 2;
+/// AF_INET6.
+pub const AF_INET6: u8 = 10;
+
+/// Key of the flow map: the local/remote 4-tuple plus protocol.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FlowKey {
+    /// Local (source) address, network-order bytes.
+    pub saddr: [u8; 16],
+    /// Remote (destination) address, network-order bytes.
+    pub daddr: [u8; 16],
+    /// Local port, host byte order.
+    pub sport: u16,
+    /// Remote port, host byte order.
+    pub dport: u16,
+    /// IPPROTO_TCP or IPPROTO_UDP.
+    pub proto: u8,
+    /// AF_INET or AF_INET6.
+    pub family: u8,
+    /// Explicit padding; always zero so the key hashes deterministically.
+    pub _pad: [u8; 2],
+}
+
+impl FlowKey {
+    /// Build an IPv4 key. `saddr`/`daddr` are the address octets exactly
+    /// as they appear on the wire (network order).
+    pub fn v4(proto: u8, saddr: [u8; 4], sport: u16, daddr: [u8; 4], dport: u16) -> Self {
+        let mut s = [0u8; 16];
+        let mut d = [0u8; 16];
+        s[..4].copy_from_slice(&saddr);
+        d[..4].copy_from_slice(&daddr);
+        FlowKey {
+            saddr: s,
+            daddr: d,
+            sport,
+            dport,
+            proto,
+            family: AF_INET,
+            _pad: [0; 2],
+        }
+    }
+
+    /// Build an IPv6 key from network-order address octets.
+    pub fn v6(proto: u8, saddr: [u8; 16], sport: u16, daddr: [u8; 16], dport: u16) -> Self {
+        FlowKey {
+            saddr,
+            daddr,
+            sport,
+            dport,
+            proto,
+            family: AF_INET6,
+            _pad: [0; 2],
+        }
+    }
+}
+
+/// Value of the flow map: who created the socket.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FlowVal {
+    /// Thread group id (userspace PID).
+    pub pid: u32,
+    /// Effective UID at connect time.
+    pub uid: u32,
+}
+
+/// Process lifecycle event kinds carried over the ring buffer.
+pub const EVENT_EXEC: u32 = 0;
+/// See [`EVENT_EXEC`].
+pub const EVENT_EXIT: u32 = 1;
+
+/// Ring buffer event emitted on sched_process_exec / sched_process_exit.
+/// Userspace resolves exe/cmdline from /proc while the pid is fresh, so
+/// the event carries only the pid and the direction.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExecEvent {
+    /// Thread group id (userspace PID).
+    pub pid: u32,
+    /// EVENT_EXEC or EVENT_EXIT.
+    pub kind: u32,
+}
+
+impl ExecEvent {
+    /// Serialized size in bytes.
+    pub const SIZE: usize = 8;
+
+    /// Decode from ring buffer bytes without unsafe transmutes, so the
+    /// userspace side stays deny(unsafe_code)-clean.
+    pub fn from_bytes(bytes: &[u8]) -> Option<ExecEvent> {
+        if bytes.len() < Self::SIZE {
+            return None;
+        }
+        Some(ExecEvent {
+            pid: u32::from_ne_bytes(bytes[0..4].try_into().ok()?),
+            kind: u32::from_ne_bytes(bytes[4..8].try_into().ok()?),
+        })
+    }
+}
+
+#[cfg(feature = "user")]
+mod pod {
+    // The only unsafe in the hallpass workspace outside the eBPF crate:
+    // FlowKey and FlowVal are repr(C), Copy, and contain no pointers or
+    // implicit padding (FlowKey pads explicitly), so any bit pattern of
+    // the right size is a valid value.
+    #[allow(unsafe_code)]
+    unsafe impl aya::Pod for super::FlowKey {}
+    #[allow(unsafe_code)]
+    unsafe impl aya::Pod for super::FlowVal {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn flow_key_layout_has_no_hidden_padding() {
+        assert_eq!(core::mem::size_of::<FlowKey>(), 40);
+        assert_eq!(core::mem::size_of::<FlowVal>(), 8);
+        assert_eq!(core::mem::size_of::<ExecEvent>(), ExecEvent::SIZE);
+    }
+
+    #[test]
+    fn v4_key_places_octets_in_network_order() {
+        // 127.0.0.1 on the wire is bytes [127, 0, 0, 1].
+        let k = FlowKey::v4(PROTO_TCP, [127, 0, 0, 1], 43210, [93, 184, 216, 34], 443);
+        assert_eq!(&k.saddr[..4], &[127, 0, 0, 1]);
+        assert_eq!(&k.saddr[4..], &[0u8; 12]);
+        assert_eq!(&k.daddr[..4], &[93, 184, 216, 34]);
+        assert_eq!(k.sport, 43210);
+        assert_eq!(k.dport, 443);
+        assert_eq!(k.family, AF_INET);
+        // The eBPF side reads skc_daddr as a be32 and stores its native
+        // bytes: to_ne_bytes of a from_be-read u32 equals wire order.
+        let wire = u32::from_be_bytes([93, 184, 216, 34]);
+        assert_eq!(wire.to_be_bytes(), [93, 184, 216, 34]);
+    }
+
+    #[test]
+    fn v6_key_round_trip() {
+        let addr = std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
+        let k = FlowKey::v6(PROTO_UDP, [0; 16], 5353, addr.octets(), 53);
+        assert_eq!(std::net::Ipv6Addr::from(k.daddr), addr);
+        assert_eq!(k.family, AF_INET6);
+    }
+
+    #[test]
+    fn exec_event_from_bytes() {
+        let mut raw = [0u8; ExecEvent::SIZE];
+        raw[0..4].copy_from_slice(&4242u32.to_ne_bytes());
+        raw[4..8].copy_from_slice(&EVENT_EXEC.to_ne_bytes());
+        let ev = ExecEvent::from_bytes(&raw).unwrap();
+        assert_eq!(ev.pid, 4242);
+        assert_eq!(ev.kind, EVENT_EXEC);
+        assert_eq!(ExecEvent::from_bytes(&raw[..4]), None);
+    }
+}

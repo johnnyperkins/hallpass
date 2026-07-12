@@ -1,10 +1,10 @@
-# Sentinel
+# Hallpass
 
-An interactive application firewall for Linux, written in Rust. Sentinel
+An interactive application firewall for Linux, written in Rust. Hallpass
 intercepts new outbound connections, attributes them to the process that made
 them, and asks you (or your rules) whether to allow them.
 
-*"Sentinel" is a working title.*
+*"Hallpass" is a working title.*
 
 ## How it works
 
@@ -12,12 +12,12 @@ New connections are diverted to userspace with nftables NFQUEUE. The daemon
 attributes each connection to a process (eBPF when available, procfs
 otherwise), enriches it with the destination domain from snooped DNS replies,
 and runs it through the rule engine. Unmatched connections trigger an
-interactive prompt in the GUI (or `sentinel-cli watch`); the reply can be
+interactive prompt in the GUI (or `hallpass-cli watch`); the reply can be
 persisted as a rule.
 
 ```
                      +---------------------------+
-    outbound         |         sentineld         |
+    outbound         |         hallpassd         |
     connection       |                           |
   ----------------->-|  nfqueue --> rules engine |--> verdict (allow/deny)
    nftables NFQUEUE  |     |            |        |
@@ -32,7 +32,7 @@ persisted as a rule.
                           +-------------+-------------+
                           |                           |
                     +-----------+              +-------------+
-                    | sentinel- |              | sentinel-ui |
+                    | hallpass- |              | hallpass-ui |
                     |    cli    |              |   (egui)    |
                     +-----------+              +-------------+
                      status, rules,             prompt popups,
@@ -43,12 +43,12 @@ persisted as a rule.
 
 | Crate                  | What it is                                                              |
 | ---------------------- | ----------------------------------------------------------------------- |
-| `sentineld`            | The daemon: nfqueue loop, rule engine, prompts, IPC server, attribution, DNS snooping |
-| `sentinel-cli`         | Command line client: status, rule management, event stream, interactive watch |
-| `sentinel-ui`          | egui desktop app: prompt popups and a management window                 |
-| `sentinel-types`       | Shared types and the length-prefixed postcard wire protocol             |
-| `sentinel-ebpf`        | Kernel-side eBPF programs (kprobes on `tcp_v4_connect` etc., exec/exit tracepoints); built separately, not a workspace member |
-| `sentinel-ebpf-common` | `no_std` types shared between kernel and userspace                      |
+| `hallpassd`            | The daemon: nfqueue loop, rule engine, prompts, IPC server, attribution, DNS snooping |
+| `hallpass-cli`         | Command line client: status, rule management, event stream, interactive watch |
+| `hallpass-ui`          | egui desktop app: prompt popups and a management window                 |
+| `hallpass-types`       | Shared types and the length-prefixed postcard wire protocol             |
+| `hallpass-ebpf`        | Kernel-side eBPF programs (kprobes on `tcp_v4_connect` etc., exec/exit tracepoints); built separately, not a workspace member |
+| `hallpass-ebpf-common` | `no_std` types shared between kernel and userspace                      |
 | `xtask`                | Build tasks (`cargo xtask build-ebpf`)                                  |
 
 ## Building
@@ -59,18 +59,18 @@ Stable Rust is enough for the default build (procfs attribution only):
 cargo build --release
 ```
 
-Binaries land in `target/release/`: `sentineld`, `sentinel-cli`, `sentinel-ui`.
+Binaries land in `target/release/`: `hallpassd`, `hallpass-cli`, `hallpass-ui`.
 
 ### eBPF attribution (optional)
 
 The eBPF programs need a nightly toolchain (picked up automatically via
-`crates/sentinel-ebpf/rust-toolchain.toml`, including `rust-src`) and
+`crates/hallpass-ebpf/rust-toolchain.toml`, including `rust-src`) and
 [bpf-linker](https://github.com/aya-rs/bpf-linker):
 
 ```sh
 cargo install bpf-linker
 cargo xtask build-ebpf                          # builds the kernel programs
-cargo build --release --features ebpf -p sentineld
+cargo build --release --features ebpf -p hallpassd
 # or both steps at once:
 cargo xtask build
 ```
@@ -81,24 +81,24 @@ kernel accepts it; otherwise it silently falls back to procfs attribution.
 ## Installing
 
 ```sh
-install -Dm755 target/release/sentineld  /usr/bin/sentineld
-install -Dm755 target/release/sentinel-cli /usr/bin/sentinel-cli
-install -Dm755 target/release/sentinel-ui  /usr/bin/sentinel-ui
-install -Dm644 etc/config.toml           /etc/sentinel/config.toml
-install -Dm644 etc/rules.d/example-allow-dns.toml /etc/sentinel/rules.d/example-allow-dns.toml
-install -Dm644 etc/sentineld.service     /etc/systemd/system/sentineld.service
-install -Dm644 etc/sentinel-ui.desktop   /usr/share/applications/sentinel-ui.desktop
+install -Dm755 target/release/hallpassd  /usr/bin/hallpassd
+install -Dm755 target/release/hallpass-cli /usr/bin/hallpass-cli
+install -Dm755 target/release/hallpass-ui  /usr/bin/hallpass-ui
+install -Dm644 etc/config.toml           /etc/hallpass/config.toml
+install -Dm644 etc/rules.d/example-allow-dns.toml /etc/hallpass/rules.d/example-allow-dns.toml
+install -Dm644 etc/hallpassd.service     /etc/systemd/system/hallpassd.service
+install -Dm644 etc/hallpass-ui.desktop   /usr/share/applications/hallpass-ui.desktop
 
-# Optional: members of the "sentinel" group may talk to the daemon socket.
-groupadd -f sentinel && usermod -aG sentinel "$USER"
+# Optional: members of the "hallpass" group may talk to the daemon socket.
+groupadd -f hallpass && usermod -aG hallpass "$USER"
 
 systemctl daemon-reload
-systemctl enable --now sentineld
+systemctl enable --now hallpassd
 ```
 
-Configuration lives in `/etc/sentinel/config.toml` (default verdict, prompt
+Configuration lives in `/etc/hallpass/config.toml` (default verdict, prompt
 timeout, queue number, socket path, rules directory). Persistent rules are
-TOML files in `/etc/sentinel/rules.d/`, one rule per file:
+TOML files in `/etc/hallpass/rules.d/`, one rule per file:
 
 ```toml
 name = "allow-dns"
@@ -122,16 +122,16 @@ The directory is watched; edits apply without a restart.
 ## Usage
 
 ```sh
-sentinel-cli status                        # daemon statistics
-sentinel-cli rules                         # list rules
-sentinel-cli rules add --name block-smtp --action deny --port 25 --duration forever
-sentinel-cli rules rm block-smtp
-sentinel-cli rules toggle allow-dns off
-sentinel-cli events                        # stream connection events
-sentinel-cli watch                         # answer prompts in the terminal
+hallpass-cli status                        # daemon statistics
+hallpass-cli rules                         # list rules
+hallpass-cli rules add --name block-smtp --action deny --port 25 --duration forever
+hallpass-cli rules rm block-smtp
+hallpass-cli rules toggle allow-dns off
+hallpass-cli events                        # stream connection events
+hallpass-cli watch                         # answer prompts in the terminal
 ```
 
-The GUI (`sentinel-ui`) connects to the same socket, pops up a dialog for each
+The GUI (`hallpass-ui`) connects to the same socket, pops up a dialog for each
 unmatched connection (allow/deny, scope, duration), and offers a management
 window for rules, live events, and statistics. Only one client at a time can
 hold the prompt-handler role.
@@ -143,14 +143,14 @@ hold the prompt-handler role.
   clean shutdown and on panic, the nftables table is removed. This is an
   availability-over-enforcement tradeoff; an attacker who can SIGKILL the
   daemon (root) can bypass it anyway.
-- **IPC socket**: `/run/sentinel/sentinel.sock`, directory 0750, socket 0660
-  root:sentinel. Only root and the `sentinel` group can manage rules or answer
+- **IPC socket**: `/run/hallpass/hallpass.sock`, directory 0750, socket 0660
+  root:hallpass. Only root and the `hallpass` group can manage rules or answer
   prompts. Peer UIDs are logged for every mutating request.
 - **Rule files**: files in `rules.d` are ignored (with a warning) unless owned
   by root (or the daemon's own euid) and not group/other writable.
 - **systemd hardening**: `ProtectSystem=strict`, `ProtectHome`,
   `NoNewPrivileges`, `MemoryDenyWriteExecute`, restricted address families,
-  and a read-write allowlist limited to `/etc/sentinel` and `/run/sentinel`.
+  and a read-write allowlist limited to `/etc/hallpass` and `/run/hallpass`.
 - **No unsafe code** in the userspace crates (`#![deny(unsafe_code)]`
   workspace-wide; the eBPF crate is the exception by nature).
 
@@ -177,8 +177,8 @@ End-to-end tests run the real daemon inside network namespaces and need root
 plus `ip`, `nft`, and `nc`:
 
 ```sh
-cargo test -p sentineld --test e2e --no-run   # just compile them
-sudo -E cargo test -p sentineld --test e2e -- --ignored --test-threads=1
+cargo test -p hallpassd --test e2e --no-run   # just compile them
+sudo -E cargo test -p hallpassd --test e2e -- --ignored --test-threads=1
 ```
 
 They cover rule enforcement (allow/deny), default verdicts, queue-bypass

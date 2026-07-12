@@ -3,7 +3,7 @@ name = "xtask"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Build tasks for the sentinel workspace"
+description = "Build tasks for the hallpass workspace"
 
 [dependencies]
 

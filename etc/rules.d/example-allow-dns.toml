@@ -1,5 +1,5 @@
 # Example rule: allow all outbound DNS queries over UDP.
-# Drop files like this into /etc/sentinel/rules.d/ to load them at startup.
+# Drop files like this into /etc/hallpass/rules.d/ to load them at startup.
 
 name = "allow-dns"
 action = "allow"
