@@ -86,13 +86,18 @@ pub async fn run(socket_path: &Path, deps: Arc<IpcDeps>) -> std::io::Result<()> 
     }
 }
 
+/// Per-client outbound queue depth. Bounded so a client that stops
+/// reading cannot grow daemon memory; events are dropped when full and
+/// prompt delivery falls back to the timeout default.
+const OUT_QUEUE_CAP: usize = 512;
+
 async fn handle_conn(stream: UnixStream, deps: Arc<IpcDeps>) -> Result<(), wire::WireError> {
     let peer_uid = stream.peer_cred().ok().map(|c| c.uid());
     let (mut reader, mut writer) = stream.into_split();
 
     // All outbound traffic goes through one channel so the prompt table
     // and event forwarders can write without owning the stream.
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<DaemonMsg>();
+    let (out_tx, mut out_rx) = mpsc::channel::<DaemonMsg>(OUT_QUEUE_CAP);
     let writer_task = tokio::spawn(async move {
         while let Some(msg) = out_rx.recv().await {
             if wire::write_msg(&mut writer, &msg).await.is_err() {
@@ -109,34 +114,49 @@ async fn handle_conn(stream: UnixStream, deps: Arc<IpcDeps>) -> Result<(), wire:
     result
 }
 
+/// Queue a reply for the writer task. Replies use the awaiting send: the
+/// queue only fills if the client stops reading, and then blocking this
+/// client's own request loop is the correct backpressure.
+async fn send(out_tx: &mpsc::Sender<DaemonMsg>, msg: DaemonMsg) {
+    let _ = out_tx.send(msg).await;
+}
+
 async fn message_loop(
     reader: &mut (impl tokio::io::AsyncRead + Unpin),
-    out_tx: &mpsc::UnboundedSender<DaemonMsg>,
+    out_tx: &mpsc::Sender<DaemonMsg>,
     peer_uid: Option<u32>,
     deps: &IpcDeps,
 ) -> Result<(), wire::WireError> {
-    let send = |msg: DaemonMsg| {
-        let _ = out_tx.send(msg);
-    };
-
     match wire::read_msg::<ClientMsg, _>(reader).await? {
         ClientMsg::Hello { version } if version == PROTOCOL_VERSION => {
-            send(DaemonMsg::HelloAck {
-                version: PROTOCOL_VERSION,
-            });
+            send(
+                out_tx,
+                DaemonMsg::HelloAck {
+                    version: PROTOCOL_VERSION,
+                },
+            )
+            .await;
         }
         ClientMsg::Hello { version } => {
-            send(DaemonMsg::Err {
-                message: format!(
-                    "protocol version mismatch: client {version}, daemon {PROTOCOL_VERSION}"
-                ),
-            });
+            send(
+                out_tx,
+                DaemonMsg::Err {
+                    message: format!(
+                        "protocol version mismatch: client {version}, daemon {PROTOCOL_VERSION}"
+                    ),
+                },
+            )
+            .await;
             return Ok(());
         }
         _ => {
-            send(DaemonMsg::Err {
-                message: "expected Hello as first message".into(),
-            });
+            send(
+                out_tx,
+                DaemonMsg::Err {
+                    message: "expected Hello as first message".into(),
+                },
+            )
+            .await;
             return Ok(());
         }
     }
@@ -151,15 +171,19 @@ async fn message_loop(
             }
             Err(e) => return Err(e),
         };
-        match msg {
-            ClientMsg::Hello { .. } => send(DaemonMsg::Err {
+        let reply = match msg {
+            ClientMsg::Hello { .. } => DaemonMsg::Err {
                 message: "duplicate Hello".into(),
-            }),
+            },
             ClientMsg::Subscribe { events, prompts } => {
                 if prompts && !deps.prompts.set_handler(out_tx.clone()) {
-                    send(DaemonMsg::Err {
-                        message: "a prompt handler is already connected".into(),
-                    });
+                    send(
+                        out_tx,
+                        DaemonMsg::Err {
+                            message: "a prompt handler is already connected".into(),
+                        },
+                    )
+                    .await;
                     continue;
                 }
                 if events {
@@ -168,11 +192,15 @@ async fn message_loop(
                     tokio::spawn(async move {
                         loop {
                             match rx.recv().await {
-                                Ok(ev) => {
-                                    if tx.send(DaemonMsg::Event(ev)).is_err() {
-                                        break; // client gone
+                                // try_send: a client that stops draining
+                                // loses events instead of growing the queue.
+                                Ok(ev) => match tx.try_send(DaemonMsg::Event(ev)) {
+                                    Ok(()) => {}
+                                    Err(mpsc::error::TrySendError::Full(_)) => {
+                                        tracing::debug!("dropping event for slow client");
                                     }
-                                }
+                                    Err(mpsc::error::TrySendError::Closed(_)) => break,
+                                },
                                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                                     tracing::warn!("event subscriber lagged, skipped {n} events");
                                 }
@@ -181,7 +209,7 @@ async fn message_loop(
                         }
                     });
                 }
-                send(DaemonMsg::Ok);
+                DaemonMsg::Ok
             }
             ClientMsg::PromptReply {
                 id,
@@ -191,37 +219,38 @@ async fn message_loop(
             } => {
                 tracing::info!(?peer_uid, id, ?verdict, "prompt reply");
                 match deps.prompts.reply(id, verdict, duration, scope) {
-                    Ok(()) => send(DaemonMsg::Ok),
-                    Err(message) => send(DaemonMsg::Err { message }),
+                    Ok(()) => DaemonMsg::Ok,
+                    Err(message) => DaemonMsg::Err { message },
                 }
             }
-            ClientMsg::RuleList => send(DaemonMsg::Rules(deps.store.list())),
+            ClientMsg::RuleList => DaemonMsg::Rules(deps.store.list()),
             ClientMsg::RuleAdd(rule) => {
                 tracing::info!(?peer_uid, rule = %rule.name, "rule add");
                 match deps.store.add(rule) {
-                    Ok(()) => send(DaemonMsg::Ok),
-                    Err(message) => send(DaemonMsg::Err { message }),
+                    Ok(()) => DaemonMsg::Ok,
+                    Err(message) => DaemonMsg::Err { message },
                 }
             }
             ClientMsg::RuleDelete { name } => {
                 tracing::info!(?peer_uid, rule = %name, "rule delete");
                 match deps.store.delete(&name) {
-                    Ok(()) => send(DaemonMsg::Ok),
-                    Err(message) => send(DaemonMsg::Err { message }),
+                    Ok(()) => DaemonMsg::Ok,
+                    Err(message) => DaemonMsg::Err { message },
                 }
             }
             ClientMsg::RuleToggle { name, enabled } => {
                 tracing::info!(?peer_uid, rule = %name, enabled, "rule toggle");
                 match deps.store.toggle(&name, enabled) {
-                    Ok(()) => send(DaemonMsg::Ok),
-                    Err(message) => send(DaemonMsg::Err { message }),
+                    Ok(()) => DaemonMsg::Ok,
+                    Err(message) => DaemonMsg::Err { message },
                 }
             }
             ClientMsg::Stats => {
                 let rules = deps.store.ruleset().rule_count() as u32;
-                send(DaemonMsg::Stats(deps.stats.snapshot(rules)));
+                DaemonMsg::Stats(deps.stats.snapshot(rules))
             }
-        }
+        };
+        send(out_tx, reply).await;
     }
 }
 

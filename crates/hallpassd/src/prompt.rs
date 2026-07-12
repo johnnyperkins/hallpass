@@ -15,9 +15,11 @@ use std::time::Duration;
 use hallpass_types::{
     Connection, DaemonMsg, PromptScope, Rule, RuleDuration, RuleMatch, Verdict,
 };
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::{Sender, UnboundedSender};
 
-use crate::events::{unix_ms_now, EventBus};
+use hallpass_types::unix_ms_now;
+
+use crate::events::EventBus;
 use crate::rules::store::RuleStore;
 use crate::stats::Counters;
 
@@ -38,7 +40,9 @@ struct Inner {
     by_id: HashMap<u64, Pending>,
     by_key: HashMap<Key, u64>,
     /// Outbound channel of the sole prompt-handler client, if connected.
-    handler: Option<UnboundedSender<DaemonMsg>>,
+    /// Bounded: a stalled client drops messages instead of growing memory;
+    /// the prompt timeout then applies the default verdict.
+    handler: Option<Sender<DaemonMsg>>,
 }
 
 /// Table of prompts awaiting a client decision.
@@ -79,7 +83,7 @@ impl PromptTable {
     }
 
     /// Claim the prompt-handler slot. Returns false if already claimed.
-    pub fn set_handler(&self, tx: UnboundedSender<DaemonMsg>) -> bool {
+    pub fn set_handler(&self, tx: Sender<DaemonMsg>) -> bool {
         let mut inner = self.inner.lock().unwrap();
         match &inner.handler {
             Some(h) if !h.is_closed() => false,
@@ -91,7 +95,7 @@ impl PromptTable {
     }
 
     /// Release the handler slot if `tx` currently holds it.
-    pub fn clear_handler(&self, tx: &UnboundedSender<DaemonMsg>) {
+    pub fn clear_handler(&self, tx: &Sender<DaemonMsg>) {
         let mut inner = self.inner.lock().unwrap();
         if inner.handler.as_ref().is_some_and(|h| h.same_channel(tx)) {
             inner.handler = None;
@@ -147,11 +151,18 @@ impl PromptTable {
 
         self.stats.record_prompted();
         let deadline_ms = unix_ms_now() + self.timeout.as_millis() as u64;
-        let _ = handler.send(DaemonMsg::PromptRequest {
-            id,
-            conn,
-            deadline_ms,
-        });
+        // try_send: never block the dispatcher on a stalled client. A
+        // dropped request is resolved by the timeout below.
+        if handler
+            .try_send(DaemonMsg::PromptRequest {
+                id,
+                conn,
+                deadline_ms,
+            })
+            .is_err()
+        {
+            tracing::warn!(id, "prompt handler not accepting requests");
+        }
 
         let table = Arc::clone(self);
         tokio::spawn(async move {
@@ -203,7 +214,7 @@ impl PromptTable {
         self.finish_default(pending.conn, pending.packets);
         let inner = self.inner.lock().unwrap();
         if let Some(h) = &inner.handler {
-            let _ = h.send(DaemonMsg::PromptExpired { id });
+            let _ = h.try_send(DaemonMsg::PromptExpired { id });
         }
     }
 
@@ -214,13 +225,14 @@ impl PromptTable {
         Some(pending)
     }
 
-    /// Release all held packets with `verdict`, count them, and emit one
-    /// event for the decision.
+    /// Release all held packets with `verdict` and emit one event for the
+    /// decision. Stats count the decision once, not per coalesced packet,
+    /// matching the single `record_prompted` for the prompt.
     fn finish(&self, conn: Connection, packets: Vec<u64>, verdict: Verdict, rule: Option<String>) {
         for seq in packets {
             let _ = self.verdict_tx.send((seq, verdict));
-            self.stats.record_verdict(verdict);
         }
+        self.stats.record_verdict(verdict);
         self.events.emit(conn, verdict, rule);
     }
 
@@ -262,7 +274,7 @@ fn rule_from_reply(
     }
     Some(Rule {
         name: format!("prompt-{stem}-{id}"),
-        action: crate::rules::engine::action_for(verdict),
+        action: verdict.into(),
         duration,
         priority: PROMPT_RULE_PRIORITY,
         enabled: true,
@@ -329,7 +341,7 @@ mod tests {
     #[tokio::test]
     async fn reply_resolves_all_coalesced_packets() {
         let mut h = harness("coalesce", 4, Verdict::Allow);
-        let (tx, mut prompt_rx) = mpsc::unbounded_channel();
+        let (tx, mut prompt_rx) = mpsc::channel(16);
         assert!(h.table.set_handler(tx.clone()));
         assert!(!h.table.set_handler(tx.clone()), "slot is exclusive");
 
@@ -354,7 +366,7 @@ mod tests {
     #[tokio::test]
     async fn overflow_applies_default() {
         let mut h = harness("overflow", 1, Verdict::Deny);
-        let (tx, mut prompt_rx) = mpsc::unbounded_channel();
+        let (tx, mut prompt_rx) = mpsc::channel(16);
         assert!(h.table.set_handler(tx));
         h.table.handle_new(conn("/bin/a", "1.1.1.1:443"), 1);
         let _ = prompt_rx.recv().await.unwrap();
@@ -366,7 +378,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn timeout_applies_default_and_notifies() {
         let mut h = harness("timeout", 4, Verdict::Deny);
-        let (tx, mut prompt_rx) = mpsc::unbounded_channel();
+        let (tx, mut prompt_rx) = mpsc::channel(16);
         assert!(h.table.set_handler(tx));
         h.table.handle_new(conn("/bin/a", "1.1.1.1:443"), 9);
         let DaemonMsg::PromptRequest { id, .. } = prompt_rx.recv().await.unwrap() else {
@@ -380,7 +392,7 @@ mod tests {
     #[tokio::test]
     async fn reply_with_duration_creates_scoped_rule() {
         let mut h = harness("rule", 4, Verdict::Allow);
-        let (tx, mut prompt_rx) = mpsc::unbounded_channel();
+        let (tx, mut prompt_rx) = mpsc::channel(16);
         assert!(h.table.set_handler(tx));
         h.table.handle_new(conn("/usr/bin/curl", "9.9.9.9:853"), 1);
         let DaemonMsg::PromptRequest { id, .. } = prompt_rx.recv().await.unwrap() else {
