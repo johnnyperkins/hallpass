@@ -7,7 +7,7 @@
 //! malformed returns `None`; it never panics on untrusted input.
 
 use std::collections::HashSet;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::num::NonZeroUsize;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -16,6 +16,11 @@ use lru::LruCache;
 
 /// Default cache capacity (distinct IPs).
 pub const CACHE_CAPACITY: usize = 8192;
+
+/// Outstanding queries the tracker remembers (per-key, LRU).
+pub const TRACKER_CAPACITY: usize = 512;
+/// How long an observed query stays answerable.
+const QUERY_TTL: Duration = Duration::from_secs(10);
 
 /// Max compression-pointer hops while reading one name.
 const MAX_POINTER_HOPS: usize = 16;
@@ -32,8 +37,16 @@ const TYPE_AAAA: u16 = 28;
 /// record TTL in seconds.
 #[derive(Debug, PartialEq, Eq)]
 pub struct SnoopedResponse {
+    pub id: u16,
     pub query_name: String,
     pub addrs: Vec<(IpAddr, u32)>,
+}
+
+/// One parsed outbound DNS query: transaction ID and first question name.
+#[derive(Debug, PartialEq, Eq)]
+pub struct SnoopedQuery {
+    pub id: u16,
+    pub query_name: String,
 }
 
 fn read_u16(buf: &[u8], pos: usize) -> Option<u16> {
@@ -84,6 +97,9 @@ fn read_name(buf: &[u8], mut pos: usize) -> Option<(String, usize)> {
         if !name.is_empty() {
             name.push('.');
         }
+        // DNS names on the wire are ASCII (IDNs arrive punycoded);
+        // non-ASCII bytes map byte-for-byte, which keeps comparisons
+        // consistent even for out-of-spec labels.
         for b in label {
             name.push(b.to_ascii_lowercase() as char);
         }
@@ -102,7 +118,24 @@ fn read_name(buf: &[u8], mut pos: usize) -> Option<(String, usize)> {
 /// it through CNAME records are attributed to the ORIGINAL query name:
 /// that is the name the application asked for and the one rules and
 /// prompts should see.
+/// Parse a DNS message that should be an outbound query: QR clear and at
+/// least one question. Returns the transaction ID and the first question
+/// name so the response can later be validated against it.
+pub fn parse_query(msg: &[u8]) -> Option<SnoopedQuery> {
+    let id = read_u16(msg, 0)?;
+    let flags = read_u16(msg, 2)?;
+    if flags & 0x8000 != 0 {
+        return None; // a response, not a query
+    }
+    if read_u16(msg, 4)? == 0 {
+        return None; // no question
+    }
+    let (query_name, _) = read_name(msg, 12)?;
+    Some(SnoopedQuery { id, query_name })
+}
+
 pub fn parse_response(msg: &[u8]) -> Option<SnoopedResponse> {
+    let id = read_u16(msg, 0)?;
     let flags = read_u16(msg, 2)?;
     let is_response = flags & 0x8000 != 0;
     let rcode = flags & 0x000F;
@@ -181,7 +214,78 @@ pub fn parse_response(msg: &[u8]) -> Option<SnoopedResponse> {
     if addrs.is_empty() {
         return None;
     }
-    Some(SnoopedResponse { query_name, addrs })
+    Some(SnoopedResponse {
+        id,
+        query_name,
+        addrs,
+    })
+}
+
+/// Key identifying one outstanding query: who asked whom, with which
+/// transaction ID, for which name.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct QueryKey {
+    client: SocketAddr,
+    server: SocketAddr,
+    id: u16,
+    name: String,
+}
+
+/// Tracks outbound queries so only genuine responses reach the IP-domain
+/// cache. A response is accepted (and the entry consumed) only when its
+/// source/destination, transaction ID, and question name all match an
+/// observed query; anything else is treated as spoofed and ignored.
+pub struct QueryTracker {
+    inner: Mutex<LruCache<QueryKey, Instant>>,
+}
+
+impl QueryTracker {
+    pub fn new(capacity: usize) -> Self {
+        QueryTracker {
+            inner: Mutex::new(LruCache::new(NonZeroUsize::new(capacity.max(1)).unwrap())),
+        }
+    }
+
+    /// Record an outbound query from `client` to `server`.
+    pub fn observe(&self, client: SocketAddr, server: SocketAddr, q: &SnoopedQuery) {
+        self.observe_at(client, server, q, Instant::now());
+    }
+
+    fn observe_at(&self, client: SocketAddr, server: SocketAddr, q: &SnoopedQuery, now: Instant) {
+        let key = QueryKey {
+            client,
+            server,
+            id: q.id,
+            name: q.query_name.clone(),
+        };
+        self.inner.lock().unwrap().put(key, now + QUERY_TTL);
+    }
+
+    /// True when a response from `server` to `client` answers an observed
+    /// query. The matching entry is consumed so a duplicate (or raced
+    /// spoof) of the same response is not accepted twice.
+    pub fn validate(&self, client: SocketAddr, server: SocketAddr, resp: &SnoopedResponse) -> bool {
+        self.validate_at(client, server, resp, Instant::now())
+    }
+
+    fn validate_at(
+        &self,
+        client: SocketAddr,
+        server: SocketAddr,
+        resp: &SnoopedResponse,
+        now: Instant,
+    ) -> bool {
+        let key = QueryKey {
+            client,
+            server,
+            id: resp.id,
+            name: resp.query_name.clone(),
+        };
+        match self.inner.lock().unwrap().pop(&key) {
+            Some(expires) => expires > now,
+            None => false,
+        }
+    }
 }
 
 struct Entry {
@@ -298,8 +402,77 @@ mod tests {
     #[test]
     fn simple_a_answer() {
         let resp = parse_response(&simple_a_response()).unwrap();
+        assert_eq!(resp.id, 0x1234);
         assert_eq!(resp.query_name, "example.com");
         assert_eq!(resp.addrs, vec![("93.184.216.34".parse().unwrap(), 300)]);
+    }
+
+    fn simple_query() -> Vec<u8> {
+        let mut msg = header(0x0100, 1, 0);
+        msg.extend(question("Example.com"));
+        msg
+    }
+
+    #[test]
+    fn query_parsing() {
+        let q = parse_query(&simple_query()).unwrap();
+        assert_eq!(q.id, 0x1234);
+        assert_eq!(q.query_name, "example.com"); // lowercased
+
+        // A response is not a query.
+        assert!(parse_query(&simple_a_response()).is_none());
+        // No question section.
+        assert!(parse_query(&header(0x0100, 0, 0)).is_none());
+        // Truncated.
+        let msg = simple_query();
+        for len in 0..msg.len() - 4 {
+            assert!(parse_query(&msg[..len]).is_none(), "truncated at {len}");
+        }
+    }
+
+    #[test]
+    fn tracker_accepts_only_matching_response() {
+        let tracker = QueryTracker::new(16);
+        let client: SocketAddr = "10.0.0.1:51000".parse().unwrap();
+        let server: SocketAddr = "9.9.9.9:53".parse().unwrap();
+        let now = Instant::now();
+        tracker.observe_at(client, server, &parse_query(&simple_query()).unwrap(), now);
+
+        let resp = parse_response(&simple_a_response()).unwrap();
+        // Wrong server, wrong client, wrong id: all rejected.
+        let other: SocketAddr = "8.8.8.8:53".parse().unwrap();
+        assert!(!tracker.validate_at(client, other, &resp, now));
+        assert!(!tracker.validate_at(server, client, &resp, now));
+        let mut wrong_id = parse_response(&simple_a_response()).unwrap();
+        wrong_id.id = 0x9999;
+        assert!(!tracker.validate_at(client, server, &wrong_id, now));
+
+        // The genuine response matches exactly once.
+        assert!(tracker.validate_at(client, server, &resp, now));
+        assert!(!tracker.validate_at(client, server, &resp, now), "consumed");
+    }
+
+    #[test]
+    fn tracker_expires_stale_queries() {
+        let tracker = QueryTracker::new(16);
+        let client: SocketAddr = "10.0.0.1:51000".parse().unwrap();
+        let server: SocketAddr = "9.9.9.9:53".parse().unwrap();
+        let now = Instant::now();
+        tracker.observe_at(client, server, &parse_query(&simple_query()).unwrap(), now);
+        let resp = parse_response(&simple_a_response()).unwrap();
+        assert!(!tracker.validate_at(client, server, &resp, now + QUERY_TTL));
+    }
+
+    #[test]
+    fn tracker_mismatched_name_rejected() {
+        let tracker = QueryTracker::new(16);
+        let client: SocketAddr = "10.0.0.1:51000".parse().unwrap();
+        let server: SocketAddr = "9.9.9.9:53".parse().unwrap();
+        let mut q = header(0x0100, 1, 0);
+        q.extend(question("other.org"));
+        tracker.observe(client, server, &parse_query(&q).unwrap());
+        let resp = parse_response(&simple_a_response()).unwrap();
+        assert!(!tracker.validate(client, server, &resp));
     }
 
     #[test]

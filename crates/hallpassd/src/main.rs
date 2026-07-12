@@ -97,7 +97,8 @@ async fn main() {
     let (prompt_tx, mut prompt_rx) =
         tokio::sync::mpsc::unbounded_channel::<nfqueue::PromptTask>();
     let (verdict_tx, verdict_rx) = tokio::sync::mpsc::unbounded_channel();
-    let (dns_tx, mut dns_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+    let (dns_tx, mut dns_rx) =
+        tokio::sync::mpsc::unbounded_channel::<(hallpass_types::FlowTuple, Vec<u8>)>();
 
     let prompts = Arc::new(PromptTable::new(
         verdict_tx,
@@ -109,20 +110,39 @@ async fn main() {
         cfg.default_verdict,
     ));
 
-    // DNS snoop consumer: parse each captured reply and record every
-    // resolved IP under the name the application originally asked for.
+    // DNS snoop consumer: record outbound queries, then only absorb
+    // responses that answer one (matching addresses, transaction ID, and
+    // question name), so spoofed replies cannot poison the domain cache.
     // The queue thread reads the cache when it builds a Connection.
     let dns_cache = Arc::new(dns::IpDomainCache::new(dns::CACHE_CAPACITY));
     let snoop_cache = Arc::clone(&dns_cache);
     tokio::spawn(async move {
-        while let Some(pkt) = dns_rx.recv().await {
-            if let Some(resp) = packet::udp_payload(&pkt).and_then(dns::parse_response) {
-                tracing::debug!(
-                    domain = %resp.query_name,
-                    addrs = resp.addrs.len(),
-                    "dns response snooped"
-                );
-                snoop_cache.absorb(&resp);
+        let tracker = dns::QueryTracker::new(dns::TRACKER_CAPACITY);
+        while let Some((tuple, pkt)) = dns_rx.recv().await {
+            let Some(payload) = packet::udp_payload(&pkt) else {
+                continue;
+            };
+            if packet::is_dns_response(&tuple) {
+                if let Some(resp) = dns::parse_response(payload) {
+                    if tracker.validate(tuple.dst, tuple.src, &resp) {
+                        tracing::debug!(
+                            domain = %resp.query_name,
+                            addrs = resp.addrs.len(),
+                            "dns response snooped"
+                        );
+                        snoop_cache.absorb(&resp);
+                    } else {
+                        tracing::debug!(
+                            domain = %resp.query_name,
+                            from = %tuple.src,
+                            "ignoring unsolicited dns response"
+                        );
+                    }
+                }
+            } else if packet::is_dns_query(&tuple) {
+                if let Some(q) = dns::parse_query(payload) {
+                    tracker.observe(tuple.src, tuple.dst, &q);
+                }
             }
         }
     });

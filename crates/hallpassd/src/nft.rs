@@ -1,27 +1,39 @@
 //! nftables ruleset install/teardown via the `nft` binary.
 //!
-//! Table `inet hallpass` with two chains:
-//! - output: queues new connections to NFQUEUE for verdicts.
-//! - input: queues UDP packets from source port 53 so the daemon can snoop
-//!   DNS replies (the queue loop accepts them immediately).
+//! Table `inet hallpass` with two chains and two queues:
+//! - output, verdict queue: new connections wait for an allow/deny verdict.
+//! - output, snoop queue: established outbound DNS queries (the first query
+//!   on a flow is `ct state new` and arrives via the verdict queue).
+//! - input, snoop queue: UDP packets from source port 53, i.e. DNS replies.
 //!
-//! Both queue rules use `bypass` so traffic keeps flowing if the daemon dies
+//! Snoop-queue packets are always accepted immediately; the daemon only
+//! records them so responses can be validated against observed queries.
+//!
+//! All queue rules use `bypass` so traffic keeps flowing if the daemon dies
 //! without tearing the table down.
 
 use std::io::Write;
 use std::process::{Command, Stdio};
 
+/// Queue number for DNS snoop traffic (verdict queue + 1).
+pub fn snoop_queue(queue_num: u16) -> u16 {
+    // Config validation guarantees queue_num < u16::MAX.
+    queue_num + 1
+}
+
 /// Render the ruleset installed at startup.
 fn ruleset(queue_num: u16) -> String {
+    let snoop = snoop_queue(queue_num);
     format!(
         "table inet hallpass {{\n\
          \tchain output {{\n\
          \t\ttype filter hook output priority mangle; policy accept;\n\
          \t\tct state new queue num {queue_num} bypass\n\
+         \t\tudp dport 53 ct state != new queue num {snoop} bypass\n\
          \t}}\n\
          \tchain input {{\n\
          \t\ttype filter hook input priority mangle; policy accept;\n\
-         \t\tudp sport 53 queue num {queue_num} bypass\n\
+         \t\tudp sport 53 queue num {snoop} bypass\n\
          \t}}\n\
          }}\n"
     )
@@ -77,7 +89,8 @@ mod tests {
         assert!(r.contains("table inet hallpass"));
         assert!(r.contains("type filter hook output priority mangle; policy accept;"));
         assert!(r.contains("ct state new queue num 3 bypass"));
+        assert!(r.contains("udp dport 53 ct state != new queue num 4 bypass"));
         assert!(r.contains("type filter hook input priority mangle; policy accept;"));
-        assert!(r.contains("udp sport 53 queue num 3 bypass"));
+        assert!(r.contains("udp sport 53 queue num 4 bypass"));
     }
 }

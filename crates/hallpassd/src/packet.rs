@@ -38,6 +38,12 @@ pub fn is_dns_response(tuple: &FlowTuple) -> bool {
     tuple.proto == Proto::Udp && tuple.src.port() == 53
 }
 
+/// True for packets that look like outbound DNS queries (UDP to port 53).
+/// The snooper records these so responses can be validated against them.
+pub fn is_dns_query(tuple: &FlowTuple) -> bool {
+    tuple.proto == Proto::Udp && tuple.dst.port() == 53
+}
+
 /// Extract the UDP payload (e.g. a DNS message) from a raw IP packet as
 /// delivered by the nfqueue snoop rule.
 pub fn udp_payload(packet: &[u8]) -> Option<&[u8]> {

@@ -44,16 +44,33 @@ impl Config {
     /// Load config from `path`. A missing file yields defaults with a
     /// warning; a malformed file is a hard error.
     pub fn load(path: &Path) -> Result<Config, String> {
-        match std::fs::read_to_string(path) {
+        let cfg: Config = match std::fs::read_to_string(path) {
             Ok(text) => {
-                toml::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))
+                toml::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 tracing::warn!(path = %path.display(), "config file not found, using defaults");
-                Ok(Config::default())
+                Config::default()
             }
-            Err(e) => Err(format!("{}: {e}", path.display())),
+            Err(e) => return Err(format!("{}: {e}", path.display())),
+        };
+        cfg.validate().map_err(|e| format!("{}: {e}", path.display()))?;
+        Ok(cfg)
+    }
+
+    /// Reject values that would render the daemon useless.
+    fn validate(&self) -> Result<(), String> {
+        if self.prompt_timeout_secs == 0 {
+            return Err("prompt_timeout_secs must be at least 1".into());
         }
+        if self.max_pending_prompts == 0 {
+            return Err("max_pending_prompts must be at least 1".into());
+        }
+        if self.queue_num == u16::MAX {
+            // queue_num + 1 is the DNS snoop queue.
+            return Err(format!("queue_num must be below {}", u16::MAX));
+        }
+        Ok(())
     }
 }
 
@@ -121,6 +138,14 @@ mod tests {
     #[test]
     fn bad_verdict_rejected() {
         assert!(toml::from_str::<Config>(r#"default_verdict = "maybe""#).is_err());
+    }
+
+    #[test]
+    fn degenerate_values_rejected() {
+        assert!(parse("prompt_timeout_secs = 0").validate().is_err());
+        assert!(parse("max_pending_prompts = 0").validate().is_err());
+        assert!(parse("queue_num = 65535").validate().is_err());
+        assert!(parse("").validate().is_ok());
     }
 
     #[test]
