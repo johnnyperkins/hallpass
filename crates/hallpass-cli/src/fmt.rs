@@ -2,18 +2,7 @@
 
 use std::fmt::Write;
 
-use hallpass_types::{
-    Action, ConnEvent, Connection, PromptScope, Rule, RuleDuration, RuleMatch, Stats, Verdict,
-};
-
-/// Human-readable action name.
-pub fn action_str(a: Action) -> &'static str {
-    match a {
-        Action::Allow => "allow",
-        Action::Deny => "deny",
-        Action::Reject => "reject",
-    }
-}
+use hallpass_types::{ConnEvent, Connection, PromptScope, Rule, Stats, Verdict};
 
 /// Human-readable verdict name (uppercase, for event lines).
 pub fn verdict_str(v: Verdict) -> &'static str {
@@ -24,30 +13,12 @@ pub fn verdict_str(v: Verdict) -> &'static str {
     }
 }
 
-/// Human-readable verdict name (lowercase, for confirmations).
-pub fn verdict_str_lower(v: Verdict) -> &'static str {
-    match v {
-        Verdict::Allow => "allow",
-        Verdict::Deny => "deny",
-        Verdict::Reject => "reject",
-    }
-}
-
 /// Human-readable prompt scope.
 pub fn scope_str(s: PromptScope) -> &'static str {
     match s {
         PromptScope::ThisPort => "this port",
         PromptScope::ThisHost => "this host",
         PromptScope::AppAnywhere => "app anywhere",
-    }
-}
-
-/// Human-readable rule duration.
-pub fn duration_str(d: RuleDuration) -> &'static str {
-    match d {
-        RuleDuration::Once => "once",
-        RuleDuration::Session => "session",
-        RuleDuration::Forever => "forever",
     }
 }
 
@@ -86,40 +57,6 @@ pub fn format_uptime(secs: u64) -> String {
     parts.join(" ")
 }
 
-/// Summarize present match fields as "key=value key=value".
-pub fn match_summary(m: &RuleMatch) -> String {
-    let mut parts: Vec<String> = Vec::new();
-    if let Some(exe) = &m.exe {
-        parts.push(format!("exe={}", exe.display()));
-    }
-    if let Some(g) = &m.exe_glob {
-        parts.push(format!("exe-glob={g}"));
-    }
-    if let Some(d) = &m.dest {
-        parts.push(format!("dest={d}"));
-    }
-    if let Some(p) = m.port {
-        parts.push(format!("port={p}"));
-    }
-    if let Some((lo, hi)) = m.port_range {
-        parts.push(format!("ports={lo}-{hi}"));
-    }
-    if let Some(d) = &m.domain {
-        parts.push(format!("domain={d}"));
-    }
-    if let Some(u) = m.user {
-        parts.push(format!("user={u}"));
-    }
-    if let Some(p) = m.proto {
-        parts.push(format!("proto={p}"));
-    }
-    if parts.is_empty() {
-        "(any)".to_string()
-    } else {
-        parts.join(" ")
-    }
-}
-
 /// Format the rule list as an aligned table with a header row.
 pub fn format_rules(rules: &[Rule]) -> String {
     if rules.is_empty() {
@@ -131,11 +68,11 @@ pub fn format_rules(rules: &[Rule]) -> String {
         .map(|r| {
             [
                 r.name.clone(),
-                action_str(r.action).to_string(),
-                duration_str(r.duration).to_string(),
+                r.action.as_str().to_string(),
+                r.duration.as_str().to_string(),
                 r.priority.to_string(),
                 if r.enabled { "yes" } else { "no" }.to_string(),
-                match_summary(&r.matcher),
+                r.matcher.summary(),
             ]
         })
         .collect();
@@ -227,7 +164,7 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hallpass_types::{FlowTuple, Proto};
+    use hallpass_types::{Action, FlowTuple, Proto, RuleDuration, RuleMatch};
     use std::net::SocketAddr;
     use std::path::PathBuf;
 

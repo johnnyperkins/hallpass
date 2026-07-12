@@ -142,6 +142,102 @@ pub enum Verdict {
     Reject,
 }
 
+// Action and Verdict are deliberately distinct types (what a rule *does*
+// vs. what happened to a connection), but their variants correspond 1:1.
+impl From<Action> for Verdict {
+    fn from(a: Action) -> Verdict {
+        match a {
+            Action::Allow => Verdict::Allow,
+            Action::Deny => Verdict::Deny,
+            Action::Reject => Verdict::Reject,
+        }
+    }
+}
+
+impl From<Verdict> for Action {
+    fn from(v: Verdict) -> Action {
+        match v {
+            Verdict::Allow => Action::Allow,
+            Verdict::Deny => Action::Deny,
+            Verdict::Reject => Action::Reject,
+        }
+    }
+}
+
+impl Action {
+    /// Lowercase name, matching the serde/TOML representation.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Action::Allow => "allow",
+            Action::Deny => "deny",
+            Action::Reject => "reject",
+        }
+    }
+}
+
+impl Verdict {
+    /// Lowercase name, matching the serde/TOML representation.
+    pub fn as_str(self) -> &'static str {
+        Action::from(self).as_str()
+    }
+}
+
+impl RuleDuration {
+    /// Lowercase name, matching the serde/TOML representation.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RuleDuration::Once => "once",
+            RuleDuration::Session => "session",
+            RuleDuration::Forever => "forever",
+        }
+    }
+}
+
+impl RuleMatch {
+    /// One-line "key=value" summary of the present criteria, or "(any)".
+    /// Shared by the CLI table and the UI rule list.
+    pub fn summary(&self) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(exe) = &self.exe {
+            parts.push(format!("exe={}", exe.display()));
+        }
+        if let Some(g) = &self.exe_glob {
+            parts.push(format!("exe-glob={g}"));
+        }
+        if let Some(d) = &self.dest {
+            parts.push(format!("dest={d}"));
+        }
+        if let Some(p) = self.port {
+            parts.push(format!("port={p}"));
+        }
+        if let Some((lo, hi)) = self.port_range {
+            parts.push(format!("ports={lo}-{hi}"));
+        }
+        if let Some(d) = &self.domain {
+            parts.push(format!("domain={d}"));
+        }
+        if let Some(u) = self.user {
+            parts.push(format!("user={u}"));
+        }
+        if let Some(p) = self.proto {
+            parts.push(format!("proto={p}"));
+        }
+        if parts.is_empty() {
+            "(any)".to_string()
+        } else {
+            parts.join(" ")
+        }
+    }
+}
+
+/// Current wall clock as Unix milliseconds.
+pub fn unix_ms_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 /// A decided connection event, emitted to subscribers.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConnEvent {

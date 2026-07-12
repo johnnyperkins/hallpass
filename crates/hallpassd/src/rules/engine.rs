@@ -1,6 +1,6 @@
 //! First-match-wins rule evaluation over a compiled, sorted rule set.
 
-use hallpass_types::{Action, Connection, Rule, Verdict};
+use hallpass_types::{Connection, Rule, Verdict};
 
 use super::model::CompiledRule;
 
@@ -8,26 +8,6 @@ use super::model::CompiledRule;
 /// higher priority first, ties broken by name for determinism.
 pub struct RuleSet {
     rules: Vec<CompiledRule>,
-}
-
-/// Map a rule action to the verdict it produces. Kept beside
-/// [`action_for`] so both directions of the correspondence live in one
-/// place.
-pub fn verdict_for(action: Action) -> Verdict {
-    match action {
-        Action::Allow => Verdict::Allow,
-        Action::Deny => Verdict::Deny,
-        Action::Reject => Verdict::Reject,
-    }
-}
-
-/// Map a verdict to the rule action that reproduces it.
-pub fn action_for(verdict: Verdict) -> Action {
-    match verdict {
-        Verdict::Allow => Action::Allow,
-        Verdict::Deny => Action::Deny,
-        Verdict::Reject => Action::Reject,
-    }
 }
 
 impl RuleSet {
@@ -57,7 +37,7 @@ impl RuleSet {
             .iter()
             .filter(|r| r.enabled)
             .find(|r| r.matches(conn))
-            .map(|r| (r, verdict_for(r.action)))
+            .map(|r| (r, Verdict::from(r.action)))
     }
 
     /// Number of compiled rules (enabled or not).
@@ -69,7 +49,7 @@ impl RuleSet {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hallpass_types::{FlowTuple, Proto, RuleDuration, RuleMatch};
+    use hallpass_types::{Action, FlowTuple, Proto, RuleDuration, RuleMatch};
     use std::path::PathBuf;
 
     fn conn(exe: &str, dst: &str, proto: Proto, domain: Option<&str>, uid: u32) -> Connection {

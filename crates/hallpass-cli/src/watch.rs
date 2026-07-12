@@ -5,11 +5,10 @@
 //! while one is being answered are queued.
 
 use std::collections::VecDeque;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use hallpass_types::wire;
 use hallpass_types::{
-    ClientMsg, Connection, DaemonMsg, PromptScope, RuleDuration, Verdict,
+    unix_ms_now, ClientMsg, Connection, DaemonMsg, PromptScope, RuleDuration, Verdict,
 };
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc;
@@ -62,13 +61,6 @@ fn parse_scope(line: &str) -> Option<PromptScope> {
         "a" => Some(PromptScope::AppAnywhere),
         _ => None,
     }
-}
-
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
 }
 
 /// Render the connection details block for a prompt.
@@ -167,7 +159,7 @@ pub async fn watch(mut client: Client) -> Result<(), CliError> {
 /// Pop the next queued prompt and print its details plus the first hint.
 fn promote(queue: &mut VecDeque<Pending>) -> Option<(Pending, Stage)> {
     let p = queue.pop_front()?;
-    print!("{}", format_prompt(&p, now_ms()));
+    print!("{}", format_prompt(&p, unix_ms_now()));
     println!("{VERDICT_HINT}");
     Some((p, Stage::Verdict))
 }
@@ -216,8 +208,8 @@ async fn step<W: tokio::io::AsyncWrite + Unpin>(
                 println!(
                     "prompt #{}: {} {} {}",
                     pending.id,
-                    fmt::verdict_str_lower(verdict),
-                    fmt::duration_str(duration),
+                    verdict.as_str(),
+                    duration.as_str(),
                     fmt::scope_str(scope)
                 );
                 return Ok(promote(queue));

@@ -115,7 +115,7 @@ impl HallpassApp {
             } => {
                 if !self.prompts.iter().any(|p| p.id == id) {
                     self.prompts
-                        .push(PromptState::new(id, conn, deadline_ms, prompt::now_unix_ms()));
+                        .push(PromptState::new(id, conn, deadline_ms, hallpass_types::unix_ms_now()));
                 }
             }
             DaemonMsg::PromptExpired { id } => {
@@ -282,9 +282,9 @@ impl HallpassApp {
                                 toggle = Some((rule.name.clone(), enabled));
                             }
                             ui.label(&rule.name);
-                            let v = action_verdict(rule.action);
+                            let v = Verdict::from(rule.action);
                             ui.colored_label(verdict_color(v), verdict_label(v));
-                            ui.monospace(summarize_match(&rule.matcher));
+                            ui.monospace(rule.matcher.summary());
                             ui.label(rule.priority.to_string());
                             if ui.button("Delete").clicked() {
                                 delete = Some(rule.name.clone());
@@ -339,7 +339,7 @@ impl HallpassApp {
     /// Render one immediate viewport per pending prompt. Returns replies to
     /// send and removes answered/expired/closed prompts.
     fn prompt_windows(&mut self, ctx: &egui::Context) {
-        let now_ms = prompt::now_unix_ms();
+        let now_ms = hallpass_types::unix_ms_now();
         // Expired locally: close silently, the daemon applies its default.
         self.prompts.retain(|p| now_ms < p.deadline_ms);
 
@@ -484,16 +484,6 @@ fn verdict_color(v: Verdict) -> Color32 {
     }
 }
 
-/// `Action` and `Verdict` are the same three variants; map so the rule table
-/// reuses the verdict label/color helpers.
-fn action_verdict(a: hallpass_types::Action) -> Verdict {
-    match a {
-        hallpass_types::Action::Allow => Verdict::Allow,
-        hallpass_types::Action::Deny => Verdict::Deny,
-        hallpass_types::Action::Reject => Verdict::Reject,
-    }
-}
-
 fn duration_label(d: RuleDuration) -> &'static str {
     match d {
         RuleDuration::Once => "Once",
@@ -528,65 +518,15 @@ fn format_uptime(secs: u64) -> String {
     format!("{h}h {m:02}m {s:02}s")
 }
 
-/// One-line human summary of rule match criteria.
-fn summarize_match(m: &hallpass_types::RuleMatch) -> String {
-    let mut parts = Vec::new();
-    if let Some(exe) = &m.exe {
-        parts.push(format!("exe={}", exe.display()));
-    }
-    if let Some(g) = &m.exe_glob {
-        parts.push(format!("exe~{g}"));
-    }
-    if let Some(d) = &m.dest {
-        parts.push(format!("dest={d}"));
-    }
-    if let Some(p) = m.port {
-        parts.push(format!("port={p}"));
-    }
-    if let Some((lo, hi)) = m.port_range {
-        parts.push(format!("port={lo}-{hi}"));
-    }
-    if let Some(d) = &m.domain {
-        parts.push(format!("domain={d}"));
-    }
-    if let Some(u) = m.user {
-        parts.push(format!("uid={u}"));
-    }
-    if let Some(p) = m.proto {
-        parts.push(format!("proto={p}"));
-    }
-    if parts.is_empty() {
-        "any".to_string()
-    } else {
-        parts.join(" ")
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hallpass_types::RuleMatch;
 
     #[test]
     fn uptime_formatting() {
         assert_eq!(format_uptime(0), "0h 00m 00s");
         assert_eq!(format_uptime(3661), "1h 01m 01s");
         assert_eq!(format_uptime(86400), "24h 00m 00s");
-    }
-
-    #[test]
-    fn match_summary() {
-        assert_eq!(summarize_match(&RuleMatch::default()), "any");
-        let m = RuleMatch {
-            exe: Some("/usr/bin/curl".into()),
-            port: Some(443),
-            domain: Some("*.example.org".into()),
-            ..Default::default()
-        };
-        assert_eq!(
-            summarize_match(&m),
-            "exe=/usr/bin/curl port=443 domain=*.example.org"
-        );
     }
 
     #[test]

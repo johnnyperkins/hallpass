@@ -1,17 +1,9 @@
 //! Broadcast of decided connection events to subscribed clients.
 
-use hallpass_types::{ConnEvent, Connection, Verdict};
+use hallpass_types::{unix_ms_now, ConnEvent, Connection, Verdict};
 use tokio::sync::broadcast;
 
 const CHANNEL_CAPACITY: usize = 256;
-
-/// Current time as Unix milliseconds.
-pub fn unix_ms_now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
 
 /// Fan-out channel for [`ConnEvent`]s. Send never blocks; slow subscribers
 /// lag and skip events, which is acceptable for a monitoring stream.
