@@ -189,12 +189,15 @@ impl RuleStore {
             return Err("rule name must not be empty".into());
         }
         CompiledRule::compile(&rule)?;
+        // Persist while holding the entries lock: the directory watcher's
+        // reload_disk() takes the same lock, so it cannot observe the new
+        // file before this add lands in `entries`.
+        let mut entries = self.entries.lock().unwrap();
         let origin = if rule.duration == hallpass_types::RuleDuration::Forever {
             Origin::Disk(self.persist(&rule)?)
         } else {
             Origin::Session
         };
-        let mut entries = self.entries.lock().unwrap();
         if let Some(pos) = entries.iter().position(|e| e.rule.name == rule.name) {
             let old = entries.remove(pos);
             // Replacing a disk rule with a session rule must not leave a
@@ -219,12 +222,14 @@ impl RuleStore {
             .position(|e| e.rule.name == name)
             .ok_or_else(|| format!("no such rule: {name}"))?;
         let old = entries.remove(pos);
-        drop(entries);
-        if let Origin::Disk(path) = old.origin {
-            if let Err(e) = std::fs::remove_file(&path) {
+        // Remove the file under the lock so a concurrent reload_disk()
+        // cannot resurrect the rule from a file whose entry is gone.
+        if let Origin::Disk(path) = &old.origin {
+            if let Err(e) = std::fs::remove_file(path) {
                 tracing::warn!(file = %path.display(), "failed to remove rule file: {e}");
             }
         }
+        drop(entries);
         self.rebuild();
         Ok(())
     }
@@ -237,14 +242,12 @@ impl RuleStore {
             .find(|e| e.rule.name == name)
             .ok_or_else(|| format!("no such rule: {name}"))?;
         entry.rule.enabled = enabled;
-        let persist = match &entry.origin {
-            Origin::Disk(_) => Some(entry.rule.clone()),
-            Origin::Session => None,
-        };
-        drop(entries);
-        if let Some(rule) = persist {
+        // Persist under the lock; see add() for the watcher race this avoids.
+        if matches!(entry.origin, Origin::Disk(_)) {
+            let rule = entry.rule.clone();
             self.persist(&rule)?;
         }
+        drop(entries);
         self.rebuild();
         Ok(())
     }
