@@ -129,10 +129,12 @@ impl Attributor for ProcfsAttributor {
             .iter()
             .flat_map(|t| t.lines().filter_map(parse_proc_net_line));
         let entry = find_local_match(entries, &tuple.src)?;
-        let pid = find_pid_for_inode(Path::new("/proc"), entry.inode);
-        let (exe_path, cmdline) = match pid {
-            Some(pid) => read_proc_details(Path::new("/proc"), pid),
-            None => (None, None),
+        let proc_root = Path::new("/proc");
+        let verified = find_pid_for_inode(proc_root, entry.inode)
+            .and_then(|pid| verified_proc_details(proc_root, pid, entry.inode));
+        let (pid, exe_path, cmdline) = match verified {
+            Some((pid, exe, cmd)) => (Some(pid), exe, cmd),
+            None => (None, None, None),
         };
         Some(ProcInfo {
             pid,
@@ -145,24 +147,46 @@ impl Attributor for ProcfsAttributor {
 
 /// Scan `proc_root`/PID/fd/* for a symlink to "socket:[inode]".
 fn find_pid_for_inode(proc_root: &Path, inode: u64) -> Option<u32> {
-    let target = format!("socket:[{inode}]");
     for entry in std::fs::read_dir(proc_root).ok()?.flatten() {
         let name = entry.file_name();
         let Some(pid) = name.to_str().and_then(|s| s.parse::<u32>().ok()) else {
             continue;
         };
-        let Ok(fds) = std::fs::read_dir(entry.path().join("fd")) else {
-            continue; // permission denied or process gone
-        };
-        for fd in fds.flatten() {
-            if let Ok(link) = std::fs::read_link(fd.path()) {
-                if link.as_os_str() == target.as_str() {
-                    return Some(pid);
-                }
-            }
+        if pid_holds_inode(proc_root, pid, inode) {
+            return Some(pid);
         }
     }
     None
+}
+
+/// Does `proc_root`/PID/fd/* contain a symlink to "socket:[inode]"?
+fn pid_holds_inode(proc_root: &Path, pid: u32, inode: u64) -> bool {
+    let target = format!("socket:[{inode}]");
+    let Ok(fds) = std::fs::read_dir(proc_root.join(pid.to_string()).join("fd")) else {
+        return false; // permission denied or process gone
+    };
+    fds.flatten()
+        .filter_map(|fd| std::fs::read_link(fd.path()).ok())
+        .any(|link| link.as_os_str() == target.as_str())
+}
+
+/// Read exe/cmdline for `pid`, then confirm the PID still holds the socket
+/// inode. Between the inode scan and the detail read the process can exit
+/// and the kernel reuse its PID; details from a recycled PID would show the
+/// wrong program in a prompt, so a failed recheck discards everything
+/// including the PID.
+fn verified_proc_details(
+    proc_root: &Path,
+    pid: u32,
+    inode: u64,
+) -> Option<(u32, Option<PathBuf>, Option<String>)> {
+    let (exe, cmdline) = read_proc_details(proc_root, pid);
+    if pid_holds_inode(proc_root, pid, inode) {
+        Some((pid, exe, cmdline))
+    } else {
+        tracing::debug!(pid, inode, "attribution discarded: PID no longer holds socket");
+        None
+    }
 }
 
 /// Best-effort read of exe symlink and cmdline for a PID. Also used by
@@ -255,5 +279,24 @@ mod tests {
         let (exe, cmdline) = read_proc_details(&dir, 4242);
         assert_eq!(exe, Some(PathBuf::from("/usr/bin/curl")));
         assert_eq!(cmdline.as_deref(), Some("curl https://example.org"));
+    }
+
+    #[test]
+    fn verified_details_require_pid_to_still_hold_inode() {
+        let td = crate::testutil::TestDir::new("procfs-verify");
+        let dir = td.path().to_path_buf();
+        let fd_dir = dir.join("4242/fd");
+        std::fs::create_dir_all(&fd_dir).unwrap();
+        std::os::unix::fs::symlink("socket:[123456]", fd_dir.join("3")).unwrap();
+        std::os::unix::fs::symlink("/usr/bin/curl", dir.join("4242/exe")).unwrap();
+
+        let (pid, exe, _) = verified_proc_details(&dir, 4242, 123456).unwrap();
+        assert_eq!(pid, 4242);
+        assert_eq!(exe, Some(PathBuf::from("/usr/bin/curl")));
+
+        // Simulate PID reuse: the fd no longer points at the socket, so
+        // the freshly read details must be discarded.
+        std::fs::remove_file(fd_dir.join("3")).unwrap();
+        assert_eq!(verified_proc_details(&dir, 4242, 123456), None);
     }
 }
