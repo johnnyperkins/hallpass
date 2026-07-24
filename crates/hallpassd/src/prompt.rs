@@ -48,6 +48,8 @@ struct Inner {
 /// Table of prompts awaiting a client decision.
 pub struct PromptTable {
     inner: Mutex<Inner>,
+    /// Monotonic prompt ID. A u64 cannot realistically wrap, so collisions
+    /// with a live prompt are ignored by design; do not make it wrapping.
     next_id: AtomicU64,
     verdict_tx: UnboundedSender<(u64, Verdict)>,
     events: Arc<EventBus>,

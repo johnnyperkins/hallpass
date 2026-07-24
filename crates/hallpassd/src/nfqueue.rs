@@ -113,6 +113,9 @@ pub fn run(queue_num: u16, mut deps: QueueDeps) -> std::io::Result<()> {
     tracing::info!(queue_num, snoop_queue, "nfqueues bound");
 
     let mut held: HashMap<u64, nfq::Message> = HashMap::new();
+    // Monotonic packet-hold sequence. u64 does not wrap in any real runtime
+    // (billions of held packets per second for centuries), so no reuse guard;
+    // do not "fix" this into a wrapping counter that could collide live keys.
     let mut next_seq: u64 = 0;
 
     while !deps.shutdown.load(Ordering::Relaxed) {
