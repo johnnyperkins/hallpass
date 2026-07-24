@@ -206,6 +206,7 @@ mod tests {
                 dns_spoof_rejected: 2,
                 rules_skipped: 1,
                 prompts_overflowed: 4,
+                other_proto_total: 6,
             }),
             DaemonMsg::Ok,
             DaemonMsg::Err {

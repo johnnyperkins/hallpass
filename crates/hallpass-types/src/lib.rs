@@ -435,6 +435,10 @@ pub struct Stats {
     /// Connections resolved with the default verdict because the pending
     /// prompt table was full.
     pub prompts_overflowed: u64,
+    /// Packets whose transport the rule engine does not model (SCTP,
+    /// ICMP, ...) or that failed to parse, resolved by the
+    /// `unhandled_proto_verdict` config instead of rules.
+    pub other_proto_total: u64,
 }
 
 /// Scope of the rule generated from an interactive prompt reply.

@@ -23,6 +23,11 @@ socket_path = "/run/hallpass/hallpass.sock"
 # that a burst of new connections is not silently denied.
 max_pending_prompts = 128
 
+# Drop packets whose transport the rule engine does not model (SCTP,
+# ICMP, ...) or that fail to parse. Rules never see these; the default
+# ("allow") keeps ping and friends working, "deny" closes the channel.
+unhandled_proto_verdict = "deny"
+
 # Drop the NFQUEUE `bypass` flag from the verdict queue: new connections
 # are dropped, not allowed, when the daemon is dead or the queue is full.
 # Availability cost: a crashed daemon takes new outbound connections down

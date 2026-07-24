@@ -14,6 +14,7 @@ pub struct Counters {
     prompted: AtomicU64,
     dns_spoof_rejected: AtomicU64,
     prompts_overflowed: AtomicU64,
+    other_proto_total: AtomicU64,
 }
 
 impl Default for Counters {
@@ -26,6 +27,7 @@ impl Default for Counters {
             prompted: AtomicU64::new(0),
             dns_spoof_rejected: AtomicU64::new(0),
             prompts_overflowed: AtomicU64::new(0),
+            other_proto_total: AtomicU64::new(0),
         }
     }
 }
@@ -57,6 +59,12 @@ impl Counters {
         self.prompts_overflowed.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Count a packet with a transport the rule engine does not model
+    /// (SCTP, ICMP, ...) or that failed to parse.
+    pub fn record_other_proto(&self) {
+        self.other_proto_total.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Snapshot for the IPC reply. `rules_loaded` and `rules_skipped` come
     /// from the rule store.
     pub fn snapshot(&self, rules_loaded: u32, rules_skipped: u64) -> Stats {
@@ -70,6 +78,7 @@ impl Counters {
             dns_spoof_rejected: self.dns_spoof_rejected.load(Ordering::Relaxed),
             rules_skipped,
             prompts_overflowed: self.prompts_overflowed.load(Ordering::Relaxed),
+            other_proto_total: self.other_proto_total.load(Ordering::Relaxed),
         }
     }
 }

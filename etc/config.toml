@@ -16,3 +16,14 @@ socket_path = "/run/hallpass/hallpass.sock"
 
 # Maximum number of connections held waiting for a prompt reply.
 max_pending_prompts = 64
+
+# Verdict for packets whose transport the rule engine does not model
+# (SCTP, ICMP, ...) or that fail to parse: "allow", "deny", or "reject".
+# Rules never see these; they are only counted. "allow" keeps ping and
+# friends working.
+unhandled_proto_verdict = "allow"
+
+# Whether the verdict queue fails open (`true`: traffic flows when the
+# daemon is dead or the queue is full) or closed (`false`: those packets
+# are dropped). See etc/config.hardened.toml.
+queue_bypass = true

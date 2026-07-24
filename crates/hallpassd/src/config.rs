@@ -25,6 +25,10 @@ pub struct Config {
     pub max_pending_prompts: usize,
     /// Directory of persisted rule files (*.toml).
     pub rules_dir: PathBuf,
+    /// Verdict for queued packets whose transport the rule engine does not
+    /// model (SCTP, ICMP, ...) or that fail to parse. Rules never see
+    /// these; they are counted and resolved by this policy alone.
+    pub unhandled_proto_verdict: Verdict,
     /// Whether the verdict queue carries the NFQUEUE `bypass` flag.
     /// `true` (default) fails open: traffic flows unfiltered when the
     /// daemon is dead or the queue is full. `false` fails closed: those
@@ -41,6 +45,7 @@ impl Default for Config {
             socket_path: PathBuf::from("/run/hallpass/hallpass.sock"),
             max_pending_prompts: 64,
             rules_dir: PathBuf::from("/etc/hallpass/rules.d"),
+            unhandled_proto_verdict: Verdict::Allow,
             queue_bypass: true,
         }
     }
@@ -135,6 +140,7 @@ mod tests {
             max_pending_prompts = 8
             rules_dir = "/tmp/rules"
             queue_bypass = false
+            unhandled_proto_verdict = "deny"
             "#,
         );
         assert_eq!(c.default_verdict, Verdict::Deny);
@@ -142,6 +148,7 @@ mod tests {
         assert_eq!(c.queue_num, 7);
         assert_eq!(c.max_pending_prompts, 8);
         assert!(!c.queue_bypass);
+        assert_eq!(c.unhandled_proto_verdict, Verdict::Deny);
     }
 
     #[test]

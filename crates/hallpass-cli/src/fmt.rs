@@ -33,6 +33,7 @@ pub fn format_stats(s: &Stats) -> String {
         ("rules skipped", s.rules_skipped.to_string()),
         ("dns spoofed", s.dns_spoof_rejected.to_string()),
         ("prompt overflows", s.prompts_overflowed.to_string()),
+        ("other protocols", s.other_proto_total.to_string()),
         ("uptime", format_uptime(s.uptime_secs)),
     ];
     let width = rows.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
@@ -246,6 +247,7 @@ mod tests {
             dns_spoof_rejected: 7,
             rules_skipped: 2,
             prompts_overflowed: 1,
+            other_proto_total: 0,
         };
         let out = format_stats(&s);
         assert!(out.contains("connections       100\n"));

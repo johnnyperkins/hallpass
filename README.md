@@ -224,6 +224,10 @@ attacker with root, who can delete the nftables table outright.
   those connections match by IP/port/exe only.
 - Only new connections (`ct state new`) are evaluated; established flows are
   never re-checked.
+- Rules only model TCP and UDP. Other transports (SCTP, ICMP, ...) are not
+  matched against rules; they are counted and resolved by the
+  `unhandled_proto_verdict` policy (`allow` by default, `deny` in the
+  hardened config).
 - **UDP verdicts are per flow, not per datagram**: conntrack marks only the
   first datagram of a UDP flow as `ct state new`, so exactly one verdict
   reaches the queue and it covers the whole flow until the conntrack entry

@@ -5,30 +5,60 @@ use std::net::{IpAddr, SocketAddr};
 use etherparse::{NetSlice, SlicedPacket, TransportSlice};
 use hallpass_types::{FlowTuple, Proto};
 
-/// Parse an IP packet into a [`FlowTuple`]. Returns `None` for anything
-/// that is not IPv4/IPv6 carrying TCP or UDP (callers accept those).
-pub fn parse_tuple(payload: &[u8]) -> Option<FlowTuple> {
-    let sliced = SlicedPacket::from_ip(payload).ok()?;
-    let (src_ip, dst_ip): (IpAddr, IpAddr) = match sliced.net? {
-        NetSlice::Ipv4(v) => (
+/// What an NFQUEUE payload parsed into.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Parsed {
+    /// TCP or UDP over IPv4/IPv6: the flows hallpass polices with rules.
+    Flow(FlowTuple),
+    /// A valid IP packet with a transport the rule engine does not model
+    /// (SCTP, ICMP, ...); carries the IP protocol number. Policy for
+    /// these comes from the `unhandled_proto_verdict` config.
+    OtherProto(u8),
+    /// Not parseable as an IP packet.
+    Malformed,
+}
+
+/// Parse an NFQUEUE payload (a raw IP packet).
+pub fn parse(payload: &[u8]) -> Parsed {
+    let Ok(sliced) = SlicedPacket::from_ip(payload) else {
+        return Parsed::Malformed;
+    };
+    // The payload ip_number is the transport after any IPv6 extension
+    // headers, unlike the fixed header's next_header field.
+    let (src_ip, dst_ip, ip_proto): (IpAddr, IpAddr, u8) = match &sliced.net {
+        Some(NetSlice::Ipv4(v)) => (
             v.header().source_addr().into(),
             v.header().destination_addr().into(),
+            v.payload().ip_number.0,
         ),
-        NetSlice::Ipv6(v) => (
+        Some(NetSlice::Ipv6(v)) => (
             v.header().source_addr().into(),
             v.header().destination_addr().into(),
+            v.payload().ip_number.0,
         ),
+        None => return Parsed::Malformed,
     };
-    let (proto, sport, dport) = match sliced.transport? {
-        TransportSlice::Tcp(t) => (Proto::Tcp, t.source_port(), t.destination_port()),
-        TransportSlice::Udp(u) => (Proto::Udp, u.source_port(), u.destination_port()),
-        _ => return None,
+    let (proto, sport, dport) = match sliced.transport {
+        Some(TransportSlice::Tcp(t)) => (Proto::Tcp, t.source_port(), t.destination_port()),
+        Some(TransportSlice::Udp(u)) => (Proto::Udp, u.source_port(), u.destination_port()),
+        _ => return Parsed::OtherProto(ip_proto),
     };
-    Some(FlowTuple {
+    Parsed::Flow(FlowTuple {
         proto,
         src: SocketAddr::new(src_ip, sport),
         dst: SocketAddr::new(dst_ip, dport),
     })
+}
+
+/// Parse an IP packet into a [`FlowTuple`]. Returns `None` for anything
+/// that is not IPv4/IPv6 carrying TCP or UDP. Test convenience over
+/// [`parse`], which the packet path uses.
+#[cfg(test)]
+pub fn parse_tuple(payload: &[u8]) -> Option<FlowTuple> {
+    match parse(payload) {
+        Parsed::Flow(t) => Some(t),
+        _ => None,
+    }
 }
 
 /// True for packets that look like DNS replies (UDP from source port 53).
@@ -89,19 +119,21 @@ mod tests {
     }
 
     #[test]
-    fn icmp_is_none() {
+    fn icmp_is_other_proto() {
         let mut buf = Vec::new();
         PacketBuilder::ipv4([10, 0, 0, 1], [10, 0, 0, 2], 64)
             .icmpv4_echo_request(1, 1)
             .write(&mut buf, &[])
             .unwrap();
+        assert_eq!(parse(&buf), Parsed::OtherProto(1)); // 1 = ICMP
         assert!(parse_tuple(&buf).is_none());
     }
 
     #[test]
-    fn garbage_is_none() {
+    fn garbage_is_malformed() {
+        assert_eq!(parse(&[0u8; 3]), Parsed::Malformed);
+        assert_eq!(parse(&[]), Parsed::Malformed);
         assert!(parse_tuple(&[0u8; 3]).is_none());
-        assert!(parse_tuple(&[]).is_none());
         assert!(udp_payload(&[0u8; 3]).is_none());
     }
 
