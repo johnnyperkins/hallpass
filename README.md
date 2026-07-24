@@ -199,7 +199,7 @@ cargo clippy --all-targets -- -D warnings
 ```
 
 End-to-end tests run the real daemon inside network namespaces and need root
-plus `ip`, `nft`, and `nc`:
+plus `ip`, `nft`, and `nc` (`python3` too for the DNS test):
 
 ```sh
 cargo test -p hallpassd --test e2e --no-run   # just compile them
@@ -207,8 +207,10 @@ sudo -E cargo test -p hallpassd --test e2e -- --ignored --test-threads=1
 ```
 
 They cover rule enforcement (allow/deny), default verdicts, queue-bypass
-fail-open after `kill -9`, and process attribution over the IPC socket. Tests
-skip gracefully when not run as root.
+fail-open after `kill -9`, process attribution over the IPC socket, and the
+DNS snoop path (a domain rule blocks a destination only after its name is
+resolved through the snooped query and validated reply). Tests skip
+gracefully when not run as root or when a needed tool is missing.
 
 License compliance is checked with [cargo-deny](https://github.com/EmbarkStudios/cargo-deny):
 

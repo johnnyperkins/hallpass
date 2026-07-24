@@ -77,6 +77,37 @@ fn assert_ok(out: &Output, what: &str) {
     );
 }
 
+/// Minimal UDP DNS helper: a server that answers every A query with a
+/// fixed address, and a client that fires one query and waits for the
+/// reply. Used to exercise the daemon's DNS snoop path end to end.
+const DNS_HELPER: &str = r#"import socket, struct, sys
+
+mode = sys.argv[1]
+if mode == "server":
+    answer = sys.argv[2]
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.bind(("0.0.0.0", 53))
+    while True:
+        data, addr = s.recvfrom(512)
+        i = 12
+        while data[i] != 0:
+            i += 1 + data[i]
+        question = data[12:i + 5]  # qname + null + qtype + qclass
+        resp = data[:2] + struct.pack(">HHHHH", 0x8180, 1, 1, 0, 0) + question
+        resp += struct.pack(">HHHIH", 0xc00c, 1, 1, 60, 4) + socket.inet_aton(answer)
+        s.sendto(resp, addr)
+else:
+    server, name = sys.argv[2], sys.argv[3]
+    query = struct.pack(">HHHHHH", 0x1234, 0x0100, 1, 0, 0, 0)
+    for label in name.split("."):
+        query += bytes([len(label)]) + label.encode()
+    query += b"\x00" + struct.pack(">HH", 1, 1)
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.settimeout(3)
+    s.sendto(query, (server, 53))
+    s.recvfrom(512)
+"#;
+
 /// Everything one test needs; `Drop` tears it all down even on panic.
 struct TestEnv {
     ns_cli: String,
@@ -85,6 +116,7 @@ struct TestEnv {
     socket_path: PathBuf,
     daemon: Option<Child>,
     listener: Option<Child>,
+    dns_server: Option<Child>,
 }
 
 impl TestEnv {
@@ -113,6 +145,7 @@ impl TestEnv {
             tmp,
             daemon: None,
             listener: None,
+            dns_server: None,
         };
 
         assert_ok(&run("ip", &["netns", "add", &ns_cli]), "netns add cli");
@@ -243,6 +276,49 @@ impl TestEnv {
         }
     }
 
+    /// Path to the DNS helper script, written on first use.
+    fn dns_helper(&self) -> PathBuf {
+        let path = self.tmp.join("dns.py");
+        if !path.exists() {
+            std::fs::write(&path, DNS_HELPER).expect("write dns helper");
+        }
+        path
+    }
+
+    /// Start the UDP DNS server in the srv namespace, answering every A
+    /// query with `SRV_IP`, and wait until it is listening on port 53.
+    fn start_dns_server(&mut self) {
+        let script = self.dns_helper();
+        let child = Command::new("ip")
+            .args(["netns", "exec", &self.ns_srv])
+            .args(["python3", &script.to_string_lossy(), "server", SRV_IP])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn dns server");
+        self.dns_server = Some(child);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            let ss = ns_run(&self.ns_srv, &["ss", "-lunH"]);
+            if String::from_utf8_lossy(&ss.stdout).contains(":53 ") {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        panic!("dns server never bound port 53");
+    }
+
+    /// Resolve `name` from the cli namespace against the srv DNS server so
+    /// the daemon snoops the query and the validated reply.
+    fn resolve(&self, name: &str) {
+        let script = self.dns_helper();
+        ns_run(
+            &self.ns_cli,
+            &["python3", &script.to_string_lossy(), "client", SRV_IP, name],
+        );
+    }
+
     /// TCP connect from the cli namespace to the srv listener. Returns
     /// whether the connection succeeded within the timeout.
     fn connect(&self, port: u16) -> bool {
@@ -258,6 +334,10 @@ impl TestEnv {
 impl Drop for TestEnv {
     fn drop(&mut self) {
         self.stop_listener();
+        if let Some(mut d) = self.dns_server.take() {
+            let _ = d.kill();
+            let _ = d.wait();
+        }
         self.kill_daemon_hard();
         // Deleting the namespaces removes the veth pair and any nft table
         // inside them; explicit nft cleanup first as belt and braces.
@@ -414,5 +494,52 @@ fn attribution_event_reports_exe_path() {
         name.contains("nc"),
         "expected the nc binary in the exe path, got {}",
         exe.display()
+    );
+}
+
+#[test]
+#[ignore = "requires root and network namespaces"]
+fn domain_rule_blocks_after_dns_snoop() {
+    const PORT: u16 = 19007;
+    const NAME: &str = "blocked.test";
+    let Some(mut env) = TestEnv::setup("dns") else { return };
+    if !tool_available("python3", "--version") {
+        eprintln!("SKIP e2e dns: python3 not found");
+        return;
+    }
+    env.start_listener(PORT);
+    env.start_dns_server();
+    // Deny by domain, any port. default_verdict = allow so the DNS query
+    // itself (which has no cached domain yet) passes and gets snooped.
+    let deny_domain = format!(
+        "name = \"e2e-dns\"\n\
+         action = \"deny\"\n\
+         duration = \"forever\"\n\
+         priority = 10\n\
+         enabled = true\n\
+         [match]\n\
+         domain = \"{NAME}\"\n"
+    );
+    env.start_daemon("allow", &[&deny_domain]);
+
+    // Control: with nothing in the IP-domain cache, the connection to
+    // SRV_IP matches no rule and the default (allow) lets it through.
+    assert!(
+        env.connect(PORT),
+        "an unmatched connection should be allowed before the domain is known; daemon log:\n{}",
+        env.daemon_log()
+    );
+
+    // Prime the cache: resolve NAME -> SRV_IP through the daemon's snoop
+    // path (query on the verdict queue, validated reply on the input snoop).
+    env.resolve(NAME);
+    std::thread::sleep(Duration::from_millis(500));
+
+    // Now SRV_IP resolves to the denied domain, so the same destination is
+    // blocked by the rule that only matches on domain.
+    assert!(
+        !env.connect(PORT),
+        "the domain rule should block the connection once DNS is snooped; daemon log:\n{}",
+        env.daemon_log()
     );
 }
