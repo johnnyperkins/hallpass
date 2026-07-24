@@ -18,13 +18,34 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      # The e2e tests are #[ignore]-gated (need root + netns), so the plain
-      # test run stays unprivileged. The hallpass-ebpf crate is not a
-      # workspace member and needs a nightly toolchain, so it is left out.
+      # The e2e tests are #[ignore]-gated (need root + netns) and run in
+      # the e2e job; the nightly-only hallpass-ebpf build has its own job.
       - name: Test
         run: cargo test --workspace
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
+
+  ebpf:
+    name: ebpf feature build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # rustup auto-installs the nightly + rust-src pinned by
+      # crates/hallpass-ebpf/rust-toolchain.toml on first use.
+      - name: Install bpf-linker
+        run: cargo install bpf-linker --locked
+      - name: Build eBPF object
+        run: cargo xtask build-ebpf
+      # Only hallpassd changes under the feature; the test job already
+      # covers the rest of the workspace.
+      - name: Clippy (ebpf feature)
+        run: cargo clippy -p hallpassd --all-targets --features ebpf -- -D warnings
+      - name: Test (ebpf feature)
+        run: cargo test -p hallpassd --features ebpf
 
   e2e:
     name: e2e (root + netns)
