@@ -40,12 +40,11 @@ jobs:
         run: cargo install bpf-linker --locked
       - name: Build eBPF object
         run: cargo xtask build-ebpf
-      # Only hallpassd changes under the feature; the test job already
-      # covers the rest of the workspace.
+      # Only hallpassd changes under the feature, and no test is gated on
+      # it (the btf tests run in the plain test job via cfg(any(test,
+      # feature))), so clippy of the feature build is the whole check.
       - name: Clippy (ebpf feature)
         run: cargo clippy -p hallpassd --all-targets --features ebpf -- -D warnings
-      - name: Test (ebpf feature)
-        run: cargo test -p hallpassd --features ebpf
 
   e2e:
     name: e2e (root + netns)
