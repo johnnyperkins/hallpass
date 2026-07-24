@@ -65,8 +65,12 @@ pub struct Connection {
     pub exe_path: Option<PathBuf>,
     /// Full command line of the process, if resolved.
     pub cmdline: Option<String>,
+    /// Executable path of the parent process, if resolved.
+    pub parent_exe: Option<PathBuf>,
     /// Destination domain name, if known (e.g. from DNS snooping).
     pub domain: Option<String>,
+    /// Name of the network interface the packet leaves through, if known.
+    pub iface: Option<String>,
 }
 
 /// What a rule does when it matches.
@@ -141,6 +145,22 @@ pub struct RuleMatch {
     /// File of executable SHA-256 hashes (64 hex digits), one per line;
     /// matches like [`RuleMatch::exe_sha256`] against any listed hash.
     pub hashes_file: Option<PathBuf>,
+    /// Substring of the process command line (case-sensitive). Scopes
+    /// interpreter rules to a script instead of the whole interpreter.
+    ///
+    /// The command line is fully under the process's own control (argv is
+    /// whatever it execs with), so treat this as a scoping convenience,
+    /// not a security boundary: pair allow rules with `exe`/`exe_sha256`,
+    /// and do not rely on it alone to keep hostile code out.
+    pub cmdline_contains: Option<String>,
+    /// Exact executable path of the parent process.
+    pub parent_exe: Option<PathBuf>,
+    /// Source IP address or CIDR block.
+    pub src: Option<String>,
+    /// Exact source port.
+    pub src_port: Option<u16>,
+    /// Outbound network interface name (e.g. "eth0", "wg0").
+    pub iface: Option<String>,
 }
 
 /// A firewall rule.
@@ -316,6 +336,21 @@ impl RuleMatch {
         }
         if let Some(f) = &self.hashes_file {
             parts.push(format!("hashes-file={}", f.display()));
+        }
+        if let Some(c) = &self.cmdline_contains {
+            parts.push(format!("cmdline~={c}"));
+        }
+        if let Some(p) = &self.parent_exe {
+            parts.push(format!("parent={}", p.display()));
+        }
+        if let Some(s) = &self.src {
+            parts.push(format!("src={s}"));
+        }
+        if let Some(p) = self.src_port {
+            parts.push(format!("src-port={p}"));
+        }
+        if let Some(i) = &self.iface {
+            parts.push(format!("iface={i}"));
         }
         if parts.is_empty() {
             "(any)".to_string()

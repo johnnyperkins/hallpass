@@ -35,7 +35,7 @@ static EBPF_OBJ: &[u8] = aya::include_bytes_aligned!(concat!(
 /// pid -> details snapshotted at exec time. Exit events are the primary
 /// eviction path, but they are lossy (the ring buffer drops under
 /// pressure), so the LRU cap is the backstop against unbounded growth.
-type ProcCache = Arc<Mutex<LruCache<u32, (Option<PathBuf>, Option<String>)>>>;
+type ProcCache = Arc<Mutex<LruCache<u32, (Option<PathBuf>, Option<String>, Option<PathBuf>)>>>;
 
 const PID_CACHE_CAP: usize = 4096;
 
@@ -105,13 +105,13 @@ impl EbpfAttributor {
         })
     }
 
-    fn details_for(&self, pid: u32) -> (Option<PathBuf>, Option<String>) {
+    fn details_for(&self, pid: u32) -> (Option<PathBuf>, Option<String>, Option<PathBuf>) {
         if let Some(d) = self.cache.lock().unwrap().get(&pid) {
             return d.clone();
         }
         // Not seen via the exec tracepoint (started before the daemon);
         // snapshot now and remember it. The exit event evicts it.
-        let d = procfs::read_proc_details(Path::new("/proc"), pid);
+        let d = procfs::proc_snapshot(Path::new("/proc"), pid);
         self.cache.lock().unwrap().put(pid, d.clone());
         d
     }
@@ -126,12 +126,13 @@ impl Drop for EbpfAttributor {
 impl Attributor for EbpfAttributor {
     fn attribute(&self, tuple: &FlowTuple) -> Option<ProcInfo> {
         let val = self.sock_map.get(&flow_key(tuple), 0).ok()?;
-        let (exe_path, cmdline) = self.details_for(val.pid);
+        let (exe_path, cmdline, parent_exe) = self.details_for(val.pid);
         Some(ProcInfo {
             pid: Some(val.pid),
             uid: val.uid,
             exe_path,
             cmdline,
+            parent_exe,
         })
     }
 }
@@ -239,7 +240,7 @@ fn spawn_event_reader(mut ring: RingBuf<MapData>, cache: ProcCache, stop: Arc<At
                         continue;
                     };
                     if ev.kind == EVENT_EXEC {
-                        let d = procfs::read_proc_details(Path::new("/proc"), ev.pid);
+                        let d = procfs::proc_snapshot(Path::new("/proc"), ev.pid);
                         cache.lock().unwrap().put(ev.pid, d);
                     } else {
                         cache.lock().unwrap().pop(&ev.pid);

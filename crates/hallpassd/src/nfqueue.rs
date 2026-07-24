@@ -84,28 +84,32 @@ enum Decision {
     Prompt(Connection),
 }
 
+/// The read-only lookups `decide` consults, bundled so a new enrichment
+/// source does not grow the signature through every call site.
+struct DecideCtx<'a> {
+    attribution: &'a AttributionChain,
+    rules: &'a RuleStore,
+    dns_cache: &'a IpDomainCache,
+    exe_hash: &'a ExeHashCache,
+}
+
 /// Decision logic, separated from nfq plumbing for testability. Reads
 /// attribution and rules but has no channel or verdict side effects;
 /// `run` commits the decision.
-fn decide(
-    tuple: Option<FlowTuple>,
-    attribution: &AttributionChain,
-    rules: &RuleStore,
-    dns_cache: &IpDomainCache,
-    exe_hash: &ExeHashCache,
-) -> Decision {
+fn decide(tuple: Option<FlowTuple>, iface: Option<String>, ctx: &DecideCtx) -> Decision {
     let Some(tuple) = tuple else {
         // Non-TCP/UDP or malformed: not ours to police.
         return Decision::Accept;
     };
-    let mut conn = attribution.connection(tuple);
-    conn.domain = dns_cache.lookup(&conn.tuple.dst.ip());
+    let mut conn = ctx.attribution.connection(tuple);
+    conn.domain = ctx.dns_cache.lookup(&conn.tuple.dst.ip());
+    conn.iface = iface;
     // One snapshot for both the enrichment decision and the match, so a
     // concurrent rule reload cannot split them. Hashing reads the binary
     // off disk; only pay for it when a hash-pinning rule could apply.
-    let set = rules.ruleset();
+    let set = ctx.rules.ruleset();
     let exe_sha256 = if set.wants_exe_hash_for(&conn) {
-        exe_hash.for_connection(&conn)
+        ctx.exe_hash.for_connection(&conn)
     } else {
         None
     };
@@ -125,6 +129,7 @@ pub fn run(queue_num: u16, mut deps: QueueDeps) -> std::io::Result<()> {
     queue.set_nonblocking(true);
     tracing::info!(queue_num, snoop_queue, "nfqueues bound");
 
+    let iface_map = crate::iface::IfaceMap::default();
     let mut held: HashMap<u64, nfq::Message> = HashMap::new();
     // Monotonic packet-hold sequence. u64 does not wrap in any real runtime
     // (billions of held packets per second for centuries), so no reuse guard;
@@ -166,13 +171,14 @@ pub fn run(queue_num: u16, mut deps: QueueDeps) -> std::io::Result<()> {
                     }
                 }
 
-                match decide(
-                    tuple,
-                    &deps.attribution,
-                    &deps.rules,
-                    &deps.dns_cache,
-                    &deps.exe_hash,
-                ) {
+                let iface = iface_map.name(msg.get_outdev());
+                let ctx = DecideCtx {
+                    attribution: &deps.attribution,
+                    rules: &deps.rules,
+                    dns_cache: &deps.dns_cache,
+                    exe_hash: &deps.exe_hash,
+                };
+                match decide(tuple, iface, &ctx) {
                     Decision::Accept => {
                         msg.set_verdict(NfqVerdict::Accept);
                         queue.verdict(msg)?;
@@ -255,6 +261,15 @@ mod tests {
         (chain, store, IpDomainCache::new(16), ExeHashCache::default(), dir)
     }
 
+    fn ctx<'a>(
+        attribution: &'a AttributionChain,
+        rules: &'a Arc<RuleStore>,
+        dns_cache: &'a IpDomainCache,
+        exe_hash: &'a ExeHashCache,
+    ) -> DecideCtx<'a> {
+        DecideCtx { attribution, rules, dns_cache, exe_hash }
+    }
+
     fn tcp_packet(dst: [u8; 4], dport: u16) -> Vec<u8> {
         let mut buf = Vec::new();
         PacketBuilder::ipv4([10, 0, 0, 1], dst, 64)
@@ -282,7 +297,7 @@ mod tests {
             },
         };
         let (chain, store, dns, hash, _dir) = setup("rule", vec![deny]);
-        match decide(tuple_of(&tcp_packet([1, 1, 1, 1], 443)), &chain, &store, &dns, &hash) {
+        match decide(tuple_of(&tcp_packet([1, 1, 1, 1], 443)), None, &ctx(&chain, &store, &dns, &hash)) {
             Decision::Verdict(Verdict::Deny, name, conn) => {
                 assert_eq!(name, "deny-443");
                 assert_eq!(conn.tuple.dst.port(), 443);
@@ -294,7 +309,7 @@ mod tests {
     #[test]
     fn unmatched_goes_to_prompt_and_unparsable_accepts() {
         let (chain, store, dns, hash, _dir) = setup("prompt", vec![]);
-        match decide(tuple_of(&tcp_packet([1, 1, 1, 1], 8443)), &chain, &store, &dns, &hash) {
+        match decide(tuple_of(&tcp_packet([1, 1, 1, 1], 8443)), None, &ctx(&chain, &store, &dns, &hash)) {
             Decision::Prompt(conn) => {
                 assert_eq!(conn.tuple.dst.port(), 8443);
                 assert_eq!(conn.exe_path, None);
@@ -302,7 +317,7 @@ mod tests {
             }
             _ => panic!("expected prompt"),
         }
-        assert!(matches!(decide(None, &chain, &store, &dns, &hash), Decision::Accept));
+        assert!(matches!(decide(None, None, &ctx(&chain, &store, &dns, &hash)), Decision::Accept));
     }
 
     #[test]
@@ -313,7 +328,7 @@ mod tests {
             query_name: "example.com".into(),
             addrs: vec![("1.1.1.1".parse().unwrap(), 300)],
         });
-        match decide(tuple_of(&tcp_packet([1, 1, 1, 1], 443)), &chain, &store, &dns, &hash) {
+        match decide(tuple_of(&tcp_packet([1, 1, 1, 1], 443)), None, &ctx(&chain, &store, &dns, &hash)) {
             Decision::Prompt(conn) => assert_eq!(conn.domain.as_deref(), Some("example.com")),
             _ => panic!("expected prompt"),
         }

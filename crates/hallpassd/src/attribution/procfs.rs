@@ -141,6 +141,7 @@ impl Attributor for ProcfsAttributor {
             uid: entry.uid,
             exe_path,
             cmdline,
+            parent_exe: pid.and_then(|p| parent_exe_of(proc_root, p)),
         })
     }
 }
@@ -187,6 +188,36 @@ fn verified_proc_details(
         tracing::debug!(pid, inode, "attribution discarded: PID no longer holds socket");
         None
     }
+}
+
+/// Parent PID from /proc/pid/stat: field 4, found after the comm field's
+/// closing paren (comm itself can contain spaces and parens).
+fn ppid_of(proc_root: &Path, pid: u32) -> Option<u32> {
+    let stat = std::fs::read_to_string(proc_root.join(pid.to_string()).join("stat")).ok()?;
+    let after_comm = stat.rsplit_once(')')?.1;
+    after_comm.split_whitespace().nth(1)?.parse().ok()
+}
+
+/// Best-effort executable path of `pid`'s parent process. The ppid is
+/// re-read after the readlink and must be unchanged: if the parent exits
+/// in between, the child is reparented (ppid changes) and a recycled PID's
+/// exe could otherwise be pinned as the parent.
+pub(super) fn parent_exe_of(proc_root: &Path, pid: u32) -> Option<PathBuf> {
+    let ppid = ppid_of(proc_root, pid)?;
+    let exe = std::fs::read_link(proc_root.join(ppid.to_string()).join("exe")).ok()?;
+    (ppid_of(proc_root, pid) == Some(ppid)).then_some(exe)
+}
+
+/// Exe, cmdline, and parent exe for `pid`, snapshotted together. Used by
+/// the eBPF attributor at exec-event time, while the parent is certainly
+/// alive.
+#[cfg_attr(not(feature = "ebpf"), allow(dead_code))]
+pub(super) fn proc_snapshot(
+    proc_root: &Path,
+    pid: u32,
+) -> (Option<PathBuf>, Option<String>, Option<PathBuf>) {
+    let (exe, cmdline) = read_proc_details(proc_root, pid);
+    (exe, cmdline, parent_exe_of(proc_root, pid))
 }
 
 /// Best-effort read of exe symlink and cmdline for a PID. Also used by
@@ -273,6 +304,10 @@ mod tests {
         std::os::unix::fs::symlink("socket:[123456]", fd_dir.join("3")).unwrap();
         std::os::unix::fs::symlink("/usr/bin/curl", dir.join("4242/exe")).unwrap();
         std::fs::write(dir.join("4242/cmdline"), b"curl\0https://example.org\0").unwrap();
+        // comm with spaces and a paren, to exercise stat parsing.
+        std::fs::write(dir.join("4242/stat"), b"4242 (cu rl)x) S 4200 4242 4242").unwrap();
+        assert_eq!(ppid_of(&dir, 4242), Some(4200));
+        assert_eq!(ppid_of(&dir, 9999), None);
 
         assert_eq!(find_pid_for_inode(&dir, 123456), Some(4242));
         assert_eq!(find_pid_for_inode(&dir, 1), None);

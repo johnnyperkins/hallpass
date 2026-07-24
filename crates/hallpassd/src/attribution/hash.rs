@@ -155,7 +155,9 @@ mod tests {
             pid: Some(std::process::id()),
             exe_path: None,
             cmdline: None,
+            parent_exe: None,
             domain: None,
+            iface: None,
         };
         let cache = ExeHashCache::default();
         let hash = cache.for_connection(&conn).unwrap();

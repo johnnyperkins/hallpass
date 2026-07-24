@@ -88,7 +88,9 @@ mod tests {
             pid: Some(1),
             exe_path: Some(PathBuf::from(exe)),
             cmdline: None,
+            parent_exe: None,
             domain: domain.map(String::from),
+            iface: None,
         }
     }
 

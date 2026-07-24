@@ -35,6 +35,11 @@ RULES ADD OPTIONS:
     --domain DOMAIN              Domain, exact or *.suffix
     --user UID                   UID of initiating process
     --proto tcp|udp              Transport protocol
+    --cmdline-contains STR       Substring of the process command line
+    --parent-exe PATH            Exact executable path of the parent process
+    --src IP|CIDR                Source IP address or CIDR block
+    --src-port PORT              Source port
+    --iface NAME                 Outbound network interface (e.g. eth0)
     --domains-file PATH          File of domains (hosts format or one per
                                  line) matched against the destination domain
     --ips-file PATH              File of destination IPs/CIDRs, one per line
@@ -186,7 +191,7 @@ fn parse_rule_add(flags: &[&str]) -> Result<Rule, String> {
                 matcher.exe_sha256 = Some(value.to_string());
             }
             "--dest" => {
-                validate_dest(value)?;
+                validate_net(value)?;
                 matcher.dest = Some(value.to_string());
             }
             "--port" => {
@@ -194,6 +199,17 @@ fn parse_rule_add(flags: &[&str]) -> Result<Rule, String> {
                     Some(value.parse::<u16>().map_err(|_| format!("invalid port '{value}'"))?);
             }
             "--domain" => matcher.domain = Some(value.to_string()),
+            "--cmdline-contains" => matcher.cmdline_contains = Some(value.to_string()),
+            "--parent-exe" => matcher.parent_exe = Some(PathBuf::from(value)),
+            "--src" => {
+                validate_net(value)?;
+                matcher.src = Some(value.to_string());
+            }
+            "--src-port" => {
+                matcher.src_port =
+                    Some(value.parse::<u16>().map_err(|_| format!("invalid src-port '{value}'"))?);
+            }
+            "--iface" => matcher.iface = Some(value.to_string()),
             "--domains-file" => matcher.domains_file = Some(PathBuf::from(value)),
             "--ips-file" => matcher.ips_file = Some(PathBuf::from(value)),
             "--hashes-file" => matcher.hashes_file = Some(PathBuf::from(value)),
@@ -235,22 +251,22 @@ fn parse_rule_add(flags: &[&str]) -> Result<Rule, String> {
     })
 }
 
-/// Validate `--dest` as an IP address or CIDR block.
-fn validate_dest(s: &str) -> Result<(), String> {
+/// Validate `--dest`/`--src` as an IP address or CIDR block.
+fn validate_net(s: &str) -> Result<(), String> {
     let (ip, prefix) = match s.split_once('/') {
         Some((ip, prefix)) => (ip, Some(prefix)),
         None => (s, None),
     };
     let addr: IpAddr = ip
         .parse()
-        .map_err(|_| format!("invalid destination '{s}': bad IP address"))?;
+        .map_err(|_| format!("invalid IP or CIDR '{s}': bad IP address"))?;
     if let Some(prefix) = prefix {
         let max = if addr.is_ipv4() { 32 } else { 128 };
         let n: u8 = prefix
             .parse()
-            .map_err(|_| format!("invalid destination '{s}': bad prefix length"))?;
+            .map_err(|_| format!("invalid IP or CIDR '{s}': bad prefix length"))?;
         if n > max {
-            return Err(format!("invalid destination '{s}': prefix > {max}"));
+            return Err(format!("invalid IP or CIDR '{s}': prefix > {max}"));
         }
     }
     Ok(())
@@ -400,13 +416,13 @@ mod tests {
 
     #[test]
     fn dest_validation() {
-        assert!(validate_dest("1.2.3.4").is_ok());
-        assert!(validate_dest("10.0.0.0/8").is_ok());
-        assert!(validate_dest("2606:4700::1111").is_ok());
-        assert!(validate_dest("2606:4700::/32").is_ok());
-        assert!(validate_dest("example.org").is_err());
-        assert!(validate_dest("10.0.0.0/33").is_err());
-        assert!(validate_dest("2606:4700::/129").is_err());
+        assert!(validate_net("1.2.3.4").is_ok());
+        assert!(validate_net("10.0.0.0/8").is_ok());
+        assert!(validate_net("2606:4700::1111").is_ok());
+        assert!(validate_net("2606:4700::/32").is_ok());
+        assert!(validate_net("example.org").is_err());
+        assert!(validate_net("10.0.0.0/33").is_err());
+        assert!(validate_net("2606:4700::/129").is_err());
     }
 
     #[test]

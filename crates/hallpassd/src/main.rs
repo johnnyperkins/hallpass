@@ -12,6 +12,7 @@ mod attribution;
 mod config;
 mod dns;
 mod events;
+mod iface;
 mod ipc;
 mod nfqueue;
 mod nft;

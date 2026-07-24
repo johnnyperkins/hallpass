@@ -261,7 +261,9 @@ mod tests {
                 pid: Some(4242),
                 exe_path: Some(PathBuf::from("/usr/bin/curl")),
                 cmdline: Some("curl https://example.org".into()),
+                parent_exe: None,
                 domain: Some("example.org".into()),
+                iface: None,
             },
             deadline_ms: 30_000,
         };

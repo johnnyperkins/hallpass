@@ -89,6 +89,7 @@ mod tests {
             uid: 1000,
             exe_path: Some("/usr/bin/curl".into()),
             cmdline: None,
+            parent_exe: None,
         }
     }
 

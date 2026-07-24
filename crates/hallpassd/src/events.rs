@@ -55,7 +55,9 @@ mod tests {
             pid: None,
             exe_path: None,
             cmdline: None,
+            parent_exe: None,
             domain: None,
+            iface: None,
         };
         bus.emit(conn.clone(), Verdict::Deny, Some("r".into()));
         let ev = rx.recv().await.unwrap();

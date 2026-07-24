@@ -67,20 +67,26 @@ pub struct CompiledRule {
     domains_file: Option<std::sync::Arc<super::lists::DomainSet>>,
     ips_file: Option<std::sync::Arc<super::lists::IpSet>>,
     hashes_file: Option<std::sync::Arc<super::lists::HashSet256>>,
+    cmdline_contains: Option<String>,
+    parent_exe: Option<PathBuf>,
+    src: Option<IpNet>,
+    src_port: Option<u16>,
+    iface: Option<String>,
+}
+
+/// Parse an IP or CIDR match field (a bare address becomes a host net).
+fn parse_net(field: &str, raw: &str) -> Result<IpNet, String> {
+    raw.parse::<IpNet>()
+        .or_else(|_| raw.parse::<std::net::IpAddr>().map(IpNet::from))
+        .map_err(|e| format!("bad {field} {raw:?}: {e}"))
 }
 
 impl CompiledRule {
     /// Compile a rule, validating cidr/glob/range fields.
     pub fn compile(rule: &Rule) -> Result<CompiledRule, String> {
         let m = &rule.matcher;
-        let dest = match &m.dest {
-            None => None,
-            Some(s) => Some(
-                s.parse::<IpNet>()
-                    .or_else(|_| s.parse::<std::net::IpAddr>().map(IpNet::from))
-                    .map_err(|e| format!("bad dest {s:?}: {e}"))?,
-            ),
-        };
+        let dest = m.dest.as_deref().map(|s| parse_net("dest", s)).transpose()?;
+        let src = m.src.as_deref().map(|s| parse_net("src", s)).transpose()?;
         let exe_glob = match &m.exe_glob {
             None => None,
             Some(g) => Some(
@@ -128,6 +134,11 @@ impl CompiledRule {
             domains_file,
             ips_file,
             hashes_file,
+            cmdline_contains: m.cmdline_contains.clone(),
+            parent_exe: m.parent_exe.clone(),
+            src,
+            src_port: m.src_port,
+            iface: m.iface.clone(),
         })
     }
 
@@ -221,6 +232,33 @@ impl CompiledRule {
                 return false;
             }
         }
+        if let Some(needle) = &self.cmdline_contains {
+            match &conn.cmdline {
+                Some(cmdline) if cmdline.contains(needle.as_str()) => {}
+                _ => return false,
+            }
+        }
+        if let Some(parent) = &self.parent_exe {
+            if conn.parent_exe.as_deref() != Some(parent) {
+                return false;
+            }
+        }
+        if let Some(net) = &self.src {
+            if !net.contains(&conn.tuple.src.ip()) {
+                return false;
+            }
+        }
+        if let Some(port) = self.src_port {
+            if conn.tuple.src.port() != port {
+                return false;
+            }
+        }
+        if let Some(iface) = &self.iface {
+            match &conn.iface {
+                Some(have) if have == iface => {}
+                _ => return false,
+            }
+        }
         true
     }
 }
@@ -289,7 +327,9 @@ mod tests {
             pid: None,
             exe_path: None,
             cmdline: None,
+            parent_exe: None,
             domain: None,
+            iface: None,
         };
         assert!(compiled.matches(&conn, Some(&"ab".repeat(32))));
         // Wrong or missing hash: no match, but other criteria still do.
@@ -317,7 +357,9 @@ mod tests {
             pid: None,
             exe_path: None,
             cmdline: None,
+            parent_exe: None,
             domain: domain.map(String::from),
+            iface: None,
         };
 
         let r = rule_with(RuleMatch {
@@ -356,6 +398,58 @@ mod tests {
         assert!(compiled.matches(&conn(None, "1.2.3.4:443"), Some(&"ab".repeat(32))));
         assert!(!compiled.matches(&conn(None, "1.2.3.4:443"), Some(&"cd".repeat(32))));
         assert!(!compiled.matches(&conn(None, "1.2.3.4:443"), None));
+    }
+
+    #[test]
+    fn new_operand_matching() {
+        let conn = Connection {
+            tuple: hallpass_types::FlowTuple {
+                proto: Proto::Tcp,
+                src: "192.168.1.5:40000".parse().unwrap(),
+                dst: "1.2.3.4:443".parse().unwrap(),
+            },
+            uid: Some(1000),
+            pid: Some(1),
+            exe_path: Some("/usr/bin/python3".into()),
+            cmdline: Some("python3 /opt/backup.py --full".into()),
+            parent_exe: Some("/usr/bin/bash".into()),
+            domain: None,
+            iface: Some("wg0".into()),
+        };
+        let check = |m: RuleMatch, expect: bool| {
+            let compiled = CompiledRule::compile(&rule_with(m)).unwrap();
+            assert_eq!(compiled.matches(&conn, None), expect);
+        };
+
+        check(RuleMatch { cmdline_contains: Some("backup.py".into()), ..Default::default() }, true);
+        check(RuleMatch { cmdline_contains: Some("restore.py".into()), ..Default::default() }, false);
+        check(RuleMatch { parent_exe: Some("/usr/bin/bash".into()), ..Default::default() }, true);
+        check(RuleMatch { parent_exe: Some("/usr/bin/zsh".into()), ..Default::default() }, false);
+        check(RuleMatch { src: Some("192.168.1.0/24".into()), ..Default::default() }, true);
+        check(RuleMatch { src: Some("10.0.0.0/8".into()), ..Default::default() }, false);
+        check(RuleMatch { src_port: Some(40000), ..Default::default() }, true);
+        check(RuleMatch { src_port: Some(40001), ..Default::default() }, false);
+        check(RuleMatch { iface: Some("wg0".into()), ..Default::default() }, true);
+        check(RuleMatch { iface: Some("eth0".into()), ..Default::default() }, false);
+
+        // Absent connection data never matches a present criterion.
+        let mut bare = conn.clone();
+        bare.cmdline = None;
+        bare.parent_exe = None;
+        bare.iface = None;
+        let m = CompiledRule::compile(&rule_with(RuleMatch {
+            cmdline_contains: Some("x".into()),
+            ..Default::default()
+        }))
+        .unwrap();
+        assert!(!m.matches(&bare, None));
+
+        // Bad src rejected at compile time.
+        assert!(CompiledRule::compile(&rule_with(RuleMatch {
+            src: Some("not-an-ip".into()),
+            ..Default::default()
+        }))
+        .is_err());
     }
 
     #[test]

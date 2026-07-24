@@ -91,7 +91,9 @@ mod tests {
             pid: Some(4242),
             exe_path: Some(PathBuf::from("/usr/bin/curl")),
             cmdline: Some("curl https://example.org".to_string()),
+            parent_exe: None,
             domain: Some("example.org".to_string()),
+            iface: None,
         }
     }
 
@@ -115,6 +117,11 @@ mod tests {
                 domains_file: Some(PathBuf::from("/etc/hallpass/rules.d/ads.list")),
                 ips_file: Some(PathBuf::from("/etc/hallpass/rules.d/bad-ips.list")),
                 hashes_file: Some(PathBuf::from("/etc/hallpass/rules.d/malware.sha256")),
+                cmdline_contains: Some("script.py".to_string()),
+                parent_exe: Some(PathBuf::from("/usr/bin/bash")),
+                src: Some("192.168.1.0/24".to_string()),
+                src_port: Some(40_000),
+                iface: Some("eth0".to_string()),
             },
         }
     }

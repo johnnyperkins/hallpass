@@ -182,7 +182,9 @@ mod tests {
             pid: Some(4242),
             exe_path: Some(PathBuf::from("/usr/bin/curl")),
             cmdline: Some("curl https://example.org".into()),
+            parent_exe: None,
             domain: domain.map(String::from),
+            iface: None,
         }
     }
 

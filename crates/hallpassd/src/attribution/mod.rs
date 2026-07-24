@@ -24,6 +24,8 @@ pub struct ProcInfo {
     pub exe_path: Option<PathBuf>,
     /// Command line from /proc/pid/cmdline.
     pub cmdline: Option<String>,
+    /// Executable path of the parent process, from /proc/ppid/exe.
+    pub parent_exe: Option<PathBuf>,
 }
 
 /// A source of process attribution. Implementations are tried in order;
@@ -74,9 +76,9 @@ impl AttributionChain {
     /// available. The domain is left unset; DNS snooping fills it in later.
     pub fn connection(&self, tuple: FlowTuple) -> Connection {
         let info = self.attribute(&tuple);
-        let (uid, pid, exe_path, cmdline) = match info {
-            Some(i) => (Some(i.uid), i.pid, i.exe_path, i.cmdline),
-            None => (None, None, None, None),
+        let (uid, pid, exe_path, cmdline, parent_exe) = match info {
+            Some(i) => (Some(i.uid), i.pid, i.exe_path, i.cmdline, i.parent_exe),
+            None => (None, None, None, None, None),
         };
         Connection {
             tuple,
@@ -84,7 +86,10 @@ impl AttributionChain {
             pid,
             exe_path,
             cmdline,
+            parent_exe,
             domain: None,
+            // Interface is packet metadata; the queue loop fills it in.
+            iface: None,
         }
     }
 }
@@ -117,6 +122,7 @@ mod tests {
             uid: 0,
             exe_path: None,
             cmdline: None,
+            parent_exe: None,
         };
         let chain = AttributionChain::new(vec![
             Box::new(Fixed(Some(hit.clone()), AtomicUsize::new(0))),
