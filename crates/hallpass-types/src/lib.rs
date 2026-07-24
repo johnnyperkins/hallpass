@@ -91,6 +91,14 @@ pub enum RuleDuration {
     Session,
     /// Persisted to disk; applies until deleted.
     Forever,
+    /// Applies until a wall-clock deadline, then the rule is removed
+    /// (including its file, for hand-written timed rules in rules.d;
+    /// rules added through the daemon are never persisted with this
+    /// duration).
+    Until {
+        /// Expiry as Unix milliseconds.
+        deadline_ms: u64,
+    },
 }
 
 /// Match criteria for a rule. All fields are optional; every present field
@@ -196,14 +204,65 @@ impl Verdict {
 }
 
 impl RuleDuration {
-    /// Lowercase name, matching the serde/TOML representation.
+    /// Lowercase name, matching the serde/TOML representation. The
+    /// `Until` deadline is not included; use [`RuleDuration::describe`]
+    /// where it matters.
     pub fn as_str(self) -> &'static str {
         match self {
             RuleDuration::Once => "once",
             RuleDuration::Session => "session",
             RuleDuration::Forever => "forever",
+            RuleDuration::Until { .. } => "until",
         }
     }
+
+    /// Human-readable form; `Until` shows the remaining time.
+    pub fn describe(self) -> String {
+        match self {
+            RuleDuration::Until { deadline_ms } => {
+                let now = unix_ms_now();
+                if deadline_ms <= now {
+                    "expired".to_string()
+                } else {
+                    format!("{}s left", (deadline_ms - now) / 1000)
+                }
+            }
+            other => other.as_str().to_string(),
+        }
+    }
+
+    /// Whether this duration has a deadline in the past.
+    pub fn expired(self, now_ms: u64) -> bool {
+        matches!(self, RuleDuration::Until { deadline_ms } if deadline_ms <= now_ms)
+    }
+
+    /// `Until` duration expiring one timespan (`30s`, `5m`, `2h`, `1d`)
+    /// from now. `None` when the timespan does not parse.
+    pub fn until_after(timespan: &str) -> Option<RuleDuration> {
+        // Saturating: an absurd timespan becomes "effectively forever"
+        // rather than wrapping into the past.
+        parse_timespan_secs(timespan).map(|secs| RuleDuration::Until {
+            deadline_ms: unix_ms_now().saturating_add(secs.saturating_mul(1000)),
+        })
+    }
+}
+
+/// Parse a human timespan like `30s`, `5m`, `2h`, or `1d` into seconds.
+/// Shared by the CLI (`--duration 5m`) and interactive prompt replies.
+pub fn parse_timespan_secs(s: &str) -> Option<u64> {
+    let (num, unit) = s.split_at(s.len().checked_sub(1)?);
+    let n: u64 = num.parse().ok()?;
+    if n == 0 {
+        return None;
+    }
+    let mult = match unit {
+        "s" => 1,
+        "m" => 60,
+        "h" => 3600,
+        "d" => 86_400,
+        _ => return None,
+    };
+    n.checked_mul(mult)
 }
 
 impl RuleMatch {
@@ -253,6 +312,35 @@ pub fn unix_ms_now() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod duration_tests {
+    use super::*;
+
+    #[test]
+    fn timespan_parsing() {
+        assert_eq!(parse_timespan_secs("30s"), Some(30));
+        assert_eq!(parse_timespan_secs("5m"), Some(300));
+        assert_eq!(parse_timespan_secs("2h"), Some(7200));
+        assert_eq!(parse_timespan_secs("1d"), Some(86_400));
+        assert_eq!(parse_timespan_secs("0s"), None);
+        assert_eq!(parse_timespan_secs("10"), None);
+        assert_eq!(parse_timespan_secs("s"), None);
+        assert_eq!(parse_timespan_secs(""), None);
+        assert_eq!(parse_timespan_secs("-5m"), None);
+        assert_eq!(parse_timespan_secs("5w"), None);
+    }
+
+    #[test]
+    fn expiry() {
+        let until = RuleDuration::Until { deadline_ms: 1000 };
+        assert!(until.expired(1000));
+        assert!(until.expired(2000));
+        assert!(!until.expired(999));
+        assert!(!RuleDuration::Forever.expired(u64::MAX));
+        assert!(!RuleDuration::Session.expired(u64::MAX));
+    }
 }
 
 /// A decided connection event, emitted to subscribers.

@@ -105,6 +105,7 @@ async fn main() {
     if let Err(e) = rules::store::spawn_watcher(Arc::clone(&store)) {
         tracing::warn!("rules dir watcher unavailable: {e}");
     }
+    rules::store::spawn_expiry_sweeper(Arc::clone(&store));
 
     // Channels between the queue thread and the async side.
     let (prompt_tx, mut prompt_rx) =

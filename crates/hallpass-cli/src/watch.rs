@@ -31,7 +31,8 @@ enum Stage {
 }
 
 const VERDICT_HINT: &str = "  [a]llow / [d]eny?";
-const DURATION_HINT: &str = "  duration: [1] once / [2] session / [3] forever?";
+const DURATION_HINT: &str =
+    "  duration: [1] once / [2] session / [3] forever / timespan (30s, 5m, 2h)?";
 const SCOPE_HINT: &str = "  scope: [p]ort / [h]ost / [a]pp anywhere?";
 
 /// Parse a verdict answer: a=allow, d=deny.
@@ -43,13 +44,14 @@ fn parse_verdict(line: &str) -> Option<Verdict> {
     }
 }
 
-/// Parse a duration answer: 1=once, 2=session, 3=forever.
+/// Parse a duration answer: 1=once, 2=session, 3=forever, or a timespan
+/// like `5m` for a rule that expires.
 fn parse_duration(line: &str) -> Option<RuleDuration> {
     match line.trim() {
         "1" => Some(RuleDuration::Once),
         "2" => Some(RuleDuration::Session),
         "3" => Some(RuleDuration::Forever),
-        _ => None,
+        other => RuleDuration::until_after(other),
     }
 }
 

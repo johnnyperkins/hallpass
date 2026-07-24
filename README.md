@@ -134,7 +134,8 @@ TOML files in `/etc/hallpass/rules.d/`, one rule per file:
 ```toml
 name = "allow-dns"
 action = "allow"        # allow | deny | reject
-duration = "forever"
+duration = "forever"    # once | session | forever; the CLI also takes a
+                        # timespan (30s, 5m, 2h, 1d) for a rule that expires
 priority = 100
 enabled = true
 

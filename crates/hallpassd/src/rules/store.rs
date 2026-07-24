@@ -239,6 +239,36 @@ impl RuleStore {
         Ok(())
     }
 
+    /// Remove rules whose `Until` deadline has passed, deleting persisted
+    /// files (hand-written `until` rules in rules.d). Returns whether
+    /// anything was removed. Called by the expiry sweeper about once a
+    /// second, which bounds how long an expired rule can keep matching.
+    pub fn sweep_expired(&self) -> bool {
+        let now = hallpass_types::unix_ms_now();
+        let mut entries = self.entries.lock().unwrap();
+        let before = entries.len();
+        // File removal happens under the lock; see delete() for the
+        // watcher race this avoids.
+        entries.retain(|e| {
+            if !e.rule.duration.expired(now) {
+                return true;
+            }
+            tracing::info!(rule = %e.rule.name, "timed rule expired");
+            if let Origin::Disk(path) = &e.origin {
+                if let Err(err) = std::fs::remove_file(path) {
+                    tracing::warn!(file = %path.display(), "failed to remove expired rule file: {err}");
+                }
+            }
+            false
+        });
+        let changed = entries.len() != before;
+        drop(entries);
+        if changed {
+            self.rebuild();
+        }
+        changed
+    }
+
     /// Re-read disk rules (hot reload), keeping session rules.
     pub fn reload_disk(&self) {
         let fresh = load_dir(&self.rules_dir);
@@ -271,6 +301,19 @@ impl RuleStore {
         let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644));
         Ok(path)
     }
+}
+
+/// Periodically remove expired `Until` rules. One-second cadence: timed
+/// rules overstay their deadline by at most about a second.
+pub fn spawn_expiry_sweeper(store: Arc<RuleStore>) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(1));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            store.sweep_expired();
+        }
+    });
 }
 
 /// Watch the rules directory and hot-reload on changes, debounced 200ms.
@@ -396,6 +439,55 @@ mod tests {
         store.add(rule("r1", RuleDuration::Session)).unwrap();
         assert!(!dir.join("r1.toml").exists());
         assert_eq!(store.list().len(), 1);
+    }
+
+    #[test]
+    fn sweep_removes_expired_until_rules() {
+        let (_td, dir) = tmpdir("sweep");
+        let store = RuleStore::new(dir.clone());
+        let now = hallpass_types::unix_ms_now();
+        let expired = rule(
+            "expired",
+            RuleDuration::Until {
+                deadline_ms: now.saturating_sub(1),
+            },
+        );
+        let live = rule(
+            "live",
+            RuleDuration::Until {
+                deadline_ms: now + 60_000,
+            },
+        );
+        store.add(expired).unwrap();
+        store.add(live).unwrap();
+        store.add(rule("forever", RuleDuration::Forever)).unwrap();
+        assert_eq!(store.list().len(), 3);
+
+        assert!(store.sweep_expired());
+        let names: Vec<String> = store.list().into_iter().map(|r| r.name).collect();
+        assert_eq!(names, vec!["live".to_string(), "forever".to_string()]);
+        // Nothing left to expire; sweep is a no-op.
+        assert!(!store.sweep_expired());
+    }
+
+    #[test]
+    fn sweep_deletes_expired_disk_rule_file() {
+        let (_td, dir) = tmpdir("sweep-disk");
+        // Hand-written rules.d file with an already-passed deadline.
+        let text = "name = \"stale\"\n\
+                    action = \"deny\"\n\
+                    priority = 1\n\
+                    enabled = true\n\
+                    [duration.until]\n\
+                    deadline_ms = 1000\n\
+                    [match]\n\
+                    port = 25\n";
+        std::fs::write(dir.join("stale.toml"), text).unwrap();
+        let store = RuleStore::new(dir.clone());
+        assert_eq!(store.list().len(), 1);
+        assert!(store.sweep_expired());
+        assert!(store.list().is_empty());
+        assert!(!dir.join("stale.toml").exists(), "expired rule file should be deleted");
     }
 
     #[test]

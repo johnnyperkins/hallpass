@@ -520,6 +520,7 @@ fn duration_label(d: RuleDuration) -> &'static str {
         RuleDuration::Once => "Once",
         RuleDuration::Session => "Session",
         RuleDuration::Forever => "Forever",
+        RuleDuration::Until { .. } => "Timed",
     }
 }
 

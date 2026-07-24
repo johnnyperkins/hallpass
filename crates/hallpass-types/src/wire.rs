@@ -215,6 +215,9 @@ mod tests {
                 RuleDuration::Once,
                 RuleDuration::Session,
                 RuleDuration::Forever,
+                RuleDuration::Until {
+                    deadline_ms: 1_720_000_060_000,
+                },
             ] {
                 for s in [
                     PromptScope::ThisPort,

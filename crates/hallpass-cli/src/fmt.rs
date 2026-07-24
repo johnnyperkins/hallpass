@@ -72,7 +72,7 @@ pub fn format_rules(rules: &[Rule]) -> String {
             [
                 r.name.clone(),
                 r.action.as_str().to_string(),
-                r.duration.as_str().to_string(),
+                r.duration.describe(),
                 r.priority.to_string(),
                 if r.enabled { "yes" } else { "no" }.to_string(),
                 r.matcher.summary(),

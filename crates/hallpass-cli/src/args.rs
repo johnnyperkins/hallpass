@@ -35,7 +35,9 @@ RULES ADD OPTIONS:
     --domain DOMAIN              Domain, exact or *.suffix
     --user UID                   UID of initiating process
     --proto tcp|udp              Transport protocol
-    --duration session|forever   Rule lifetime (default: forever)
+    --duration session|forever|TIMESPAN
+                                 Rule lifetime (default: forever); TIMESPAN
+                                 like 30s, 5m, 2h, 1d expires the rule
     --priority N                 Priority, higher wins (default: 0)
 
 GLOBAL OPTIONS:
@@ -79,6 +81,8 @@ pub struct Cli {
 }
 
 /// Result of parsing: either a command line or a help request.
+// One short-lived value per process; the size gap vs `Help` is harmless.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum Parsed {
     /// Normal invocation.
@@ -198,7 +202,8 @@ fn parse_rule_add(flags: &[&str]) -> Result<Rule, String> {
                 duration = match value {
                     "session" => RuleDuration::Session,
                     "forever" => RuleDuration::Forever,
-                    other => return Err(format!("invalid duration '{other}'")),
+                    other => RuleDuration::until_after(other)
+                        .ok_or_else(|| format!("invalid duration '{other}'"))?,
                 };
             }
             "--priority" => {
@@ -328,6 +333,23 @@ mod tests {
         assert_eq!(rule.matcher.domain.as_deref(), Some("*.example.org"));
         assert_eq!(rule.matcher.user, Some(1000));
         assert_eq!(rule.matcher.proto, Some(Proto::Tcp));
+    }
+
+    #[test]
+    fn rules_add_timed_duration() {
+        let timed = parse_ok(&[
+            "rules", "add", "--name", "t", "--action", "allow", "--duration", "5m",
+        ]);
+        let Cmd::RulesAdd(rule) = timed.cmd else { panic!("expected RulesAdd") };
+        let RuleDuration::Until { deadline_ms } = rule.duration else {
+            panic!("expected Until, got {:?}", rule.duration)
+        };
+        let now = hallpass_types::unix_ms_now();
+        assert!(deadline_ms > now + 290_000 && deadline_ms <= now + 300_000);
+        assert!(parse_err(&[
+            "rules", "add", "--name", "t", "--action", "allow", "--duration", "5w"
+        ])
+        .contains("invalid duration"));
     }
 
     #[test]
