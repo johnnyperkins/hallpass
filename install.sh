@@ -16,36 +16,33 @@ set -eu
 root=$(CDPATH= cd "$(dirname "$0")" && pwd)
 cd "$root"
 
-# The eBPF build itself is the capability probe: rustup auto-installs the
-# nightly pinned by crates/hallpass-ebpf/rust-toolchain.toml, and xtask
-# reports a missing bpf-linker with install instructions. No toolchain
-# knowledge is duplicated here.
-build_ebpf=0
+# `cargo xtask build` (eBPF object, then the workspace with the ebpf
+# feature) is the single owner of the eBPF build recipe, and doubles as
+# the capability probe: rustup auto-installs the nightly pinned by
+# crates/hallpass-ebpf/rust-toolchain.toml, and xtask reports a missing
+# bpf-linker with install instructions. No toolchain knowledge here.
+echo ">> Building release binaries..."
 case ${HALLPASS_EBPF:-auto} in
-0)
-	echo ">> HALLPASS_EBPF=0: procfs-only build."
-	;;
-1)
-	cargo xtask build-ebpf # fail the install if the eBPF build fails
-	build_ebpf=1
-	;;
-*)
-	if cargo xtask build-ebpf; then
-		build_ebpf=1
-	else
+auto)
+	if ! cargo xtask build; then
 		echo ">> eBPF build failed (see above); building procfs-only."
 		echo "   eBPF attribution is recommended; fix the build and re-run,"
 		echo "   or silence this fallback with HALLPASS_EBPF=0."
+		cargo build --release
 	fi
 	;;
-esac
-
-echo ">> Building release binaries..."
-if [ "$build_ebpf" = 1 ]; then
-	cargo build --release --workspace --features hallpassd/ebpf
-else
+1)
+	cargo xtask build # fail the install if the eBPF build fails
+	;;
+0)
+	echo ">> HALLPASS_EBPF=0: procfs-only build."
 	cargo build --release
-fi
+	;;
+*)
+	echo "HALLPASS_EBPF must be 1, 0, or unset; got '${HALLPASS_EBPF}'" >&2
+	exit 1
+	;;
+esac
 
 # Pick the login user even when the script itself is later re-run under sudo.
 target_user=${SUDO_USER:-$(id -un)}

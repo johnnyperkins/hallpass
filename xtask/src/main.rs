@@ -33,7 +33,8 @@ fn print_usage() {
     eprintln!("usage: cargo xtask <task>");
     eprintln!("tasks:");
     eprintln!("  build-ebpf    build the hallpass-ebpf kernel programs");
-    eprintln!("  build         build-ebpf, then the whole workspace (with the ebpf feature)");
+    eprintln!("  build         build-ebpf, then a release build of the whole workspace");
+    eprintln!("                (with the ebpf feature); what install.sh runs");
     eprintln!("  test          run the workspace unit/integration tests (no privileges)");
     eprintln!("  e2e           run the hallpassd e2e tests (compiles as you, runs the");
     eprintln!("                test binary under sudo -E; will prompt for your password)");
@@ -74,7 +75,7 @@ fn build_ebpf() -> Result<(), String> {
 
 fn build_workspace() -> Result<(), String> {
     run(Command::new("cargo")
-        .args(["build", "--workspace", "--features", "hallpassd/ebpf"])
+        .args(["build", "--release", "--workspace", "--features", "hallpassd/ebpf"])
         .current_dir(workspace_root()))
 }
 
