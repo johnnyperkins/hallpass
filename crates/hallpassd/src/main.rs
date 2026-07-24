@@ -201,7 +201,11 @@ async fn main() {
     if nft_installed {
         nft::teardown();
     }
-    let _ = std::fs::remove_file(&cfg.socket_path);
+    if let Err(e) = std::fs::remove_file(&cfg.socket_path) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!("failed to remove socket {}: {e}", cfg.socket_path.display());
+        }
+    }
     let _ = queue_thread.join();
     tracing::info!("hallpassd stopped");
 }
