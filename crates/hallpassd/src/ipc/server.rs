@@ -247,7 +247,8 @@ async fn message_loop(
             }
             ClientMsg::Stats => {
                 let rules = deps.store.ruleset().rule_count() as u32;
-                DaemonMsg::Stats(deps.stats.snapshot(rules))
+                let skipped = deps.store.rules_skipped();
+                DaemonMsg::Stats(deps.stats.snapshot(rules, skipped))
             }
         };
         send(out_tx, reply).await;

@@ -192,6 +192,9 @@ mod tests {
                 prompted: 5,
                 rules_loaded: 3,
                 uptime_secs: 3600,
+                dns_spoof_rejected: 2,
+                rules_skipped: 1,
+                prompts_overflowed: 4,
             }),
             DaemonMsg::Ok,
             DaemonMsg::Err {

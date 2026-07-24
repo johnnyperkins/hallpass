@@ -133,6 +133,7 @@ impl PromptTable {
         if inner.by_id.len() >= self.max_pending {
             drop(inner);
             tracing::warn!("pending prompt table full, applying default verdict");
+            self.stats.record_prompt_overflow();
             self.finish_default(conn, vec![seq]);
             return;
         }

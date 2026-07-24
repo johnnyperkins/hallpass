@@ -7,6 +7,7 @@
 
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -33,6 +34,9 @@ pub struct RuleStore {
     active: ArcSwap<RuleSet>,
     entries: Mutex<Vec<Entry>>,
     rules_dir: PathBuf,
+    /// Cumulative count of disk rule files skipped across every load
+    /// (bad permissions, unparsable, or duplicate name).
+    rules_skipped: AtomicU64,
 }
 
 /// A rule file is trusted when owned by root (or by the daemon's own euid,
@@ -65,14 +69,22 @@ fn sanitize_filename(name: &str) -> String {
     }
 }
 
-fn load_dir(dir: &Path) -> Vec<Entry> {
+/// Result of scanning the rules directory: the accepted entries and how
+/// many files were skipped (bad permissions, unparsable, or duplicate name).
+struct LoadResult {
+    entries: Vec<Entry>,
+    skipped: u64,
+}
+
+fn load_dir(dir: &Path) -> LoadResult {
     let self_uid = effective_uid().unwrap_or(u32::MAX);
     let mut entries = Vec::new();
+    let mut skipped = 0u64;
     let read = match std::fs::read_dir(dir) {
         Ok(r) => r,
         Err(e) => {
             tracing::warn!(dir = %dir.display(), "cannot read rules dir: {e}");
-            return entries;
+            return LoadResult { entries, skipped };
         }
     };
     for item in read.flatten() {
@@ -84,6 +96,7 @@ fn load_dir(dir: &Path) -> Vec<Entry> {
             Ok(m) => m,
             Err(e) => {
                 tracing::warn!(file = %path.display(), "cannot stat rule file: {e}");
+                skipped += 1;
                 continue;
             }
         };
@@ -94,6 +107,7 @@ fn load_dir(dir: &Path) -> Vec<Entry> {
                 mode = format!("{:o}", meta.mode() & 0o7777),
                 "skipping rule file: must be owned by root and not group/world-writable"
             );
+            skipped += 1;
             continue;
         }
         let rule: Rule = match std::fs::read_to_string(&path)
@@ -103,11 +117,13 @@ fn load_dir(dir: &Path) -> Vec<Entry> {
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!(file = %path.display(), "skipping unparsable rule file: {e}");
+                skipped += 1;
                 continue;
             }
         };
         if entries.iter().any(|e: &Entry| e.rule.name == rule.name) {
             tracing::warn!(file = %path.display(), rule = %rule.name, "skipping duplicate rule name");
+            skipped += 1;
             continue;
         }
         entries.push(Entry {
@@ -115,21 +131,32 @@ fn load_dir(dir: &Path) -> Vec<Entry> {
             origin: Origin::Disk(path),
         });
     }
-    entries
+    LoadResult { entries, skipped }
 }
 
 impl RuleStore {
     /// Create a store, loading persisted rules from `rules_dir`.
     pub fn new(rules_dir: PathBuf) -> RuleStore {
-        let entries = load_dir(&rules_dir);
-        tracing::info!(count = entries.len(), dir = %rules_dir.display(), "loaded disk rules");
+        let loaded = load_dir(&rules_dir);
+        tracing::info!(
+            count = loaded.entries.len(),
+            skipped = loaded.skipped,
+            dir = %rules_dir.display(),
+            "loaded disk rules"
+        );
         let store = RuleStore {
             active: ArcSwap::from_pointee(RuleSet::compile(&[])),
-            entries: Mutex::new(entries),
+            entries: Mutex::new(loaded.entries),
             rules_dir,
+            rules_skipped: AtomicU64::new(loaded.skipped),
         };
         store.rebuild();
         store
+    }
+
+    /// Cumulative count of disk rule files skipped since startup.
+    pub fn rules_skipped(&self) -> u64 {
+        self.rules_skipped.load(Ordering::Relaxed)
     }
 
     /// Current compiled snapshot. Callers that only need one lookup
@@ -225,9 +252,10 @@ impl RuleStore {
     /// Re-read disk rules (hot reload), keeping session rules.
     pub fn reload_disk(&self) {
         let fresh = load_dir(&self.rules_dir);
+        self.rules_skipped.fetch_add(fresh.skipped, Ordering::Relaxed);
         let mut entries = self.entries.lock().unwrap();
         entries.retain(|e| e.origin == Origin::Session);
-        for f in fresh {
+        for f in fresh.entries {
             if !entries.iter().any(|e| e.rule.name == f.rule.name) {
                 entries.push(f);
             }

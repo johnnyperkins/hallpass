@@ -12,6 +12,8 @@ pub struct Counters {
     allowed: AtomicU64,
     denied: AtomicU64,
     prompted: AtomicU64,
+    dns_spoof_rejected: AtomicU64,
+    prompts_overflowed: AtomicU64,
 }
 
 impl Default for Counters {
@@ -22,6 +24,8 @@ impl Default for Counters {
             allowed: AtomicU64::new(0),
             denied: AtomicU64::new(0),
             prompted: AtomicU64::new(0),
+            dns_spoof_rejected: AtomicU64::new(0),
+            prompts_overflowed: AtomicU64::new(0),
         }
     }
 }
@@ -42,8 +46,20 @@ impl Counters {
         self.prompted.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Snapshot for the IPC reply. `rules_loaded` comes from the rule store.
-    pub fn snapshot(&self, rules_loaded: u32) -> Stats {
+    /// Count a DNS response rejected as unsolicited/spoofed.
+    pub fn record_dns_spoof_rejected(&self) {
+        self.dns_spoof_rejected.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Count a connection resolved by default because the prompt table was
+    /// full.
+    pub fn record_prompt_overflow(&self) {
+        self.prompts_overflowed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Snapshot for the IPC reply. `rules_loaded` and `rules_skipped` come
+    /// from the rule store.
+    pub fn snapshot(&self, rules_loaded: u32, rules_skipped: u64) -> Stats {
         Stats {
             connections_total: self.connections_total.load(Ordering::Relaxed),
             allowed: self.allowed.load(Ordering::Relaxed),
@@ -51,6 +67,9 @@ impl Counters {
             prompted: self.prompted.load(Ordering::Relaxed),
             rules_loaded,
             uptime_secs: self.start.elapsed().as_secs(),
+            dns_spoof_rejected: self.dns_spoof_rejected.load(Ordering::Relaxed),
+            rules_skipped,
+            prompts_overflowed: self.prompts_overflowed.load(Ordering::Relaxed),
         }
     }
 }
@@ -66,11 +85,17 @@ mod tests {
         c.record_verdict(Verdict::Deny);
         c.record_verdict(Verdict::Reject);
         c.record_prompted();
-        let s = c.snapshot(5);
+        c.record_dns_spoof_rejected();
+        c.record_prompt_overflow();
+        c.record_prompt_overflow();
+        let s = c.snapshot(5, 4);
         assert_eq!(s.connections_total, 3);
         assert_eq!(s.allowed, 1);
         assert_eq!(s.denied, 2);
         assert_eq!(s.prompted, 1);
         assert_eq!(s.rules_loaded, 5);
+        assert_eq!(s.dns_spoof_rejected, 1);
+        assert_eq!(s.rules_skipped, 4);
+        assert_eq!(s.prompts_overflowed, 2);
     }
 }

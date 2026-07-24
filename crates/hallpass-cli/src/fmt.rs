@@ -30,6 +30,9 @@ pub fn format_stats(s: &Stats) -> String {
         ("denied", s.denied.to_string()),
         ("prompted", s.prompted.to_string()),
         ("rules loaded", s.rules_loaded.to_string()),
+        ("rules skipped", s.rules_skipped.to_string()),
+        ("dns spoofed", s.dns_spoof_rejected.to_string()),
+        ("prompt overflows", s.prompts_overflowed.to_string()),
         ("uptime", format_uptime(s.uptime_secs)),
     ];
     let width = rows.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
@@ -238,11 +241,17 @@ mod tests {
             prompted: 5,
             rules_loaded: 3,
             uptime_secs: 3600,
+            dns_spoof_rejected: 7,
+            rules_skipped: 2,
+            prompts_overflowed: 1,
         };
         let out = format_stats(&s);
-        assert!(out.contains("connections   100\n"));
-        assert!(out.contains("rules loaded  3\n"));
-        assert!(out.contains("uptime        1h 0m 0s\n"));
+        assert!(out.contains("connections       100\n"));
+        assert!(out.contains("rules loaded      3\n"));
+        assert!(out.contains("rules skipped     2\n"));
+        assert!(out.contains("dns spoofed       7\n"));
+        assert!(out.contains("prompt overflows  1\n"));
+        assert!(out.contains("uptime            1h 0m 0s\n"));
     }
 
     #[test]

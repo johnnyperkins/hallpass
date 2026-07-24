@@ -116,6 +116,7 @@ async fn main() {
     // The queue thread reads the cache when it builds a Connection.
     let dns_cache = Arc::new(dns::IpDomainCache::new(dns::CACHE_CAPACITY));
     let snoop_cache = Arc::clone(&dns_cache);
+    let snoop_stats = Arc::clone(&counters);
     tokio::spawn(async move {
         let tracker = dns::QueryTracker::new(dns::TRACKER_CAPACITY);
         while let Some((tuple, pkt)) = dns_rx.recv().await {
@@ -132,6 +133,7 @@ async fn main() {
                         );
                         snoop_cache.absorb(&resp);
                     } else {
+                        snoop_stats.record_dns_spoof_rejected();
                         tracing::debug!(
                             domain = %resp.query_name,
                             from = %tuple.src,

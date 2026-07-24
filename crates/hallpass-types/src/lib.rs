@@ -267,6 +267,15 @@ pub struct Stats {
     pub rules_loaded: u32,
     /// Daemon uptime in seconds.
     pub uptime_secs: u64,
+    /// DNS responses rejected as unsolicited/spoofed (did not match a
+    /// recorded query).
+    pub dns_spoof_rejected: u64,
+    /// Rule files skipped while loading (bad permissions, unparsable, or a
+    /// duplicate name).
+    pub rules_skipped: u64,
+    /// Connections resolved with the default verdict because the pending
+    /// prompt table was full.
+    pub prompts_overflowed: u64,
 }
 
 /// Scope of the rule generated from an interactive prompt reply.
