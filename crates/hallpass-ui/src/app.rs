@@ -430,6 +430,21 @@ fn prompt_ui(ui: &mut egui::Ui, p: &mut PromptState, now_ms: u64, answered: &mut
     });
     ui.add_space(6.0);
 
+    // Attribution is advisory (procfs races, eBPF offset guesses, cache
+    // TTLs), and an "App anywhere" allow rule is only as strong as the exe
+    // match: any process that execs the same binary inherits it. Warn before
+    // the reply widens a rule to every destination.
+    if p.scope == PromptScope::AppAnywhere {
+        ui.colored_label(
+            REJECT_COLOR,
+            format!(
+                "\u{26a0} \"App anywhere\" lets any process running {} reach any destination.",
+                prompt::exe_name(&p.conn)
+            ),
+        );
+        ui.add_space(6.0);
+    }
+
     ui.horizontal(|ui| {
         let allow = egui::Button::new(RichText::new("Allow").color(Color32::WHITE).strong())
             .fill(ALLOW_COLOR)
