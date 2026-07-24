@@ -1,8 +1,13 @@
 #!/bin/sh
 # Hallpass one-command installer.
 #
-#   ./install.sh              # build (procfs attribution) + install + enable
-#   HALLPASS_EBPF=1 ./install.sh   # also build the eBPF attribution programs
+#   ./install.sh                   # build + install + enable
+#   HALLPASS_EBPF=1 ./install.sh   # require eBPF attribution (fail if toolchain missing)
+#   HALLPASS_EBPF=0 ./install.sh   # force the procfs-only build
+#
+# eBPF attribution is recommended and built by default when the toolchain
+# (nightly Rust + bpf-linker) is available; otherwise the build falls back
+# to procfs-only attribution with a note.
 #
 # The build runs as the invoking user (so target/ stays user-owned); only
 # the system install steps use sudo, which will prompt for your password.
@@ -11,12 +16,33 @@ set -eu
 root=$(CDPATH= cd "$(dirname "$0")" && pwd)
 cd "$root"
 
+# The eBPF build itself is the capability probe: rustup auto-installs the
+# nightly pinned by crates/hallpass-ebpf/rust-toolchain.toml, and xtask
+# reports a missing bpf-linker with install instructions. No toolchain
+# knowledge is duplicated here.
+build_ebpf=0
+case ${HALLPASS_EBPF:-auto} in
+0)
+	echo ">> HALLPASS_EBPF=0: procfs-only build."
+	;;
+1)
+	cargo xtask build-ebpf # fail the install if the eBPF build fails
+	build_ebpf=1
+	;;
+*)
+	if cargo xtask build-ebpf; then
+		build_ebpf=1
+	else
+		echo ">> eBPF build failed (see above); building procfs-only."
+		echo "   eBPF attribution is recommended; fix the build and re-run,"
+		echo "   or silence this fallback with HALLPASS_EBPF=0."
+	fi
+	;;
+esac
+
 echo ">> Building release binaries..."
-if [ "${HALLPASS_EBPF:-0}" = "1" ]; then
-	# eBPF path: needs nightly + bpf-linker; builds kernel programs then the
-	# daemon with the ebpf feature.
-	cargo xtask build
-	cargo build --release --features ebpf -p hallpassd
+if [ "$build_ebpf" = 1 ]; then
+	cargo build --release --workspace --features hallpassd/ebpf
 else
 	cargo build --release
 fi

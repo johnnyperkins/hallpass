@@ -61,8 +61,11 @@ cargo build --release
 
 Binaries land in `target/release/`: `hallpassd`, `hallpass-cli`, `hallpass-ui`.
 
-### eBPF attribution (optional)
+### eBPF attribution (recommended)
 
+eBPF attribution records the owning process at `connect()` time in the
+kernel, so even processes that exit before the first packet is inspected
+attribute correctly; procfs attribution races those and can come up empty.
 The eBPF programs need a nightly toolchain (picked up automatically via
 `crates/hallpass-ebpf/rust-toolchain.toml`, including `rust-src`) and
 [bpf-linker](https://github.com/aya-rs/bpf-linker):
@@ -75,16 +78,23 @@ cargo build --release --features ebpf -p hallpassd
 cargo xtask build
 ```
 
-At runtime the daemon loads the eBPF object if it was compiled in and the
-kernel accepts it; otherwise it silently falls back to procfs attribution.
+At load time the daemon resolves the kernel struct offsets the programs
+read (`sock_common`, `msghdr`) from the running kernel's BTF
+(`/sys/kernel/btf/vmlinux`) and patches them into the object, so the
+programs are not tied to one kernel version or architecture layout.
+Kernels without BTF fall back to compiled-in x86_64 offsets. At runtime
+the daemon loads the eBPF object if it was compiled in and the kernel
+accepts it; otherwise it silently falls back to procfs attribution, and
+any flow eBPF cannot resolve is retried through procfs.
 
 ## Installing
 
 One command builds, installs, and starts everything:
 
 ```sh
-./install.sh                    # procfs attribution (stable Rust)
-HALLPASS_EBPF=1 ./install.sh    # also build the eBPF attribution programs
+./install.sh                    # eBPF attribution when the toolchain is present
+HALLPASS_EBPF=1 ./install.sh    # require eBPF (fail instead of falling back)
+HALLPASS_EBPF=0 ./install.sh    # force the procfs-only build (stable Rust)
 ```
 
 It builds the release binaries as your user, then uses `sudo` (prompting
