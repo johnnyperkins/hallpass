@@ -291,6 +291,12 @@ pub enum PromptScope {
 }
 
 /// Messages sent from a client (CLI/UI) to the daemon.
+///
+/// Wire-protocol evolution rule: postcard encodes an enum by its variant
+/// index, so reordering or removing a variant silently reinterprets old
+/// clients' messages - far worse than the version handshake's clean
+/// rejection. Only ever append variants, and bump [`PROTOCOL_VERSION`] on
+/// any reorder or removal. The same rule applies to [`DaemonMsg`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ClientMsg {
     /// Handshake; must be the first message on a connection.
@@ -337,6 +343,11 @@ pub enum ClientMsg {
 }
 
 /// Messages sent from the daemon to a client.
+///
+/// Append-only: postcard encodes an enum by its variant index, so
+/// reordering or removing a variant breaks old clients silently. Only add
+/// variants at the end, and bump [`PROTOCOL_VERSION`] on any reorder or
+/// removal. See [`ClientMsg`] for the full rule.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DaemonMsg {
     /// Handshake acknowledgement.
