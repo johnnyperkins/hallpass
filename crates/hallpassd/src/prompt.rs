@@ -365,6 +365,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn udp_once_covers_the_flow_without_a_rule() {
+        // conntrack marks only the first datagram of a UDP flow `ct state
+        // new`, so a single verdict reaches the queue and covers the whole
+        // flow. `Once` reuses that: the held datagram is released with the
+        // verdict and no persistent rule is created, so a genuinely new
+        // flow prompts again.
+        let mut h = harness("udp-once", 4, Verdict::Deny);
+        let (tx, mut prompt_rx) = mpsc::channel(16);
+        assert!(h.table.set_handler(tx));
+        let mut c = conn("/usr/bin/dig", "9.9.9.9:53");
+        c.tuple.proto = Proto::Udp;
+        h.table.handle_new(c, 1);
+        let DaemonMsg::PromptRequest { id, .. } = prompt_rx.recv().await.unwrap() else {
+            panic!("expected PromptRequest");
+        };
+        h.table
+            .reply(id, Verdict::Allow, RuleDuration::Once, PromptScope::ThisHost)
+            .unwrap();
+        assert_eq!(h.verdict_rx.recv().await, Some((1, Verdict::Allow)));
+        assert!(h.store.list().is_empty(), "Once creates no rule for UDP either");
+    }
+
+    #[tokio::test]
     async fn overflow_applies_default() {
         let mut h = harness("overflow", 1, Verdict::Deny);
         let (tx, mut prompt_rx) = mpsc::channel(16);

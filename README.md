@@ -188,6 +188,13 @@ hold the prompt-handler role.
   those connections match by IP/port/exe only.
 - Only new connections (`ct state new`) are evaluated; established flows are
   never re-checked.
+- **UDP verdicts are per flow, not per datagram**: conntrack marks only the
+  first datagram of a UDP flow as `ct state new`, so exactly one verdict
+  reaches the queue and it covers the whole flow until the conntrack entry
+  expires. A `Once` prompt reply therefore means "this flow" for UDP (as it
+  means "this connection" for TCP): the held datagram is released with the
+  verdict, no rule is persisted, and a genuinely new flow to the same
+  destination prompts again.
 - eBPF struct offsets are tuned for x86_64 distro kernels; on mismatch the
   daemon falls back to procfs attribution automatically.
 
