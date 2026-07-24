@@ -1,5 +1,7 @@
 //! Map network flows to the local process that owns them.
 
+#[cfg(any(test, feature = "ebpf"))]
+pub mod btf;
 pub mod cache;
 #[cfg(feature = "ebpf")]
 pub mod ebpf;

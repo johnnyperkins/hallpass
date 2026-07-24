@@ -10,10 +10,12 @@
 //! Byte order convention (shared with hallpass-ebpf-common): addresses
 //! are raw network-order bytes, ports are host order.
 //!
-//! struct offsets: this program reads sock_common/msghdr fields at fixed
-//! offsets valid for x86_64 kernels with CONFIG_NET_NS=y (every distro
-//! kernel). If a field moves, lookups miss and hallpassd falls back to
-//! procfs attribution; nothing breaks.
+//! struct offsets: sock_common/msghdr field offsets are `#[no_mangle]`
+//! globals that the loader patches with values resolved from the running
+//! kernel's BTF (see hallpassd's attribution::btf). The compiled-in
+//! defaults are the x86_64 CONFIG_NET_NS=y layout, used as-is when BTF
+//! is unavailable. If an offset is still wrong, lookups miss and
+//! hallpassd falls back to procfs attribution; nothing breaks.
 
 #![no_std]
 #![no_main]
@@ -29,17 +31,32 @@ use hallpass_ebpf_common::{
     ExecEvent, FlowKey, FlowVal, AF_INET, AF_INET6, EVENT_EXEC, EVENT_EXIT, PROTO_TCP, PROTO_UDP,
 };
 
-// struct sock_common field offsets (x86_64, CONFIG_NET_NS=y).
-const SKC_DADDR: usize = 0; // __be32
-const SKC_RCV_SADDR: usize = 4; // __be32
-const SKC_DPORT: usize = 12; // __be16
-const SKC_NUM: usize = 14; // u16, host order
-const SKC_FAMILY: usize = 16; // u16
-const SKC_V6_DADDR: usize = 56; // struct in6_addr
-const SKC_V6_RCV_SADDR: usize = 72; // struct in6_addr
+// struct sock_common / msghdr field offsets. Loader-patched globals
+// (hallpassd resolves the real values from kernel BTF and overrides them
+// by symbol name; unpatched, these x86_64 CONFIG_NET_NS=y defaults
+// apply). Read only through `off()` so the compiler cannot fold the
+// defaults into the code.
+#[no_mangle]
+static OFF_SKC_DADDR: u32 = 0; // __be32
+#[no_mangle]
+static OFF_SKC_RCV_SADDR: u32 = 4; // __be32
+#[no_mangle]
+static OFF_SKC_DPORT: u32 = 12; // __be16
+#[no_mangle]
+static OFF_SKC_NUM: u32 = 14; // u16, host order
+#[no_mangle]
+static OFF_SKC_FAMILY: u32 = 16; // u16
+#[no_mangle]
+static OFF_SKC_V6_DADDR: u32 = 56; // struct in6_addr
+#[no_mangle]
+static OFF_SKC_V6_RCV_SADDR: u32 = 72; // struct in6_addr
+#[no_mangle]
+static OFF_MSG_NAME: u32 = 0; // void *
 
-// struct msghdr: msg_name is the first field.
-const MSG_NAME: usize = 0;
+#[inline(always)]
+fn off(global: &'static u32) -> usize {
+    unsafe { core::ptr::read_volatile(global) as usize }
+}
 
 // struct sockaddr_in / sockaddr_in6 field offsets.
 const SIN_PORT: usize = 2; // __be16 in both
@@ -75,24 +92,24 @@ fn current_flow_val() -> FlowVal {
 /// PROTO_UDP; for UDP an explicit destination (from msghdr) overrides the
 /// socket's connected peer.
 unsafe fn sock_flow_key(sk: u64, proto: u8, dest: Option<(&[u8], u16)>) -> Result<FlowKey, ()> {
-    let family: u16 = read(sk, SKC_FAMILY)?;
-    let sport: u16 = read(sk, SKC_NUM)?;
+    let family: u16 = read(sk, off(&OFF_SKC_FAMILY))?;
+    let sport: u16 = read(sk, off(&OFF_SKC_NUM))?;
     match family as u8 {
         AF_INET => {
-            let saddr: u32 = read(sk, SKC_RCV_SADDR)?;
+            let saddr: u32 = read(sk, off(&OFF_SKC_RCV_SADDR))?;
             let (daddr, dport) = match dest {
                 Some((addr, port)) if addr.len() >= 4 => {
                     ([addr[0], addr[1], addr[2], addr[3]], port)
                 }
                 _ => {
-                    let d: u32 = read(sk, SKC_DADDR)?;
-                    (d.to_ne_bytes(), u16::from_be(read::<u16>(sk, SKC_DPORT)?))
+                    let d: u32 = read(sk, off(&OFF_SKC_DADDR))?;
+                    (d.to_ne_bytes(), u16::from_be(read::<u16>(sk, off(&OFF_SKC_DPORT))?))
                 }
             };
             Ok(FlowKey::v4(proto, saddr.to_ne_bytes(), sport, daddr, dport))
         }
         AF_INET6 => {
-            let saddr: [u8; 16] = read(sk, SKC_V6_RCV_SADDR)?;
+            let saddr: [u8; 16] = read(sk, off(&OFF_SKC_V6_RCV_SADDR))?;
             let (daddr, dport): ([u8; 16], u16) = match dest {
                 Some((addr, port)) if addr.len() >= 16 => {
                     let mut d = [0u8; 16];
@@ -100,8 +117,8 @@ unsafe fn sock_flow_key(sk: u64, proto: u8, dest: Option<(&[u8], u16)>) -> Resul
                     (d, port)
                 }
                 _ => (
-                    read(sk, SKC_V6_DADDR)?,
-                    u16::from_be(read::<u16>(sk, SKC_DPORT)?),
+                    read(sk, off(&OFF_SKC_V6_DADDR))?,
+                    u16::from_be(read::<u16>(sk, off(&OFF_SKC_DPORT))?),
                 ),
             };
             // Dual-stack sockets carry v4-mapped peers; the wire traffic
@@ -161,7 +178,7 @@ fn udp_send(ctx: &ProbeContext, addr_off: usize, addr_len: usize) -> u32 {
     let (sk, msg) = (sk as u64, msg as u64);
     let mut buf = [0u8; 16];
     let dest = unsafe {
-        match read::<u64>(msg, MSG_NAME) {
+        match read::<u64>(msg, off(&OFF_MSG_NAME)) {
             Ok(name) if name != 0 => {
                 let port: u16 = match read(name, SIN_PORT) {
                     Ok(p) => u16::from_be(p),

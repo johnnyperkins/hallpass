@@ -23,6 +23,7 @@ use lru::LruCache;
 use hallpass_ebpf_common::{ExecEvent, FlowKey, FlowVal, EVENT_EXEC, PROTO_TCP, PROTO_UDP};
 use hallpass_types::{FlowTuple, Proto};
 
+use super::btf::Btf;
 use super::{procfs, Attributor, ProcInfo};
 
 /// The object produced by `cargo xtask build-ebpf`.
@@ -63,7 +64,14 @@ impl EbpfAttributor {
     }
 
     fn load() -> Result<EbpfAttributor, String> {
-        let mut ebpf = EbpfLoader::new()
+        // Patch kernel struct offsets resolved from BTF into the programs
+        // before the verifier sees them; see resolve_offsets().
+        let offs = resolve_offsets();
+        let mut loader = EbpfLoader::new();
+        for (name, value) in &offs {
+            loader.override_global(name, value, true);
+        }
+        let mut ebpf = loader
             .load(EBPF_OBJ)
             .map_err(|e| format!("load object: {e}"))?;
 
@@ -126,6 +134,45 @@ impl Attributor for EbpfAttributor {
             cmdline,
         })
     }
+}
+
+/// Kernel struct offsets for the eBPF programs, resolved from the running
+/// kernel's BTF: per-kernel resolution instead of trusting one compiled-in
+/// layout. Returns an empty list when BTF is missing (kernel built without
+/// CONFIG_DEBUG_INFO_BTF) or a field cannot be found: nothing is patched
+/// and the x86_64 defaults compiled into the object apply. A wrong default
+/// only costs eBPF lookup misses, which the procfs attributor absorbs.
+fn resolve_offsets() -> Vec<(&'static str, u32)> {
+    let resolved = match Btf::from_sys_fs() {
+        Ok(btf) => resolve_from_btf(&btf),
+        Err(e) => {
+            tracing::warn!("kernel BTF unavailable, using compiled-in x86_64 offsets: {e}");
+            return Vec::new();
+        }
+    };
+    resolved.unwrap_or_else(|| {
+        tracing::warn!("BTF offset resolution incomplete, using compiled-in x86_64 offsets");
+        Vec::new()
+    })
+}
+
+fn resolve_from_btf(btf: &Btf) -> Option<Vec<(&'static str, u32)>> {
+    // The programs read fields off a `struct sock *`, so each sock_common
+    // offset is `sock.__sk_common` (0 on every known kernel, but resolved
+    // anyway) plus the field's offset within sock_common.
+    let skc = btf.struct_field_offset("sock", "__sk_common")?;
+    let sock_common = btf.struct_id("sock_common")?;
+    let sc = |field| btf.field_offset(sock_common, field).map(|o| skc + o);
+    Some(vec![
+        ("OFF_SKC_DADDR", sc("skc_daddr")?),
+        ("OFF_SKC_RCV_SADDR", sc("skc_rcv_saddr")?),
+        ("OFF_SKC_DPORT", sc("skc_dport")?),
+        ("OFF_SKC_NUM", sc("skc_num")?),
+        ("OFF_SKC_FAMILY", sc("skc_family")?),
+        ("OFF_SKC_V6_DADDR", sc("skc_v6_daddr")?),
+        ("OFF_SKC_V6_RCV_SADDR", sc("skc_v6_rcv_saddr")?),
+        ("OFF_MSG_NAME", btf.struct_field_offset("msghdr", "msg_name")?),
+    ])
 }
 
 /// FlowTuple -> map key, matching the byte-order convention of
