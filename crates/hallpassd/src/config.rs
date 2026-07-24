@@ -63,6 +63,11 @@ impl Config {
         if self.prompt_timeout_secs == 0 {
             return Err("prompt_timeout_secs must be at least 1".into());
         }
+        // The prompt table turns this into a millisecond deadline; keep it
+        // far away from any range where that arithmetic could truncate.
+        if self.prompt_timeout_secs > 3600 {
+            return Err("prompt_timeout_secs must be at most 3600".into());
+        }
         if self.max_pending_prompts == 0 {
             return Err("max_pending_prompts must be at least 1".into());
         }
@@ -143,6 +148,7 @@ mod tests {
     #[test]
     fn degenerate_values_rejected() {
         assert!(parse("prompt_timeout_secs = 0").validate().is_err());
+        assert!(parse("prompt_timeout_secs = 3601").validate().is_err());
         assert!(parse("max_pending_prompts = 0").validate().is_err());
         assert!(parse("queue_num = 65535").validate().is_err());
         assert!(parse("").validate().is_ok());
