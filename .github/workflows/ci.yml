@@ -26,6 +26,32 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
 
+  e2e:
+    name: e2e (root + netns)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install tools
+        # iproute2 and python3 ship with the runner image; the suite also
+        # needs nft and nc.
+        run: sudo apt-get update && sudo apt-get install -y nftables netcat-openbsd
+      # Build unprivileged so the cache and target/ stay runner-user-owned;
+      # only the test run itself needs root.
+      - name: Build e2e test binary
+        run: cargo test -p hallpassd --test e2e --no-run
+      - name: Run e2e tests
+        # --test-threads=1: the tests share fixed namespace names.
+        # The suite skips gracefully (and passes) when the environment is
+        # unusable; grep for the skip marker so a broken root or tool setup
+        # fails the job instead of going silently green. --nocapture because
+        # the harness hides stderr of passing tests.
+        shell: bash
+        run: |
+          sudo -E "$(command -v cargo)" test -p hallpassd --test e2e -- --ignored --test-threads=1 --nocapture 2>&1 | tee e2e.log
+          ! grep -q 'SKIP e2e' e2e.log
+
   deny:
     name: cargo-deny
     runs-on: ubuntu-latest
