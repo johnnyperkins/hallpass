@@ -160,6 +160,24 @@ proto = "udp"
 
 The directory is watched; edits apply without a restart.
 
+Decided connections can also be exported to syslog (local socket or a
+remote collector) for SIEM ingestion, as RFC 5424 structured data or JSON:
+
+```toml
+[syslog]
+format = "rfc5424"        # rfc5424 | json
+[syslog.target]
+kind = "udp"              # or kind = "local" with an optional path
+addr = "10.0.0.9:514"     # literal IP:port; hostnames are not resolved
+```
+
+Export runs as an ordinary event subscriber, so a stalled or unreachable
+collector costs events, never verdicts. Values are escaped and capped, and
+control characters are neutralized, so a process cannot forge log records
+through its own command line. A UDP collector needs a rule allowing
+hallpassd to reach it, since export datagrams are outbound traffic like
+any other.
+
 ## Usage
 
 ```sh

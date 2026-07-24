@@ -2,7 +2,7 @@
 
 use std::fmt::Write;
 
-use hallpass_types::{ConnEvent, Connection, PromptScope, Rule, Stats, Verdict};
+use hallpass_types::{format_ts, ConnEvent, Connection, PromptScope, Rule, Stats, Verdict};
 
 /// Human-readable verdict name (uppercase, for event lines).
 pub fn verdict_str(v: Verdict) -> &'static str {
@@ -135,34 +135,6 @@ pub fn format_event(ev: &ConnEvent) -> String {
         dst_display(&ev.conn),
         rule
     )
-}
-
-/// Format Unix milliseconds as `YYYY-MM-DD HH:MM:SS` (UTC).
-pub fn format_ts(unix_ms: u64) -> String {
-    let secs = (unix_ms / 1000) as i64;
-    let days = secs.div_euclid(86400);
-    let sod = secs.rem_euclid(86400);
-    let (y, m, d) = civil_from_days(days);
-    format!(
-        "{y:04}-{m:02}-{d:02} {:02}:{:02}:{:02}",
-        sod / 3600,
-        sod / 60 % 60,
-        sod % 60
-    )
-}
-
-/// Days-since-epoch to (year, month, day). Howard Hinnant's algorithm.
-fn civil_from_days(z: i64) -> (i64, u32, u32) {
-    let z = z + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
-    (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
 #[cfg(test)]

@@ -20,6 +20,7 @@ mod packet;
 mod prompt;
 mod rules;
 mod stats;
+mod syslog;
 #[cfg(test)]
 mod testutil;
 
@@ -107,6 +108,9 @@ async fn main() {
         tracing::warn!("rules dir watcher unavailable: {e}");
     }
     rules::store::spawn_expiry_sweeper(Arc::clone(&store));
+    if let Some(syslog_cfg) = cfg.syslog.clone() {
+        syslog::spawn(Arc::clone(&events), syslog_cfg);
+    }
 
     // Channels between the queue thread and the async side.
     let (prompt_tx, mut prompt_rx) =

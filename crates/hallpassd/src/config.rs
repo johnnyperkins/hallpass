@@ -29,6 +29,8 @@ pub struct Config {
     /// model (SCTP, ICMP, ...) or that fail to parse. Rules never see
     /// these; they are counted and resolved by this policy alone.
     pub unhandled_proto_verdict: Verdict,
+    /// Export decided connections to syslog. Absent means no export.
+    pub syslog: Option<crate::syslog::SyslogConfig>,
     /// Whether the verdict queue carries the NFQUEUE `bypass` flag.
     /// `true` (default) fails open: traffic flows unfiltered when the
     /// daemon is dead or the queue is full. `false` fails closed: those
@@ -46,6 +48,7 @@ impl Default for Config {
             max_pending_prompts: 64,
             rules_dir: PathBuf::from("/etc/hallpass/rules.d"),
             unhandled_proto_verdict: Verdict::Allow,
+            syslog: None,
             queue_bypass: true,
         }
     }

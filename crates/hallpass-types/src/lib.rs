@@ -368,6 +368,56 @@ pub fn unix_ms_now() -> u64 {
         .unwrap_or(0)
 }
 
+/// Unix milliseconds as `YYYY-MM-DD HH:MM:SS` (UTC), for human output.
+pub fn format_ts(unix_ms: u64) -> String {
+    let (y, m, d, h, min, s, _) = civil_from_unix_ms(unix_ms);
+    format!("{y:04}-{m:02}-{d:02} {h:02}:{min:02}:{s:02}")
+}
+
+/// Unix milliseconds as an RFC 3339 UTC timestamp with milliseconds.
+pub fn format_rfc3339(unix_ms: u64) -> String {
+    let (y, m, d, h, min, s, ms) = civil_from_unix_ms(unix_ms);
+    format!("{y:04}-{m:02}-{d:02}T{h:02}:{min:02}:{s:02}.{ms:03}Z")
+}
+
+/// Split Unix milliseconds into (year, month, day, hour, minute, second,
+/// millisecond) in UTC.
+fn civil_from_unix_ms(unix_ms: u64) -> (i64, u32, u32, u64, u64, u64, u64) {
+    let secs = (unix_ms / 1000) as i64;
+    let days = secs.div_euclid(86_400);
+    let sod = secs.rem_euclid(86_400) as u64;
+    let (y, m, d) = civil_from_days(days);
+    (y, m, d, sod / 3600, sod / 60 % 60, sod % 60, unix_ms % 1000)
+}
+
+/// Days-since-epoch to (year, month, day). Howard Hinnant's algorithm.
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+#[cfg(test)]
+mod time_tests {
+    use super::*;
+
+    #[test]
+    fn timestamp_formats() {
+        assert_eq!(format_ts(0), "1970-01-01 00:00:00");
+        assert_eq!(format_rfc3339(0), "1970-01-01T00:00:00.000Z");
+        // 2024-07-03 09:46:40.123 UTC.
+        assert_eq!(format_ts(1_720_000_000_123), "2024-07-03 09:46:40");
+        assert_eq!(format_rfc3339(1_720_000_000_123), "2024-07-03T09:46:40.123Z");
+    }
+}
+
 #[cfg(test)]
 mod duration_tests {
     use super::*;

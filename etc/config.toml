@@ -27,3 +27,24 @@ unhandled_proto_verdict = "allow"
 # daemon is dead or the queue is full) or closed (`false`: those packets
 # are dropped). See etc/config.hardened.toml.
 queue_bypass = true
+
+# Optional: export every decided connection to syslog. Omit the whole
+# [syslog] section for no export. Export is a plain event subscriber, so
+# a stalled collector costs events, never verdicts. Facility is auth, so
+# distro configs usually route these to auth.log; severity is warning for
+# deny/reject and info for allow.
+#
+# [syslog]
+# format = "rfc5424"          # rfc5424 (structured data) | json
+# [syslog.target]
+# kind = "local"              # local syslog datagram socket
+# path = "/dev/log"
+#
+# ...or a remote collector. The address must be a literal IP and port
+# (no hostnames: resolving one would run through the daemon's own DNS
+# path at startup). Export datagrams are themselves outbound traffic and
+# get filtered like any other, so add a rule allowing hallpassd to reach
+# the collector - otherwise a default-deny posture blocks its own logs.
+# [syslog.target]
+# kind = "udp"
+# addr = "10.0.0.9:514"
