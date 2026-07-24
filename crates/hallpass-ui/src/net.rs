@@ -22,6 +22,9 @@ pub enum UiEvent {
     Connected,
     /// Socket lost or connect failed; next retry after this delay.
     Disconnected { retry_in: Duration },
+    /// A message was consumed but never reached the daemon; it will not be
+    /// retried (the daemon's prompt timeout backstops lost replies).
+    SendFailed { msg: ClientMsg },
     /// A message from the daemon.
     Daemon(DaemonMsg),
 }
@@ -169,9 +172,10 @@ async fn connect_and_serve(
             outgoing = from_ui.recv() => {
                 match outgoing {
                     Some(msg) => {
-                        write_msg(&mut writer, &msg)
-                            .await
-                            .map_err(|e| fail(format!("write: {e}")))?;
+                        if let Err(e) = write_msg(&mut writer, &msg).await {
+                            send_ui(to_ui, ctx, UiEvent::SendFailed { msg });
+                            return Err(fail(format!("write: {e}")));
+                        }
                     }
                     // UI channel closed: app is exiting.
                     None => return Ok(()),

@@ -100,6 +100,22 @@ impl HallpassApp {
                     // Pending prompts are dead with the connection.
                     self.prompts.clear();
                 }
+                UiEvent::SendFailed { msg } => {
+                    // The message is gone; for a prompt reply the daemon
+                    // falls back to its default verdict, so tell the user
+                    // instead of failing silently.
+                    let what = match msg {
+                        ClientMsg::PromptReply { .. } => {
+                            "your prompt answer; the daemon applies its default action"
+                        }
+                        ClientMsg::RuleAdd(_) => "a rule change",
+                        ClientMsg::RuleDelete { .. } => "a rule deletion",
+                        ClientMsg::RuleToggle { .. } => "a rule toggle",
+                        _ => "a request",
+                    };
+                    self.last_error =
+                        Some(format!("connection lost before delivering {what}"));
+                }
                 UiEvent::Daemon(msg) => self.handle_daemon_msg(msg),
             }
         }
