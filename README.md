@@ -186,8 +186,6 @@ hold the prompt-handler role.
 - **DoT / DoH are invisible** to the DNS snooper: domain-based rules only see
   names resolved through plaintext UDP port 53. Encrypted DNS still works, but
   those connections match by IP/port/exe only.
-- **Reject currently behaves like Drop**: the `reject` action drops the packet
-  without sending TCP RST / ICMP unreachable yet.
 - Only new connections (`ct state new`) are evaluated; established flows are
   never re-checked.
 - eBPF struct offsets are tuned for x86_64 distro kernels; on mismatch the

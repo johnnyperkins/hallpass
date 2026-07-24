@@ -54,12 +54,21 @@ pub struct QueueDeps {
     pub shutdown: Arc<AtomicBool>,
 }
 
-fn to_nfq(verdict: Verdict) -> NfqVerdict {
+/// Apply `verdict` to a held packet and hand it back to the kernel.
+///
+/// `Reject` cannot be issued from the queue directly: the packet is accepted
+/// back into the output chain carrying [`crate::nft::REJECT_MARK`], where a
+/// dedicated nft rule turns it into a TCP RST or ICMP unreachable.
+fn apply_verdict(queue: &mut Queue, mut msg: nfq::Message, verdict: Verdict) -> std::io::Result<()> {
     match verdict {
-        Verdict::Allow => NfqVerdict::Accept,
-        // Reject-with-RST is future work; both deny flavors drop for now.
-        Verdict::Deny | Verdict::Reject => NfqVerdict::Drop,
+        Verdict::Allow => msg.set_verdict(NfqVerdict::Accept),
+        Verdict::Deny => msg.set_verdict(NfqVerdict::Drop),
+        Verdict::Reject => {
+            msg.set_nfmark(crate::nft::REJECT_MARK);
+            msg.set_verdict(NfqVerdict::Accept);
+        }
     }
+    queue.verdict(msg)
 }
 
 /// What to do with one received packet.
@@ -112,9 +121,8 @@ pub fn run(queue_num: u16, mut deps: QueueDeps) -> std::io::Result<()> {
         // Apply verdicts decided by the async side.
         while let Ok((seq, verdict)) = deps.verdict_rx.try_recv() {
             busy = true;
-            if let Some(mut msg) = held.remove(&seq) {
-                msg.set_verdict(to_nfq(verdict));
-                queue.verdict(msg)?;
+            if let Some(msg) = held.remove(&seq) {
+                apply_verdict(&mut queue, msg, verdict)?;
             }
         }
 
@@ -150,8 +158,7 @@ pub fn run(queue_num: u16, mut deps: QueueDeps) -> std::io::Result<()> {
                     Decision::Verdict(verdict, rule_name, conn) => {
                         deps.stats.record_verdict(verdict);
                         deps.events.emit(conn, verdict, Some(rule_name));
-                        msg.set_verdict(to_nfq(verdict));
-                        queue.verdict(msg)?;
+                        apply_verdict(&mut queue, msg, verdict)?;
                     }
                     Decision::Prompt(conn) => {
                         let seq = next_seq;
