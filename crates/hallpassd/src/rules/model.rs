@@ -56,6 +56,8 @@ pub struct CompiledRule {
     pub enabled: bool,
     exe: Option<PathBuf>,
     exe_glob: Option<GlobMatcher>,
+    /// Lowercase hex; validated at compile time.
+    exe_sha256: Option<String>,
     dest: Option<IpNet>,
     port: Option<u16>,
     port_range: Option<(u16, u16)>,
@@ -89,6 +91,16 @@ impl CompiledRule {
                 return Err(format!("bad port_range {lo}-{hi}: start exceeds end"));
             }
         }
+        let exe_sha256 = m
+            .exe_sha256
+            .as_ref()
+            .map(|h| {
+                if h.len() != 64 || !h.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    return Err(format!("bad exe_sha256 {h:?}: expected 64 hex digits"));
+                }
+                Ok(h.to_ascii_lowercase())
+            })
+            .transpose()?;
         Ok(CompiledRule {
             name: rule.name.clone(),
             action: rule.action,
@@ -96,6 +108,7 @@ impl CompiledRule {
             enabled: rule.enabled,
             exe: m.exe.clone(),
             exe_glob,
+            exe_sha256,
             dest,
             port: m.port,
             port_range: m.port_range,
@@ -105,9 +118,36 @@ impl CompiledRule {
         })
     }
 
+    /// True when this rule matches on the executable hash. The packet path
+    /// uses this (via [`RuleSet::wants_exe_hash_for`]) to hash a binary
+    /// only when some hash-pinning rule could actually apply.
+    ///
+    /// [`RuleSet::wants_exe_hash_for`]: super::engine::RuleSet::wants_exe_hash_for
+    pub fn wants_exe_hash(&self) -> bool {
+        self.exe_sha256.is_some()
+    }
+
     /// True when every present criterion matches (AND semantics). A rule
-    /// with no criteria matches everything.
-    pub fn matches(&self, conn: &Connection) -> bool {
+    /// with no criteria matches everything. `exe_sha256` is the hash of
+    /// the connection's executable, if it was computed (lowercase hex).
+    pub fn matches(&self, conn: &Connection, exe_sha256: Option<&str>) -> bool {
+        if !self.matches_ignoring_hash(conn) {
+            return false;
+        }
+        if let Some(want) = &self.exe_sha256 {
+            // Hashes are produced lowercase on both sides; direct compare.
+            match exe_sha256 {
+                Some(have) if have == want.as_str() => {}
+                _ => return false,
+            }
+        }
+        true
+    }
+
+    /// All criteria except the executable hash. Split out so the packet
+    /// path can decide whether hashing is worth doing for a connection
+    /// before paying for it.
+    pub fn matches_ignoring_hash(&self, conn: &Connection) -> bool {
         let dst = conn.tuple.dst;
         if let Some(exe) = &self.exe {
             if conn.exe_path.as_deref() != Some(exe) {
@@ -188,6 +228,44 @@ mod tests {
             ..Default::default()
         });
         assert!(CompiledRule::compile(&r).is_err());
+    }
+
+    #[test]
+    fn exe_sha256_validation_and_matching() {
+        // Bad lengths / non-hex rejected at compile time.
+        for bad in ["short", &"g".repeat(64), &"a".repeat(63)] {
+            let r = rule_with(RuleMatch {
+                exe_sha256: Some(bad.to_string()),
+                ..Default::default()
+            });
+            assert!(CompiledRule::compile(&r).is_err(), "accepted {bad:?}");
+        }
+
+        // Uppercase rule hash matches lowercase connection hash.
+        let hash = "AB".repeat(32);
+        let r = rule_with(RuleMatch {
+            exe_sha256: Some(hash.clone()),
+            ..Default::default()
+        });
+        let compiled = CompiledRule::compile(&r).unwrap();
+        assert!(compiled.wants_exe_hash());
+        let conn = Connection {
+            tuple: hallpass_types::FlowTuple {
+                proto: Proto::Tcp,
+                src: "10.0.0.1:40000".parse().unwrap(),
+                dst: "1.2.3.4:443".parse().unwrap(),
+            },
+            uid: None,
+            pid: None,
+            exe_path: None,
+            cmdline: None,
+            domain: None,
+        };
+        assert!(compiled.matches(&conn, Some(&"ab".repeat(32))));
+        // Wrong or missing hash: no match, but other criteria still do.
+        assert!(!compiled.matches(&conn, Some(&"cd".repeat(32))));
+        assert!(!compiled.matches(&conn, None));
+        assert!(compiled.matches_ignoring_hash(&conn));
     }
 
     #[test]

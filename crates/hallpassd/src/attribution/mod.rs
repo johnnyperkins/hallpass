@@ -5,6 +5,7 @@ pub mod btf;
 pub mod cache;
 #[cfg(feature = "ebpf")]
 pub mod ebpf;
+pub mod hash;
 pub mod procfs;
 
 use std::path::PathBuf;

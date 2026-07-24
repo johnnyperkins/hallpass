@@ -159,23 +159,10 @@ impl RuleStore {
         self.rules_skipped.load(Ordering::Relaxed)
     }
 
-    /// Current compiled snapshot. Callers that only need one lookup
-    /// should prefer [`RuleStore::match_verdict`].
+    /// Current compiled snapshot. The packet path takes one snapshot per
+    /// packet so enrichment decisions and matching see the same rules.
     pub fn ruleset(&self) -> Arc<RuleSet> {
         self.active.load_full()
-    }
-
-    /// Match one connection against the active snapshot. Uses the cheap
-    /// `load()` guard instead of cloning the Arc; this is the per-packet
-    /// path.
-    pub fn match_verdict(
-        &self,
-        conn: &hallpass_types::Connection,
-    ) -> Option<(String, hallpass_types::Verdict)> {
-        self.active
-            .load()
-            .match_conn(conn)
-            .map(|(rule, verdict)| (rule.name.clone(), verdict))
     }
 
     /// All rules, for `RuleList` replies.

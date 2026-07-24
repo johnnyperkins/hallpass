@@ -35,6 +35,7 @@ globset = "0.4"
 notify = "8"
 arc-swap = "1"
 lru = "0.16"
+sha2 = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

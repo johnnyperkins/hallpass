@@ -29,6 +29,7 @@ RULES ADD OPTIONS:
     --action allow|deny|reject   Action on match (required)
     --exe PATH                   Exact executable path
     --exe-glob GLOB              Glob matched against executable path
+    --exe-sha256 HEX             SHA-256 of the executable (64 hex digits)
     --dest IP|CIDR               Destination IP address or CIDR block
     --port PORT                  Destination port
     --domain DOMAIN              Domain, exact or *.suffix
@@ -167,6 +168,12 @@ fn parse_rule_add(flags: &[&str]) -> Result<Rule, String> {
             }
             "--exe" => matcher.exe = Some(PathBuf::from(value)),
             "--exe-glob" => matcher.exe_glob = Some(value.to_string()),
+            "--exe-sha256" => {
+                if value.len() != 64 || !value.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    return Err(format!("invalid exe-sha256 '{value}': expected 64 hex digits"));
+                }
+                matcher.exe_sha256 = Some(value.to_string());
+            }
             "--dest" => {
                 validate_dest(value)?;
                 matcher.dest = Some(value.to_string());

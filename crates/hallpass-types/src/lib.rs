@@ -16,7 +16,10 @@ use serde::{Deserialize, Serialize};
 
 /// Wire protocol version. Bump on incompatible changes to [`ClientMsg`] or
 /// [`DaemonMsg`].
-pub const PROTOCOL_VERSION: u32 = 1;
+///
+/// v2: added `RuleMatch::exe_sha256` (postcard encodes structs positionally,
+/// so new fields are incompatible).
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Transport-layer protocol of a connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -98,6 +101,16 @@ pub struct RuleMatch {
     pub exe: Option<PathBuf>,
     /// Glob pattern matched against the executable path.
     pub exe_glob: Option<String>,
+    /// SHA-256 of the executable file, as 64 hex digits (case-insensitive).
+    /// Pins the rule to the exact binary contents, not just its path.
+    ///
+    /// When the hash cannot be computed (process already gone, unreadable
+    /// binary), the rule does not match and evaluation falls through to
+    /// lower-priority rules or the prompt/default verdict. A deny rule
+    /// pinning a known-bad hash therefore cannot vouch for connections it
+    /// cannot verify; pair it with a default-deny posture when that
+    /// matters.
+    pub exe_sha256: Option<String>,
     /// Destination IP address or CIDR block, parsed by the rule engine.
     pub dest: Option<String>,
     /// Exact destination port.
@@ -203,6 +216,10 @@ impl RuleMatch {
         }
         if let Some(g) = &self.exe_glob {
             parts.push(format!("exe-glob={g}"));
+        }
+        if let Some(h) = &self.exe_sha256 {
+            // Full hashes overwhelm one-line summaries; show a prefix.
+            parts.push(format!("sha256={}..", &h[..h.len().min(12)]));
         }
         if let Some(d) = &self.dest {
             parts.push(format!("dest={d}"));

@@ -19,6 +19,7 @@ use nfq::{Queue, Verdict as NfqVerdict};
 use hallpass_types::{Connection, FlowTuple, Verdict};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
+use crate::attribution::hash::ExeHashCache;
 use crate::attribution::AttributionChain;
 use crate::dns::IpDomainCache;
 use crate::events::EventBus;
@@ -51,6 +52,8 @@ pub struct QueueDeps {
     pub dns_tx: UnboundedSender<(FlowTuple, Vec<u8>)>,
     /// IP -> domain cache filled by the DNS snoop consumer.
     pub dns_cache: Arc<IpDomainCache>,
+    /// Executable hash cache, consulted only when a rule pins a hash.
+    pub exe_hash: Arc<ExeHashCache>,
     pub shutdown: Arc<AtomicBool>,
 }
 
@@ -89,6 +92,7 @@ fn decide(
     attribution: &AttributionChain,
     rules: &RuleStore,
     dns_cache: &IpDomainCache,
+    exe_hash: &ExeHashCache,
 ) -> Decision {
     let Some(tuple) = tuple else {
         // Non-TCP/UDP or malformed: not ours to police.
@@ -96,8 +100,17 @@ fn decide(
     };
     let mut conn = attribution.connection(tuple);
     conn.domain = dns_cache.lookup(&conn.tuple.dst.ip());
-    match rules.match_verdict(&conn) {
-        Some((rule_name, verdict)) => Decision::Verdict(verdict, rule_name, conn),
+    // One snapshot for both the enrichment decision and the match, so a
+    // concurrent rule reload cannot split them. Hashing reads the binary
+    // off disk; only pay for it when a hash-pinning rule could apply.
+    let set = rules.ruleset();
+    let exe_sha256 = if set.wants_exe_hash_for(&conn) {
+        exe_hash.for_connection(&conn)
+    } else {
+        None
+    };
+    match set.match_conn(&conn, exe_sha256.as_deref()) {
+        Some((rule, verdict)) => Decision::Verdict(verdict, rule.name.clone(), conn),
         None => Decision::Prompt(conn),
     }
 }
@@ -153,7 +166,13 @@ pub fn run(queue_num: u16, mut deps: QueueDeps) -> std::io::Result<()> {
                     }
                 }
 
-                match decide(tuple, &deps.attribution, &deps.rules, &deps.dns_cache) {
+                match decide(
+                    tuple,
+                    &deps.attribution,
+                    &deps.rules,
+                    &deps.dns_cache,
+                    &deps.exe_hash,
+                ) {
                     Decision::Accept => {
                         msg.set_verdict(NfqVerdict::Accept);
                         queue.verdict(msg)?;
@@ -226,14 +245,14 @@ mod tests {
     fn setup(
         tag: &str,
         rules: Vec<Rule>,
-    ) -> (AttributionChain, Arc<RuleStore>, IpDomainCache, TestDir) {
+    ) -> (AttributionChain, Arc<RuleStore>, IpDomainCache, ExeHashCache, TestDir) {
         let dir = TestDir::new(&format!("nfq-{tag}"));
         let store = Arc::new(RuleStore::new(dir.path().to_path_buf()));
         for r in rules {
             store.add(r).unwrap();
         }
         let chain = AttributionChain::new(vec![Box::new(NoAttr)]);
-        (chain, store, IpDomainCache::new(16), dir)
+        (chain, store, IpDomainCache::new(16), ExeHashCache::default(), dir)
     }
 
     fn tcp_packet(dst: [u8; 4], dport: u16) -> Vec<u8> {
@@ -262,8 +281,8 @@ mod tests {
                 ..Default::default()
             },
         };
-        let (chain, store, dns, _dir) = setup("rule", vec![deny]);
-        match decide(tuple_of(&tcp_packet([1, 1, 1, 1], 443)), &chain, &store, &dns) {
+        let (chain, store, dns, hash, _dir) = setup("rule", vec![deny]);
+        match decide(tuple_of(&tcp_packet([1, 1, 1, 1], 443)), &chain, &store, &dns, &hash) {
             Decision::Verdict(Verdict::Deny, name, conn) => {
                 assert_eq!(name, "deny-443");
                 assert_eq!(conn.tuple.dst.port(), 443);
@@ -274,8 +293,8 @@ mod tests {
 
     #[test]
     fn unmatched_goes_to_prompt_and_unparsable_accepts() {
-        let (chain, store, dns, _dir) = setup("prompt", vec![]);
-        match decide(tuple_of(&tcp_packet([1, 1, 1, 1], 8443)), &chain, &store, &dns) {
+        let (chain, store, dns, hash, _dir) = setup("prompt", vec![]);
+        match decide(tuple_of(&tcp_packet([1, 1, 1, 1], 8443)), &chain, &store, &dns, &hash) {
             Decision::Prompt(conn) => {
                 assert_eq!(conn.tuple.dst.port(), 8443);
                 assert_eq!(conn.exe_path, None);
@@ -283,18 +302,18 @@ mod tests {
             }
             _ => panic!("expected prompt"),
         }
-        assert!(matches!(decide(None, &chain, &store, &dns), Decision::Accept));
+        assert!(matches!(decide(None, &chain, &store, &dns, &hash), Decision::Accept));
     }
 
     #[test]
     fn domain_enrichment_from_dns_cache() {
-        let (chain, store, dns, _dir) = setup("domain", vec![]);
+        let (chain, store, dns, hash, _dir) = setup("domain", vec![]);
         dns.absorb(&crate::dns::SnoopedResponse {
             id: 1,
             query_name: "example.com".into(),
             addrs: vec![("1.1.1.1".parse().unwrap(), 300)],
         });
-        match decide(tuple_of(&tcp_packet([1, 1, 1, 1], 443)), &chain, &store, &dns) {
+        match decide(tuple_of(&tcp_packet([1, 1, 1, 1], 443)), &chain, &store, &dns, &hash) {
             Decision::Prompt(conn) => assert_eq!(conn.domain.as_deref(), Some("example.com")),
             _ => panic!("expected prompt"),
         }

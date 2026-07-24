@@ -8,6 +8,9 @@ use super::model::CompiledRule;
 /// higher priority first, ties broken by name for determinism.
 pub struct RuleSet {
     rules: Vec<CompiledRule>,
+    /// Whether any enabled rule pins an executable hash; precomputed so
+    /// the per-packet check is free when the feature is unused.
+    has_hash_rules: bool,
 }
 
 impl RuleSet {
@@ -28,21 +31,43 @@ impl RuleSet {
                 .cmp(&a.priority)
                 .then_with(|| a.name.cmp(&b.name))
         });
-        RuleSet { rules: compiled }
+        let has_hash_rules = compiled.iter().any(|r| r.enabled && r.wants_exe_hash());
+        RuleSet {
+            rules: compiled,
+            has_hash_rules,
+        }
     }
 
-    /// First enabled rule matching `conn`, with its verdict.
-    pub fn match_conn(&self, conn: &Connection) -> Option<(&CompiledRule, Verdict)> {
+    /// First enabled rule matching `conn`, with its verdict. `exe_sha256`
+    /// is the connection executable's hash if it was computed; pass the
+    /// result of gating on [`RuleSet::wants_exe_hash_for`].
+    pub fn match_conn(
+        &self,
+        conn: &Connection,
+        exe_sha256: Option<&str>,
+    ) -> Option<(&CompiledRule, Verdict)> {
         self.rules
             .iter()
             .filter(|r| r.enabled)
-            .find(|r| r.matches(conn))
+            .find(|r| r.matches(conn, exe_sha256))
             .map(|r| (r, Verdict::from(r.action)))
     }
 
     /// Number of compiled rules (enabled or not).
     pub fn rule_count(&self) -> usize {
         self.rules.len()
+    }
+
+    /// True when some enabled hash-pinning rule could apply to `conn`
+    /// (its other criteria match), so hashing the executable can change
+    /// the verdict. Keeps binary hashing off the packet path unless a
+    /// hash rule is actually in play for this connection.
+    pub fn wants_exe_hash_for(&self, conn: &Connection) -> bool {
+        self.has_hash_rules
+            && self
+                .rules
+                .iter()
+                .any(|r| r.enabled && r.wants_exe_hash() && r.matches_ignoring_hash(conn))
     }
 }
 
@@ -292,7 +317,7 @@ mod tests {
         for case in cases {
             let set = RuleSet::compile(&case.rules);
             let got = set
-                .match_conn(&case.conn)
+                .match_conn(&case.conn, None)
                 .map(|(r, v)| (r.name.clone(), v));
             let want = case.expect.map(|(n, v)| (n.to_string(), v));
             assert_eq!(got, want, "case: {}", case.name);
@@ -303,6 +328,6 @@ mod tests {
     fn empty_set() {
         let set = RuleSet::compile(&[]);
         assert_eq!(set.rule_count(), 0);
-        assert!(set.match_conn(&curl()).is_none());
+        assert!(set.match_conn(&curl(), None).is_none());
     }
 }

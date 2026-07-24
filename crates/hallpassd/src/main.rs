@@ -170,6 +170,7 @@ async fn main() {
             verdict_rx,
             dns_tx,
             dns_cache,
+            exe_hash: Arc::new(attribution::hash::ExeHashCache::default()),
             shutdown: Arc::clone(&shutdown),
         },
     );

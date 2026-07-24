@@ -105,6 +105,7 @@ mod tests {
             matcher: RuleMatch {
                 exe: Some(PathBuf::from("/usr/bin/curl")),
                 exe_glob: Some("/usr/bin/*".to_string()),
+                exe_sha256: Some("a".repeat(64)),
                 dest: Some("10.0.0.0/8".to_string()),
                 port: Some(443),
                 port_range: Some((1024, 65535)),
