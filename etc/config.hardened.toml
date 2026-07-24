@@ -1,0 +1,24 @@
+# Hallpass daemon configuration - hardened, enforce-by-default posture.
+#
+# Use this instead of config.toml when you want unmatched and unanswered
+# connections blocked rather than allowed. The daemon still fails open if it
+# dies (the NFQUEUE `bypass` flag keeps the network up), so this hardens the
+# live-daemon behaviour, not the daemon-is-dead case.
+
+# Block when no rule matches and no client answers the prompt in time.
+default_verdict = "deny"
+
+# Seconds to wait for an interactive prompt reply before applying the
+# default verdict. Short, so a stalled prompt handler blocks quickly.
+prompt_timeout_secs = 10
+
+# NFQUEUE queue number the daemon binds to.
+queue_num = 0
+
+# Unix socket for CLI/UI clients.
+socket_path = "/run/hallpass/hallpass.sock"
+
+# Maximum number of connections held waiting for a prompt reply. Beyond
+# this the default (deny) verdict is applied, so keep it generous enough
+# that a burst of new connections is not silently denied.
+max_pending_prompts = 128

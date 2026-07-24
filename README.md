@@ -159,6 +159,15 @@ hold the prompt-handler role.
 
 ## Security model
 
+**The enforcement guarantee in one sentence: hallpass only blocks what a live,
+healthy daemon explicitly denies.** Everything below is a consequence of that.
+Queue `bypass`, `default_verdict = "allow"`, and the prompt-timeout default all
+fail open, so a dead, wedged, or unconfigured daemon lets traffic through. For
+an enforce-by-default posture, start from
+[`etc/config.hardened.toml`](etc/config.hardened.toml) (`default_verdict =
+"deny"`); the residual gap is the queue `bypass` flag, which an attacker with
+root can trip by killing the daemon regardless.
+
 - **Fail-open by design**: the NFQUEUE rules use the `bypass` flag, so if the
   daemon dies traffic flows unfiltered instead of bricking the network. On
   clean shutdown and on panic, the nftables table is removed. This is an
