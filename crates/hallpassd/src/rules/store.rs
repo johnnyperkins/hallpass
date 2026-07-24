@@ -39,9 +39,9 @@ pub struct RuleStore {
     rules_skipped: AtomicU64,
 }
 
-/// A rule file is trusted when owned by root (or by the daemon's own euid,
-/// for non-root development runs) and not group/world-writable.
-fn file_perms_ok(file_uid: u32, mode: u32, self_uid: u32) -> bool {
+/// A rule (or list) file is trusted when owned by root (or by the daemon's
+/// own euid, for non-root development runs) and not group/world-writable.
+pub(crate) fn file_perms_ok(file_uid: u32, mode: u32, self_uid: u32) -> bool {
     (file_uid == 0 || file_uid == self_uid) && mode & 0o022 == 0
 }
 

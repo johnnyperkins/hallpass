@@ -148,6 +148,9 @@ proto = "udp"
 # dest = "10.0.0.0/8"
 # domain = "*.example.org"
 # user = 1000
+# domains_file = "/etc/hallpass/rules.d/ads.list"   # hosts format or one per line
+# ips_file = "/etc/hallpass/rules.d/bad-ips.list"   # IPs/CIDRs, one per line
+# hashes_file = "/etc/hallpass/rules.d/bad.sha256"  # exe SHA-256s, one per line
 ```
 
 The directory is watched; edits apply without a restart.

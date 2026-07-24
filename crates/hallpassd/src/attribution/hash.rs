@@ -16,21 +16,26 @@ use hallpass_types::Connection;
 use lru::LruCache;
 use sha2::{Digest, Sha256};
 
-/// File identity snapshot; a changed binary changes this key.
+/// File identity snapshot; a changed file changes this key. Shared with
+/// the rule-list cache, which invalidates the same way.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct FileId {
+pub(crate) struct FileId {
     dev: u64,
     ino: u64,
     mtime: i64,
+    // Seconds-only mtime misses a same-size rewrite within one second;
+    // nanoseconds close that window on filesystems that record them.
+    mtime_nsec: i64,
     size: u64,
 }
 
 impl FileId {
-    fn of(meta: &std::fs::Metadata) -> FileId {
+    pub(crate) fn of(meta: &std::fs::Metadata) -> FileId {
         FileId {
             dev: meta.dev(),
             ino: meta.ino(),
             mtime: meta.mtime(),
+            mtime_nsec: meta.mtime_nsec(),
             size: meta.size(),
         }
     }

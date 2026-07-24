@@ -64,6 +64,9 @@ pub struct CompiledRule {
     domain: Option<DomainPattern>,
     user: Option<u32>,
     proto: Option<Proto>,
+    domains_file: Option<std::sync::Arc<super::lists::DomainSet>>,
+    ips_file: Option<std::sync::Arc<super::lists::IpSet>>,
+    hashes_file: Option<std::sync::Arc<super::lists::HashSet256>>,
 }
 
 impl CompiledRule {
@@ -93,13 +96,20 @@ impl CompiledRule {
         }
         let exe_sha256 = m
             .exe_sha256
-            .as_ref()
-            .map(|h| {
-                if h.len() != 64 || !h.bytes().all(|b| b.is_ascii_hexdigit()) {
-                    return Err(format!("bad exe_sha256 {h:?}: expected 64 hex digits"));
-                }
-                Ok(h.to_ascii_lowercase())
-            })
+            .as_deref()
+            .map(super::lists::parse_sha256_hex)
+            .transpose()
+            .map_err(|e| format!("bad exe_sha256: {e}"))?;
+        let domains_file = m
+            .domains_file
+            .as_deref()
+            .map(super::lists::DomainSet::load)
+            .transpose()?;
+        let ips_file = m.ips_file.as_deref().map(super::lists::IpSet::load).transpose()?;
+        let hashes_file = m
+            .hashes_file
+            .as_deref()
+            .map(super::lists::HashSet256::load)
             .transpose()?;
         Ok(CompiledRule {
             name: rule.name.clone(),
@@ -115,6 +125,9 @@ impl CompiledRule {
             domain: m.domain.as_deref().map(DomainPattern::parse),
             user: m.user,
             proto: m.proto,
+            domains_file,
+            ips_file,
+            hashes_file,
         })
     }
 
@@ -124,7 +137,7 @@ impl CompiledRule {
     ///
     /// [`RuleSet::wants_exe_hash_for`]: super::engine::RuleSet::wants_exe_hash_for
     pub fn wants_exe_hash(&self) -> bool {
-        self.exe_sha256.is_some()
+        self.exe_sha256.is_some() || self.hashes_file.is_some()
     }
 
     /// True when every present criterion matches (AND semantics). A rule
@@ -138,6 +151,12 @@ impl CompiledRule {
             // Hashes are produced lowercase on both sides; direct compare.
             match exe_sha256 {
                 Some(have) if have == want.as_str() => {}
+                _ => return false,
+            }
+        }
+        if let Some(hashes) = &self.hashes_file {
+            match exe_sha256 {
+                Some(have) if hashes.contains(have) => {}
                 _ => return false,
             }
         }
@@ -188,6 +207,17 @@ impl CompiledRule {
         }
         if let Some(proto) = self.proto {
             if conn.tuple.proto != proto {
+                return false;
+            }
+        }
+        if let Some(domains) = &self.domains_file {
+            match &conn.domain {
+                Some(d) if domains.contains(d) => {}
+                _ => return false,
+            }
+        }
+        if let Some(ips) = &self.ips_file {
+            if !ips.contains(&dst.ip()) {
                 return false;
             }
         }
@@ -266,6 +296,66 @@ mod tests {
         assert!(!compiled.matches(&conn, Some(&"cd".repeat(32))));
         assert!(!compiled.matches(&conn, None));
         assert!(compiled.matches_ignoring_hash(&conn));
+    }
+
+    #[test]
+    fn list_files_compile_and_match() {
+        use crate::testutil::TestDir;
+        let dir = TestDir::new("model-lists");
+        let domains = dir.path().join("ads.list");
+        std::fs::write(&domains, "0.0.0.0 ads.example.com\n").unwrap();
+        let ips = dir.path().join("bad.list");
+        std::fs::write(&ips, "10.0.0.0/8\n").unwrap();
+
+        let conn = |domain: Option<&str>, dst: &str| Connection {
+            tuple: hallpass_types::FlowTuple {
+                proto: Proto::Tcp,
+                src: "10.0.0.1:40000".parse().unwrap(),
+                dst: dst.parse().unwrap(),
+            },
+            uid: None,
+            pid: None,
+            exe_path: None,
+            cmdline: None,
+            domain: domain.map(String::from),
+        };
+
+        let r = rule_with(RuleMatch {
+            domains_file: Some(domains),
+            ..Default::default()
+        });
+        let compiled = CompiledRule::compile(&r).unwrap();
+        assert!(compiled.matches(&conn(Some("ads.example.com"), "1.2.3.4:443"), None));
+        assert!(!compiled.matches(&conn(Some("other.example.com"), "1.2.3.4:443"), None));
+        assert!(!compiled.matches(&conn(None, "1.2.3.4:443"), None));
+
+        let r = rule_with(RuleMatch {
+            ips_file: Some(ips),
+            ..Default::default()
+        });
+        let compiled = CompiledRule::compile(&r).unwrap();
+        assert!(compiled.matches(&conn(None, "10.5.5.5:443"), None));
+        assert!(!compiled.matches(&conn(None, "1.2.3.4:443"), None));
+
+        // Missing list file: rule fails to compile (skipped with warning).
+        let r = rule_with(RuleMatch {
+            hashes_file: Some(dir.path().join("nope.sha256")),
+            ..Default::default()
+        });
+        assert!(CompiledRule::compile(&r).is_err());
+
+        // A hashes_file makes the rule want executable hashing.
+        let hashes = dir.path().join("h.sha256");
+        std::fs::write(&hashes, format!("{}\n", "ab".repeat(32))).unwrap();
+        let r = rule_with(RuleMatch {
+            hashes_file: Some(hashes),
+            ..Default::default()
+        });
+        let compiled = CompiledRule::compile(&r).unwrap();
+        assert!(compiled.wants_exe_hash());
+        assert!(compiled.matches(&conn(None, "1.2.3.4:443"), Some(&"ab".repeat(32))));
+        assert!(!compiled.matches(&conn(None, "1.2.3.4:443"), Some(&"cd".repeat(32))));
+        assert!(!compiled.matches(&conn(None, "1.2.3.4:443"), None));
     }
 
     #[test]

@@ -112,6 +112,9 @@ mod tests {
                 domain: Some("*.example.org".to_string()),
                 user: Some(1000),
                 proto: Some(Proto::Udp),
+                domains_file: Some(PathBuf::from("/etc/hallpass/rules.d/ads.list")),
+                ips_file: Some(PathBuf::from("/etc/hallpass/rules.d/bad-ips.list")),
+                hashes_file: Some(PathBuf::from("/etc/hallpass/rules.d/malware.sha256")),
             },
         }
     }

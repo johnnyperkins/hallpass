@@ -35,6 +35,11 @@ RULES ADD OPTIONS:
     --domain DOMAIN              Domain, exact or *.suffix
     --user UID                   UID of initiating process
     --proto tcp|udp              Transport protocol
+    --domains-file PATH          File of domains (hosts format or one per
+                                 line) matched against the destination domain
+    --ips-file PATH              File of destination IPs/CIDRs, one per line
+    --hashes-file PATH           File of executable SHA-256 hashes, one per
+                                 line (paths are read by the daemon)
     --duration session|forever|TIMESPAN
                                  Rule lifetime (default: forever); TIMESPAN
                                  like 30s, 5m, 2h, 1d expires the rule
@@ -45,6 +50,8 @@ GLOBAL OPTIONS:
     -h, --help                   Show this help";
 
 /// A parsed command.
+// One short-lived value per process; see `Parsed` below.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum Cmd {
     /// `status`
@@ -187,6 +194,9 @@ fn parse_rule_add(flags: &[&str]) -> Result<Rule, String> {
                     Some(value.parse::<u16>().map_err(|_| format!("invalid port '{value}'"))?);
             }
             "--domain" => matcher.domain = Some(value.to_string()),
+            "--domains-file" => matcher.domains_file = Some(PathBuf::from(value)),
+            "--ips-file" => matcher.ips_file = Some(PathBuf::from(value)),
+            "--hashes-file" => matcher.hashes_file = Some(PathBuf::from(value)),
             "--user" => {
                 matcher.user =
                     Some(value.parse::<u32>().map_err(|_| format!("invalid uid '{value}'"))?);

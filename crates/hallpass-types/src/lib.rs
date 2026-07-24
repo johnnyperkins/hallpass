@@ -131,6 +131,16 @@ pub struct RuleMatch {
     pub user: Option<u32>,
     /// Transport protocol.
     pub proto: Option<Proto>,
+    /// File of domains to match the destination domain against: hosts
+    /// format ("0.0.0.0 ads.example.com") or one domain per line, `#`
+    /// comments. Reloaded when the rules directory reloads, so keep list
+    /// files inside it (any extension except .toml).
+    pub domains_file: Option<PathBuf>,
+    /// File of destination IPs or CIDR blocks, one per line.
+    pub ips_file: Option<PathBuf>,
+    /// File of executable SHA-256 hashes (64 hex digits), one per line;
+    /// matches like [`RuleMatch::exe_sha256`] against any listed hash.
+    pub hashes_file: Option<PathBuf>,
 }
 
 /// A firewall rule.
@@ -298,6 +308,15 @@ impl RuleMatch {
         if let Some(p) = self.proto {
             parts.push(format!("proto={p}"));
         }
+        if let Some(f) = &self.domains_file {
+            parts.push(format!("domains-file={}", f.display()));
+        }
+        if let Some(f) = &self.ips_file {
+            parts.push(format!("ips-file={}", f.display()));
+        }
+        if let Some(f) = &self.hashes_file {
+            parts.push(format!("hashes-file={}", f.display()));
+        }
         if parts.is_empty() {
             "(any)".to_string()
         } else {
@@ -402,6 +421,9 @@ pub enum PromptScope {
 /// clients' messages - far worse than the version handshake's clean
 /// rejection. Only ever append variants, and bump [`PROTOCOL_VERSION`] on
 /// any reorder or removal. The same rule applies to [`DaemonMsg`].
+// Short-lived, one per request; the size gap vs small variants is harmless,
+// and boxing `RuleAdd` would complicate every constructor for nothing.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ClientMsg {
     /// Handshake; must be the first message on a connection.
