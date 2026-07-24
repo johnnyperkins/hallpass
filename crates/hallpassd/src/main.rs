@@ -177,7 +177,7 @@ async fn main() {
     let queue_thread = nfqueue::spawn(
         cfg.queue_num,
         nfqueue::QueueDeps {
-            attribution: AttributionChain::default_chain(),
+            attribution: AttributionChain::default_chain(Some(Arc::clone(&dns_cache))),
             rules: Arc::clone(&store),
             events: Arc::clone(&events),
             stats: Arc::clone(&counters),

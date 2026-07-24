@@ -17,11 +17,14 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use aya::maps::{HashMap as FlowMap, MapData, RingBuf};
-use aya::programs::{KProbe, TracePoint};
+use aya::programs::uprobe::UProbeScope;
+use aya::programs::{KProbe, TracePoint, UProbe};
 use aya::{Ebpf, EbpfLoader};
 use lru::LruCache;
-use hallpass_ebpf_common::{ExecEvent, FlowKey, FlowVal, EVENT_EXEC, PROTO_TCP, PROTO_UDP};
+use hallpass_ebpf_common::{DnsEvent, ExecEvent, FlowKey, FlowVal, EVENT_EXEC, PROTO_TCP, PROTO_UDP};
 use hallpass_types::{FlowTuple, Proto};
+
+use crate::dns::{IpDomainCache, SnoopedResponse};
 
 use super::btf::Btf;
 use super::{procfs, Attributor, ProcInfo};
@@ -50,8 +53,10 @@ pub struct EbpfAttributor {
 impl EbpfAttributor {
     /// Load and attach the eBPF programs. Returns None (with a warning)
     /// on any failure so the caller falls back to procfs attribution.
-    pub fn new() -> Option<EbpfAttributor> {
-        match Self::load() {
+    /// `dns_cache`, when given, is fed resolved (name, address) pairs
+    /// snooped from getaddrinfo via uprobes.
+    pub fn new(dns_cache: Option<Arc<IpDomainCache>>) -> Option<EbpfAttributor> {
+        match Self::load(dns_cache) {
             Ok(a) => {
                 tracing::info!("eBPF attribution active");
                 Some(a)
@@ -63,7 +68,7 @@ impl EbpfAttributor {
         }
     }
 
-    fn load() -> Result<EbpfAttributor, String> {
+    fn load(dns_cache: Option<Arc<IpDomainCache>>) -> Result<EbpfAttributor, String> {
         // Patch kernel struct offsets resolved from BTF into the programs
         // before the verifier sees them; see resolve_offsets().
         let offs = resolve_offsets();
@@ -97,6 +102,26 @@ impl EbpfAttributor {
         )));
         let stop = Arc::new(AtomicBool::new(false));
         spawn_event_reader(ring, Arc::clone(&cache), Arc::clone(&stop));
+
+        // getaddrinfo DNS snooping is best-effort on top of attribution:
+        // statically linked or non-libc programs never hit the uprobe, and
+        // the wire snooper still covers plaintext UDP 53.
+        if let Some(dns) = dns_cache {
+            match attach_getaddrinfo(&mut ebpf) {
+                Ok(()) => {
+                    let dns_ring = RingBuf::try_from(
+                        ebpf.take_map("DNS_EVENTS")
+                            .ok_or("DNS_EVENTS missing from object")?,
+                    )
+                    .map_err(|e| format!("DNS_EVENTS: {e}"))?;
+                    spawn_dns_reader(dns_ring, dns, Arc::clone(&stop));
+                    tracing::info!("getaddrinfo DNS snoop active");
+                }
+                Err(e) => {
+                    tracing::warn!("getaddrinfo DNS snoop unavailable: {e}");
+                }
+            }
+        }
         Ok(EbpfAttributor {
             _ebpf: ebpf,
             sock_map,
@@ -216,6 +241,22 @@ fn attach_kprobe(ebpf: &mut Ebpf, prog: &str, fns: &[&str]) -> Result<(), String
     Ok(())
 }
 
+/// Attach the getaddrinfo entry/return uprobes to the system libc, for
+/// every process.
+fn attach_getaddrinfo(ebpf: &mut Ebpf) -> Result<(), String> {
+    for prog in ["getaddrinfo_enter", "getaddrinfo_ret"] {
+        let p: &mut UProbe = ebpf
+            .program_mut(prog)
+            .ok_or_else(|| format!("program {prog} missing"))?
+            .try_into()
+            .map_err(|e| format!("{prog}: {e}"))?;
+        p.load().map_err(|e| format!("load {prog}: {e}"))?;
+        p.attach("getaddrinfo", "libc", UProbeScope::AllProcesses)
+            .map_err(|e| format!("attach {prog}: {e}"))?;
+    }
+    Ok(())
+}
+
 fn attach_tracepoint(ebpf: &mut Ebpf, name: &str) -> Result<(), String> {
     let p: &mut TracePoint = ebpf
         .program_mut(name)
@@ -226,6 +267,62 @@ fn attach_tracepoint(ebpf: &mut Ebpf, name: &str) -> Result<(), String> {
     p.attach("sched", name)
         .map_err(|e| format!("attach {name}: {e}"))?;
     Ok(())
+}
+
+/// TTL for uprobe-snooped resolutions. The real DNS TTL is not visible at
+/// the getaddrinfo layer; the cache clamps this into its supported range.
+const UPROBE_DNS_TTL_SECS: u32 = 120;
+
+/// Drain getaddrinfo events into the IP -> domain cache.
+///
+/// The eBPF side pins the queried name at call entry, so the (name, addr)
+/// pair reflects one real resolution and cannot be split by a concurrent
+/// buffer rewrite. The recorded mapping is still only as trustworthy as
+/// what the process resolved: like the wire snooper (and like any
+/// IP->domain cache), a process resolving a name it controls can map its
+/// own name to any address, and the single-value-per-IP cache means the
+/// last resolver of an address wins. Domain rules are therefore a
+/// convenience over IP/exe rules, not a boundary against a local process
+/// that is choosing its own DNS - which is why this feeds the same cache
+/// the wire path does rather than a privileged one.
+fn spawn_dns_reader(mut ring: RingBuf<MapData>, dns: Arc<IpDomainCache>, stop: Arc<AtomicBool>) {
+    std::thread::Builder::new()
+        .name("ebpf-dns".into())
+        .spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                while let Some(item) = ring.next() {
+                    let Some((ip, raw)) = DnsEvent::parse(&item) else {
+                        continue;
+                    };
+                    let Some(name) = normalize_domain(raw) else {
+                        continue;
+                    };
+                    tracing::debug!(domain = %name, %ip, "getaddrinfo resolution snooped");
+                    dns.absorb(&SnoopedResponse {
+                        id: 0,
+                        query_name: name,
+                        addrs: vec![(ip, UPROBE_DNS_TTL_SECS)],
+                    });
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        })
+        .expect("spawn ebpf-dns thread");
+}
+
+/// Lowercase, strip a trailing dot, and reject a name with control or
+/// whitespace characters (log-injection and match-evasion guard) or an
+/// implausible length. Matches the plaintext snooper's expectation that a
+/// cached domain is the exact name a rule would carry.
+fn normalize_domain(raw: &str) -> Option<String> {
+    let trimmed = raw.strip_suffix('.').unwrap_or(raw);
+    if trimmed.is_empty()
+        || trimmed.len() > 253
+        || trimmed.bytes().any(|b| b <= b' ' || b == 0x7f)
+    {
+        return None;
+    }
+    Some(trimmed.to_ascii_lowercase())
 }
 
 /// Drain exec/exit events into the pid cache. Exec events snapshot
@@ -250,4 +347,21 @@ fn spawn_event_reader(mut ring: RingBuf<MapData>, cache: ProcCache, stop: Arc<At
             }
         })
         .expect("spawn ebpf-events thread");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_domain;
+
+    #[test]
+    fn domain_normalization() {
+        assert_eq!(normalize_domain("Example.COM").as_deref(), Some("example.com"));
+        assert_eq!(normalize_domain("example.com.").as_deref(), Some("example.com"));
+        assert_eq!(normalize_domain(""), None);
+        assert_eq!(normalize_domain("."), None);
+        // Control char / whitespace / injection guard.
+        assert_eq!(normalize_domain("bad\nname.com"), None);
+        assert_eq!(normalize_domain("has space.com"), None);
+        assert_eq!(normalize_domain(&"a".repeat(254)), None);
+    }
 }

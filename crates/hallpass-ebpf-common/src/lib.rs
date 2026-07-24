@@ -118,6 +118,59 @@ impl ExecEvent {
     }
 }
 
+/// Capacity of the hostname buffer in [`DnsEvent`]. DNS names max out at
+/// 253 octets in presentation form.
+pub const DNS_NAME_CAP: usize = 256;
+
+/// One resolved (name, address) pair observed by the getaddrinfo uprobe,
+/// emitted over the DNS ring buffer. One event per address in the result
+/// list; the name repeats.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct DnsEvent {
+    /// Resolved address, network-order bytes (IPv4 in the first 4).
+    pub addr: [u8; 16],
+    /// AF_INET or AF_INET6.
+    pub family: u8,
+    /// Explicit padding; always zero.
+    pub _pad: [u8; 3],
+    /// Bytes of `name` actually used (no NUL).
+    pub name_len: u32,
+    /// The queried hostname, UTF-8/ASCII bytes.
+    pub name: [u8; DNS_NAME_CAP],
+}
+
+impl DnsEvent {
+    /// Serialized size in bytes.
+    pub const SIZE: usize = 16 + 1 + 3 + 4 + DNS_NAME_CAP;
+
+    /// Decode from ring buffer bytes; None on short input, a bad length,
+    /// or an unknown family.
+    pub fn parse(bytes: &[u8]) -> Option<(core::net::IpAddr, &str)> {
+        if bytes.len() < Self::SIZE {
+            return None;
+        }
+        let family = bytes[16];
+        let name_len = u32::from_ne_bytes(bytes[20..24].try_into().ok()?) as usize;
+        if name_len > DNS_NAME_CAP {
+            return None;
+        }
+        let name = core::str::from_utf8(&bytes[24..24 + name_len]).ok()?;
+        let ip: core::net::IpAddr = match family {
+            AF_INET => {
+                let o: [u8; 4] = bytes[..4].try_into().ok()?;
+                core::net::Ipv4Addr::from(o).into()
+            }
+            AF_INET6 => {
+                let o: [u8; 16] = bytes[..16].try_into().ok()?;
+                core::net::Ipv6Addr::from(o).into()
+            }
+            _ => return None,
+        };
+        Some((ip, name))
+    }
+}
+
 #[cfg(feature = "user")]
 mod pod {
     // The only unsafe in the hallpass workspace outside the eBPF crate:
@@ -163,6 +216,28 @@ mod tests {
         let k = FlowKey::v6(PROTO_UDP, [0; 16], 5353, addr.octets(), 53);
         assert_eq!(std::net::Ipv6Addr::from(k.daddr), addr);
         assert_eq!(k.family, AF_INET6);
+    }
+
+    #[test]
+    fn dns_event_parse_roundtrip() {
+        let mut raw = [0u8; DnsEvent::SIZE];
+        raw[..4].copy_from_slice(&[1, 2, 3, 4]); // 1.2.3.4
+        raw[16] = AF_INET;
+        let name = b"example.com";
+        raw[20..24].copy_from_slice(&(name.len() as u32).to_ne_bytes());
+        raw[24..24 + name.len()].copy_from_slice(name);
+        let (ip, got) = DnsEvent::parse(&raw).unwrap();
+        assert_eq!(ip, core::net::Ipv4Addr::new(1, 2, 3, 4));
+        assert_eq!(got, "example.com");
+
+        // Short buffer, bad length, unknown family all reject.
+        assert!(DnsEvent::parse(&raw[..DnsEvent::SIZE - 1]).is_none());
+        let mut bad_len = raw;
+        bad_len[20..24].copy_from_slice(&(DNS_NAME_CAP as u32 + 1).to_ne_bytes());
+        assert!(DnsEvent::parse(&bad_len).is_none());
+        let mut bad_family = raw;
+        bad_family[16] = 99;
+        assert!(DnsEvent::parse(&bad_family).is_none());
     }
 
     #[test]

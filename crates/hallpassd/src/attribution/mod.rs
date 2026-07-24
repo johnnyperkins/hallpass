@@ -51,11 +51,14 @@ impl AttributionChain {
     }
 
     /// Default chain: eBPF first when built with the `ebpf` feature and
-    /// loadable on this system, then procfs.
-    pub fn default_chain() -> Arc<Self> {
+    /// loadable on this system, then procfs. `dns_cache` receives
+    /// getaddrinfo-snooped resolutions when the eBPF DNS uprobes attach
+    /// (unused otherwise).
+    #[cfg_attr(not(feature = "ebpf"), allow(unused_variables))]
+    pub fn default_chain(dns_cache: Option<Arc<crate::dns::IpDomainCache>>) -> Arc<Self> {
         let procfs: Box<dyn Attributor> = Box::new(procfs::ProcfsAttributor);
         #[cfg(feature = "ebpf")]
-        if let Some(e) = ebpf::EbpfAttributor::new() {
+        if let Some(e) = ebpf::EbpfAttributor::new(dns_cache) {
             return Arc::new(Self::new(vec![Box::new(e), procfs]));
         }
         Arc::new(Self::new(vec![procfs]))

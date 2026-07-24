@@ -22,13 +22,17 @@
 #![allow(clippy::result_unit_err)]
 
 use aya_ebpf::{
-    helpers::{bpf_get_current_pid_tgid, bpf_get_current_uid_gid, bpf_probe_read_kernel},
-    macros::{kprobe, kretprobe, map, tracepoint},
-    maps::{HashMap, LruHashMap, RingBuf},
+    helpers::{
+        bpf_get_current_pid_tgid, bpf_get_current_uid_gid, bpf_probe_read_kernel,
+        bpf_probe_read_user, bpf_probe_read_user_str_bytes,
+    },
+    macros::{kprobe, kretprobe, map, tracepoint, uprobe, uretprobe},
+    maps::{HashMap, LruHashMap, PerCpuArray, RingBuf},
     programs::{ProbeContext, RetProbeContext, TracePointContext},
 };
 use hallpass_ebpf_common::{
-    ExecEvent, FlowKey, FlowVal, AF_INET, AF_INET6, EVENT_EXEC, EVENT_EXIT, PROTO_TCP, PROTO_UDP,
+    DnsEvent, ExecEvent, AF_INET, AF_INET6, DNS_NAME_CAP, EVENT_EXEC, EVENT_EXIT, FlowKey,
+    FlowVal, PROTO_TCP, PROTO_UDP,
 };
 
 // struct sock_common / msghdr field offsets. Loader-patched globals
@@ -75,6 +79,39 @@ static PROC_SCRATCH: HashMap<u64, u64> = HashMap::with_max_entries(512, 0);
 /// Process exec/exit events for the userspace cache.
 #[map]
 static EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
+
+/// getaddrinfo entry scratch: the queried name is copied here at entry so
+/// the return probe records what was actually looked up, not whatever the
+/// (attacker-controllable) node buffer holds after the blocking call. LRU
+/// so a missed return probe (thread killed mid-call) ages out instead of
+/// wedging the map. Keyed by pid_tgid.
+#[map]
+static DNS_SCRATCH: LruHashMap<u64, DnsScratch> = LruHashMap::with_max_entries(512, 0);
+
+/// Captured getaddrinfo arguments carried from entry to return.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct DnsScratch {
+    /// `struct addrinfo **res` out-parameter pointer.
+    res: u64,
+    /// Length of the captured name (no NUL).
+    name_len: u32,
+    /// The queried hostname, copied at entry.
+    name: [u8; DNS_NAME_CAP],
+}
+
+/// Resolved (name, address) pairs for the userspace domain cache.
+#[map]
+static DNS_EVENTS: RingBuf = RingBuf::with_byte_size(128 * 1024, 0);
+
+// A DnsScratch and a DnsEvent are ~280 bytes each: two of them blow the
+// 512-byte BPF stack, so both probes assemble their values in per-CPU
+// scratch maps instead. Programs are non-preemptible on their CPU, so a
+// single slot each is enough.
+#[map]
+static DNS_SCRATCH_BUF: PerCpuArray<DnsScratch> = PerCpuArray::with_max_entries(1, 0);
+#[map]
+static DNS_EVENT_BUF: PerCpuArray<DnsEvent> = PerCpuArray::with_max_entries(1, 0);
 
 #[inline(always)]
 unsafe fn read<T>(base: u64, off: usize) -> Result<T, ()> {
@@ -214,6 +251,128 @@ pub fn udp_sendmsg(ctx: ProbeContext) -> u32 {
 #[kprobe]
 pub fn udpv6_sendmsg(ctx: ProbeContext) -> u32 {
     udp_send(&ctx, SIN6_ADDR, 16)
+}
+
+// struct addrinfo field offsets, 64-bit glibc and musl (both lay the
+// POSIX fields out identically: four ints, socklen_t + padding, then
+// three pointers).
+const AI_FAMILY: usize = 4; // int
+const AI_ADDR: usize = 24; // struct sockaddr *
+const AI_NEXT: usize = 40; // struct addrinfo *
+
+/// Result-list entries walked per getaddrinfo call. Bounded for the
+/// verifier; real resolutions rarely exceed a handful of addresses.
+const MAX_ADDRS: usize = 10;
+
+#[inline(always)]
+unsafe fn read_user<T>(base: u64, off: usize) -> Result<T, ()> {
+    bpf_probe_read_user((base as usize + off) as *const T).map_err(|_| ())
+}
+
+// Attached to glibc/musl getaddrinfo: int getaddrinfo(node, service,
+// hints, struct addrinfo **res). The addrinfo offsets below are the
+// 64-bit glibc/musl layout; a 32-bit process would need different
+// offsets, so misreads there just drop events (reads are fault-safe).
+#[uprobe]
+pub fn getaddrinfo_enter(ctx: ProbeContext) -> u32 {
+    let (Some(node), Some(res)): (Option<*const u8>, Option<*const u8>) = (ctx.arg(0), ctx.arg(3))
+    else {
+        return 0;
+    };
+    if node.is_null() || res.is_null() {
+        return 0;
+    }
+    // Capture the name NOW: getaddrinfo blocks for the resolution, during
+    // which another thread could rewrite the buffer, so reading it at
+    // return could bind a real address to a forged name and poison the
+    // domain cache. Reading it here pins it to this call. The value is
+    // assembled in per-CPU scratch to stay off the BPF stack.
+    let Some(scratch) = DNS_SCRATCH_BUF.get_ptr_mut(0) else {
+        return 0;
+    };
+    let scratch = unsafe { &mut *scratch };
+    scratch.res = res as u64;
+    scratch.name_len = 0;
+    match unsafe { bpf_probe_read_user_str_bytes(node as *const u8, &mut scratch.name) } {
+        Ok(s) if !s.is_empty() => scratch.name_len = s.len() as u32,
+        _ => return 0,
+    }
+    let _ = DNS_SCRATCH.insert(bpf_get_current_pid_tgid(), &*scratch, 0);
+    0
+}
+
+#[uretprobe]
+pub fn getaddrinfo_ret(ctx: RetProbeContext) -> u32 {
+    let id = bpf_get_current_pid_tgid();
+    let (Some(scratch), Some(ev)) = (
+        unsafe { DNS_SCRATCH.get(id) },
+        DNS_EVENT_BUF.get_ptr_mut(0),
+    ) else {
+        return 0;
+    };
+    let ev = unsafe { &mut *ev };
+    let res = scratch.res;
+    let failed = ctx.ret::<i32>() != 0;
+    if !failed {
+        ev.name_len = scratch.name_len;
+        ev.name = scratch.name;
+        ev._pad = [0u8; 3];
+    }
+    let _ = DNS_SCRATCH.remove(id);
+    if failed {
+        return 0; // resolution failed; nothing to record
+    }
+
+    // Walk the result list, one event per address.
+    let mut ai: u64 = match unsafe { read_user(res, 0) } {
+        Ok(p) => p,
+        Err(()) => return 0,
+    };
+    for _ in 0..MAX_ADDRS {
+        if ai == 0 {
+            break;
+        }
+        let family: i32 = match unsafe { read_user(ai, AI_FAMILY) } {
+            Ok(f) => f,
+            Err(()) => return 0,
+        };
+        let sa: u64 = match unsafe { read_user(ai, AI_ADDR) } {
+            Ok(p) => p,
+            Err(()) => return 0,
+        };
+        if sa != 0 {
+            let emitted = unsafe {
+                match family as u8 {
+                    AF_INET => match read_user::<[u8; 4]>(sa, SIN_ADDR) {
+                        Ok(a) => {
+                            ev.addr = [0u8; 16];
+                            ev.addr[..4].copy_from_slice(&a);
+                            ev.family = AF_INET;
+                            true
+                        }
+                        Err(()) => false,
+                    },
+                    AF_INET6 => match read_user::<[u8; 16]>(sa, SIN6_ADDR) {
+                        Ok(a) => {
+                            ev.addr = a;
+                            ev.family = AF_INET6;
+                            true
+                        }
+                        Err(()) => false,
+                    },
+                    _ => false,
+                }
+            };
+            if emitted {
+                let _ = DNS_EVENTS.output::<DnsEvent>(&*ev, 0);
+            }
+        }
+        ai = match unsafe { read_user(ai, AI_NEXT) } {
+            Ok(p) => p,
+            Err(()) => return 0,
+        };
+    }
+    0
 }
 
 fn emit_event(kind: u32) {

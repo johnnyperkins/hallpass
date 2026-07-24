@@ -47,7 +47,7 @@ persisted as a rule.
 | `hallpass-cli`         | Command line client: status, rule management, event stream, interactive watch |
 | `hallpass-ui`          | egui desktop app: prompt popups and a management window                 |
 | `hallpass-types`       | Shared types and the length-prefixed postcard wire protocol             |
-| `hallpass-ebpf`        | Kernel-side eBPF programs (kprobes on `tcp_v4_connect` etc., exec/exit tracepoints); built separately, not a workspace member |
+| `hallpass-ebpf`        | Kernel-side eBPF programs (kprobes on `tcp_v4_connect` etc., exec/exit tracepoints, `getaddrinfo` uprobes); built separately, not a workspace member |
 | `hallpass-ebpf-common` | `no_std` types shared between kernel and userspace                      |
 | `xtask`                | Build tasks (`cargo xtask build-ebpf`)                                  |
 
@@ -209,6 +209,12 @@ attacker with root, who can delete the nftables table outright.
   and a reply only enters the IP-domain cache when its source/destination
   addresses, transaction ID, and question name match a recorded query.
   Spoofed packets from source port 53 cannot poison domain rules.
+- **Domain rules are a convenience, not a boundary against a local
+  process choosing its own DNS.** Both snoopers record what was resolved;
+  a process that controls a zone can point a name it owns at any address,
+  and the cache keeps one domain per address, so the last resolver of an
+  address wins. Scope security-relevant rules with `exe`/`exe_sha256` or
+  IP/CIDR criteria rather than domain alone.
 - **Rule files**: files in `rules.d` are ignored (with a warning) unless owned
   by root (or the daemon's own euid) and not group/other writable.
 - **systemd hardening**: `ProtectSystem=strict`, `ProtectHome`,
@@ -219,9 +225,13 @@ attacker with root, who can delete the nftables table outright.
 
 ## Limitations
 
-- **DoT / DoH are invisible** to the DNS snooper: domain-based rules only see
-  names resolved through plaintext UDP port 53. Encrypted DNS still works, but
-  those connections match by IP/port/exe only.
+- **DoT / DoH are invisible to the wire snooper**: it only sees names
+  resolved through plaintext UDP port 53. With the `ebpf` feature the
+  daemon also snoops `getaddrinfo` via uprobes on libc, which catches
+  resolutions through systemd-resolved's stub and encrypted upstreams as
+  long as the process uses the system resolver. Statically linked
+  programs, non-libc runtimes, and apps doing their own DoH still match
+  by IP/port/exe only.
 - Only new connections (`ct state new`) are evaluated; established flows are
   never re-checked.
 - Rules only model TCP and UDP. Other transports (SCTP, ICMP, ...) are not
