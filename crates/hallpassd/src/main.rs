@@ -2,8 +2,9 @@
 //!
 //! Startup order: config, nftables install, then three long-lived workers:
 //! the blocking nfqueue loop on its own thread, the prompt dispatcher, and
-//! the IPC server. SIGTERM/SIGINT (and the panic hook) tear the nftables
-//! table down so a dead daemon never leaves traffic queued.
+//! the IPC server. SIGTERM/SIGINT tear the nftables table down; the panic
+//! hook does too only in fail-open mode (`queue_bypass = true`), because in
+//! fail-closed mode the leftover table is what keeps enforcement up.
 
 #![deny(unsafe_code)]
 
@@ -64,23 +65,35 @@ async fn main() {
         );
     }
 
-    let nft_installed = match nft::install(cfg.queue_num) {
+    let nft_installed = match nft::install(cfg.queue_num, cfg.queue_bypass) {
         Ok(()) => {
             tracing::info!("nftables ruleset installed");
             true
         }
-        Err(e) => {
+        Err(e) if cfg.queue_bypass => {
             tracing::error!("nftables install failed, continuing without interception: {e}");
             false
         }
+        Err(e) => {
+            // Fail-closed posture: running unenforced would silently
+            // contradict the operator's declared choice. Refuse to start.
+            tracing::error!("nftables install failed and queue_bypass is off: {e}");
+            std::process::exit(1);
+        }
     };
 
-    // Any panic must not leave the nft table (and thus queued packets)
-    // behind. Teardown is idempotent; exiting is safer than running with
+    // Fail-open mode: a panic must not leave the nft table (and thus queued
+    // packets) behind. Fail-closed mode is the opposite: the table IS the
+    // enforcement, so a panicking daemon leaves it up (bypass-less queue
+    // drops new connections) until a restart or an explicit teardown.
+    // Teardown is idempotent; exiting is safer than running with
     // interception half torn down.
     let default_hook = std::panic::take_hook();
+    let teardown_on_panic = cfg.queue_bypass;
     std::panic::set_hook(Box::new(move |info| {
-        nft::teardown();
+        if teardown_on_panic {
+            nft::teardown();
+        }
         default_hook(info);
         std::process::exit(101);
     }));

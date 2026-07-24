@@ -173,6 +173,11 @@ impl TestEnv {
     /// Write config plus rule files, then start hallpassd inside the cli
     /// namespace and wait for its nftables table and IPC socket.
     fn start_daemon(&mut self, default_verdict: &str, rules: &[&str]) {
+        self.start_daemon_with(default_verdict, rules, "");
+    }
+
+    /// Like [`TestEnv::start_daemon`], with extra raw config lines appended.
+    fn start_daemon_with(&mut self, default_verdict: &str, rules: &[&str], extra_config: &str) {
         let rules_dir = self.tmp.join("rules.d");
         for (i, text) in rules.iter().enumerate() {
             std::fs::write(rules_dir.join(format!("rule{i}.toml")), text).expect("write rule");
@@ -186,7 +191,8 @@ impl TestEnv {
                  queue_num = 0\n\
                  socket_path = \"{}\"\n\
                  max_pending_prompts = 16\n\
-                 rules_dir = \"{}\"\n",
+                 rules_dir = \"{}\"\n\
+                 {extra_config}",
                 self.socket_path.display(),
                 rules_dir.display()
             ),
@@ -232,6 +238,16 @@ impl TestEnv {
             let _ = d.kill(); // Child::kill sends SIGKILL
             let _ = d.wait();
         }
+    }
+
+    /// Crash the daemon and assert its nft table survived the crash.
+    fn kill_daemon_and_assert_table_stays(&mut self) {
+        self.kill_daemon_hard();
+        let table = ns_run(&self.ns_cli, &["nft", "list", "table", "inet", "hallpass"]);
+        assert!(
+            table.status.success(),
+            "nft table should still exist after kill -9"
+        );
     }
 
     /// Start `nc -l` in the srv namespace and wait until the port listens.
@@ -423,15 +439,31 @@ fn queue_bypass_keeps_traffic_flowing_after_daemon_crash() {
 
     // Crash the daemon. The nft queue rules stay installed, but their
     // `bypass` flag means packets are accepted with no one listening.
-    env.kill_daemon_hard();
-    let table = ns_run(&env.ns_cli, &["nft", "list", "table", "inet", "hallpass"]);
-    assert!(
-        table.status.success(),
-        "nft table should still exist after kill -9"
-    );
+    env.kill_daemon_and_assert_table_stays();
     assert!(
         env.connect(19005),
         "queue-bypass should fail open when the daemon is dead"
+    );
+}
+
+#[test]
+#[ignore = "requires root and network namespaces"]
+fn fail_closed_queue_blocks_after_daemon_crash() {
+    let Some(mut env) = TestEnv::setup("failclosed") else { return };
+    env.start_listener(19007);
+    env.start_daemon_with("allow", &[], "queue_bypass = false\n");
+    assert!(
+        env.connect(19007),
+        "sanity: live daemon with default allow should permit; log:\n{}",
+        env.daemon_log()
+    );
+
+    // Crash the daemon. Without `bypass`, packets queued to a dead
+    // listener are dropped: enforcement survives the crash.
+    env.kill_daemon_and_assert_table_stays();
+    assert!(
+        !env.connect(19007),
+        "queue without bypass should fail closed when the daemon is dead"
     );
 }
 

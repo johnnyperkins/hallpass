@@ -25,6 +25,11 @@ pub struct Config {
     pub max_pending_prompts: usize,
     /// Directory of persisted rule files (*.toml).
     pub rules_dir: PathBuf,
+    /// Whether the verdict queue carries the NFQUEUE `bypass` flag.
+    /// `true` (default) fails open: traffic flows unfiltered when the
+    /// daemon is dead or the queue is full. `false` fails closed: those
+    /// packets are dropped, trading availability for enforcement.
+    pub queue_bypass: bool,
 }
 
 impl Default for Config {
@@ -36,6 +41,7 @@ impl Default for Config {
             socket_path: PathBuf::from("/run/hallpass/hallpass.sock"),
             max_pending_prompts: 64,
             rules_dir: PathBuf::from("/etc/hallpass/rules.d"),
+            queue_bypass: true,
         }
     }
 }
@@ -115,6 +121,7 @@ mod tests {
         assert_eq!(c.socket_path, PathBuf::from("/run/hallpass/hallpass.sock"));
         assert_eq!(c.max_pending_prompts, 64);
         assert_eq!(c.rules_dir, PathBuf::from("/etc/hallpass/rules.d"));
+        assert!(c.queue_bypass);
     }
 
     #[test]
@@ -127,12 +134,14 @@ mod tests {
             socket_path = "/tmp/s.sock"
             max_pending_prompts = 8
             rules_dir = "/tmp/rules"
+            queue_bypass = false
             "#,
         );
         assert_eq!(c.default_verdict, Verdict::Deny);
         assert_eq!(c.prompt_timeout_secs, 30);
         assert_eq!(c.queue_num, 7);
         assert_eq!(c.max_pending_prompts, 8);
+        assert!(!c.queue_bypass);
     }
 
     #[test]

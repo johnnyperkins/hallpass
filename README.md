@@ -170,20 +170,27 @@ hold the prompt-handler role.
 
 ## Security model
 
-**The enforcement guarantee in one sentence: hallpass only blocks what a live,
-healthy daemon explicitly denies.** Everything below is a consequence of that.
-Queue `bypass`, `default_verdict = "allow"`, and the prompt-timeout default all
-fail open, so a dead, wedged, or unconfigured daemon lets traffic through. For
-an enforce-by-default posture, start from
+**The enforcement guarantee in one sentence: by default, hallpass only blocks
+what a live, healthy daemon explicitly denies.** Everything below is a
+consequence of that. Queue `bypass`, `default_verdict = "allow"`, and the
+prompt-timeout default all fail open, so a dead, wedged, or unconfigured
+daemon lets traffic through. For an enforce-by-default posture, start from
 [`etc/config.hardened.toml`](etc/config.hardened.toml) (`default_verdict =
-"deny"`); the residual gap is the queue `bypass` flag, which an attacker with
-root can trip by killing the daemon regardless.
+"deny"`, `queue_bypass = false`): unmatched connections are denied and
+enforcement survives a dead or overloaded daemon. The residual gap is an
+attacker with root, who can delete the nftables table outright.
 
-- **Fail-open by design**: the NFQUEUE rules use the `bypass` flag, so if the
-  daemon dies traffic flows unfiltered instead of bricking the network. On
-  clean shutdown and on panic, the nftables table is removed. This is an
-  availability-over-enforcement tradeoff; an attacker who can SIGKILL the
-  daemon (root) can bypass it anyway.
+- **Fail-open by default**: the NFQUEUE verdict rule uses the `bypass` flag,
+  so if the daemon dies traffic flows unfiltered instead of bricking the
+  network. On clean shutdown and on panic, the nftables table is removed.
+  This is an availability-over-enforcement tradeoff; set
+  `queue_bypass = false` to invert it and have new connections dropped
+  whenever no live daemon is deciding them (daemon dead, queue full). In
+  that mode a panic deliberately leaves the table up, so enforcement holds
+  until the daemon restarts; clean shutdown still removes it. The
+  DNS snoop queues always keep `bypass` - they are observe-only, and
+  dropping DNS with the daemon gone would cost availability without adding
+  enforcement.
 - **IPC socket**: `/run/hallpass/hallpass.sock`, directory 0750, socket 0660
   root:hallpass. Only root and the `hallpass` group can manage rules or answer
   prompts. Peer UIDs are logged for every mutating request. Per-client

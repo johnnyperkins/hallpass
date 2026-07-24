@@ -16,8 +16,13 @@
 //! queue itself can only accept or drop, so the reject cannot be issued from
 //! the nfqueue thread directly.
 //!
-//! All queue rules use `bypass` so traffic keeps flowing if the daemon dies
-//! without tearing the table down.
+//! The snoop queues always use `bypass`: they are purely observational
+//! (packets are accepted immediately), so dropping DNS when the daemon is
+//! gone would cost availability and buy no enforcement. The verdict queue's
+//! `bypass` is configurable (`queue_bypass`): with it, traffic keeps
+//! flowing if the daemon dies without tearing the table down (fail open);
+//! without it, new connections are dropped when no daemon is listening or
+//! the queue overflows (fail closed).
 
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -34,9 +39,10 @@ pub fn snoop_queue(queue_num: u16) -> u16 {
 }
 
 /// Render the ruleset installed at startup.
-fn ruleset(queue_num: u16) -> String {
+fn ruleset(queue_num: u16, verdict_bypass: bool) -> String {
     let snoop = snoop_queue(queue_num);
     let mark = REJECT_MARK;
+    let bypass = if verdict_bypass { " bypass" } else { "" };
     // The reject rules sit right after the verdict queue: a packet the
     // daemon accepts with REJECT_MARK resumes chain traversal here and is
     // rejected; unmarked (allowed) packets fall through untouched.
@@ -44,7 +50,7 @@ fn ruleset(queue_num: u16) -> String {
         "table inet hallpass {{\n\
          \tchain output {{\n\
          \t\ttype filter hook output priority mangle; policy accept;\n\
-         \t\tct state new queue num {queue_num} bypass\n\
+         \t\tct state new queue num {queue_num}{bypass}\n\
          \t\tmeta mark {mark} meta l4proto tcp reject with tcp reset\n\
          \t\tmeta mark {mark} reject\n\
          \t\tudp dport 53 ct state != new queue num {snoop} bypass\n\
@@ -58,11 +64,11 @@ fn ruleset(queue_num: u16) -> String {
 }
 
 /// Install the hallpass table, replacing any stale one from a previous run.
-pub fn install(queue_num: u16) -> std::io::Result<()> {
+pub fn install(queue_num: u16, verdict_bypass: bool) -> std::io::Result<()> {
     // A leftover table from a crashed run would double-queue packets.
     // Deletion of a nonexistent table fails; that is expected and ignored.
     let _ = run_nft(&["delete", "table", "inet", "hallpass"], None);
-    run_nft(&["-f", "-"], Some(&ruleset(queue_num)))
+    run_nft(&["-f", "-"], Some(&ruleset(queue_num, verdict_bypass)))
 }
 
 /// Remove the hallpass table. Failure is logged, not fatal: this runs on
@@ -103,7 +109,7 @@ mod tests {
 
     #[test]
     fn ruleset_contains_expected_rules() {
-        let r = ruleset(3);
+        let r = ruleset(3, true);
         assert!(r.contains("table inet hallpass"));
         assert!(r.contains("type filter hook output priority mangle; policy accept;"));
         assert!(r.contains("ct state new queue num 3 bypass"));
@@ -111,6 +117,16 @@ mod tests {
         assert!(r.contains(&format!("meta mark {REJECT_MARK} reject")));
         assert!(r.contains("udp dport 53 ct state != new queue num 4 bypass"));
         assert!(r.contains("type filter hook input priority mangle; policy accept;"));
+        assert!(r.contains("udp sport 53 queue num 4 bypass"));
+    }
+
+    #[test]
+    fn fail_closed_drops_bypass_on_verdict_queue_only() {
+        let r = ruleset(3, false);
+        assert!(r.contains("ct state new queue num 3\n"));
+        assert!(!r.contains("queue num 3 bypass"));
+        // Snoop queues are observational; they always keep bypass.
+        assert!(r.contains("udp dport 53 ct state != new queue num 4 bypass"));
         assert!(r.contains("udp sport 53 queue num 4 bypass"));
     }
 }

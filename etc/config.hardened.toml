@@ -1,9 +1,9 @@
 # Hallpass daemon configuration - hardened, enforce-by-default posture.
 #
 # Use this instead of config.toml when you want unmatched and unanswered
-# connections blocked rather than allowed. The daemon still fails open if it
-# dies (the NFQUEUE `bypass` flag keeps the network up), so this hardens the
-# live-daemon behaviour, not the daemon-is-dead case.
+# connections blocked rather than allowed, and enforcement to survive a
+# dead or overloaded daemon (`queue_bypass = false`). The residual gap is
+# an attacker with root, who can delete the nftables table outright.
 
 # Block when no rule matches and no client answers the prompt in time.
 default_verdict = "deny"
@@ -22,3 +22,11 @@ socket_path = "/run/hallpass/hallpass.sock"
 # this the default (deny) verdict is applied, so keep it generous enough
 # that a burst of new connections is not silently denied.
 max_pending_prompts = 128
+
+# Drop the NFQUEUE `bypass` flag from the verdict queue: new connections
+# are dropped, not allowed, when the daemon is dead or the queue is full.
+# Availability cost: a crashed daemon takes new outbound connections down
+# with it until it restarts (established flows keep working, and the
+# table is removed on clean shutdown). The DNS snoop queues always keep
+# `bypass`; they are observe-only.
+queue_bypass = false
