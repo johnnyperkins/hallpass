@@ -138,41 +138,45 @@ impl Attributor for EbpfAttributor {
 
 /// Kernel struct offsets for the eBPF programs, resolved from the running
 /// kernel's BTF: per-kernel resolution instead of trusting one compiled-in
-/// layout. Returns an empty list when BTF is missing (kernel built without
-/// CONFIG_DEBUG_INFO_BTF) or a field cannot be found: nothing is patched
-/// and the x86_64 defaults compiled into the object apply. A wrong default
-/// only costs eBPF lookup misses, which the procfs attributor absorbs.
+/// layout. Whatever resolves gets patched; any field that does not (BTF
+/// missing entirely, or a single renamed/bitfield-ized member on a future
+/// kernel) is left at the x86_64 default compiled into the object, with a
+/// warning. A wrong default only costs eBPF lookup misses, which the
+/// procfs attributor absorbs.
 fn resolve_offsets() -> Vec<(&'static str, u32)> {
-    let resolved = match Btf::from_sys_fs() {
-        Ok(btf) => resolve_from_btf(&btf),
+    let btf = match Btf::from_sys_fs() {
+        Ok(b) => b,
         Err(e) => {
             tracing::warn!("kernel BTF unavailable, using compiled-in x86_64 offsets: {e}");
             return Vec::new();
         }
     };
-    resolved.unwrap_or_else(|| {
-        tracing::warn!("BTF offset resolution incomplete, using compiled-in x86_64 offsets");
-        Vec::new()
-    })
-}
-
-fn resolve_from_btf(btf: &Btf) -> Option<Vec<(&'static str, u32)>> {
     // The programs read fields off a `struct sock *`, so each sock_common
     // offset is `sock.__sk_common` (0 on every known kernel, but resolved
     // anyway) plus the field's offset within sock_common.
-    let skc = btf.struct_field_offset("sock", "__sk_common")?;
-    let sock_common = btf.struct_id("sock_common")?;
-    let sc = |field| btf.field_offset(sock_common, field).map(|o| skc + o);
-    Some(vec![
-        ("OFF_SKC_DADDR", sc("skc_daddr")?),
-        ("OFF_SKC_RCV_SADDR", sc("skc_rcv_saddr")?),
-        ("OFF_SKC_DPORT", sc("skc_dport")?),
-        ("OFF_SKC_NUM", sc("skc_num")?),
-        ("OFF_SKC_FAMILY", sc("skc_family")?),
-        ("OFF_SKC_V6_DADDR", sc("skc_v6_daddr")?),
-        ("OFF_SKC_V6_RCV_SADDR", sc("skc_v6_rcv_saddr")?),
-        ("OFF_MSG_NAME", btf.struct_field_offset("msghdr", "msg_name")?),
-    ])
+    let skc = btf.struct_field_offset("sock", "__sk_common");
+    let sock_common = btf.struct_id("sock_common");
+    let sc = |field| match (skc, sock_common) {
+        (Some(base), Some(id)) => btf.field_offset(id, field).map(|o| base + o),
+        _ => None,
+    };
+    let mut resolved = Vec::new();
+    for (symbol, offset) in [
+        ("OFF_SKC_DADDR", sc("skc_daddr")),
+        ("OFF_SKC_RCV_SADDR", sc("skc_rcv_saddr")),
+        ("OFF_SKC_DPORT", sc("skc_dport")),
+        ("OFF_SKC_NUM", sc("skc_num")),
+        ("OFF_SKC_FAMILY", sc("skc_family")),
+        ("OFF_SKC_V6_DADDR", sc("skc_v6_daddr")),
+        ("OFF_SKC_V6_RCV_SADDR", sc("skc_v6_rcv_saddr")),
+        ("OFF_MSG_NAME", btf.struct_field_offset("msghdr", "msg_name")),
+    ] {
+        match offset {
+            Some(o) => resolved.push((symbol, o)),
+            None => tracing::warn!(symbol, "BTF offset unresolved; compiled-in x86_64 default applies"),
+        }
+    }
+    resolved
 }
 
 /// FlowTuple -> map key, matching the byte-order convention of

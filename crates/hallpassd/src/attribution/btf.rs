@@ -344,5 +344,29 @@ mod tests {
             assert!(off < 256, "{field} offset {off} implausible");
         }
         assert!(btf.struct_field_offset("msghdr", "msg_name").is_some());
+
+        // On x86_64, the live offsets must match the defaults compiled
+        // into the eBPF statics (crates/hallpass-ebpf/src/main.rs). BTF
+        // patching hides a drifted default everywhere except BTF-less
+        // kernels, which are exactly the machines the defaults serve, so
+        // drift must fail here instead.
+        #[cfg(target_arch = "x86_64")]
+        for (field, default) in [
+            ("skc_daddr", 0),
+            ("skc_rcv_saddr", 4),
+            ("skc_dport", 12),
+            ("skc_num", 14),
+            ("skc_family", 16),
+            ("skc_v6_daddr", 56),
+            ("skc_v6_rcv_saddr", 72),
+        ] {
+            assert_eq!(
+                btf.struct_field_offset("sock_common", field),
+                Some(default),
+                "compiled-in default for {field} drifted from the live kernel"
+            );
+        }
+        #[cfg(target_arch = "x86_64")]
+        assert_eq!(btf.struct_field_offset("msghdr", "msg_name"), Some(0));
     }
 }
