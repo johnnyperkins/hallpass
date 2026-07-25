@@ -298,6 +298,11 @@ impl TestEnv {
     /// OpenBSD `-l PORT` form. Listeners accumulate: a test that needs to
     /// distinguish "blocked" from "connection refused" on several ports
     /// needs one listening on each.
+    ///
+    /// A *completed* connection ends the listener, since `nc -l` serves
+    /// one connection and exits. Probing a port twice therefore needs a
+    /// fresh listener in between, or the second probe is refused rather
+    /// than filtered, which from here looks exactly like a block.
     fn start_listener(&mut self, port: u16) {
         // Which form this nc accepts is a property of the host, not of
         // the port, so probing it once keeps a test that needs four
@@ -869,13 +874,12 @@ fn domains_file_rule_blocks_after_dns_snoop() {
 fn timed_rule_stops_applying_after_its_deadline() {
     const PORT: u16 = 19014;
     /// Lead time on the deadline. It has to outlast the whole
-    /// effect-detection phase: that polls with `connect`, and a blocked
-    /// probe burns nc's full 3s timeout, so a probe started just inside
-    /// EFFECT_WAIT finishes at EFFECT_WAIT + 3s. Finishing after the
-    /// deadline would see the rule already expired and report a correct
-    /// daemon as broken.
-    const EFFECT_WAIT: Duration = Duration::from_secs(6);
-    const LEAD: Duration = Duration::from_secs(15);
+    /// Lead time on the deadline, which has to outlast the reload wait
+    /// plus one blocked connect (nc's full 3s timeout). The watcher
+    /// debounces 200ms, so a reload anywhere near RELOAD_WAIT is an
+    /// anomaly worth failing on rather than racing against.
+    const RELOAD_WAIT: Duration = Duration::from_secs(6);
+    const LEAD: Duration = Duration::from_secs(10);
     let Some(mut env) = TestEnv::setup("timed") else { return };
     env.start_listener(PORT);
 
@@ -904,12 +908,26 @@ fn timed_rule_stops_applying_after_its_deadline() {
         }),
     )
     .expect("write timed rule");
-    wait_until(EFFECT_WAIT, || !env.connect(PORT)).unwrap_or_else(|| {
+    // Wait for the reload in the log rather than by probing with
+    // `connect`: a probe that runs before the watcher fires is allowed by
+    // the default verdict, and a completed connection makes `nc -l` exit.
+    // Every later probe would then be refused rather than blocked, which
+    // looks identical from here and would leave nothing listening for the
+    // post-expiry assertion.
+    wait_until(RELOAD_WAIT, || {
+        env.daemon_log().contains("rules reloaded from disk")
+    })
+    .unwrap_or_else(|| {
         panic!(
-            "timed rule never took effect; daemon log:\n{}",
+            "the watcher never reloaded the timed rule; daemon log:\n{}",
             env.daemon_log()
         )
     });
+    assert!(
+        !env.connect(PORT),
+        "a timed rule should apply before its deadline; daemon log:\n{}",
+        env.daemon_log()
+    );
 
     // Past the deadline the once-a-second sweep drops the rule and
     // deletes the file it was loaded from.
