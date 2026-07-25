@@ -245,6 +245,11 @@ attacker with root, who can delete the nftables table outright.
   every prompt with the default verdict and give the operator no way to
   see it or change it; binding first means that failure costs nothing,
   because nothing has been installed yet.
+- **No queueing without a listener**: the nfqueues are bound before the
+  nftables rules that feed them are installed, so no packet is ever
+  resolved by the queue's `bypass` flag alone (which would skip the
+  default verdict and every rule). Packets arriving before the verdict
+  loop starts buffer in the queue and are judged when it drains.
 - **DNS snoop validation**: outbound queries are observed alongside replies,
   and a reply only enters the IP-domain cache when its source/destination
   addresses, transaction ID, and question name match a recorded query.
