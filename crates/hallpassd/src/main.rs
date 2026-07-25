@@ -85,21 +85,46 @@ async fn main() {
         }
     };
 
-    let nft_installed = match nft::install(cfg.queue_num, cfg.queue_bypass) {
-        Ok(()) => {
-            tracing::info!("nftables ruleset installed");
-            true
-        }
+    // Bind the nfqueues before installing the nftables rules that feed
+    // them, for the same reason the IPC socket binds first. A packet
+    // queued while no listener is bound is resolved by the `bypass` flag
+    // alone, skipping the default verdict and every rule: under
+    // fail-open that silently allows what a rule would deny, for however
+    // long the listener takes to arrive. Binding first means the moment
+    // packets can be queued, something is there to judge them.
+    let queue = match nfqueue::bind(cfg.queue_num) {
+        Ok(q) => Some(q),
         Err(e) if cfg.queue_bypass => {
-            tracing::error!("nftables install failed, continuing without interception: {e}");
-            false
+            // Without privileges (development runs) the bind fails and
+            // interception is off; IPC and rule management still work.
+            tracing::error!("nfqueue bind failed, continuing without interception: {e}");
+            None
         }
         Err(e) => {
-            // Fail-closed posture: running unenforced would silently
-            // contradict the operator's declared choice. Refuse to start.
-            tracing::error!("nftables install failed and queue_bypass is off: {e}");
+            tracing::error!("nfqueue bind failed and queue_bypass is off: {e}");
             std::process::exit(1);
         }
+    };
+
+    let nft_installed = match &queue {
+        None => false,
+        Some(_) => match nft::install(cfg.queue_num, cfg.queue_bypass) {
+            Ok(()) => {
+                tracing::info!("nftables ruleset installed");
+                true
+            }
+            Err(e) if cfg.queue_bypass => {
+                tracing::error!("nftables install failed, continuing without interception: {e}");
+                false
+            }
+            Err(e) => {
+                // Fail-closed posture: running unenforced would silently
+                // contradict the operator's declared choice. Refuse to
+                // start.
+                tracing::error!("nftables install failed and queue_bypass is off: {e}");
+                std::process::exit(1);
+            }
+        },
     };
 
     // Fail-open mode: a panic must not leave the nft table (and thus queued
@@ -194,24 +219,29 @@ async fn main() {
         }
     });
 
-    // Blocking nfqueue loop on its own thread.
+    // Blocking nfqueue loop on its own thread, over the queue bound
+    // before the nftables install. None means interception is off for
+    // this run (no privileges); rule management still works over IPC.
     let shutdown = Arc::new(AtomicBool::new(false));
-    let queue_thread = nfqueue::spawn(
-        cfg.queue_num,
-        nfqueue::QueueDeps {
-            attribution: AttributionChain::default_chain(Some(Arc::clone(&dns_cache))),
-            rules: Arc::clone(&store),
-            events: Arc::clone(&events),
-            stats: Arc::clone(&counters),
-            prompt_tx,
-            verdict_rx,
-            dns_tx,
-            dns_cache,
-            exe_hash: Arc::new(attribution::hash::ExeHashCache::default()),
-            unhandled_verdict: cfg.unhandled_proto_verdict,
-            shutdown: Arc::clone(&shutdown),
-        },
-    );
+    let queue_thread = queue.map(|queue| {
+        nfqueue::spawn(
+            queue,
+            cfg.queue_num,
+            nfqueue::QueueDeps {
+                attribution: AttributionChain::default_chain(Some(Arc::clone(&dns_cache))),
+                rules: Arc::clone(&store),
+                events: Arc::clone(&events),
+                stats: Arc::clone(&counters),
+                prompt_tx,
+                verdict_rx,
+                dns_tx,
+                dns_cache,
+                exe_hash: Arc::new(attribution::hash::ExeHashCache::default()),
+                unhandled_verdict: cfg.unhandled_proto_verdict,
+                shutdown: Arc::clone(&shutdown),
+            },
+        )
+    });
 
     // IPC server.
     let ipc_deps = Arc::new(ipc::server::IpcDeps {
@@ -244,6 +274,8 @@ async fn main() {
             tracing::warn!("failed to remove socket {}: {e}", cfg.socket_path.display());
         }
     }
-    let _ = queue_thread.join();
+    if let Some(t) = queue_thread {
+        let _ = t.join();
+    }
     tracing::info!("hallpassd stopped");
 }

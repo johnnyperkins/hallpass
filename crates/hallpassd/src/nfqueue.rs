@@ -117,14 +117,26 @@ fn decide(tuple: FlowTuple, iface: Option<String>, ctx: &DecideCtx) -> Decision 
 
 /// Run the queue loop until `shutdown` is set. Blocking; call from a
 /// dedicated std thread.
-pub fn run(queue_num: u16, mut deps: QueueDeps) -> std::io::Result<()> {
+/// Open and bind both queues.
+///
+/// Separate from [`run`] so the daemon can bind them before installing
+/// the nftables rules that feed them. A packet queued while no listener
+/// is bound is resolved by the `bypass` flag alone: accepted under
+/// fail-open, dropped under fail-closed. Either way the configured
+/// default verdict and rules are silently skipped for however long the
+/// gap lasts, so the gap must not exist.
+pub fn bind(queue_num: u16) -> std::io::Result<Queue> {
     let snoop_queue = crate::nft::snoop_queue(queue_num);
     let mut queue = Queue::open()?;
     queue.bind(queue_num)?;
     queue.bind(snoop_queue)?;
     queue.set_nonblocking(true);
     tracing::info!(queue_num, snoop_queue, "nfqueues bound");
+    Ok(queue)
+}
 
+pub fn run(mut queue: Queue, queue_num: u16, mut deps: QueueDeps) -> std::io::Result<()> {
+    let snoop_queue = crate::nft::snoop_queue(queue_num);
     let iface_map = crate::iface::IfaceMap::default();
     let mut held: HashMap<u64, nfq::Message> = HashMap::new();
     // Monotonic packet-hold sequence. u64 does not wrap in any real runtime
@@ -231,14 +243,14 @@ pub fn run(queue_num: u16, mut deps: QueueDeps) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Spawn the queue loop on its own thread. Errors are logged; the daemon
-/// keeps running (IPC stays useful even if packet interception fails,
-/// e.g. when not running as root).
-pub fn spawn(queue_num: u16, deps: QueueDeps) -> std::thread::JoinHandle<()> {
+/// Spawn the queue loop on its own thread over an already-bound queue.
+/// Errors are logged; the daemon keeps running (IPC stays useful even if
+/// packet interception fails mid-flight).
+pub fn spawn(queue: Queue, queue_num: u16, deps: QueueDeps) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name("nfqueue".into())
         .spawn(move || {
-            if let Err(e) = run(queue_num, deps) {
+            if let Err(e) = run(queue, queue_num, deps) {
                 tracing::error!("nfqueue loop failed: {e}");
             }
         })
