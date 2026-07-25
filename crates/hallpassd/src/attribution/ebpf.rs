@@ -30,11 +30,10 @@ use crate::dns::{IpDomainCache, SnoopedResponse};
 use super::btf::Btf;
 use super::{procfs, Attributor, ProcInfo};
 
-/// The object produced by `cargo xtask build-ebpf`.
-static EBPF_OBJ: &[u8] = aya::include_bytes_aligned!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../target/bpfel-unknown-none/release/hallpass-ebpf"
-));
+/// The eBPF object, located by build.rs: an explicit `HALLPASS_EBPF_OBJ`,
+/// a prebuilt object vendored in the crate, or whatever `cargo xtask
+/// build-ebpf` produced, in that order.
+static EBPF_OBJ: &[u8] = aya::include_bytes_aligned!(env!("HALLPASS_EBPF_OBJ"));
 
 /// pid -> details snapshotted at exec time. Exit events are the primary
 /// eviction path, but they are lossy (the ring buffer drops under

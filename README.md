@@ -78,6 +78,20 @@ cargo build --release --features ebpf -p hallpassd
 cargo xtask build
 ```
 
+Building the object is only needed if you do not already have one. The
+`ebpf` feature embeds whichever object it finds first:
+
+1. `HALLPASS_EBPF_OBJ`, if set, pointing at the object file.
+2. `crates/hallpassd/prebuilt/hallpass-ebpf`, for a vendored or packaged
+   object.
+3. `target/bpfel-unknown-none/release/hallpass-ebpf`, what `cargo xtask
+   build-ebpf` writes.
+
+So a prebuilt object can be dropped in or pointed at, and the daemon
+itself then builds on stable with no nightly and no bpf-linker. If none
+of the three exists the build fails with these instructions rather than
+an error from inside the embedding macro.
+
 At load time the daemon resolves the kernel struct offsets the programs
 read (`sock_common`, `msghdr`) from the running kernel's BTF
 (`/sys/kernel/btf/vmlinux`) and patches them into the object, so the

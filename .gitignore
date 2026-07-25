@@ -1,3 +1,6 @@
 /target
 target/
 *.o
+
+# Vendored eBPF object for stable builds (see README).
+crates/hallpassd/prebuilt/
