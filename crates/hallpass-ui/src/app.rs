@@ -9,6 +9,7 @@ use eframe::egui::{self, Color32, RichText};
 use hallpass_types::{ClientMsg, ConnEvent, PromptScope, Rule, RuleDuration, Stats, Verdict};
 use tokio::sync::mpsc::UnboundedSender;
 
+use crate::editor::RuleEditor;
 use crate::net::{self, UiEvent};
 use crate::prompt::{self, PromptState};
 
@@ -16,11 +17,11 @@ use crate::prompt::{self, PromptState};
 const MAX_EVENTS: usize = 1000;
 
 /// Green accent for Allow.
-const ALLOW_COLOR: Color32 = Color32::from_rgb(0x2e, 0xa0, 0x43);
+pub(crate) const ALLOW_COLOR: Color32 = Color32::from_rgb(0x2e, 0xa0, 0x43);
 /// Red accent for Deny.
-const DENY_COLOR: Color32 = Color32::from_rgb(0xc9, 0x3c, 0x37);
+pub(crate) const DENY_COLOR: Color32 = Color32::from_rgb(0xc9, 0x3c, 0x37);
 /// Orange accent for Reject.
-const REJECT_COLOR: Color32 = Color32::from_rgb(0xd0, 0x87, 0x20);
+pub(crate) const REJECT_COLOR: Color32 = Color32::from_rgb(0xd0, 0x87, 0x20);
 
 /// Which tab of the main window is active.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,6 +53,8 @@ pub struct HallpassApp {
     /// Set by the Quit button; lets the main viewport actually close instead
     /// of hiding.
     quit_requested: bool,
+    /// Open rule add/edit form, if any.
+    editor: Option<RuleEditor>,
 }
 
 impl HallpassApp {
@@ -70,6 +73,7 @@ impl HallpassApp {
             stats: Stats::default(),
             last_error: None,
             quit_requested: false,
+            editor: None,
         }
     }
 
@@ -145,8 +149,22 @@ impl HallpassApp {
             }
             DaemonMsg::Rules(rules) => self.rules = rules,
             DaemonMsg::Stats(stats) => self.stats = stats,
-            DaemonMsg::Err { message } => self.last_error = Some(message),
-            DaemonMsg::HelloAck { .. } | DaemonMsg::Ok => {}
+            // Replies arrive in request order on the one IPC stream, so
+            // while a save is in flight the next Ok/Err answers it: keep
+            // the form (and everything typed into it) alive on a reject,
+            // close it on success.
+            DaemonMsg::Err { message } => {
+                match self.editor.as_mut().filter(|e| e.awaiting_ack()) {
+                    Some(editor) => editor.ack_err(&message),
+                    None => self.last_error = Some(message),
+                }
+            }
+            DaemonMsg::Ok => {
+                if self.editor.as_ref().is_some_and(RuleEditor::awaiting_ack) {
+                    self.editor = None;
+                }
+            }
+            DaemonMsg::HelloAck { .. } => {}
         }
     }
 
@@ -265,6 +283,9 @@ impl HallpassApp {
 
     fn rules_tab(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
+            if ui.button("Add rule").clicked() {
+                self.editor = Some(RuleEditor::add());
+            }
             if ui.button("Refresh").clicked() {
                 self.send(ClientMsg::RuleList);
             }
@@ -278,18 +299,20 @@ impl HallpassApp {
 
         let mut toggle: Option<(String, bool)> = None;
         let mut delete: Option<String> = None;
+        let mut edit: Option<RuleEditor> = None;
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 egui::Grid::new("rules_grid")
                     .striped(true)
-                    .num_columns(6)
+                    .num_columns(7)
                     .show(ui, |ui| {
                         ui.strong("On");
                         ui.strong("Name");
                         ui.strong("Action");
                         ui.strong("Match");
                         ui.strong("Priority");
+                        ui.strong("");
                         ui.strong("");
                         ui.end_row();
                         for rule in &mut self.rules {
@@ -302,6 +325,9 @@ impl HallpassApp {
                             ui.colored_label(verdict_color(v), verdict_label(v));
                             ui.monospace(rule.matcher.summary());
                             ui.label(rule.priority.to_string());
+                            if ui.button("Edit").clicked() {
+                                edit = Some(RuleEditor::edit(rule));
+                            }
                             if ui.button("Delete").clicked() {
                                 delete = Some(rule.name.clone());
                             }
@@ -310,6 +336,9 @@ impl HallpassApp {
                     });
             });
 
+        if let Some(editor) = edit {
+            self.editor = Some(editor);
+        }
         if let Some((name, enabled)) = toggle {
             if let Some(rule) = self.rules.iter_mut().find(|r| r.name == name) {
                 rule.enabled = enabled;
@@ -319,6 +348,24 @@ impl HallpassApp {
         if let Some(name) = delete {
             self.rules.retain(|r| r.name != name);
             self.send(ClientMsg::RuleDelete { name });
+        }
+    }
+
+    /// Render the rule editor window, sending the rule when saved. The
+    /// form stays open until the daemon acks: `handle_daemon_msg` closes
+    /// it on Ok and puts a rejection message into it on Err, so a
+    /// server-side validation failure does not destroy what was typed.
+    fn editor_window(&mut self, ctx: &egui::Context) {
+        let Some(editor) = &mut self.editor else {
+            return;
+        };
+        let (keep_open, saved) = editor.window(ctx);
+        if let Some(rule) = saved {
+            self.send(ClientMsg::RuleAdd(rule));
+            self.send(ClientMsg::RuleList);
+        }
+        if !keep_open {
+            self.editor = None;
         }
     }
 
@@ -489,6 +536,7 @@ impl eframe::App for HallpassApp {
         let ctx = ui.ctx().clone();
         self.drain_net();
         self.main_window(ui);
+        self.editor_window(&ctx);
         self.prompt_windows(&ctx);
         if !self.prompts.is_empty() {
             // Keep countdown bars moving.
