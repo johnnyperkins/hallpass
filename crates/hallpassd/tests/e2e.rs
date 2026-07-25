@@ -227,15 +227,19 @@ impl TestEnv {
         )
         .expect("write config");
 
+        // Capture stdout as well as stderr: tracing_subscriber::fmt
+        // writes to stdout, so nulling it would leave every "daemon log:"
+        // in this file's failure messages blank.
         let log = std::fs::File::create(self.tmp.join("hallpassd.log")).expect("log file");
+        let log_err = log.try_clone().expect("clone log handle");
         let child = Command::new("ip")
             .args(["netns", "exec", &self.ns_cli])
             .arg(env!("CARGO_BIN_EXE_hallpassd"))
             .arg("--config")
             .arg(&config_path)
             .env("RUST_LOG", "debug")
-            .stdout(Stdio::null())
-            .stderr(log)
+            .stdout(Stdio::from(log))
+            .stderr(Stdio::from(log_err))
             .spawn()
             .expect("spawn hallpassd");
         self.daemon = Some(child);
