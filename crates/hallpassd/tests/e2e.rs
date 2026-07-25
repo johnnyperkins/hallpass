@@ -17,14 +17,29 @@
 //! message on stderr instead of failing.
 
 use std::os::unix::fs::MetadataExt;
-use std::path::PathBuf;
+use std::os::unix::net::UnixDatagram;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-use hallpass_types::{wire, ClientMsg, DaemonMsg, PROTOCOL_VERSION};
+use hallpass_types::{
+    wire, Action, ClientMsg, DaemonMsg, Proto, Rule, RuleDuration, RuleMatch, PROTOCOL_VERSION,
+};
+use sha2::{Digest, Sha256};
 
 const CLI_IP: &str = "10.99.77.1";
 const SRV_IP: &str = "10.99.77.2";
+/// The subnet both namespaces sit in, for `ips_file` lists.
+const SUBNET: &str = "10.99.77.0/24";
+/// veth endpoint names, in the cli and srv namespaces respectively. The
+/// cli side is also what an `iface` rule matches on.
+const DEV_CLI: &str = "snte2ec";
+const DEV_SRV: &str = "snte2es";
+
+/// How long to let a snooped resolution settle into the domain cache
+/// before a rule can be expected to match on it.
+const DNS_SETTLE: Duration = Duration::from_millis(500);
 
 /// Effective UID via st_uid of /proc/self (no libc, no unsafe).
 fn effective_uid() -> Option<u32> {
@@ -66,6 +81,19 @@ fn ns_run(ns: &str, args: &[&str]) -> Output {
     let mut full = vec!["netns", "exec", ns];
     full.extend_from_slice(args);
     run("ip", &full)
+}
+
+/// Poll `cond` until it holds or `limit` passes. Returns `None` on
+/// timeout, so callers can report the daemon log at the failing point.
+fn wait_until(limit: Duration, mut cond: impl FnMut() -> bool) -> Option<()> {
+    let deadline = Instant::now() + limit;
+    while Instant::now() < deadline {
+        if cond() {
+            return Some(());
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    None
 }
 
 fn assert_ok(out: &Output, what: &str) {
@@ -115,7 +143,7 @@ struct TestEnv {
     tmp: PathBuf,
     socket_path: PathBuf,
     daemon: Option<Child>,
-    listener: Option<Child>,
+    listeners: Vec<Child>,
     dns_server: Option<Child>,
 }
 
@@ -144,7 +172,7 @@ impl TestEnv {
             socket_path: tmp.join("hallpass.sock"),
             tmp,
             daemon: None,
-            listener: None,
+            listeners: Vec::new(),
             dns_server: None,
         };
 
@@ -153,13 +181,13 @@ impl TestEnv {
         assert_ok(
             &run(
                 "ip",
-                &["link", "add", "snte2ec", "type", "veth", "peer", "name", "snte2es"],
+                &["link", "add", DEV_CLI, "type", "veth", "peer", "name", DEV_SRV],
             ),
             "veth create",
         );
-        assert_ok(&run("ip", &["link", "set", "snte2ec", "netns", &ns_cli]), "veth to cli");
-        assert_ok(&run("ip", &["link", "set", "snte2es", "netns", &ns_srv]), "veth to srv");
-        for (ns, dev, ip) in [(&ns_cli, "snte2ec", CLI_IP), (&ns_srv, "snte2es", SRV_IP)] {
+        assert_ok(&run("ip", &["link", "set", DEV_CLI, "netns", &ns_cli]), "veth to cli");
+        assert_ok(&run("ip", &["link", "set", DEV_SRV, "netns", &ns_srv]), "veth to srv");
+        for (ns, dev, ip) in [(&ns_cli, DEV_CLI, CLI_IP), (&ns_srv, DEV_SRV, SRV_IP)] {
             assert_ok(
                 &run("ip", &["-n", ns, "addr", "add", &format!("{ip}/24"), "dev", dev]),
                 "addr add",
@@ -178,9 +206,9 @@ impl TestEnv {
 
     /// Like [`TestEnv::start_daemon`], with extra raw config lines appended.
     fn start_daemon_with(&mut self, default_verdict: &str, rules: &[&str], extra_config: &str) {
-        let rules_dir = self.tmp.join("rules.d");
+        let rules_dir = self.rules_dir();
         for (i, text) in rules.iter().enumerate() {
-            std::fs::write(rules_dir.join(format!("rule{i}.toml")), text).expect("write rule");
+            std::fs::write(self.rule_path(i), text).expect("write rule");
         }
         let config_path = self.tmp.join("config.toml");
         std::fs::write(
@@ -232,6 +260,17 @@ impl TestEnv {
         std::fs::read_to_string(self.tmp.join("hallpassd.log")).unwrap_or_default()
     }
 
+    fn rules_dir(&self) -> PathBuf {
+        self.tmp.join("rules.d")
+    }
+
+    /// Path of the file [`TestEnv::start_daemon`] writes the `i`th rule
+    /// to. Tests that watch a rule file (timed rules delete their own)
+    /// need the same naming the writer uses.
+    fn rule_path(&self, i: usize) -> PathBuf {
+        self.rules_dir().join(format!("rule{i}.toml"))
+    }
+
     /// SIGKILL the daemon, simulating a crash. The nft table stays behind.
     fn kill_daemon_hard(&mut self) {
         if let Some(mut d) = self.daemon.take() {
@@ -252,41 +291,56 @@ impl TestEnv {
 
     /// Start `nc -l` in the srv namespace and wait until the port listens.
     /// Tries the Debian/traditional `-l -p PORT` form first, then the
-    /// OpenBSD `-l PORT` form.
+    /// OpenBSD `-l PORT` form. Listeners accumulate: a test that needs to
+    /// distinguish "blocked" from "connection refused" on several ports
+    /// needs one listening on each.
     fn start_listener(&mut self, port: u16) {
+        // Which form this nc accepts is a property of the host, not of
+        // the port, so probing it once keeps a test that needs four
+        // listeners from paying the discovery timeout four times.
+        static FORM: OnceLock<usize> = OnceLock::new();
         let port_s = port.to_string();
-        let forms: [&[&str]; 2] = [&["nc", "-l", "-p", &port_s], &["nc", "-l", &port_s]];
-        for form in forms {
+        let all: [&[&str]; 2] = [&["nc", "-l", "-p", &port_s], &["nc", "-l", &port_s]];
+        let forms: Vec<(usize, &[&str])> = match FORM.get() {
+            Some(&i) => vec![(i, all[i])],
+            None => all.into_iter().enumerate().collect(),
+        };
+        for (i, form) in forms {
             let mut args = vec!["netns", "exec", self.ns_srv.as_str()];
             args.extend_from_slice(form);
-            let child = Command::new("ip")
+            let mut child = Command::new("ip")
                 .args(&args)
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .spawn()
                 .expect("spawn nc listener");
-            self.listener = Some(child);
             let deadline = Instant::now() + Duration::from_secs(3);
+            let mut bound = false;
             while Instant::now() < deadline {
-                if let Some(child) = self.listener.as_mut() {
-                    if child.try_wait().expect("try_wait").is_some() {
-                        break; // this nc form exited immediately; try next
-                    }
+                if child.try_wait().expect("try_wait").is_some() {
+                    break; // this nc form exited immediately; try next
                 }
                 let ss = ns_run(&self.ns_srv, &["ss", "-ltnH"]);
                 if String::from_utf8_lossy(&ss.stdout).contains(&format!(":{port} ")) {
-                    return;
+                    bound = true;
+                    break;
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }
-            self.stop_listener();
+            if bound {
+                let _ = FORM.set(i);
+                self.listeners.push(child);
+                return;
+            }
+            let _ = child.kill();
+            let _ = child.wait();
         }
         panic!("nc listener never bound port {port}");
     }
 
-    fn stop_listener(&mut self) {
-        if let Some(mut l) = self.listener.take() {
+    fn stop_listeners(&mut self) {
+        for mut l in self.listeners.drain(..) {
             let _ = l.kill();
             let _ = l.wait();
         }
@@ -326,13 +380,15 @@ impl TestEnv {
     }
 
     /// Resolve `name` from the cli namespace against the srv DNS server so
-    /// the daemon snoops the query and the validated reply.
+    /// the daemon snoops the query and the validated reply, then wait for
+    /// the result to reach the domain cache.
     fn resolve(&self, name: &str) {
         let script = self.dns_helper();
         ns_run(
             &self.ns_cli,
             &["python3", &script.to_string_lossy(), "client", SRV_IP, name],
         );
+        std::thread::sleep(DNS_SETTLE);
     }
 
     /// TCP connect from the cli namespace to the srv listener. Returns
@@ -345,11 +401,29 @@ impl TestEnv {
         .status
         .success()
     }
+
+    /// One ICMP echo from the cli namespace. ICMP is neither TCP nor UDP,
+    /// so it is what `unhandled_proto_verdict` decides.
+    fn ping(&self) -> bool {
+        ns_run(&self.ns_cli, &["ping", "-c", "1", "-W", "3", SRV_IP])
+            .status
+            .success()
+    }
+
+    /// Write an auxiliary file (a match list) into the temp dir and
+    /// return its path. Both locations work, since the rule loader only
+    /// reads `.toml`; the temp dir root just keeps the two kinds of file
+    /// visibly apart.
+    fn write_aux(&self, name: &str, contents: &str) -> PathBuf {
+        let path = self.tmp.join(name);
+        std::fs::write(&path, contents).expect("write aux file");
+        path
+    }
 }
 
 impl Drop for TestEnv {
     fn drop(&mut self) {
-        self.stop_listener();
+        self.stop_listeners();
         if let Some(mut d) = self.dns_server.take() {
             let _ = d.kill();
             let _ = d.wait();
@@ -364,17 +438,89 @@ impl Drop for TestEnv {
     }
 }
 
-fn rule(name: &str, action: &str, port: u16) -> String {
-    format!(
-        "name = \"{name}\"\n\
-         action = \"{action}\"\n\
-         duration = \"forever\"\n\
-         priority = 10\n\
-         enabled = true\n\
-         [match]\n\
-         port = {port}\n\
-         proto = \"tcp\"\n"
-    )
+/// Build a rule file body matching `port`, with `extra` filling in
+/// whatever else the test is exercising.
+///
+/// Rules are constructed typed and serialized, never written as a TOML
+/// literal: [`RuleMatch`] does not reject unknown keys, so a misspelled
+/// operand in a hand-written string would silently degrade the rule to a
+/// port-only match. Every "should block" assertion here would still pass
+/// while testing nothing.
+fn rule_with(
+    name: &str,
+    action: Action,
+    port: u16,
+    extra: impl FnOnce(&mut RuleMatch),
+) -> String {
+    let mut matcher = RuleMatch {
+        port: Some(port),
+        ..Default::default()
+    };
+    extra(&mut matcher);
+    rule_toml(&Rule {
+        name: name.to_string(),
+        action,
+        duration: RuleDuration::Forever,
+        priority: 10,
+        enabled: true,
+        matcher,
+    })
+}
+
+fn rule_toml(r: &Rule) -> String {
+    toml::to_string(r).expect("serialize rule to TOML")
+}
+
+/// A plain TCP rule on `port`.
+fn rule(name: &str, action: Action, port: u16) -> String {
+    rule_with(name, action, port, |m| m.proto = Some(Proto::Tcp))
+}
+
+/// SHA-256 of a file as lowercase hex, the form `exe_sha256` expects.
+fn sha256_of(path: &Path) -> String {
+    let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    format!("{:x}", Sha256::digest(&bytes))
+}
+
+/// Fully resolved path of a tool, matching what the daemon reads out of
+/// `/proc/<pid>/exe`. `nc` in particular is usually a symlink chain.
+fn tool_path(tool: &str) -> Option<PathBuf> {
+    let out = run("sh", &["-c", &format!("command -v {tool}")]);
+    if !out.status.success() {
+        return None;
+    }
+    std::fs::canonicalize(String::from_utf8_lossy(&out.stdout).trim()).ok()
+}
+
+/// The timed-rule TOML shape is the one a test cannot eyeball, since
+/// serde renders `RuleDuration::Until` as a nested table that has to land
+/// after the scalar fields to be valid TOML. Unlike the rest of this
+/// file, this needs no root, so it guards the builder on every `cargo
+/// test` run rather than only under sudo.
+#[test]
+fn timed_rule_serializes_to_loadable_toml() {
+    let text = rule_toml(&Rule {
+        name: "timed".to_string(),
+        action: Action::Deny,
+        duration: RuleDuration::Until {
+            deadline_ms: 1_720_000_000_123,
+        },
+        priority: 10,
+        enabled: true,
+        matcher: RuleMatch {
+            port: Some(19014),
+            proto: Some(Proto::Tcp),
+            ..Default::default()
+        },
+    });
+    let back: Rule = toml::from_str(&text).unwrap_or_else(|e| panic!("reparse {text:?}: {e}"));
+    assert_eq!(
+        back.duration,
+        RuleDuration::Until {
+            deadline_ms: 1_720_000_000_123
+        }
+    );
+    assert_eq!(back.matcher.port, Some(19014));
 }
 
 #[test]
@@ -382,7 +528,7 @@ fn rule(name: &str, action: &str, port: u16) -> String {
 fn deny_rule_blocks_connection() {
     let Some(mut env) = TestEnv::setup("deny") else { return };
     env.start_listener(19001);
-    env.start_daemon("allow", &[&rule("e2e-deny", "deny", 19001)]);
+    env.start_daemon("allow", &[&rule("e2e-deny", Action::Deny, 19001)]);
     assert!(
         !env.connect(19001),
         "connection should be blocked by the deny rule; daemon log:\n{}",
@@ -395,7 +541,7 @@ fn deny_rule_blocks_connection() {
 fn allow_rule_permits_connection() {
     let Some(mut env) = TestEnv::setup("allow") else { return };
     env.start_listener(19002);
-    env.start_daemon("deny", &[&rule("e2e-allow", "allow", 19002)]);
+    env.start_daemon("deny", &[&rule("e2e-allow", Action::Allow, 19002)]);
     assert!(
         env.connect(19002),
         "connection should be permitted by the allow rule; daemon log:\n{}",
@@ -565,7 +711,6 @@ fn domain_rule_blocks_after_dns_snoop() {
     // Prime the cache: resolve NAME -> SRV_IP through the daemon's snoop
     // path (query on the verdict queue, validated reply on the input snoop).
     env.resolve(NAME);
-    std::thread::sleep(Duration::from_millis(500));
 
     // Now SRV_IP resolves to the denied domain, so the same destination is
     // blocked by the rule that only matches on domain.
@@ -574,4 +719,352 @@ fn domain_rule_blocks_after_dns_snoop() {
         "the domain rule should block the connection once DNS is snooped; daemon log:\n{}",
         env.daemon_log()
     );
+}
+
+
+/// One expected outcome for a port, so a test that exercises several
+/// operands at once keeps each port's expectation next to its reason.
+struct Case {
+    port: u16,
+    allowed: bool,
+    why: &'static str,
+}
+
+impl TestEnv {
+    /// Start a listener on every case's port. Every case needs one: a
+    /// refused connection fails exactly like a blocked one, so without a
+    /// listener a "should block" assertion passes vacuously.
+    fn start_listeners(&mut self, cases: &[Case]) {
+        for c in cases {
+            self.start_listener(c.port);
+        }
+    }
+
+    fn assert_cases(&self, cases: &[Case]) {
+        for c in cases {
+            assert_eq!(
+                self.connect(c.port),
+                c.allowed,
+                "{}; daemon log:\n{}",
+                c.why,
+                self.daemon_log()
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires root and network namespaces"]
+fn hash_rules_match_only_the_real_binary() {
+    const HIT: u16 = 19008;
+    const MISS: u16 = 19009;
+    const LIST: u16 = 19010;
+    let Some(mut env) = TestEnv::setup("hash") else { return };
+    let Some(nc) = tool_path("nc") else {
+        eprintln!("SKIP e2e hash: cannot resolve the nc binary");
+        return;
+    };
+    let real = sha256_of(&nc);
+    // A hash no real file has, to prove the operand is what matched.
+    let wrong = "0".repeat(64);
+
+    let cases = [
+        Case { port: HIT, allowed: false, why: "exe_sha256 pinned to the real nc hash should block" },
+        Case { port: MISS, allowed: true, why: "exe_sha256 pinned to another hash must not match nc" },
+        Case { port: LIST, allowed: false, why: "hashes_file listing the real nc hash should block" },
+    ];
+    env.start_listeners(&cases);
+    let hashes = env.write_aux("blocked.sha256", &format!("# blocklist\n{real}\n"));
+    env.start_daemon(
+        "allow",
+        &[
+            &rule_with("e2e-hash-hit", Action::Deny, HIT, |m| {
+                m.exe_sha256 = Some(real.clone())
+            }),
+            &rule_with("e2e-hash-miss", Action::Deny, MISS, |m| {
+                m.exe_sha256 = Some(wrong)
+            }),
+            &rule_with("e2e-hash-list", Action::Deny, LIST, |m| {
+                m.hashes_file = Some(hashes)
+            }),
+        ],
+    );
+    env.assert_cases(&cases);
+}
+
+#[test]
+#[ignore = "requires root and network namespaces"]
+fn ips_file_rule_blocks_a_listed_destination() {
+    const LISTED: u16 = 19011;
+    const UNLISTED: u16 = 19012;
+    let Some(mut env) = TestEnv::setup("ipslist") else { return };
+
+    let cases = [
+        Case { port: LISTED, allowed: false, why: "ips_file covering the destination should block" },
+        Case { port: UNLISTED, allowed: true, why: "ips_file not covering the destination must not match" },
+    ];
+    env.start_listeners(&cases);
+
+    // One list covers the server's subnet; the other names a network the
+    // server is not in, so only the first should match.
+    let listed = env.write_aux("bad-ips.list", &format!("# blocklist\n{SUBNET}\n"));
+    let unlisted = env.write_aux("other-ips.list", "10.42.0.0/16\n");
+    env.start_daemon(
+        "allow",
+        &[
+            &rule_with("e2e-ips-hit", Action::Deny, LISTED, |m| {
+                m.ips_file = Some(listed)
+            }),
+            &rule_with("e2e-ips-miss", Action::Deny, UNLISTED, |m| {
+                m.ips_file = Some(unlisted)
+            }),
+        ],
+    );
+    env.assert_cases(&cases);
+}
+
+#[test]
+#[ignore = "requires root and network namespaces"]
+fn domains_file_rule_blocks_after_dns_snoop() {
+    const PORT: u16 = 19013;
+    const NAME: &str = "listed.test";
+    let Some(mut env) = TestEnv::setup("domlist") else { return };
+    if !tool_available("python3", "--version") {
+        eprintln!("SKIP e2e domlist: python3 not found");
+        return;
+    }
+    env.start_listener(PORT);
+    env.start_dns_server();
+
+    // Hosts format: an address followed by the name it blocks.
+    let domains = env.write_aux("blocked.hosts", &format!("# blocklist\n0.0.0.0 {NAME}\n"));
+    env.start_daemon(
+        "allow",
+        &[&rule_with("e2e-domains-file", Action::Deny, PORT, |m| {
+            m.domains_file = Some(domains)
+        })],
+    );
+
+    assert!(
+        env.connect(PORT),
+        "nothing in the domain cache yet, so the rule cannot match; daemon log:\n{}",
+        env.daemon_log()
+    );
+
+    env.resolve(NAME);
+
+    assert!(
+        !env.connect(PORT),
+        "domains_file should block once the name resolves to the destination; daemon log:\n{}",
+        env.daemon_log()
+    );
+}
+
+#[test]
+#[ignore = "requires root and network namespaces"]
+fn timed_rule_stops_applying_after_its_deadline() {
+    const PORT: u16 = 19014;
+    /// Lead time on the deadline. It has to outlast the whole
+    /// effect-detection phase: that polls with `connect`, and a blocked
+    /// probe burns nc's full 3s timeout, so a probe started just inside
+    /// EFFECT_WAIT finishes at EFFECT_WAIT + 3s. Finishing after the
+    /// deadline would see the rule already expired and report a correct
+    /// daemon as broken.
+    const EFFECT_WAIT: Duration = Duration::from_secs(6);
+    const LEAD: Duration = Duration::from_secs(15);
+    let Some(mut env) = TestEnv::setup("timed") else { return };
+    env.start_listener(PORT);
+
+    // Start with no rules, then drop the timed rule in and let the
+    // directory watcher pick it up. Writing it up front would date the
+    // deadline from before daemon startup, which is allowed to take
+    // several seconds and would eat the whole lead on a loaded machine.
+    env.start_daemon("allow", &[]);
+    let deadline = hallpass_types::unix_ms_now() + LEAD.as_millis() as u64;
+    let rule_file = env.rule_path(0);
+    std::fs::write(
+        &rule_file,
+        rule_toml(&Rule {
+            name: "e2e-timed".to_string(),
+            action: Action::Deny,
+            duration: RuleDuration::Until {
+                deadline_ms: deadline,
+            },
+            priority: 10,
+            enabled: true,
+            matcher: RuleMatch {
+                port: Some(PORT),
+                proto: Some(Proto::Tcp),
+                ..Default::default()
+            },
+        }),
+    )
+    .expect("write timed rule");
+    wait_until(EFFECT_WAIT, || !env.connect(PORT)).unwrap_or_else(|| {
+        panic!(
+            "timed rule never took effect; daemon log:\n{}",
+            env.daemon_log()
+        )
+    });
+
+    // Past the deadline the once-a-second sweep drops the rule and
+    // deletes the file it was loaded from.
+    wait_until(LEAD + Duration::from_secs(5), || !rule_file.exists()).unwrap_or_else(|| {
+        panic!(
+            "the sweep should delete the expired rule's file; daemon log:\n{}",
+            env.daemon_log()
+        )
+    });
+    assert!(
+        env.connect(PORT),
+        "an expired timed rule should no longer apply; daemon log:\n{}",
+        env.daemon_log()
+    );
+}
+
+#[test]
+#[ignore = "requires root and network namespaces"]
+fn source_and_interface_operands_match() {
+    const IFACE: u16 = 19015;
+    const SRC: u16 = 19016;
+    const CMDLINE: u16 = 19017;
+    const WRONG_IFACE: u16 = 19018;
+    let Some(mut env) = TestEnv::setup("operands") else { return };
+
+    let cases = [
+        Case { port: IFACE, allowed: false, why: "iface should match the veth the packet leaves by" },
+        Case { port: SRC, allowed: false, why: "src should match the client namespace address" },
+        Case { port: CMDLINE, allowed: false, why: "cmdline_contains should match the port in nc's argv" },
+        Case { port: WRONG_IFACE, allowed: true, why: "iface naming another device must not match" },
+    ];
+    env.start_listeners(&cases);
+
+    env.start_daemon(
+        "allow",
+        &[
+            &rule_with("e2e-iface", Action::Deny, IFACE, |m| {
+                m.iface = Some(DEV_CLI.to_string())
+            }),
+            &rule_with("e2e-src", Action::Deny, SRC, |m| {
+                m.src = Some(CLI_IP.to_string())
+            }),
+            // `nc -z -w 3 10.99.77.2 19017` carries the port in argv.
+            &rule_with("e2e-cmdline", Action::Deny, CMDLINE, |m| {
+                m.cmdline_contains = Some(CMDLINE.to_string())
+            }),
+            &rule_with("e2e-iface-miss", Action::Deny, WRONG_IFACE, |m| {
+                m.iface = Some("nosuchdev".to_string())
+            }),
+        ],
+    );
+    env.assert_cases(&cases);
+}
+
+#[test]
+#[ignore = "requires root and network namespaces"]
+fn unhandled_proto_verdict_denies_icmp() {
+    let Some(mut env) = TestEnv::setup("unhandled-deny") else { return };
+    if !tool_available("ping", "-V") {
+        eprintln!("SKIP e2e unhandled-deny: ping not found");
+        return;
+    }
+    // ICMP is neither TCP nor UDP, so no rule can model it and the
+    // dedicated policy decides. TCP stays at default allow, so a drop
+    // here can only have come from unhandled_proto_verdict.
+    env.start_daemon_with("allow", &[], "unhandled_proto_verdict = \"deny\"\n");
+    assert!(
+        !env.ping(),
+        "unhandled_proto_verdict = deny should drop ICMP; daemon log:\n{}",
+        env.daemon_log()
+    );
+}
+
+#[test]
+#[ignore = "requires root and network namespaces"]
+fn unhandled_proto_verdict_allows_icmp_under_default_deny() {
+    let Some(mut env) = TestEnv::setup("unhandled-allow") else { return };
+    if !tool_available("ping", "-V") {
+        eprintln!("SKIP e2e unhandled-allow: ping not found");
+        return;
+    }
+    // The mirror of the deny case: default_verdict would block this, so
+    // passing proves the policy is what answered.
+    env.start_daemon_with("deny", &[], "unhandled_proto_verdict = \"allow\"\n");
+    assert!(
+        env.ping(),
+        "unhandled_proto_verdict = allow should pass ICMP under default deny; daemon log:\n{}",
+        env.daemon_log()
+    );
+}
+
+#[test]
+#[ignore = "requires root and network namespaces"]
+fn syslog_export_writes_a_record_per_decision() {
+    const PORT: u16 = 19019;
+    let Some(mut env) = TestEnv::setup("syslog") else { return };
+    let Some(nc) = tool_path("nc") else {
+        eprintln!("SKIP e2e syslog: cannot resolve the nc binary");
+        return;
+    };
+    env.start_listener(PORT);
+
+    // Bind the collector before the daemon starts so the export sink has
+    // somewhere to send.
+    let sock_path = env.tmp.join("syslog.sock");
+    let collector = UnixDatagram::bind(&sock_path).expect("bind syslog collector");
+    collector
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .expect("set read timeout");
+
+    env.start_daemon_with(
+        "allow",
+        &[&rule("e2e-syslog", Action::Deny, PORT)],
+        &format!(
+            "[syslog]\n\
+             format = \"json\"\n\
+             [syslog.target]\n\
+             kind = \"local\"\n\
+             path = \"{}\"\n",
+            sock_path.display()
+        ),
+    );
+
+    assert!(!env.connect(PORT), "sanity: the deny rule should block");
+
+    // Match on field-anchored fragments, not bare substrings: the record
+    // carries the process command line too, so a loose `contains("nc")`
+    // or `contains("19019")` would be satisfied by argv even if
+    // attribution and the destination were missing entirely.
+    let dst = format!("\"dst\":\"{SRV_IP}:{PORT}\"");
+    let exe = format!("\"exe\":\"{}\"", nc.display());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut buf = [0u8; 4096];
+    let mut seen = Vec::new();
+    loop {
+        assert!(
+            Instant::now() < deadline,
+            "no syslog record for {dst} arrived; records seen:\n{}\ndaemon log:\n{}",
+            seen.join("\n"),
+            env.daemon_log()
+        );
+        let Ok(n) = collector.recv(&mut buf) else {
+            continue;
+        };
+        let record = String::from_utf8_lossy(&buf[..n]).to_string();
+        if !record.contains(&dst) {
+            seen.push(record);
+            continue;
+        }
+        // A JSON record, not the RFC 5424 rendering the format key would
+        // otherwise select.
+        assert!(
+            record.contains("{\"") && record.contains("\"verdict\":\"deny\""),
+            "expected a JSON record carrying the deny verdict: {record}"
+        );
+        assert!(
+            record.contains(&exe),
+            "expected the attributed binary as an exe field: {record}"
+        );
+        return;
+    }
 }
