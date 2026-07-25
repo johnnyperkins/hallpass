@@ -280,16 +280,19 @@ impl RuleDuration {
 /// Parse a human timespan like `30s`, `5m`, `2h`, or `1d` into seconds.
 /// Shared by the CLI (`--duration 5m`) and interactive prompt replies.
 pub fn parse_timespan_secs(s: &str) -> Option<u64> {
-    let (num, unit) = s.split_at(s.len().checked_sub(1)?);
-    let n: u64 = num.parse().ok()?;
+    // Split off the unit by characters, not bytes: byte-indexed split_at
+    // panics mid-codepoint, and this parses free text typed into the UI.
+    let mut chars = s.chars();
+    let unit = chars.next_back()?;
+    let n: u64 = chars.as_str().parse().ok()?;
     if n == 0 {
         return None;
     }
     let mult = match unit {
-        "s" => 1,
-        "m" => 60,
-        "h" => 3600,
-        "d" => 86_400,
+        's' => 1,
+        'm' => 60,
+        'h' => 3600,
+        'd' => 86_400,
         _ => return None,
     };
     n.checked_mul(mult)
@@ -431,6 +434,11 @@ mod duration_tests {
         assert_eq!(parse_timespan_secs("0s"), None);
         assert_eq!(parse_timespan_secs("10"), None);
         assert_eq!(parse_timespan_secs("s"), None);
+        // Multi-byte final characters must parse as None, not panic:
+        // this function sees free text typed into the UI.
+        assert_eq!(parse_timespan_secs("30\u{5206}"), None);
+        assert_eq!(parse_timespan_secs("5\u{3bc}"), None);
+        assert_eq!(parse_timespan_secs("\u{5206}"), None);
         assert_eq!(parse_timespan_secs(""), None);
         assert_eq!(parse_timespan_secs("-5m"), None);
         assert_eq!(parse_timespan_secs("5w"), None);
