@@ -357,7 +357,7 @@ fn spawn_dns_reader(ring: RingBuf<MapData>, dns: Arc<IpDomainCache>, stop: StopR
         let Some(name) = normalize_domain(raw) else {
             return;
         };
-        tracing::debug!(domain = %name, %ip, "getaddrinfo resolution snooped");
+        tracing::debug!(domain = %name, %ip, "libc resolver snooped a resolution");
         dns.absorb(&SnoopedResponse {
             id: 0,
             query_name: name,

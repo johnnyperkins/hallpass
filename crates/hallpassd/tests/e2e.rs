@@ -83,6 +83,11 @@ fn ns_run(ns: &str, args: &[&str]) -> Output {
     run("ip", &full)
 }
 
+/// Per-namespace `/etc` overlay that `ip netns exec` bind-mounts.
+fn netns_etc(ns: &str) -> PathBuf {
+    PathBuf::from("/etc/netns").join(ns)
+}
+
 /// Poll `cond` until it holds or `limit` passes. Returns `None` on
 /// timeout, so callers can report the daemon log at the failing point.
 fn wait_until(limit: Duration, mut cond: impl FnMut() -> bool) -> Option<()> {
@@ -419,6 +424,18 @@ impl TestEnv {
             .success()
     }
 
+    /// Point the client namespace's resolver at the test DNS server.
+    ///
+    /// `ip netns exec` bind-mounts `/etc/netns/<ns>/resolv.conf` over
+    /// `/etc/resolv.conf`, which is the only way to make libc's resolver
+    /// (and therefore the uprobes) query a server inside the namespace.
+    fn set_resolv_conf(&self, nameserver: &str) {
+        let dir = netns_etc(&self.ns_cli);
+        std::fs::create_dir_all(&dir).expect("create /etc/netns dir");
+        std::fs::write(dir.join("resolv.conf"), format!("nameserver {nameserver}\n"))
+            .expect("write resolv.conf");
+    }
+
     /// Write an auxiliary file (a match list) into the temp dir and
     /// return its path. Both locations work, since the rule loader only
     /// reads `.toml`; the temp dir root just keeps the two kinds of file
@@ -444,6 +461,9 @@ impl Drop for TestEnv {
         let _ = run("ip", &["netns", "del", &self.ns_cli]);
         let _ = run("ip", &["netns", "del", &self.ns_srv]);
         let _ = std::fs::remove_dir_all(&self.tmp);
+        // Written outside the namespace, so namespace teardown does not
+        // reclaim it.
+        let _ = std::fs::remove_dir_all(netns_etc(&self.ns_cli));
     }
 }
 
@@ -1089,4 +1109,78 @@ fn syslog_export_writes_a_record_per_decision() {
         );
         return;
     }
+}
+
+#[test]
+#[ignore = "requires root and network namespaces"]
+fn libc_resolver_uprobes_feed_the_domain_cache() {
+    const PORT: u16 = 19020;
+    const NAME: &str = "uprobed.test";
+    if !cfg!(feature = "ebpf") {
+        eprintln!("SKIP e2e uprobe: built without the ebpf feature");
+        return;
+    }
+    let Some(mut env) = TestEnv::setup("uprobe") else { return };
+    for tool in [("python3", "--version"), ("getent", "--version")] {
+        if !tool_available(tool.0, tool.1) {
+            eprintln!("SKIP e2e uprobe: {} not found", tool.0);
+            return;
+        }
+    }
+    env.start_listener(PORT);
+    env.start_dns_server();
+    // libc resolves through whatever /etc/resolv.conf names, so the
+    // namespace needs its own pointing at the test server.
+    env.set_resolv_conf(SRV_IP);
+
+    env.start_daemon(
+        "allow",
+        &[&rule_with("e2e-uprobe", Action::Deny, PORT, |m| {
+            m.domain = Some(NAME.to_string())
+        })],
+    );
+    // Without eBPF attribution (no BTF, no bpf-linker at build time, a
+    // kernel that refuses the programs) there are no uprobes to test.
+    if wait_until(Duration::from_secs(5), || {
+        env.daemon_log().contains("libc DNS snoop active")
+    })
+    .is_none()
+    {
+        eprintln!(
+            "SKIP e2e uprobe: libc DNS snoop never came up; daemon log:\n{}",
+            env.daemon_log()
+        );
+        return;
+    }
+
+    assert!(
+        env.connect(PORT),
+        "nothing resolved yet, so the domain rule cannot match; daemon log:\n{}",
+        env.daemon_log()
+    );
+
+    // `getent ahosts` goes through getaddrinfo; `getent hosts` calls a
+    // different entry point, so it would exercise nothing here.
+    let out = ns_run(&env.ns_cli, &["getent", "ahosts", NAME]);
+    assert_ok(&out, "getent ahosts");
+
+    // The wire snooper sees this query too (plaintext UDP 53), so a
+    // blocked connection alone would not show which path recorded it.
+    // This log line is emitted only by the uprobe ring reader.
+    wait_until(Duration::from_secs(5), || {
+        let log = env.daemon_log();
+        log.contains("libc resolver snooped a resolution") && log.contains(NAME)
+    })
+    .unwrap_or_else(|| {
+        panic!(
+            "the uprobe path never reported resolving {NAME}; daemon log:\n{}",
+            env.daemon_log()
+        )
+    });
+
+    assert!(
+        !env.connect(PORT),
+        "the domain rule should block once the resolution is cached; daemon log:\n{}",
+        env.daemon_log()
+    );
 }
