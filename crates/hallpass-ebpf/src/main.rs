@@ -100,6 +100,12 @@ struct DnsScratch {
     name: [u8; DNS_NAME_CAP],
 }
 
+/// Same as [`DNS_SCRATCH`], for the gethostbyname probes. A separate map
+/// so a nested call on one thread cannot make one probe pair consume the
+/// other's captured name.
+#[map]
+static HOST_SCRATCH: LruHashMap<u64, DnsScratch> = LruHashMap::with_max_entries(512, 0);
+
 /// Resolved (name, address) pairs for the userspace domain cache.
 #[map]
 static DNS_EVENTS: RingBuf = RingBuf::with_byte_size(128 * 1024, 0);
@@ -260,8 +266,14 @@ const AI_FAMILY: usize = 4; // int
 const AI_ADDR: usize = 24; // struct sockaddr *
 const AI_NEXT: usize = 40; // struct addrinfo *
 
-/// Result-list entries walked per getaddrinfo call. Bounded for the
-/// verifier; real resolutions rarely exceed a handful of addresses.
+// struct hostent field offsets, 64-bit: two pointers, two ints, one
+// pointer.
+const H_ADDRTYPE: usize = 16; // int
+const H_LENGTH: usize = 20; // int
+const H_ADDR_LIST: usize = 24; // char **, NULL-terminated
+
+/// Result-list entries walked per resolution. Bounded for the verifier;
+/// real resolutions rarely exceed a handful of addresses.
 const MAX_ADDRS: usize = 10;
 
 #[inline(always)]
@@ -269,60 +281,96 @@ unsafe fn read_user<T>(base: u64, off: usize) -> Result<T, ()> {
     bpf_probe_read_user((base as usize + off) as *const T).map_err(|_| ())
 }
 
+/// Capture the queried name at call entry into `scratch_map`.
+///
+/// Always at entry, never at return: a resolver call blocks for the
+/// lookup, and another thread could rewrite the caller's buffer in the
+/// meantime, which would bind a real address to a forged name and poison
+/// the domain cache. `extra` rides along for whatever the return probe
+/// needs (the getaddrinfo out-parameter; unused for gethostbyname).
+#[inline(always)]
+fn capture_name(
+    scratch_map: &LruHashMap<u64, DnsScratch>,
+    node: *const u8,
+    extra: u64,
+) -> u32 {
+    if node.is_null() {
+        return 0;
+    }
+    // Assembled in per-CPU scratch to stay off the 512-byte BPF stack.
+    let Some(scratch) = DNS_SCRATCH_BUF.get_ptr_mut(0) else {
+        return 0;
+    };
+    let scratch = unsafe { &mut *scratch };
+    scratch.res = extra;
+    scratch.name_len = 0;
+    match unsafe { bpf_probe_read_user_str_bytes(node, &mut scratch.name) } {
+        Ok(s) if !s.is_empty() => scratch.name_len = s.len() as u32,
+        _ => return 0,
+    }
+    let _ = scratch_map.insert(bpf_get_current_pid_tgid(), &*scratch, 0);
+    0
+}
+
+/// Take the captured name for this thread and stage it in the per-CPU
+/// event buffer, ready for one event per resolved address.
+#[inline(always)]
+fn take_captured_name(scratch_map: &LruHashMap<u64, DnsScratch>) -> Option<(&'static mut DnsEvent, u64)> {
+    let id = bpf_get_current_pid_tgid();
+    let scratch = unsafe { scratch_map.get(id) }?;
+    let ev = DNS_EVENT_BUF.get_ptr_mut(0)?;
+    let ev = unsafe { &mut *ev };
+    ev.name_len = scratch.name_len;
+    ev.name = scratch.name;
+    ev._pad = [0u8; 3];
+    let extra = scratch.res;
+    let _ = scratch_map.remove(id);
+    Some((ev, extra))
+}
+
+/// Read `len` address bytes from `addr` and emit one event.
+#[inline(always)]
+fn emit_addr(ev: &mut DnsEvent, family: u8, addr: u64) {
+    let ok = unsafe {
+        match family {
+            AF_INET => read_user::<[u8; 4]>(addr, 0).map(|a| {
+                ev.addr = [0u8; 16];
+                ev.addr[..4].copy_from_slice(&a);
+            }),
+            AF_INET6 => read_user::<[u8; 16]>(addr, 0).map(|a| ev.addr = a),
+            _ => Err(()),
+        }
+    };
+    if ok.is_ok() {
+        ev.family = family;
+        let _ = DNS_EVENTS.output::<DnsEvent>(&*ev, 0);
+    }
+}
+
 // Attached to glibc/musl getaddrinfo: int getaddrinfo(node, service,
-// hints, struct addrinfo **res). The addrinfo offsets below are the
-// 64-bit glibc/musl layout; a 32-bit process would need different
-// offsets, so misreads there just drop events (reads are fault-safe).
+// hints, struct addrinfo **res). The struct offsets used here are the
+// 64-bit glibc/musl layout; a 32-bit process would need different ones,
+// so misreads there just drop events (reads are fault-safe).
 #[uprobe]
 pub fn getaddrinfo_enter(ctx: ProbeContext) -> u32 {
     let (Some(node), Some(res)): (Option<*const u8>, Option<*const u8>) = (ctx.arg(0), ctx.arg(3))
     else {
         return 0;
     };
-    if node.is_null() || res.is_null() {
+    if res.is_null() {
         return 0;
     }
-    // Capture the name NOW: getaddrinfo blocks for the resolution, during
-    // which another thread could rewrite the buffer, so reading it at
-    // return could bind a real address to a forged name and poison the
-    // domain cache. Reading it here pins it to this call. The value is
-    // assembled in per-CPU scratch to stay off the BPF stack.
-    let Some(scratch) = DNS_SCRATCH_BUF.get_ptr_mut(0) else {
-        return 0;
-    };
-    let scratch = unsafe { &mut *scratch };
-    scratch.res = res as u64;
-    scratch.name_len = 0;
-    match unsafe { bpf_probe_read_user_str_bytes(node as *const u8, &mut scratch.name) } {
-        Ok(s) if !s.is_empty() => scratch.name_len = s.len() as u32,
-        _ => return 0,
-    }
-    let _ = DNS_SCRATCH.insert(bpf_get_current_pid_tgid(), &*scratch, 0);
-    0
+    capture_name(&DNS_SCRATCH, node, res as u64)
 }
 
 #[uretprobe]
 pub fn getaddrinfo_ret(ctx: RetProbeContext) -> u32 {
-    let id = bpf_get_current_pid_tgid();
-    let (Some(scratch), Some(ev)) = (
-        unsafe { DNS_SCRATCH.get(id) },
-        DNS_EVENT_BUF.get_ptr_mut(0),
-    ) else {
+    let Some((ev, res)) = take_captured_name(&DNS_SCRATCH) else {
         return 0;
     };
-    let ev = unsafe { &mut *ev };
-    let res = scratch.res;
-    let failed = ctx.ret::<i32>() != 0;
-    if !failed {
-        ev.name_len = scratch.name_len;
-        ev.name = scratch.name;
-        ev._pad = [0u8; 3];
-    }
-    let _ = DNS_SCRATCH.remove(id);
-    if failed {
+    if ctx.ret::<i32>() != 0 {
         return 0; // resolution failed; nothing to record
     }
-
     // Walk the result list, one event per address.
     let mut ai: u64 = match unsafe { read_user(res, 0) } {
         Ok(p) => p,
@@ -341,36 +389,77 @@ pub fn getaddrinfo_ret(ctx: RetProbeContext) -> u32 {
             Err(()) => return 0,
         };
         if sa != 0 {
-            let emitted = unsafe {
-                match family as u8 {
-                    AF_INET => match read_user::<[u8; 4]>(sa, SIN_ADDR) {
-                        Ok(a) => {
-                            ev.addr = [0u8; 16];
-                            ev.addr[..4].copy_from_slice(&a);
-                            ev.family = AF_INET;
-                            true
-                        }
-                        Err(()) => false,
-                    },
-                    AF_INET6 => match read_user::<[u8; 16]>(sa, SIN6_ADDR) {
-                        Ok(a) => {
-                            ev.addr = a;
-                            ev.family = AF_INET6;
-                            true
-                        }
-                        Err(()) => false,
-                    },
-                    _ => false,
-                }
+            // sockaddr_in/sockaddr_in6 keep the address past the family
+            // and port fields.
+            let off = match family as u8 {
+                AF_INET => SIN_ADDR,
+                AF_INET6 => SIN6_ADDR,
+                _ => usize::MAX,
             };
-            if emitted {
-                let _ = DNS_EVENTS.output::<DnsEvent>(&*ev, 0);
+            if off != usize::MAX {
+                emit_addr(ev, family as u8, sa + off as u64);
             }
         }
         ai = match unsafe { read_user(ai, AI_NEXT) } {
             Ok(p) => p,
             Err(()) => return 0,
         };
+    }
+    0
+}
+
+// Attached to glibc gethostbyname and gethostbyname2, whose first
+// argument is the name in both. Legacy but still used by IPv4-only and
+// older programs (`getent hosts` among them), which would otherwise
+// resolve invisibly to the uprobe path.
+#[uprobe]
+pub fn gethostbyname_enter(ctx: ProbeContext) -> u32 {
+    let Some(node): Option<*const u8> = ctx.arg(0) else {
+        return 0;
+    };
+    capture_name(&HOST_SCRATCH, node, 0)
+}
+
+#[uretprobe]
+pub fn gethostbyname_ret(ctx: RetProbeContext) -> u32 {
+    let Some((ev, _)) = take_captured_name(&HOST_SCRATCH) else {
+        return 0;
+    };
+    // Returns `struct hostent *`, NULL on failure.
+    let hostent = ctx.ret::<u64>();
+    if hostent == 0 {
+        return 0;
+    }
+    let (family, len, list): (i32, i32, u64) = unsafe {
+        match (
+            read_user(hostent, H_ADDRTYPE),
+            read_user(hostent, H_LENGTH),
+            read_user(hostent, H_ADDR_LIST),
+        ) {
+            (Ok(f), Ok(l), Ok(p)) => (f, l, p),
+            _ => return 0,
+        }
+    };
+    // h_addr_list is a NULL-terminated array of pointers to addresses of
+    // h_length bytes each; reject a length that disagrees with the family
+    // rather than reading the wrong number of bytes.
+    let expected = match family as u8 {
+        AF_INET => 4,
+        AF_INET6 => 16,
+        _ => return 0,
+    };
+    if len != expected || list == 0 {
+        return 0;
+    }
+    for i in 0..MAX_ADDRS {
+        let addr: u64 = match unsafe { read_user(list, i * 8) } {
+            Ok(p) => p,
+            Err(()) => return 0,
+        };
+        if addr == 0 {
+            break;
+        }
+        emit_addr(ev, family as u8, addr);
     }
     0
 }

@@ -57,7 +57,7 @@ impl EbpfAttributor {
     /// Load and attach the eBPF programs. Returns None (with a warning)
     /// on any failure so the caller falls back to procfs attribution.
     /// `dns_cache`, when given, is fed resolved (name, address) pairs
-    /// snooped from getaddrinfo via uprobes.
+    /// snooped from the libc resolver entry points via uprobes.
     ///
     /// Must be called from within a tokio runtime: the ring-buffer
     /// readers are spawned tasks driven by epoll readiness.
@@ -109,11 +109,11 @@ impl EbpfAttributor {
         let (stop, stop_rx) = watch::channel(false);
         spawn_event_reader(ring, Arc::clone(&cache), stop_rx.clone());
 
-        // getaddrinfo DNS snooping is best-effort on top of attribution:
-        // statically linked or non-libc programs never hit the uprobe, and
-        // the wire snooper still covers plaintext UDP 53.
+        // libc DNS snooping is best-effort on top of attribution:
+        // statically linked or non-libc programs never hit the uprobes,
+        // and the wire snooper still covers plaintext UDP 53.
         if let Some(dns) = dns_cache {
-            match attach_getaddrinfo(&mut ebpf) {
+            match attach_dns_uprobes(&mut ebpf) {
                 Ok(()) => {
                     let dns_ring = RingBuf::try_from(
                         ebpf.take_map("DNS_EVENTS")
@@ -121,10 +121,10 @@ impl EbpfAttributor {
                     )
                     .map_err(|e| format!("DNS_EVENTS: {e}"))?;
                     spawn_dns_reader(dns_ring, dns, stop_rx);
-                    tracing::info!("getaddrinfo DNS snoop active");
+                    tracing::info!("libc DNS snoop active (getaddrinfo, gethostbyname)");
                 }
                 Err(e) => {
-                    tracing::warn!("getaddrinfo DNS snoop unavailable: {e}");
+                    tracing::warn!("libc DNS snoop unavailable: {e}");
                 }
             }
         }
@@ -247,18 +247,53 @@ fn attach_kprobe(ebpf: &mut Ebpf, prog: &str, fns: &[&str]) -> Result<(), String
     Ok(())
 }
 
-/// Attach the getaddrinfo entry/return uprobes to the system libc, for
-/// every process.
-fn attach_getaddrinfo(ebpf: &mut Ebpf) -> Result<(), String> {
-    for prog in ["getaddrinfo_enter", "getaddrinfo_ret"] {
+/// Attach the DNS-snooping uprobes to the system libc, for every process.
+///
+/// `getaddrinfo` is the modern path and is required; the `gethostbyname`
+/// family is best effort, since not every libc exports both spellings and
+/// losing the legacy path is better than losing DNS snooping entirely.
+fn attach_dns_uprobes(ebpf: &mut Ebpf) -> Result<(), String> {
+    attach_uprobe_pair(
+        ebpf,
+        ["getaddrinfo_enter", "getaddrinfo_ret"],
+        &["getaddrinfo"],
+    )?;
+    if let Err(e) = attach_uprobe_pair(
+        ebpf,
+        ["gethostbyname_enter", "gethostbyname_ret"],
+        &["gethostbyname", "gethostbyname2"],
+    ) {
+        tracing::warn!("legacy gethostbyname snoop unavailable: {e}");
+    }
+    Ok(())
+}
+
+/// Load an entry/return program pair and attach both to every symbol in
+/// `symbols`. Symbols missing from this libc are skipped; the pair fails
+/// only when none of them resolved.
+fn attach_uprobe_pair(
+    ebpf: &mut Ebpf,
+    progs: [&str; 2],
+    symbols: &[&str],
+) -> Result<(), String> {
+    for prog in progs {
         let p: &mut UProbe = ebpf
             .program_mut(prog)
             .ok_or_else(|| format!("program {prog} missing"))?
             .try_into()
             .map_err(|e| format!("{prog}: {e}"))?;
         p.load().map_err(|e| format!("load {prog}: {e}"))?;
-        p.attach("getaddrinfo", "libc", UProbeScope::AllProcesses)
-            .map_err(|e| format!("attach {prog}: {e}"))?;
+        let mut last_err = None;
+        let mut attached = 0;
+        for symbol in symbols {
+            match p.attach(*symbol, "libc", UProbeScope::AllProcesses) {
+                Ok(_) => attached += 1,
+                Err(e) => last_err = Some(format!("{prog} -> {symbol}: {e}")),
+            }
+        }
+        if attached == 0 {
+            return Err(last_err.unwrap_or_else(|| format!("{prog}: no symbols given")));
+        }
     }
     Ok(())
 }

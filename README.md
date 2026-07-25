@@ -47,7 +47,7 @@ persisted as a rule.
 | `hallpass-cli`         | Command line client: status, rule management, event stream, interactive watch |
 | `hallpass-ui`          | egui desktop app: prompt popups and a management window                 |
 | `hallpass-types`       | Shared types and the length-prefixed postcard wire protocol             |
-| `hallpass-ebpf`        | Kernel-side eBPF programs (kprobes on `tcp_v4_connect` etc., exec/exit tracepoints, `getaddrinfo` uprobes); built separately, not a workspace member |
+| `hallpass-ebpf`        | Kernel-side eBPF programs (kprobes on `tcp_v4_connect` etc., exec/exit tracepoints, libc resolver uprobes); built separately, not a workspace member |
 | `hallpass-ebpf-common` | `no_std` types shared between kernel and userspace                      |
 | `xtask`                | Build tasks (`cargo xtask build-ebpf`)                                  |
 
@@ -245,7 +245,8 @@ attacker with root, who can delete the nftables table outright.
 
 - **DoT / DoH are invisible to the wire snooper**: it only sees names
   resolved through plaintext UDP port 53. With the `ebpf` feature the
-  daemon also snoops `getaddrinfo` via uprobes on libc, which catches
+  daemon also snoops the libc resolver entry points (`getaddrinfo`,
+  `gethostbyname`, `gethostbyname2`) via uprobes, which catches
   resolutions through systemd-resolved's stub and encrypted upstreams as
   long as the process uses the system resolver. Statically linked
   programs, non-libc runtimes, and apps doing their own DoH still match
