@@ -54,6 +54,9 @@ impl AttributionChain {
     /// loadable on this system, then procfs. `dns_cache` receives
     /// getaddrinfo-snooped resolutions when the eBPF DNS uprobes attach
     /// (unused otherwise).
+    ///
+    /// With the `ebpf` feature this must be called from within a tokio
+    /// runtime; see [`ebpf::EbpfAttributor::new`].
     #[cfg_attr(not(feature = "ebpf"), allow(unused_variables))]
     pub fn default_chain(dns_cache: Option<Arc<crate::dns::IpDomainCache>>) -> Arc<Self> {
         let procfs: Box<dyn Attributor> = Box::new(procfs::ProcfsAttributor);

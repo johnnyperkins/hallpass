@@ -12,15 +12,16 @@
 use std::net::IpAddr;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use aya::maps::{HashMap as FlowMap, MapData, RingBuf};
 use aya::programs::uprobe::UProbeScope;
 use aya::programs::{KProbe, TracePoint, UProbe};
 use aya::{Ebpf, EbpfLoader};
 use lru::LruCache;
+use tokio::io::unix::AsyncFd;
+use tokio::io::Interest;
+use tokio::sync::watch;
 use hallpass_ebpf_common::{DnsEvent, ExecEvent, FlowKey, FlowVal, EVENT_EXEC, PROTO_TCP, PROTO_UDP};
 use hallpass_types::{FlowTuple, Proto};
 
@@ -47,7 +48,9 @@ pub struct EbpfAttributor {
     _ebpf: Ebpf,
     sock_map: FlowMap<MapData, FlowKey, FlowVal>,
     cache: ProcCache,
-    stop: Arc<AtomicBool>,
+    /// Stop signal for the ring-buffer readers; the [`Drop`] impl sends on
+    /// it, and dropping it alone would also wake them.
+    stop: watch::Sender<bool>,
 }
 
 impl EbpfAttributor {
@@ -55,6 +58,9 @@ impl EbpfAttributor {
     /// on any failure so the caller falls back to procfs attribution.
     /// `dns_cache`, when given, is fed resolved (name, address) pairs
     /// snooped from getaddrinfo via uprobes.
+    ///
+    /// Must be called from within a tokio runtime: the ring-buffer
+    /// readers are spawned tasks driven by epoll readiness.
     pub fn new(dns_cache: Option<Arc<IpDomainCache>>) -> Option<EbpfAttributor> {
         match Self::load(dns_cache) {
             Ok(a) => {
@@ -100,8 +106,8 @@ impl EbpfAttributor {
         let cache: ProcCache = Arc::new(Mutex::new(LruCache::new(
             NonZeroUsize::new(PID_CACHE_CAP).expect("nonzero capacity"),
         )));
-        let stop = Arc::new(AtomicBool::new(false));
-        spawn_event_reader(ring, Arc::clone(&cache), Arc::clone(&stop));
+        let (stop, stop_rx) = watch::channel(false);
+        spawn_event_reader(ring, Arc::clone(&cache), stop_rx.clone());
 
         // getaddrinfo DNS snooping is best-effort on top of attribution:
         // statically linked or non-libc programs never hit the uprobe, and
@@ -114,7 +120,7 @@ impl EbpfAttributor {
                             .ok_or("DNS_EVENTS missing from object")?,
                     )
                     .map_err(|e| format!("DNS_EVENTS: {e}"))?;
-                    spawn_dns_reader(dns_ring, dns, Arc::clone(&stop));
+                    spawn_dns_reader(dns_ring, dns, stop_rx);
                     tracing::info!("getaddrinfo DNS snoop active");
                 }
                 Err(e) => {
@@ -144,7 +150,7 @@ impl EbpfAttributor {
 
 impl Drop for EbpfAttributor {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
+        let _ = self.stop.send(true);
     }
 }
 
@@ -285,29 +291,21 @@ const UPROBE_DNS_TTL_SECS: u32 = 120;
 /// convenience over IP/exe rules, not a boundary against a local process
 /// that is choosing its own DNS - which is why this feeds the same cache
 /// the wire path does rather than a privileged one.
-fn spawn_dns_reader(mut ring: RingBuf<MapData>, dns: Arc<IpDomainCache>, stop: Arc<AtomicBool>) {
-    std::thread::Builder::new()
-        .name("ebpf-dns".into())
-        .spawn(move || {
-            while !stop.load(Ordering::Relaxed) {
-                while let Some(item) = ring.next() {
-                    let Some((ip, raw)) = DnsEvent::parse(&item) else {
-                        continue;
-                    };
-                    let Some(name) = normalize_domain(raw) else {
-                        continue;
-                    };
-                    tracing::debug!(domain = %name, %ip, "getaddrinfo resolution snooped");
-                    dns.absorb(&SnoopedResponse {
-                        id: 0,
-                        query_name: name,
-                        addrs: vec![(ip, UPROBE_DNS_TTL_SECS)],
-                    });
-                }
-                std::thread::sleep(Duration::from_millis(50));
-            }
-        })
-        .expect("spawn ebpf-dns thread");
+fn spawn_dns_reader(ring: RingBuf<MapData>, dns: Arc<IpDomainCache>, stop: StopRx) {
+    spawn_ring_reader("ebpf-dns", ring, stop, move |item| {
+        let Some((ip, raw)) = DnsEvent::parse(item) else {
+            return;
+        };
+        let Some(name) = normalize_domain(raw) else {
+            return;
+        };
+        tracing::debug!(domain = %name, %ip, "getaddrinfo resolution snooped");
+        dns.absorb(&SnoopedResponse {
+            id: 0,
+            query_name: name,
+            addrs: vec![(ip, UPROBE_DNS_TTL_SECS)],
+        });
+    });
 }
 
 /// Lowercase, strip a trailing dot, and reject a name with control or
@@ -327,31 +325,100 @@ fn normalize_domain(raw: &str) -> Option<String> {
 
 /// Drain exec/exit events into the pid cache. Exec events snapshot
 /// /proc/pid/{exe,cmdline} while the process is fresh; exit events evict.
-fn spawn_event_reader(mut ring: RingBuf<MapData>, cache: ProcCache, stop: Arc<AtomicBool>) {
-    std::thread::Builder::new()
-        .name("ebpf-events".into())
-        .spawn(move || {
-            while !stop.load(Ordering::Relaxed) {
-                while let Some(item) = ring.next() {
-                    let Some(ev) = ExecEvent::from_bytes(&item) else {
-                        continue;
-                    };
-                    if ev.kind == EVENT_EXEC {
-                        let d = procfs::proc_snapshot(Path::new("/proc"), ev.pid);
-                        cache.lock().unwrap().put(ev.pid, d);
-                    } else {
-                        cache.lock().unwrap().pop(&ev.pid);
+fn spawn_event_reader(ring: RingBuf<MapData>, cache: ProcCache, stop: StopRx) {
+    spawn_ring_reader("ebpf-events", ring, stop, move |item| {
+        let Some(ev) = ExecEvent::from_bytes(item) else {
+            return;
+        };
+        if ev.kind == EVENT_EXEC {
+            let d = procfs::proc_snapshot(Path::new("/proc"), ev.pid);
+            cache.lock().unwrap().put(ev.pid, d);
+        } else {
+            cache.lock().unwrap().pop(&ev.pid);
+        }
+    });
+}
+
+/// Shutdown signal for the ring-buffer readers. A watch channel rather
+/// than a polled flag so a reader parked on the ring buffer wakes
+/// immediately when the attributor is dropped.
+type StopRx = watch::Receiver<bool>;
+
+/// Drain `ring` into `handle`, driven by epoll readiness on the ring
+/// buffer's fd.
+///
+/// Polling on a timer would delay every event by up to the poll interval,
+/// which matters: a domain learned from the DNS ring buffer is only
+/// useful if it lands before the connection that follows the resolution
+/// is decided, and an exec snapshot is only fresh if it beats the process
+/// to its first connect.
+///
+/// `handle` runs on a runtime worker rather than a dedicated thread, so
+/// it must stay short. Both callers qualify: they do a handful of reads
+/// from /proc (kernel-generated, no disk) and take an uncontended mutex.
+/// Anything heavier belongs on a blocking task.
+fn spawn_ring_reader(
+    name: &'static str,
+    ring: RingBuf<MapData>,
+    mut stop: StopRx,
+    mut handle: impl FnMut(&[u8]) + Send + 'static,
+) {
+    let mut ring = match AsyncFd::with_interest(ring, Interest::READABLE) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(reader = name, "cannot watch ring buffer: {e}");
+            return;
+        }
+    };
+    tokio::spawn(async move {
+        loop {
+            let mut guard = tokio::select! {
+                _ = stop.changed() => return,
+                readable = ring.readable_mut() => match readable {
+                    Ok(g) => g,
+                    Err(e) => {
+                        tracing::error!(reader = name, "ring buffer readiness failed: {e}");
+                        return;
                     }
-                }
-                std::thread::sleep(Duration::from_millis(50));
+                },
+            };
+            // Drain fully before clearing readiness: the kernel only
+            // re-arms the notification once the buffer is emptied.
+            let inner = guard.get_inner_mut();
+            while let Some(item) = inner.next() {
+                handle(&item);
             }
-        })
-        .expect("spawn ebpf-events thread");
+            guard.clear_ready();
+        }
+    });
 }
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_domain;
+    use super::*;
+
+    /// The readers select on `stop.changed()`. If a fresh (or cloned)
+    /// receiver reported a change straight away they would exit at
+    /// startup, leaving attribution and DNS snooping silently dead, so
+    /// pin the semantics rather than assuming them.
+    #[tokio::test]
+    async fn stop_signal_fires_only_on_shutdown() {
+        let (stop, rx) = watch::channel(false);
+        let mut readers = [rx.clone(), rx];
+        for r in &mut readers {
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(50), r.changed())
+                    .await
+                    .is_err(),
+                "receiver reported a change before shutdown"
+            );
+        }
+        // Both the explicit signal and a dropped sender must wake them.
+        stop.send(true).unwrap();
+        assert!(readers[0].changed().await.is_ok());
+        drop(stop);
+        assert!(readers[1].changed().await.is_ok());
+    }
 
     #[test]
     fn domain_normalization() {
