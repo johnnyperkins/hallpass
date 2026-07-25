@@ -187,13 +187,16 @@ impl PromptTable {
             .ok_or_else(|| format!("unknown or expired prompt id {id}"))?;
 
         let mut rule_name = None;
+        let mut added_rule = None;
         if duration != RuleDuration::Once {
             match rule_from_reply(id, &pending.conn, verdict, duration, scope) {
                 Some(rule) => {
                     rule_name = Some(rule.name.clone());
-                    if let Err(e) = self.store.add(rule) {
+                    if let Err(e) = self.store.add(rule.clone()) {
                         tracing::warn!("failed to add rule from prompt reply: {e}");
                         rule_name = None;
+                    } else {
+                        added_rule = Some(rule);
                     }
                 }
                 None => {
@@ -205,7 +208,63 @@ impl PromptTable {
             }
         }
         self.finish(pending.conn, pending.packets, verdict, rule_name);
+        // The new rule may cover other prompts already on screen: the
+        // same app talking to its other endpoints. Resolve those now
+        // rather than leaving a stack of popups whose answer is already
+        // decided (and whose eventual timeout would apply the default
+        // verdict, possibly the opposite one).
+        if let Some(rule) = added_rule {
+            self.resolve_covered_by(&rule);
+        }
         Ok(())
+    }
+
+    /// Resolve every pending prompt whose connection `rule` now matches,
+    /// with the rule's own action. The handler is told each prompt is
+    /// gone via `PromptExpired`, the same message it already handles for
+    /// timeouts, so open popups close without a new message kind.
+    fn resolve_covered_by(&self, rule: &Rule) {
+        let compiled = match crate::rules::model::CompiledRule::compile(rule) {
+            Ok(c) => c,
+            Err(e) => {
+                // The store accepted the rule, so this cannot happen; if
+                // it somehow does, the uncovered prompts just stay open.
+                tracing::warn!("cannot compile prompt rule for sweeping: {e}");
+                return;
+            }
+        };
+        let verdict = Verdict::from(rule.action);
+        let mut inner = self.inner.lock().unwrap();
+        // Prompt rules never carry a hash criterion, so no hash is
+        // computed for the match.
+        let covered: Vec<u64> = inner
+            .by_id
+            .iter()
+            .filter(|(_, p)| compiled.matches(&p.conn, None))
+            .map(|(&id, _)| id)
+            .collect();
+        let mut resolved = Vec::new();
+        for id in covered {
+            if let Some(pending) = inner.by_id.remove(&id) {
+                inner.by_key.remove(&pending.key);
+                resolved.push((id, pending));
+            }
+        }
+        let handler = inner.handler.clone();
+        drop(inner);
+
+        for (id, pending) in resolved {
+            tracing::info!(id, rule = %rule.name, "prompt covered by new rule");
+            self.finish(
+                pending.conn,
+                pending.packets,
+                verdict,
+                Some(rule.name.clone()),
+            );
+            if let Some(h) = &handler {
+                let _ = h.try_send(DaemonMsg::PromptExpired { id });
+            }
+        }
     }
 
     /// Timeout path: apply the default verdict and notify the handler.
@@ -389,6 +448,84 @@ mod tests {
             .unwrap();
         assert_eq!(h.verdict_rx.recv().await, Some((1, Verdict::Allow)));
         assert!(h.store.list().is_empty(), "Once creates no rule for UDP either");
+    }
+
+    /// An app-wide (or host-wide) answer resolves the other prompts the
+    /// same app already has open, with the same verdict; unrelated apps'
+    /// prompts stay.
+    #[tokio::test]
+    async fn broad_reply_resolves_other_prompts_it_covers() {
+        let mut h = harness("sweep", 8, Verdict::Deny);
+        let (tx, mut prompt_rx) = mpsc::channel(16);
+        assert!(h.table.set_handler(tx));
+
+        // One app, three endpoints; another app, one endpoint.
+        h.table.handle_new(conn("/usr/bin/chrome", "1.1.1.1:443"), 1);
+        h.table.handle_new(conn("/usr/bin/chrome", "2.2.2.2:443"), 2);
+        h.table.handle_new(conn("/usr/bin/chrome", "3.3.3.3:80"), 3);
+        h.table.handle_new(conn("/bin/other", "4.4.4.4:443"), 4);
+        let DaemonMsg::PromptRequest { id: first, .. } = prompt_rx.recv().await.unwrap() else {
+            panic!("expected PromptRequest");
+        };
+        for _ in 0..3 {
+            let _ = prompt_rx.recv().await.unwrap();
+        }
+
+        // Allow the app anywhere: every chrome prompt resolves allow.
+        h.table
+            .reply(first, Verdict::Allow, RuleDuration::Session, PromptScope::AppAnywhere)
+            .unwrap();
+        let mut released = std::collections::HashMap::new();
+        for _ in 0..3 {
+            let (seq, v) = h.verdict_rx.recv().await.unwrap();
+            released.insert(seq, v);
+        }
+        assert_eq!(
+            released,
+            [(1, Verdict::Allow), (2, Verdict::Allow), (3, Verdict::Allow)].into(),
+            "all three chrome endpoints released with the replied verdict"
+        );
+
+        // The two covered prompts are announced gone so popups close.
+        let mut expired = 0;
+        while let Ok(msg) = prompt_rx.try_recv() {
+            if matches!(msg, DaemonMsg::PromptExpired { .. }) {
+                expired += 1;
+            }
+        }
+        assert_eq!(expired, 2, "both covered prompts expired to the handler");
+
+        // The unrelated app's prompt is untouched and still answerable.
+        assert!(h.verdict_rx.try_recv().is_err());
+        let other_id = first + 3;
+        h.table
+            .reply(other_id, Verdict::Deny, RuleDuration::Once, PromptScope::ThisPort)
+            .unwrap();
+        assert_eq!(h.verdict_rx.recv().await, Some((4, Verdict::Deny)));
+    }
+
+    /// A port-scoped answer must not touch the app's prompts for other
+    /// destinations.
+    #[tokio::test]
+    async fn narrow_reply_leaves_other_prompts_open() {
+        let mut h = harness("narrow", 8, Verdict::Deny);
+        let (tx, mut prompt_rx) = mpsc::channel(16);
+        assert!(h.table.set_handler(tx));
+        h.table.handle_new(conn("/usr/bin/chrome", "1.1.1.1:443"), 1);
+        h.table.handle_new(conn("/usr/bin/chrome", "2.2.2.2:443"), 2);
+        let DaemonMsg::PromptRequest { id: first, .. } = prompt_rx.recv().await.unwrap() else {
+            panic!("expected PromptRequest");
+        };
+        let _ = prompt_rx.recv().await.unwrap();
+
+        h.table
+            .reply(first, Verdict::Allow, RuleDuration::Session, PromptScope::ThisPort)
+            .unwrap();
+        assert_eq!(h.verdict_rx.recv().await, Some((1, Verdict::Allow)));
+        // The second endpoint's prompt is still pending: no verdict, no
+        // expiry announcement.
+        assert!(h.verdict_rx.try_recv().is_err());
+        assert!(prompt_rx.try_recv().is_err());
     }
 
     #[tokio::test]
