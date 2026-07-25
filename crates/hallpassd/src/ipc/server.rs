@@ -45,36 +45,63 @@ fn parse_group_line(line: &str, group: &str) -> Option<u32> {
 
 /// Bind the socket with restrictive permissions: parent dir 0750, socket
 /// 0660, group `hallpass` if it exists.
-fn bind_socket(path: &Path) -> std::io::Result<UnixListener> {
-    if let Some(parent) = path.parent() {
-        if !parent.exists() {
-            std::fs::DirBuilder::new()
-                .recursive(true)
-                .mode(0o750)
-                .create(parent)?;
-        }
+///
+/// Separate from [`serve`] so the daemon can take the socket before it
+/// installs any nftables rules: losing the control channel is a security
+/// failure, not a degraded mode, and it must be discovered while backing
+/// out is still free.
+pub fn bind(path: &Path) -> std::io::Result<UnixListener> {
+    let parent = path.parent().unwrap_or(Path::new("."));
+    if !parent.exists() {
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o750)
+            .create(parent)?;
     }
-    let _ = std::fs::remove_file(path); // stale socket from a previous run
-    let listener = UnixListener::bind(path)?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o660))?;
-    match lookup_gid("hallpass") {
-        Some(gid) => {
-            if let Err(e) = std::os::unix::fs::chown(path, None, Some(gid)) {
-                tracing::warn!("chown {} to group hallpass failed: {e}", path.display());
+
+    // Bind inside a staging directory only root can enter, then move the
+    // finished socket into place. `bind` applies the umask to the new
+    // socket, so a daemon started without a restrictive one (anything
+    // but the shipped unit file) would publish a world-writable socket
+    // for the window between bind and the chmod below, and a local user
+    // who connected inside it would hold a full rule-management channel.
+    // Staging closes the window instead of narrowing it.
+    let staging = parent.join(".hallpass-bind");
+    let _ = std::fs::remove_dir_all(&staging);
+    std::fs::DirBuilder::new().mode(0o700).create(&staging)?;
+    let staged = staging.join("sock");
+
+    let bound = (|| {
+        let listener = UnixListener::bind(&staged)?;
+        std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o660))?;
+        // A failed chown costs reachability, not safety: the socket stays
+        // at the tighter owner-only access, so warn rather than refuse to
+        // start (non-root development runs cannot chown at all).
+        match lookup_gid("hallpass") {
+            Some(gid) => {
+                if let Err(e) = std::os::unix::fs::chown(&staged, None, Some(gid)) {
+                    tracing::warn!("chown {} to group hallpass failed: {e}", path.display());
+                }
             }
+            None => tracing::warn!(
+                "group 'hallpass' not found; socket {} stays root-only",
+                path.display()
+            ),
         }
-        None => tracing::warn!(
-            "group 'hallpass' not found; socket {} stays root-only",
-            path.display()
-        ),
-    }
-    Ok(listener)
+        // Atomic, and it replaces any stale socket from a previous run
+        // without a window where the path does not exist.
+        std::fs::rename(&staged, path)?;
+        Ok(listener)
+    })();
+
+    let _ = std::fs::remove_dir_all(&staging);
+    bound
 }
 
-/// Accept loop. Runs until the daemon shuts down (task is aborted).
-pub async fn run(socket_path: &Path, deps: Arc<IpcDeps>) -> std::io::Result<()> {
-    let listener = bind_socket(socket_path)?;
-    tracing::info!(path = %socket_path.display(), "IPC listening");
+/// Accept loop over an already-bound listener. Runs until the daemon
+/// shuts down (task is aborted).
+pub async fn serve(listener: UnixListener, deps: Arc<IpcDeps>) -> std::io::Result<()> {
+    tracing::info!("IPC listening");
     loop {
         let (stream, _addr) = listener.accept().await?;
         let deps = Arc::clone(&deps);
@@ -263,6 +290,35 @@ mod tests {
 
     fn parse(line: &str) -> Option<u32> {
         parse_group_line(line, "hallpass")
+    }
+
+    /// The socket must never be reachable at a mode looser than 0660,
+    /// including for the window between creating it and tightening it.
+    /// Binding under a permissive umask is what would expose that window.
+    #[tokio::test]
+    async fn bind_publishes_a_socket_no_looser_than_0660() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("hallpass-bind-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("hallpass.sock");
+
+        let listener = bind(&path).expect("bind");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o660, "socket mode {mode:o}");
+        assert!(
+            !dir.join(".hallpass-bind").exists(),
+            "staging dir should be cleaned up"
+        );
+
+        // Rebinding over a live socket replaces it rather than failing,
+        // so a restart never leaves the path missing.
+        drop(listener);
+        let _ = bind(&path).expect("rebind over an existing socket");
+        assert!(path.exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

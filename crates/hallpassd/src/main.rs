@@ -67,6 +67,24 @@ async fn main() {
         );
     }
 
+    // Take the control socket before installing any nftables rules. A
+    // daemon that filters traffic but cannot be reached answers every
+    // prompt with the default verdict and gives the operator no way to
+    // see it happening or change it, which under `default_verdict =
+    // "allow"` is an open firewall that looks healthy. Binding first
+    // makes that failure free to back out of: nothing is installed yet,
+    // so exiting leaves the system exactly as it was found.
+    let ipc_listener = match ipc::server::bind(&cfg.socket_path) {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::error!(
+                path = %cfg.socket_path.display(),
+                "failed to bind the IPC socket, refusing to filter without a control channel: {e}"
+            );
+            std::process::exit(1);
+        }
+    };
+
     let nft_installed = match nft::install(cfg.queue_num, cfg.queue_bypass) {
         Ok(()) => {
             tracing::info!("nftables ruleset installed");
@@ -202,9 +220,8 @@ async fn main() {
         events,
         stats: counters,
     });
-    let socket_path = cfg.socket_path.clone();
     let ipc_task = tokio::spawn(async move {
-        if let Err(e) = ipc::server::run(&socket_path, ipc_deps).await {
+        if let Err(e) = ipc::server::serve(ipc_listener, ipc_deps).await {
             tracing::error!("IPC server failed: {e}");
         }
     });
