@@ -399,30 +399,66 @@ impl HallpassApp {
 
     // ---- prompt popups ---------------------------------------------------
 
-    /// Render one immediate viewport per pending prompt. Returns replies to
-    /// send and removes answered/expired/closed prompts.
+    /// Render one immediate viewport per *application* with pending
+    /// prompts, showing the oldest prompt plus the app's other pending
+    /// destinations. One busy program (a browser at startup) then costs
+    /// one window, not one per endpoint; answering with a host- or
+    /// app-wide scope makes the daemon resolve the covered prompts, which
+    /// arrive back as `PromptExpired` and empty the window's queue.
     fn prompt_windows(&mut self, ctx: &egui::Context) {
         let now_ms = hallpass_types::unix_ms_now();
         // Expired locally: close silently, the daemon applies its default.
         self.prompts.retain(|p| now_ms < p.deadline_ms);
 
+        // Group by exe, oldest prompt (lowest id) first within each app.
+        // Sorting keeps both the grouping and the front prompt stable
+        // across frames.
+        self.prompts
+            .sort_by(|a, b| (&a.conn.exe_path, a.id).cmp(&(&b.conn.exe_path, b.id)));
+        let mut groups: Vec<(usize, usize)> = Vec::new(); // (start, len)
+        for (i, p) in self.prompts.iter().enumerate() {
+            match groups.last_mut() {
+                Some((start, len))
+                    if self.prompts[*start].conn.exe_path == p.conn.exe_path =>
+                {
+                    *len += 1;
+                }
+                _ => groups.push((i, 1)),
+            }
+        }
+
         let mut answered: Vec<(u64, ClientMsg)> = Vec::new();
         let mut closed: Vec<u64> = Vec::new();
 
-        for p in &mut self.prompts {
-            let viewport_id = egui::ViewportId::from_hash_of(("hallpass-prompt", p.id));
+        for (start, len) in groups {
+            let rest: Vec<String> = self.prompts[start + 1..start + len]
+                .iter()
+                .map(|p| format!("{} {}", p.conn.tuple.proto, prompt::format_dest(&p.conn)))
+                .collect();
+            let group_ids: Vec<u64> = self.prompts[start..start + len]
+                .iter()
+                .map(|p| p.id)
+                .collect();
+            let p = &mut self.prompts[start];
+            // Keyed by exe rather than prompt id, so the window survives
+            // its front prompt being answered and shows the next one.
+            let viewport_id =
+                egui::ViewportId::from_hash_of(("hallpass-prompt-app", &p.conn.exe_path));
             let builder = egui::ViewportBuilder::default()
                 .with_title("Connection request")
-                .with_inner_size([440.0, 300.0])
+                .with_inner_size([440.0, 330.0])
                 .with_resizable(false)
                 .with_always_on_top();
             ctx.show_viewport_immediate(viewport_id, builder, |ui, _class| {
                 egui::CentralPanel::default().show(ui, |ui| {
-                    prompt_ui(ui, p, now_ms, &mut answered);
+                    prompt_ui(ui, p, now_ms, &rest, &mut answered);
                 });
                 if ui.ctx().input(|i| i.viewport().close_requested()) {
-                    // Closed without answering: daemon default applies.
-                    closed.push(p.id);
+                    // Closed without answering: dismiss the whole app's
+                    // queue, or the window would reopen next frame for
+                    // the next prompt. The daemon's timeout applies its
+                    // default to each, exactly as before.
+                    closed.extend(&group_ids);
                 }
             });
         }
@@ -435,8 +471,16 @@ impl HallpassApp {
     }
 }
 
-/// Body of a single prompt popup.
-fn prompt_ui(ui: &mut egui::Ui, p: &mut PromptState, now_ms: u64, answered: &mut Vec<(u64, ClientMsg)>) {
+/// Body of a single prompt popup: the app's oldest pending prompt, plus
+/// its other pending destinations (`rest`), which a host- or app-wide
+/// answer will cover in the same stroke.
+fn prompt_ui(
+    ui: &mut egui::Ui,
+    p: &mut PromptState,
+    now_ms: u64,
+    rest: &[String],
+    answered: &mut Vec<(u64, ClientMsg)>,
+) {
     let conn = &p.conn;
 
     ui.horizontal(|ui| {
@@ -465,6 +509,24 @@ fn prompt_ui(ui: &mut egui::Ui, p: &mut PromptState, now_ms: u64, answered: &mut
             ));
             ui.end_row();
         });
+    if !rest.is_empty() {
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new(format!("{} more request(s) pending from this app:", rest.len()))
+                .small(),
+        );
+        // A handful is informative; a browser's full endpoint list is not.
+        for dest in rest.iter().take(5) {
+            ui.label(RichText::new(format!("  {dest}")).small().monospace());
+        }
+        if rest.len() > 5 {
+            ui.label(RichText::new(format!("  ...and {} more", rest.len() - 5)).small());
+        }
+        ui.label(
+            RichText::new("Answering \"This host\" or \"App anywhere\" also settles the covered ones.")
+                .small(),
+        );
+    }
     ui.separator();
 
     ui.horizontal(|ui| {
