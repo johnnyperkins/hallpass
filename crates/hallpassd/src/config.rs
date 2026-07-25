@@ -8,6 +8,10 @@ use serde::Deserialize;
 /// Default location of the daemon config file.
 pub const DEFAULT_CONFIG_PATH: &str = "/etc/hallpass/config.toml";
 
+/// Longest usable unix socket path: `sun_path` is 108 bytes including the
+/// terminating NUL.
+const MAX_SOCKET_PATH: usize = 107;
+
 /// Daemon configuration. Every field has a default so a missing or partial
 /// file still yields a usable config.
 #[derive(Debug, Clone, Deserialize)]
@@ -88,6 +92,16 @@ impl Config {
         if self.queue_num == u16::MAX {
             // queue_num + 1 is the DNS snoop queue.
             return Err(format!("queue_num must be below {}", u16::MAX));
+        }
+        // A too-long socket path only fails when the IPC server binds,
+        // which is after the nftables table is installed - the daemon
+        // would then filter traffic with no way to answer prompts. Catch
+        // it here instead. sun_path is 108 bytes including the NUL.
+        let socket_len = self.socket_path.as_os_str().len();
+        if socket_len > MAX_SOCKET_PATH {
+            return Err(format!(
+                "socket_path is {socket_len} bytes, must be at most {MAX_SOCKET_PATH}"
+            ));
         }
         Ok(())
     }
@@ -171,6 +185,11 @@ mod tests {
         assert!(parse("max_pending_prompts = 0").validate().is_err());
         assert!(parse("queue_num = 65535").validate().is_err());
         assert!(parse("").validate().is_ok());
+
+        // sun_path is 108 bytes with the NUL, so 107 is the last that fits.
+        let path = |n: usize| format!("socket_path = \"/{}\"", "s".repeat(n - 1));
+        assert!(parse(&path(MAX_SOCKET_PATH)).validate().is_ok());
+        assert!(parse(&path(MAX_SOCKET_PATH + 1)).validate().is_err());
     }
 
     #[test]
