@@ -88,12 +88,15 @@ static EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
 #[map]
 static DNS_SCRATCH: LruHashMap<u64, DnsScratch> = LruHashMap::with_max_entries(512, 0);
 
-/// Captured getaddrinfo arguments carried from entry to return.
+/// Captured resolver arguments carried from entry to return.
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct DnsScratch {
-    /// `struct addrinfo **res` out-parameter pointer.
-    res: u64,
+    /// The call's out-parameter pointer, when it has one: `struct
+    /// addrinfo **res` for getaddrinfo, `struct hostent **result` for the
+    /// reentrant variants. Zero for the probes that return their result
+    /// directly.
+    out: u64,
     /// Length of the captured name (no NUL).
     name_len: u32,
     /// The queried hostname, copied at entry.
@@ -286,14 +289,10 @@ unsafe fn read_user<T>(base: u64, off: usize) -> Result<T, ()> {
 /// Always at entry, never at return: a resolver call blocks for the
 /// lookup, and another thread could rewrite the caller's buffer in the
 /// meantime, which would bind a real address to a forged name and poison
-/// the domain cache. `extra` rides along for whatever the return probe
-/// needs (the getaddrinfo out-parameter; unused for gethostbyname).
+/// the domain cache. `out` rides along for the return probe: the call's
+/// out-parameter, or zero when it returns its result directly.
 #[inline(always)]
-fn capture_name(
-    scratch_map: &LruHashMap<u64, DnsScratch>,
-    node: *const u8,
-    extra: u64,
-) -> u32 {
+fn capture_name(scratch_map: &LruHashMap<u64, DnsScratch>, node: *const u8, out: u64) -> u32 {
     if node.is_null() {
         return 0;
     }
@@ -302,7 +301,7 @@ fn capture_name(
         return 0;
     };
     let scratch = unsafe { &mut *scratch };
-    scratch.res = extra;
+    scratch.out = out;
     scratch.name_len = 0;
     match unsafe { bpf_probe_read_user_str_bytes(node, &mut scratch.name) } {
         Ok(s) if !s.is_empty() => scratch.name_len = s.len() as u32,
@@ -315,7 +314,9 @@ fn capture_name(
 /// Take the captured name for this thread and stage it in the per-CPU
 /// event buffer, ready for one event per resolved address.
 #[inline(always)]
-fn take_captured_name(scratch_map: &LruHashMap<u64, DnsScratch>) -> Option<(&'static mut DnsEvent, u64)> {
+fn take_captured_name(
+    scratch_map: &LruHashMap<u64, DnsScratch>,
+) -> Option<(&'static mut DnsEvent, u64)> {
     let id = bpf_get_current_pid_tgid();
     let scratch = unsafe { scratch_map.get(id) }?;
     let ev = DNS_EVENT_BUF.get_ptr_mut(0)?;
@@ -323,9 +324,55 @@ fn take_captured_name(scratch_map: &LruHashMap<u64, DnsScratch>) -> Option<(&'st
     ev.name_len = scratch.name_len;
     ev.name = scratch.name;
     ev._pad = [0u8; 3];
-    let extra = scratch.res;
+    let out = scratch.out;
     let _ = scratch_map.remove(id);
-    Some((ev, extra))
+    Some((ev, out))
+}
+
+/// Entry probe for a resolver that returns through an out-parameter:
+/// capture the name at argument 0 and the out-parameter pointer at
+/// `out_arg`. Inlined so `out_arg` folds to a constant per probe.
+#[inline(always)]
+fn resolver_enter(
+    ctx: &ProbeContext,
+    scratch_map: &LruHashMap<u64, DnsScratch>,
+    out_arg: usize,
+) -> u32 {
+    let (Some(node), Some(out)): (Option<*const u8>, Option<*const u8>) =
+        (ctx.arg(0), ctx.arg(out_arg))
+    else {
+        return 0;
+    };
+    if out.is_null() {
+        return 0;
+    }
+    capture_name(scratch_map, node, out as u64)
+}
+
+/// Return probe counterpart: reject a failed call, take this thread's
+/// captured name, and dereference the out-parameter stashed with it.
+///
+/// The failure check runs before the name is staged because callers of
+/// the reentrant variants conventionally retry on `ERANGE` with a bigger
+/// buffer, and every retry would otherwise copy a whole name into the
+/// event buffer only to drop it. The scratch entry is consumed either
+/// way, so a rejected call cannot leave one behind for a later
+/// resolution on the same thread to pick up.
+#[inline(always)]
+fn take_out_param(
+    ret: i32,
+    scratch_map: &LruHashMap<u64, DnsScratch>,
+) -> Option<(&'static mut DnsEvent, u64)> {
+    if ret != 0 {
+        let _ = scratch_map.remove(bpf_get_current_pid_tgid());
+        return None;
+    }
+    let (ev, out) = take_captured_name(scratch_map)?;
+    let result: u64 = unsafe { read_user(out, 0) }.ok()?;
+    if result == 0 {
+        return None; // resolver reported success but filled in nothing
+    }
+    Some((ev, result))
 }
 
 /// Read `len` address bytes from `addr` and emit one event.
@@ -353,28 +400,15 @@ fn emit_addr(ev: &mut DnsEvent, family: u8, addr: u64) {
 // so misreads there just drop events (reads are fault-safe).
 #[uprobe]
 pub fn getaddrinfo_enter(ctx: ProbeContext) -> u32 {
-    let (Some(node), Some(res)): (Option<*const u8>, Option<*const u8>) = (ctx.arg(0), ctx.arg(3))
-    else {
-        return 0;
-    };
-    if res.is_null() {
-        return 0;
-    }
-    capture_name(&DNS_SCRATCH, node, res as u64)
+    resolver_enter(&ctx, &DNS_SCRATCH, 3)
 }
 
 #[uretprobe]
 pub fn getaddrinfo_ret(ctx: RetProbeContext) -> u32 {
-    let Some((ev, res)) = take_captured_name(&DNS_SCRATCH) else {
+    // `res` points at the head of the result list; walk it, one event per
+    // address.
+    let Some((ev, mut ai)) = take_out_param(ctx.ret::<i32>(), &DNS_SCRATCH) else {
         return 0;
-    };
-    if ctx.ret::<i32>() != 0 {
-        return 0; // resolution failed; nothing to record
-    }
-    // Walk the result list, one event per address.
-    let mut ai: u64 = match unsafe { read_user(res, 0) } {
-        Ok(p) => p,
-        Err(()) => return 0,
     };
     for _ in 0..MAX_ADDRS {
         if ai == 0 {
@@ -430,6 +464,12 @@ pub fn gethostbyname_ret(ctx: RetProbeContext) -> u32 {
     if hostent == 0 {
         return 0;
     }
+    emit_hostent(ev, hostent)
+}
+
+/// Walk a `struct hostent`'s address list, emitting one event per address.
+#[inline(always)]
+fn emit_hostent(ev: &mut DnsEvent, hostent: u64) -> u32 {
     let (family, len, list): (i32, i32, u64) = unsafe {
         match (
             read_user(hostent, H_ADDRTYPE),
@@ -462,6 +502,59 @@ pub fn gethostbyname_ret(ctx: RetProbeContext) -> u32 {
         emit_addr(ev, family as u8, addr);
     }
     0
+}
+
+// The reentrant variants return their result through an out-parameter
+// instead of a static buffer:
+//
+//   int gethostbyname_r (const char *name,         struct hostent *ret,
+//                        char *buf, size_t buflen,
+//                        struct hostent **result, int *h_errnop);
+//   int gethostbyname2_r(const char *name, int af, struct hostent *ret,
+//                        char *buf, size_t buflen,
+//                        struct hostent **result, int *h_errnop);
+//
+// The extra `af` shifts every later argument by one, so each spelling
+// needs its own probe pair. What is captured at entry is `result`, not
+// `ret`: glibc can return 0 with `*result` NULL when the host is not
+// found, leaving `ret` unfilled, so the double pointer is the only field
+// that distinguishes a real answer.
+
+/// Same as [`HOST_SCRATCH`], for `gethostbyname_r`.
+#[map]
+static HOST_R_SCRATCH: LruHashMap<u64, DnsScratch> = LruHashMap::with_max_entries(512, 0);
+
+/// Same as [`HOST_SCRATCH`], for `gethostbyname2_r`. Kept apart from
+/// [`HOST_R_SCRATCH`] because glibc may reach one through the other: with
+/// separate maps a nested call emits its own (correct) name instead of
+/// consuming the outer call's.
+#[map]
+static HOST2_R_SCRATCH: LruHashMap<u64, DnsScratch> = LruHashMap::with_max_entries(512, 0);
+
+#[uprobe]
+pub fn gethostbyname_r_enter(ctx: ProbeContext) -> u32 {
+    resolver_enter(&ctx, &HOST_R_SCRATCH, 4)
+}
+
+#[uretprobe]
+pub fn gethostbyname_r_ret(ctx: RetProbeContext) -> u32 {
+    match take_out_param(ctx.ret::<i32>(), &HOST_R_SCRATCH) {
+        Some((ev, hostent)) => emit_hostent(ev, hostent),
+        None => 0,
+    }
+}
+
+#[uprobe]
+pub fn gethostbyname2_r_enter(ctx: ProbeContext) -> u32 {
+    resolver_enter(&ctx, &HOST2_R_SCRATCH, 5)
+}
+
+#[uretprobe]
+pub fn gethostbyname2_r_ret(ctx: RetProbeContext) -> u32 {
+    match take_out_param(ctx.ret::<i32>(), &HOST2_R_SCRATCH) {
+        Some((ev, hostent)) => emit_hostent(ev, hostent),
+        None => 0,
+    }
 }
 
 fn emit_event(kind: u32) {

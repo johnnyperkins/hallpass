@@ -121,7 +121,7 @@ impl EbpfAttributor {
                     )
                     .map_err(|e| format!("DNS_EVENTS: {e}"))?;
                     spawn_dns_reader(dns_ring, dns, stop_rx);
-                    tracing::info!("libc DNS snoop active (getaddrinfo, gethostbyname)");
+                    tracing::info!("libc DNS snoop active (getaddrinfo, gethostbyname family)");
                 }
                 Err(e) => {
                     tracing::warn!("libc DNS snoop unavailable: {e}");
@@ -250,20 +250,32 @@ fn attach_kprobe(ebpf: &mut Ebpf, prog: &str, fns: &[&str]) -> Result<(), String
 /// Attach the DNS-snooping uprobes to the system libc, for every process.
 ///
 /// `getaddrinfo` is the modern path and is required; the `gethostbyname`
-/// family is best effort, since not every libc exports both spellings and
-/// losing the legacy path is better than losing DNS snooping entirely.
+/// family is best effort, since not every libc exports every spelling
+/// (musl has no `gethostbyname2_r`, for one) and losing a legacy entry
+/// point is better than losing DNS snooping entirely.
 fn attach_dns_uprobes(ebpf: &mut Ebpf) -> Result<(), String> {
     attach_uprobe_pair(
         ebpf,
         ["getaddrinfo_enter", "getaddrinfo_ret"],
         &["getaddrinfo"],
     )?;
-    if let Err(e) = attach_uprobe_pair(
-        ebpf,
-        ["gethostbyname_enter", "gethostbyname_ret"],
-        &["gethostbyname", "gethostbyname2"],
-    ) {
-        tracing::warn!("legacy gethostbyname snoop unavailable: {e}");
+    for (progs, symbols) in [
+        (
+            ["gethostbyname_enter", "gethostbyname_ret"],
+            &["gethostbyname", "gethostbyname2"][..],
+        ),
+        (
+            ["gethostbyname_r_enter", "gethostbyname_r_ret"],
+            &["gethostbyname_r"][..],
+        ),
+        (
+            ["gethostbyname2_r_enter", "gethostbyname2_r_ret"],
+            &["gethostbyname2_r"][..],
+        ),
+    ] {
+        if let Err(e) = attach_uprobe_pair(ebpf, progs, symbols) {
+            tracing::warn!("legacy resolver snoop unavailable: {e}");
+        }
     }
     Ok(())
 }

@@ -245,8 +245,9 @@ attacker with root, who can delete the nftables table outright.
 
 - **DoT / DoH are invisible to the wire snooper**: it only sees names
   resolved through plaintext UDP port 53. With the `ebpf` feature the
-  daemon also snoops the libc resolver entry points (`getaddrinfo`,
-  `gethostbyname`, `gethostbyname2`) via uprobes, which catches
+  daemon also snoops the libc resolver entry points (`getaddrinfo`, the
+  `gethostbyname` family, and their reentrant `_r` variants) via uprobes,
+  which catches
   resolutions through systemd-resolved's stub and encrypted upstreams as
   long as the process uses the system resolver. Statically linked
   programs, non-libc runtimes, and apps doing their own DoH still match
