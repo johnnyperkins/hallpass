@@ -293,6 +293,14 @@ unsafe fn read_user<T>(base: u64, off: usize) -> Result<T, ()> {
 /// out-parameter, or zero when it returns its result directly.
 #[inline(always)]
 fn capture_name(scratch_map: &LruHashMap<u64, DnsScratch>, node: *const u8, out: u64) -> u32 {
+    // Drop any entry this thread left behind before deciding whether to
+    // capture a new one. A return probe can be missed (uretprobe
+    // maxactive exhausted, thread killed mid-call), and without this an
+    // entry survives to be consumed by the *next* call's return probe:
+    // that call's `out` pointer is usually the same stack slot, so the
+    // stale name would be emitted against fresh addresses. Every bail-out
+    // below therefore has to leave the map empty, not merely unchanged.
+    discard_capture(scratch_map);
     if node.is_null() {
         return 0;
     }
@@ -309,6 +317,12 @@ fn capture_name(scratch_map: &LruHashMap<u64, DnsScratch>, node: *const u8, out:
     }
     let _ = scratch_map.insert(bpf_get_current_pid_tgid(), &*scratch, 0);
     0
+}
+
+/// Forget whatever this thread captured, if anything.
+#[inline(always)]
+fn discard_capture(scratch_map: &LruHashMap<u64, DnsScratch>) {
+    let _ = scratch_map.remove(bpf_get_current_pid_tgid());
 }
 
 /// Take the captured name for this thread and stage it in the per-CPU
@@ -341,9 +355,11 @@ fn resolver_enter(
     let (Some(node), Some(out)): (Option<*const u8>, Option<*const u8>) =
         (ctx.arg(0), ctx.arg(out_arg))
     else {
+        discard_capture(scratch_map);
         return 0;
     };
     if out.is_null() {
+        discard_capture(scratch_map);
         return 0;
     }
     capture_name(scratch_map, node, out as u64)
@@ -364,7 +380,7 @@ fn take_out_param(
     scratch_map: &LruHashMap<u64, DnsScratch>,
 ) -> Option<(&'static mut DnsEvent, u64)> {
     if ret != 0 {
-        let _ = scratch_map.remove(bpf_get_current_pid_tgid());
+        discard_capture(scratch_map);
         return None;
     }
     let (ev, out) = take_captured_name(scratch_map)?;

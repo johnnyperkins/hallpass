@@ -250,9 +250,10 @@ fn attach_kprobe(ebpf: &mut Ebpf, prog: &str, fns: &[&str]) -> Result<(), String
 /// Attach the DNS-snooping uprobes to the system libc, for every process.
 ///
 /// `getaddrinfo` is the modern path and is required; the `gethostbyname`
-/// family is best effort, since not every libc exports every spelling
-/// (musl has no `gethostbyname2_r`, for one) and losing a legacy entry
-/// point is better than losing DNS snooping entirely.
+/// family is best effort, since which of the legacy spellings a libc
+/// exports (and whether they are stripped from a hardened build) varies,
+/// and losing one legacy entry point is better than losing DNS snooping
+/// entirely.
 fn attach_dns_uprobes(ebpf: &mut Ebpf) -> Result<(), String> {
     attach_uprobe_pair(
         ebpf,
@@ -288,6 +289,9 @@ fn attach_uprobe_pair(
     progs: [&str; 2],
     symbols: &[&str],
 ) -> Result<(), String> {
+    // Load both halves before attaching either. An entry probe attached
+    // next to a return probe that failed to load would trap every call in
+    // every process and stash scratch entries nothing ever consumes.
     for prog in progs {
         let p: &mut UProbe = ebpf
             .program_mut(prog)
@@ -295,6 +299,13 @@ fn attach_uprobe_pair(
             .try_into()
             .map_err(|e| format!("{prog}: {e}"))?;
         p.load().map_err(|e| format!("load {prog}: {e}"))?;
+    }
+    for prog in progs {
+        let p: &mut UProbe = ebpf
+            .program_mut(prog)
+            .ok_or_else(|| format!("program {prog} missing"))?
+            .try_into()
+            .map_err(|e| format!("{prog}: {e}"))?;
         let mut last_err = None;
         let mut attached = 0;
         for symbol in symbols {
