@@ -220,9 +220,17 @@ attacker with root, who can delete the nftables table outright.
   enforcement.
 - **IPC socket**: `/run/hallpass/hallpass.sock`, directory 0750, socket 0660
   root:hallpass. Only root and the `hallpass` group can manage rules or answer
-  prompts. Peer UIDs are logged for every mutating request. Per-client
-  outbound queues are bounded; a client that stops reading loses events
-  instead of growing daemon memory.
+  prompts. The socket is created inside a 0700 staging directory and moved
+  into place once its mode and group are set, so it is never reachable at
+  whatever mode the process umask would have produced. Peer UIDs are logged
+  for every mutating request. Per-client outbound queues are bounded; a
+  client that stops reading loses events instead of growing daemon memory.
+- **No filtering without a control channel**: the socket is bound before
+  any nftables rule is installed, and the daemon exits if it cannot be
+  bound. A daemon that filtered traffic while unreachable would answer
+  every prompt with the default verdict and give the operator no way to
+  see it or change it; binding first means that failure costs nothing,
+  because nothing has been installed yet.
 - **DNS snoop validation**: outbound queries are observed alongside replies,
   and a reply only enters the IP-domain cache when its source/destination
   addresses, transaction ID, and question name match a recorded query.
@@ -234,7 +242,10 @@ attacker with root, who can delete the nftables table outright.
   address wins. Scope security-relevant rules with `exe`/`exe_sha256` or
   IP/CIDR criteria rather than domain alone.
 - **Rule files**: files in `rules.d` are ignored (with a warning) unless owned
-  by root (or the daemon's own euid) and not group/other writable.
+  by root (or the daemon's own euid) and not group/other writable. Symlinks
+  are skipped, and the ownership check and the parsed bytes come from the
+  same file descriptor, so the file that was checked is the file that is
+  read. The same policy and mechanism apply to match-list files.
 - **systemd hardening**: `ProtectSystem=strict`, `ProtectHome`,
   `NoNewPrivileges`, `MemoryDenyWriteExecute`, restricted address families,
   and a read-write allowlist limited to `/etc/hallpass` and `/run/hallpass`.

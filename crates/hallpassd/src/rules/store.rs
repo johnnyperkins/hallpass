@@ -5,6 +5,7 @@
 //! the compiled [`RuleSet`] and swaps it atomically, so the packet path
 //! reads rules lock-free.
 
+use std::io::Read;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -92,7 +93,35 @@ fn load_dir(dir: &Path) -> LoadResult {
         if path.extension().is_none_or(|e| e != "toml") {
             continue;
         }
-        let meta = match item.metadata() {
+        // Reject symlinks before opening. `File::open` follows them, and
+        // the fstat below would then describe the target, so a link is
+        // the one way a rule could be loaded from outside this directory.
+        // Checked off the directory entry, which does not follow.
+        match item.file_type() {
+            Ok(t) if t.is_symlink() => {
+                tracing::warn!(file = %path.display(), "skipping symlinked rule file");
+                skipped += 1;
+                continue;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(file = %path.display(), "cannot stat rule file: {e}");
+                skipped += 1;
+                continue;
+            }
+        }
+        // Identity and content both come from this fd, as in lists.rs: no
+        // window where the trust-checked file and the parsed bytes could
+        // differ.
+        let mut file = match std::fs::File::open(&path) {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::warn!(file = %path.display(), "cannot open rule file: {e}");
+                skipped += 1;
+                continue;
+            }
+        };
+        let meta = match file.metadata() {
             Ok(m) => m,
             Err(e) => {
                 tracing::warn!(file = %path.display(), "cannot stat rule file: {e}");
@@ -100,6 +129,11 @@ fn load_dir(dir: &Path) -> LoadResult {
                 continue;
             }
         };
+        if !meta.is_file() {
+            tracing::warn!(file = %path.display(), "skipping rule entry that is not a regular file");
+            skipped += 1;
+            continue;
+        }
         if !file_perms_ok(meta.uid(), meta.mode(), self_uid) {
             tracing::warn!(
                 file = %path.display(),
@@ -110,9 +144,11 @@ fn load_dir(dir: &Path) -> LoadResult {
             skipped += 1;
             continue;
         }
-        let rule: Rule = match std::fs::read_to_string(&path)
+        let mut text = String::new();
+        let rule: Rule = match file
+            .read_to_string(&mut text)
             .map_err(|e| e.to_string())
-            .and_then(|t| toml::from_str(&t).map_err(|e| e.to_string()))
+            .and_then(|_| toml::from_str(&text).map_err(|e| e.to_string()))
         {
             Ok(r) => r,
             Err(e) => {
@@ -376,6 +412,31 @@ mod tests {
         assert!(!file_perms_ok(1001, 0o100644, 1000)); // wrong owner
         assert!(!file_perms_ok(0, 0o100664, 1000)); // group-writable
         assert!(!file_perms_ok(0, 0o100646, 1000)); // world-writable
+    }
+
+    /// A rule file reached through a symlink is not loaded. The mode of
+    /// the link itself would pass no trust check, but the point is that
+    /// the check and the read now see the same fd, so a link swapped in
+    /// after the check cannot redirect what gets parsed.
+    #[test]
+    fn symlinked_rule_file_is_skipped() {
+        let (_td, dir) = tmpdir("symlink");
+        let outside = dir.join("real.txt");
+        std::fs::write(
+            &outside,
+            "name = \"linked\"\naction = \"allow\"\nduration = \"forever\"\n\
+             priority = 1\nenabled = true\n[match]\nport = 80\n",
+        )
+        .unwrap();
+        let rules = dir.join("rules.d");
+        std::fs::create_dir_all(&rules).unwrap();
+        std::os::unix::fs::symlink(&outside, rules.join("linked.toml")).unwrap();
+
+        let store = RuleStore::new(rules);
+        assert!(
+            store.list().is_empty(),
+            "a symlinked rule file should not be loaded"
+        );
     }
 
     #[test]
