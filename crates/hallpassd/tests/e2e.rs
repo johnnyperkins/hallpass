@@ -252,6 +252,17 @@ impl TestEnv {
         // Ready when the nft table exists and the socket is bound.
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
+            // A daemon that exited during startup is worth reporting on
+            // its own. Under `queue_bypass = true` its table is torn down
+            // with it and every connection is then allowed, so the only
+            // symptom otherwise is that assertions expecting a block fail
+            // one by one with nothing pointing at the cause.
+            if let Some(status) = self.daemon.as_mut().and_then(|d| d.try_wait().ok().flatten()) {
+                panic!(
+                    "daemon exited during startup ({status}); log:\n{}",
+                    self.daemon_log()
+                );
+            }
             let table_up = ns_run(&self.ns_cli, &["nft", "list", "table", "inet", "hallpass"])
                 .status
                 .success();
@@ -262,6 +273,18 @@ impl TestEnv {
                 panic!("daemon not ready in 10s; log:\n{}", self.daemon_log());
             }
             std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    /// Fail loudly if the daemon is no longer running. Tests that expect
+    /// a connection to be blocked otherwise report the block failing
+    /// rather than the daemon being gone.
+    fn assert_daemon_alive(&mut self) {
+        if let Some(status) = self.daemon.as_mut().and_then(|d| d.try_wait().ok().flatten()) {
+            panic!(
+                "daemon is no longer running ({status}); log:\n{}",
+                self.daemon_log()
+            );
         }
     }
 
@@ -558,6 +581,7 @@ fn deny_rule_blocks_connection() {
     let Some(mut env) = TestEnv::setup("deny") else { return };
     env.start_listener(19001);
     env.start_daemon("allow", &[&rule("e2e-deny", Action::Deny, 19001)]);
+    env.assert_daemon_alive();
     assert!(
         !env.connect(19001),
         "connection should be blocked by the deny rule; daemon log:\n{}",
@@ -597,6 +621,7 @@ fn no_rule_default_deny_blocks() {
     let Some(mut env) = TestEnv::setup("defdeny") else { return };
     env.start_listener(19004);
     env.start_daemon("deny", &[]);
+    env.assert_daemon_alive();
     assert!(
         !env.connect(19004),
         "default deny should block an unmatched connection; daemon log:\n{}",
@@ -610,6 +635,7 @@ fn queue_bypass_keeps_traffic_flowing_after_daemon_crash() {
     let Some(mut env) = TestEnv::setup("bypass") else { return };
     env.start_listener(19005);
     env.start_daemon("deny", &[]);
+    env.assert_daemon_alive();
     assert!(!env.connect(19005), "sanity: daemon should be denying");
 
     // Crash the daemon. The nft queue rules stay installed, but their
@@ -769,7 +795,8 @@ impl TestEnv {
         }
     }
 
-    fn assert_cases(&self, cases: &[Case]) {
+    fn assert_cases(&mut self, cases: &[Case]) {
+        self.assert_daemon_alive();
         for c in cases {
             assert_eq!(
                 self.connect(c.port),
@@ -1014,6 +1041,7 @@ fn unhandled_proto_verdict_denies_icmp() {
     // dedicated policy decides. TCP stays at default allow, so a drop
     // here can only have come from unhandled_proto_verdict.
     env.start_daemon_with("allow", &[], "unhandled_proto_verdict = \"deny\"\n");
+    env.assert_daemon_alive();
     assert!(
         !env.ping(),
         "unhandled_proto_verdict = deny should drop ICMP; daemon log:\n{}",
@@ -1071,6 +1099,7 @@ fn syslog_export_writes_a_record_per_decision() {
         ),
     );
 
+    env.assert_daemon_alive();
     assert!(!env.connect(PORT), "sanity: the deny rule should block");
 
     // Match on field-anchored fragments, not bare substrings: the record
