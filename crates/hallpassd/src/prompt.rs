@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use hallpass_types::{
-    Connection, DaemonMsg, PromptScope, Rule, RuleDuration, RuleMatch, Verdict,
+    Connection, DaemonMsg, PromptScope, Proto, Rule, RuleDuration, RuleMatch, Verdict,
 };
 use tokio::sync::mpsc::{Sender, UnboundedSender};
 
@@ -26,13 +26,18 @@ use crate::stats::Counters;
 /// Priority given to rules created from prompt replies.
 const PROMPT_RULE_PRIORITY: u32 = 50;
 
-type Key = (Option<PathBuf>, IpAddr, u16);
+/// Coalescing key: (exe, proto, dst ip, dst port). The protocol is part
+/// of it because a TCP and a UDP flow to the same ip:port (e.g. HTTPS and
+/// QUIC) are different requests; one prompt must not answer both.
+type Key = (Option<PathBuf>, Proto, IpAddr, u16);
 
 struct Pending {
     key: Key,
     conn: Connection,
     /// Queue-thread sequence numbers of all packets awaiting this prompt.
     packets: Vec<u64>,
+    /// Absolute deadline sent with the request, kept for re-delivery.
+    deadline_ms: u64,
 }
 
 #[derive(Default)]
@@ -90,6 +95,18 @@ impl PromptTable {
         match &inner.handler {
             Some(h) if !h.is_closed() => false,
             _ => {
+                // Re-deliver everything still pending: requests are
+                // otherwise sent only at creation, so prompts opened
+                // before this handler connected (or while the previous
+                // one was dying) would sit invisible until their
+                // timeout applies the default verdict.
+                for (&id, p) in inner.by_id.iter() {
+                    let _ = tx.try_send(DaemonMsg::PromptRequest {
+                        id,
+                        conn: p.conn.clone(),
+                        deadline_ms: p.deadline_ms,
+                    });
+                }
                 inner.handler = Some(tx);
                 true
             }
@@ -111,6 +128,7 @@ impl PromptTable {
     pub fn handle_new(self: &Arc<Self>, conn: Connection, seq: u64) {
         let key: Key = (
             conn.exe_path.clone(),
+            conn.tuple.proto,
             conn.tuple.dst.ip(),
             conn.tuple.dst.port(),
         );
@@ -141,6 +159,7 @@ impl PromptTable {
         }
 
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let deadline_ms = unix_ms_now() + self.timeout.as_millis() as u64;
         inner.by_key.insert(key.clone(), id);
         inner.by_id.insert(
             id,
@@ -148,12 +167,12 @@ impl PromptTable {
                 key,
                 conn: conn.clone(),
                 packets: vec![seq],
+                deadline_ms,
             },
         );
         drop(inner);
 
         self.stats.record_prompted();
-        let deadline_ms = unix_ms_now() + self.timeout.as_millis() as u64;
         // try_send: never block the dispatcher on a stalled client. A
         // dropped request is resolved by the timeout below.
         if handler
@@ -222,8 +241,11 @@ impl PromptTable {
     /// Resolve every pending prompt whose connection `rule` now matches,
     /// with the rule's own action. The handler is told each prompt is
     /// gone via `PromptExpired`, the same message it already handles for
-    /// timeouts, so open popups close without a new message kind.
-    fn resolve_covered_by(&self, rule: &Rule) {
+    /// timeouts, so open popups close without a new message kind. Also
+    /// called by the IPC server when a client adds a rule directly, for
+    /// the same reason replies sweep: an already-open prompt the new
+    /// rule covers must not fall through to the timeout default.
+    pub fn resolve_covered_by(&self, rule: &Rule) {
         let compiled = match crate::rules::model::CompiledRule::compile(rule) {
             Ok(c) => c,
             Err(e) => {
@@ -526,6 +548,66 @@ mod tests {
         // expiry announcement.
         assert!(h.verdict_rx.try_recv().is_err());
         assert!(prompt_rx.try_recv().is_err());
+    }
+
+    /// TCP and UDP flows to the same ip:port are different requests
+    /// (HTTPS vs QUIC); one prompt must not answer both.
+    #[tokio::test]
+    async fn different_protocols_prompt_separately() {
+        let mut h = harness("proto", 4, Verdict::Allow);
+        let (tx, mut prompt_rx) = mpsc::channel(16);
+        assert!(h.table.set_handler(tx));
+        h.table.handle_new(conn("/bin/a", "1.1.1.1:443"), 1);
+        let mut udp = conn("/bin/a", "1.1.1.1:443");
+        udp.tuple.proto = Proto::Udp;
+        h.table.handle_new(udp, 2);
+
+        let DaemonMsg::PromptRequest { id: tcp_id, .. } = prompt_rx.recv().await.unwrap() else {
+            panic!("expected PromptRequest");
+        };
+        let DaemonMsg::PromptRequest { id: udp_id, .. } = prompt_rx.recv().await.unwrap() else {
+            panic!("expected a second PromptRequest for the UDP flow");
+        };
+        assert_ne!(tcp_id, udp_id);
+
+        h.table
+            .reply(tcp_id, Verdict::Deny, RuleDuration::Once, PromptScope::ThisPort)
+            .unwrap();
+        assert_eq!(h.verdict_rx.recv().await, Some((1, Verdict::Deny)));
+        // The UDP prompt is untouched and still answerable.
+        assert!(h.verdict_rx.try_recv().is_err());
+        h.table
+            .reply(udp_id, Verdict::Allow, RuleDuration::Once, PromptScope::ThisPort)
+            .unwrap();
+        assert_eq!(h.verdict_rx.recv().await, Some((2, Verdict::Allow)));
+    }
+
+    /// A handler claiming the slot receives the prompts that were opened
+    /// while the previous handler was connected (or dying), instead of
+    /// them silently timing out to the default verdict.
+    #[tokio::test]
+    async fn new_handler_receives_pending_prompts() {
+        let mut h = harness("redeliver", 4, Verdict::Allow);
+        let (tx1, mut rx1) = mpsc::channel(16);
+        assert!(h.table.set_handler(tx1));
+        h.table.handle_new(conn("/bin/a", "1.1.1.1:443"), 1);
+        let DaemonMsg::PromptRequest { id, .. } = rx1.recv().await.unwrap() else {
+            panic!("expected PromptRequest");
+        };
+
+        // The handler dies without answering; a new one takes the slot.
+        drop(rx1);
+        let (tx2, mut rx2) = mpsc::channel(16);
+        assert!(h.table.set_handler(tx2));
+        let DaemonMsg::PromptRequest { id: redelivered, .. } = rx2.recv().await.unwrap() else {
+            panic!("expected the pending prompt to be re-delivered");
+        };
+        assert_eq!(redelivered, id);
+
+        h.table
+            .reply(id, Verdict::Deny, RuleDuration::Once, PromptScope::ThisPort)
+            .unwrap();
+        assert_eq!(h.verdict_rx.recv().await, Some((1, Verdict::Deny)));
     }
 
     #[tokio::test]
