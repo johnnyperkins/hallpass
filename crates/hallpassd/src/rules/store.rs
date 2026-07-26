@@ -157,6 +157,14 @@ fn load_dir(dir: &Path) -> LoadResult {
                 continue;
             }
         };
+        // The same validation add() applies: a rule that cannot compile
+        // would otherwise sit inert in the set and crash clients that
+        // render it (e.g. a malformed exe_sha256).
+        if let Err(e) = CompiledRule::compile(&rule) {
+            tracing::warn!(file = %path.display(), "skipping invalid rule file: {e}");
+            skipped += 1;
+            continue;
+        }
         if entries.iter().any(|e: &Entry| e.rule.name == rule.name) {
             tracing::warn!(file = %path.display(), rule = %rule.name, "skipping duplicate rule name");
             skipped += 1;
@@ -217,7 +225,7 @@ impl RuleStore {
         // file before this add lands in `entries`.
         let mut entries = self.entries.lock().unwrap();
         let origin = if rule.duration == hallpass_types::RuleDuration::Forever {
-            Origin::Disk(self.persist(&rule)?)
+            Origin::Disk(self.persist(&rule, &entries)?)
         } else {
             Origin::Session
         };
@@ -265,10 +273,17 @@ impl RuleStore {
             .find(|e| e.rule.name == name)
             .ok_or_else(|| format!("no such rule: {name}"))?;
         entry.rule.enabled = enabled;
-        // Persist under the lock; see add() for the watcher race this avoids.
-        if matches!(entry.origin, Origin::Disk(_)) {
+        // Persist under the lock; see add() for the watcher race this
+        // avoids. Write to the entry's own file: a hand-written rule can
+        // live in a file whose name differs from the rule name, and a
+        // name-derived path would orphan it (the stale file would revert
+        // or resurrect the rule on the next reload).
+        if let Origin::Disk(path) = entry.origin.clone() {
             let rule = entry.rule.clone();
-            self.persist(&rule)?;
+            if let Err(e) = self.persist_to(&rule, &path) {
+                entry.rule.enabled = !enabled;
+                return Err(e);
+            }
         }
         drop(entries);
         self.rebuild();
@@ -326,16 +341,50 @@ impl RuleStore {
         self.active.store(Arc::new(RuleSet::compile(&rules)));
     }
 
-    fn persist(&self, rule: &Rule) -> Result<PathBuf, String> {
+    fn persist(&self, rule: &Rule, entries: &[Entry]) -> Result<PathBuf, String> {
         std::fs::create_dir_all(&self.rules_dir)
             .map_err(|e| format!("create {}: {e}", self.rules_dir.display()))?;
-        let path = self
-            .rules_dir
-            .join(format!("{}.toml", sanitize_filename(&rule.name)));
-        let text = toml::to_string_pretty(rule).map_err(|e| format!("serialize rule: {e}"))?;
-        std::fs::write(&path, text).map_err(|e| format!("write {}: {e}", path.display()))?;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644));
+        let path = self.unique_path(&rule.name, entries);
+        self.persist_to(rule, &path)?;
         Ok(path)
+    }
+
+    /// A file path for `name` that no other rule's file occupies.
+    /// Sanitizing collapses distinct names ("allow dns", "allow_dns",
+    /// "allow/dns") onto one stem, and reusing a colliding path would
+    /// silently overwrite the other rule's file.
+    fn unique_path(&self, name: &str, entries: &[Entry]) -> PathBuf {
+        let stem = sanitize_filename(name);
+        let mine = |e: &Entry, p: &Path| {
+            e.rule.name == name && matches!(&e.origin, Origin::Disk(d) if d == p)
+        };
+        let taken = |p: &PathBuf| {
+            entries
+                .iter()
+                .any(|e| e.rule.name != name && matches!(&e.origin, Origin::Disk(d) if d == p))
+                // A file nothing tracks (skipped as invalid, or another
+                // rule's future name) is not ours to overwrite either.
+                || (p.exists() && !entries.iter().any(|e| mine(e, p)))
+        };
+        let mut n = 1u32;
+        loop {
+            let path = if n == 1 {
+                self.rules_dir.join(format!("{stem}.toml"))
+            } else {
+                self.rules_dir.join(format!("{stem}-{n}.toml"))
+            };
+            if !taken(&path) {
+                return path;
+            }
+            n += 1;
+        }
+    }
+
+    fn persist_to(&self, rule: &Rule, path: &Path) -> Result<(), String> {
+        let text = toml::to_string_pretty(rule).map_err(|e| format!("serialize rule: {e}"))?;
+        std::fs::write(path, text).map_err(|e| format!("write {}: {e}", path.display()))?;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644));
+        Ok(())
     }
 }
 
@@ -489,6 +538,59 @@ mod tests {
         assert!(store.list().is_empty());
         assert!(store.delete("r1").is_err());
         assert!(store.toggle("r1", true).is_err());
+    }
+
+    /// Toggling a hand-written rule whose file name differs from the
+    /// rule name must update that file, not spawn a name-derived twin
+    /// that reverts or resurrects the rule on reload.
+    #[test]
+    fn toggle_updates_the_original_disk_file() {
+        let (_td, dir) = tmpdir("toggle-origin");
+        let text = "name = \"block-x\"\naction = \"deny\"\nduration = \"forever\"\n\
+                    priority = 1\nenabled = true\n[match]\nport = 25\n";
+        std::fs::write(dir.join("00-block.toml"), text).unwrap();
+        let store = RuleStore::new(dir.clone());
+        store.toggle("block-x", false).unwrap();
+
+        assert!(!dir.join("block-x.toml").exists(), "no name-derived twin");
+        let on_disk: Rule =
+            toml::from_str(&std::fs::read_to_string(dir.join("00-block.toml")).unwrap()).unwrap();
+        assert!(!on_disk.enabled, "the original file carries the toggle");
+        store.reload_disk();
+        assert!(!store.list()[0].enabled, "reload does not revert the toggle");
+    }
+
+    /// Distinct rule names that sanitize to the same file stem must not
+    /// share a file: the second persist would silently overwrite (and a
+    /// later delete would remove) the first rule's backing file.
+    #[test]
+    fn colliding_sanitized_names_get_distinct_files() {
+        let (_td, dir) = tmpdir("collide");
+        let store = RuleStore::new(dir.clone());
+        store.add(rule("allow dns", RuleDuration::Forever)).unwrap();
+        store.add(rule("allow_dns", RuleDuration::Forever)).unwrap();
+
+        let files: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
+        assert_eq!(files.len(), 2, "one file per rule: {files:?}");
+        let store2 = RuleStore::new(dir);
+        assert_eq!(store2.list().len(), 2, "both rules survive a restart");
+    }
+
+    /// An unparsable-but-valid-TOML rule (bad matcher) is skipped on
+    /// load, like add() would have rejected it.
+    #[test]
+    fn invalid_disk_rule_is_skipped_on_load() {
+        let (_td, dir) = tmpdir("invalid-disk");
+        let text = "name = \"bad\"\naction = \"deny\"\nduration = \"forever\"\n\
+                    priority = 1\nenabled = true\n[match]\ndest = \"not-an-ip\"\n";
+        std::fs::write(dir.join("bad.toml"), text).unwrap();
+        let store = RuleStore::new(dir);
+        assert!(store.list().is_empty());
+        assert_eq!(store.rules_skipped(), 1);
     }
 
     #[test]
