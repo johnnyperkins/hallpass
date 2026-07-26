@@ -311,7 +311,10 @@ impl RuleMatch {
         }
         if let Some(h) = &self.exe_sha256 {
             // Full hashes overwhelm one-line summaries; show a prefix.
-            parts.push(format!("sha256={}..", &h[..h.len().min(12)]));
+            // Cut on a char boundary: hand-written rule files can carry
+            // arbitrary text here, and a byte slice would panic on it.
+            let cut = h.char_indices().nth(12).map_or(h.len(), |(i, _)| i);
+            parts.push(format!("sha256={}..", &h[..cut]));
         }
         if let Some(d) = &self.dest {
             parts.push(format!("dest={d}"));
@@ -418,6 +421,29 @@ mod time_tests {
         // 2024-07-03 09:46:40.123 UTC.
         assert_eq!(format_ts(1_720_000_000_123), "2024-07-03 09:46:40");
         assert_eq!(format_rfc3339(1_720_000_000_123), "2024-07-03T09:46:40.123Z");
+    }
+}
+
+#[cfg(test)]
+mod summary_tests {
+    use super::*;
+
+    /// The sha256 prefix cut must land on a char boundary: rule files can
+    /// carry arbitrary text here, and a byte slice would panic clients
+    /// rendering the rule list.
+    #[test]
+    fn summary_survives_multibyte_sha256() {
+        let m = RuleMatch {
+            exe_sha256: Some("\u{5206}\u{6790}\u{30cf}\u{30c3}\u{30b7}\u{30e5}".into()),
+            ..Default::default()
+        };
+        assert!(m.summary().starts_with("sha256="));
+
+        let m = RuleMatch {
+            exe_sha256: Some("aaaaaaaaaaaaaaaa".into()),
+            ..Default::default()
+        };
+        assert_eq!(m.summary(), "sha256=aaaaaaaaaaaa..");
     }
 }
 
