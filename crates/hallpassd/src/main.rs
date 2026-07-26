@@ -161,6 +161,10 @@ async fn main() {
     let (verdict_tx, verdict_rx) = tokio::sync::mpsc::unbounded_channel();
     let (dns_tx, mut dns_rx) =
         tokio::sync::mpsc::unbounded_channel::<(hallpass_types::FlowTuple, Vec<u8>)>();
+    // Signalled by the queue thread when its loop dies on a persistent
+    // error: the daemon must then shut down (tearing nftables down on the
+    // way) rather than keep queueing traffic nobody drains.
+    let (fatal_tx, mut fatal_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
 
     let prompts = Arc::new(PromptTable::new(
         verdict_tx,
@@ -239,6 +243,7 @@ async fn main() {
                 exe_hash: Arc::new(attribution::hash::ExeHashCache::default()),
                 unhandled_verdict: cfg.unhandled_proto_verdict,
                 shutdown: Arc::clone(&shutdown),
+                fatal_tx,
             },
         )
     });
@@ -256,11 +261,12 @@ async fn main() {
         }
     });
 
-    // Wait for SIGTERM or SIGINT.
+    // Wait for SIGTERM, SIGINT, or a fatal queue-loop error.
     let mut sigterm = signal(SignalKind::terminate()).expect("install SIGTERM handler");
     tokio::select! {
         _ = tokio::signal::ctrl_c() => tracing::info!("SIGINT received"),
         _ = sigterm.recv() => tracing::info!("SIGTERM received"),
+        _ = fatal_rx.recv() => tracing::error!("nfqueue loop died, shutting down"),
     }
 
     tracing::info!("shutting down");

@@ -57,6 +57,10 @@ pub struct QueueDeps {
     /// Verdict for packets rules cannot model (SCTP, ICMP, malformed).
     pub unhandled_verdict: Verdict,
     pub shutdown: Arc<AtomicBool>,
+    /// Signalled when the loop dies on a persistent error, so the daemon
+    /// shuts down (and tears nftables down) instead of running on looking
+    /// healthy while every queued packet blackholes.
+    pub fatal_tx: UnboundedSender<()>,
 }
 
 /// Apply `verdict` to a held packet and hand it back to the kernel.
@@ -64,7 +68,7 @@ pub struct QueueDeps {
 /// `Reject` cannot be issued from the queue directly: the packet is accepted
 /// back into the output chain carrying [`crate::nft::REJECT_MARK`], where a
 /// dedicated nft rule turns it into a TCP RST or ICMP unreachable.
-fn apply_verdict(queue: &mut Queue, mut msg: nfq::Message, verdict: Verdict) -> std::io::Result<()> {
+fn apply_verdict(queue: &mut Queue, mut msg: nfq::Message, verdict: Verdict) {
     match verdict {
         Verdict::Allow => msg.set_verdict(NfqVerdict::Accept),
         Verdict::Deny => msg.set_verdict(NfqVerdict::Drop),
@@ -73,7 +77,13 @@ fn apply_verdict(queue: &mut Queue, mut msg: nfq::Message, verdict: Verdict) -> 
             msg.set_verdict(NfqVerdict::Accept);
         }
     }
-    queue.verdict(msg)
+    // Per-packet errors are logged, not propagated: the message is
+    // consumed either way (typically the kernel already dropped it,
+    // e.g. after its queue timeout), and one failed verdict must not
+    // take the whole enforcement loop down with it.
+    if let Err(e) = queue.verdict(msg) {
+        tracing::warn!("verdict delivery failed: {e}");
+    }
 }
 
 /// What to do with one received flow packet.
@@ -135,6 +145,11 @@ pub fn bind(queue_num: u16) -> std::io::Result<Queue> {
     Ok(queue)
 }
 
+/// Give up after this many recv failures in a row: one transient error
+/// (ENOBUFS under a burst) must not kill enforcement, but a persistent
+/// one (queue fd gone) must not spin forever either.
+const MAX_RECV_ERRORS: u32 = 50;
+
 pub fn run(mut queue: Queue, queue_num: u16, mut deps: QueueDeps) -> std::io::Result<()> {
     let snoop_queue = crate::nft::snoop_queue(queue_num);
     let iface_map = crate::iface::IfaceMap::default();
@@ -143,21 +158,24 @@ pub fn run(mut queue: Queue, queue_num: u16, mut deps: QueueDeps) -> std::io::Re
     // (billions of held packets per second for centuries), so no reuse guard;
     // do not "fix" this into a wrapping counter that could collide live keys.
     let mut next_seq: u64 = 0;
+    let mut recv_errors: u32 = 0;
+    let mut fatal: Option<std::io::Error> = None;
 
-    while !deps.shutdown.load(Ordering::Relaxed) {
+    while fatal.is_none() && !deps.shutdown.load(Ordering::Relaxed) {
         let mut busy = false;
 
         // Apply verdicts decided by the async side.
         while let Ok((seq, verdict)) = deps.verdict_rx.try_recv() {
             busy = true;
             if let Some(msg) = held.remove(&seq) {
-                apply_verdict(&mut queue, msg, verdict)?;
+                apply_verdict(&mut queue, msg, verdict);
             }
         }
 
         match queue.recv() {
-            Ok(mut msg) => {
+            Ok(msg) => {
                 busy = true;
+                recv_errors = 0;
                 let parsed = packet::parse(msg.get_payload());
 
                 // Snoop-queue packets (established DNS queries, DNS replies)
@@ -166,8 +184,7 @@ pub fn run(mut queue: Queue, queue_num: u16, mut deps: QueueDeps) -> std::io::Re
                     if let packet::Parsed::Flow(t) = parsed {
                         let _ = deps.dns_tx.send((t, msg.get_payload().to_vec()));
                     }
-                    msg.set_verdict(NfqVerdict::Accept);
-                    queue.verdict(msg)?;
+                    apply_verdict(&mut queue, msg, Verdict::Allow);
                     continue;
                 }
 
@@ -188,7 +205,7 @@ pub fn run(mut queue: Queue, queue_num: u16, mut deps: QueueDeps) -> std::io::Re
                             "unhandled packet blocked by policy"
                         );
                     }
-                    apply_verdict(&mut queue, msg, deps.unhandled_verdict)?;
+                    apply_verdict(&mut queue, msg, deps.unhandled_verdict);
                     continue;
                 };
 
@@ -209,7 +226,7 @@ pub fn run(mut queue: Queue, queue_num: u16, mut deps: QueueDeps) -> std::io::Re
                     Decision::Verdict(verdict, rule_name, conn) => {
                         deps.stats.record_verdict(verdict);
                         deps.events.emit(conn, verdict, Some(rule_name));
-                        apply_verdict(&mut queue, msg, verdict)?;
+                        apply_verdict(&mut queue, msg, verdict);
                     }
                     Decision::Prompt(conn) => {
                         let seq = next_seq;
@@ -218,14 +235,23 @@ pub fn run(mut queue: Queue, queue_num: u16, mut deps: QueueDeps) -> std::io::Re
                             held.insert(seq, msg);
                         } else {
                             // Prompt path gone (shutdown); fail open.
-                            msg.set_verdict(NfqVerdict::Accept);
-                            queue.verdict(msg)?;
+                            apply_verdict(&mut queue, msg, Verdict::Allow);
                         }
                     }
                 }
             }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-            Err(e) => return Err(e),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                recv_errors = 0;
+            }
+            Err(e) => {
+                recv_errors += 1;
+                if recv_errors >= MAX_RECV_ERRORS {
+                    fatal = Some(e);
+                } else {
+                    tracing::warn!(attempt = recv_errors, "nfqueue recv failed: {e}");
+                    std::thread::sleep(IDLE_POLL);
+                }
+            }
         }
 
         if !busy {
@@ -233,25 +259,37 @@ pub fn run(mut queue: Queue, queue_num: u16, mut deps: QueueDeps) -> std::io::Re
         }
     }
 
-    // Shutdown: release anything still held so nothing hangs in the kernel.
+    // Shutdown or fatal error: release anything still held so nothing
+    // hangs in the kernel, and unbind so packets stop being queued.
     for (_, mut msg) in held.drain() {
         msg.set_verdict(NfqVerdict::Accept);
         let _ = queue.verdict(msg);
     }
-    queue.unbind(queue_num)?;
-    queue.unbind(snoop_queue)?;
-    Ok(())
+    if let Err(e) = queue.unbind(queue_num) {
+        tracing::warn!(queue_num, "nfqueue unbind failed: {e}");
+    }
+    if let Err(e) = queue.unbind(snoop_queue) {
+        tracing::warn!(snoop_queue, "nfqueue unbind failed: {e}");
+    }
+    match fatal {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
 /// Spawn the queue loop on its own thread over an already-bound queue.
-/// Errors are logged; the daemon keeps running (IPC stays useful even if
-/// packet interception fails mid-flight).
+/// A persistent error is fatal for the whole daemon: with nftables still
+/// installed and nobody draining the queue, staying up would silently
+/// blackhole (fail-closed) or bypass (fail-open) all new traffic while
+/// looking healthy, so the loop signals `fatal_tx` and main shuts down.
 pub fn spawn(queue: Queue, queue_num: u16, deps: QueueDeps) -> std::thread::JoinHandle<()> {
+    let fatal_tx = deps.fatal_tx.clone();
     std::thread::Builder::new()
         .name("nfqueue".into())
         .spawn(move || {
             if let Err(e) = run(queue, queue_num, deps) {
-                tracing::error!("nfqueue loop failed: {e}");
+                tracing::error!("nfqueue loop failed, stopping the daemon: {e}");
+                let _ = fatal_tx.send(());
             }
         })
         .expect("spawn nfqueue thread")
