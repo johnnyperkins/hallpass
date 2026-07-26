@@ -152,6 +152,24 @@ async fn connect_and_serve(
         Err(e) => return Err(SessionError::early(format!("read HelloAck: {e}"))),
     }
 
+    // Drop whatever the UI queued while disconnected before serving:
+    // prompt replies for dead ids would draw spurious daemon errors, and
+    // list/stat refreshes are re-requested on Connected anyway. Rule
+    // changes and prompt replies are reported so their loss is not
+    // silent.
+    while let Ok(msg) = from_ui.try_recv() {
+        if matches!(
+            msg,
+            ClientMsg::PromptReply { .. }
+                | ClientMsg::RuleAdd(_)
+                | ClientMsg::RuleDelete { .. }
+                | ClientMsg::RuleToggle { .. }
+        ) && !send_ui(to_ui, ctx, UiEvent::SendFailed { msg })
+        {
+            return Ok(());
+        }
+    }
+
     if !send_ui(to_ui, ctx, UiEvent::Connected) {
         return Ok(());
     }

@@ -263,6 +263,13 @@ impl RuleEditor {
         self.error = Some(format!("daemon rejected the rule: {message}"));
     }
 
+    /// The save never reached the daemon (connection lost): re-enable
+    /// the form so it can be retried without losing what was typed.
+    pub fn ack_lost(&mut self, message: &str) {
+        self.awaiting = false;
+        self.error = Some(message.to_string());
+    }
+
     fn form(&mut self, ui: &mut egui::Ui, saved: &mut Option<Rule>) {
         egui::Grid::new("rule-editor-grid")
             .num_columns(2)

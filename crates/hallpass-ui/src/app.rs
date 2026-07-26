@@ -38,6 +38,28 @@ enum ConnStatus {
     Reconnecting { retry_in: Duration },
 }
 
+/// What an in-flight Ok/Err on the ordered IPC stream will answer.
+/// Prompt replies, toggles, deletes, and saves all draw Ok/Err from the
+/// same stream, so replies must be matched to requests in FIFO order or
+/// an unrelated ack would close (or fail) the rule editor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AckKind {
+    RuleSave,
+    Other,
+}
+
+/// The ack, if any, the daemon will send for `msg`.
+fn ack_kind(msg: &ClientMsg) -> Option<AckKind> {
+    match msg {
+        ClientMsg::RuleAdd(_) => Some(AckKind::RuleSave),
+        ClientMsg::Subscribe { .. }
+        | ClientMsg::PromptReply { .. }
+        | ClientMsg::RuleDelete { .. }
+        | ClientMsg::RuleToggle { .. } => Some(AckKind::Other),
+        _ => None,
+    }
+}
+
 pub struct HallpassApp {
     /// Channel to the tokio thread (UI -> daemon).
     to_daemon: UnboundedSender<ClientMsg>,
@@ -55,6 +77,8 @@ pub struct HallpassApp {
     quit_requested: bool,
     /// Open rule add/edit form, if any.
     editor: Option<RuleEditor>,
+    /// FIFO of what each expected Ok/Err answers, in send order.
+    pending_acks: VecDeque<AckKind>,
 }
 
 impl HallpassApp {
@@ -74,10 +98,14 @@ impl HallpassApp {
             last_error: None,
             quit_requested: false,
             editor: None,
+            pending_acks: VecDeque::new(),
         }
     }
 
-    fn send(&self, msg: ClientMsg) {
+    fn send(&mut self, msg: ClientMsg) {
+        if let Some(kind) = ack_kind(&msg) {
+            self.pending_acks.push_back(kind);
+        }
         // The net thread outlives the app; a send error only happens during
         // shutdown and is safe to ignore.
         let _ = self.to_daemon.send(msg);
@@ -101,10 +129,26 @@ impl HallpassApp {
                 }
                 UiEvent::Disconnected { retry_in } => {
                     self.status = ConnStatus::Reconnecting { retry_in };
-                    // Pending prompts are dead with the connection.
+                    // Pending prompts and in-flight acks are dead with
+                    // the connection.
                     self.prompts.clear();
+                    self.pending_acks.clear();
+                    if let Some(editor) = self.editor.as_mut().filter(|e| e.awaiting_ack()) {
+                        editor.ack_lost("connection lost; the rule was not saved");
+                    }
                 }
                 UiEvent::SendFailed { msg } => {
+                    // Its ack will never arrive; keep the FIFO aligned.
+                    if ack_kind(&msg).is_some() {
+                        self.pending_acks.pop_front();
+                    }
+                    if matches!(msg, ClientMsg::RuleAdd(_)) {
+                        if let Some(editor) =
+                            self.editor.as_mut().filter(|e| e.awaiting_ack())
+                        {
+                            editor.ack_lost("connection lost; the rule was not saved");
+                        }
+                    }
                     // The message is gone; for a prompt reply the daemon
                     // falls back to its default verdict, so tell the user
                     // instead of failing silently.
@@ -149,18 +193,24 @@ impl HallpassApp {
             }
             DaemonMsg::Rules(rules) => self.rules = rules,
             DaemonMsg::Stats(stats) => self.stats = stats,
-            // Replies arrive in request order on the one IPC stream, so
-            // while a save is in flight the next Ok/Err answers it: keep
+            // Replies arrive in request order on the one IPC stream;
+            // `pending_acks` records what each was for, so a save's ack
+            // is told apart from a toggle's or a prompt reply's: keep
             // the form (and everything typed into it) alive on a reject,
-            // close it on success.
+            // close it on success, and route unrelated acks elsewhere.
             DaemonMsg::Err { message } => {
-                match self.editor.as_mut().filter(|e| e.awaiting_ack()) {
-                    Some(editor) => editor.ack_err(&message),
-                    None => self.last_error = Some(message),
+                match (
+                    self.pending_acks.pop_front(),
+                    self.editor.as_mut().filter(|e| e.awaiting_ack()),
+                ) {
+                    (Some(AckKind::RuleSave), Some(editor)) => editor.ack_err(&message),
+                    _ => self.last_error = Some(message),
                 }
             }
             DaemonMsg::Ok => {
-                if self.editor.as_ref().is_some_and(RuleEditor::awaiting_ack) {
+                if self.pending_acks.pop_front() == Some(AckKind::RuleSave)
+                    && self.editor.as_ref().is_some_and(RuleEditor::awaiting_ack)
+                {
                     self.editor = None;
                 }
             }
@@ -412,14 +462,18 @@ impl HallpassApp {
 
         // Group by exe, oldest prompt (lowest id) first within each app.
         // Sorting keeps both the grouping and the front prompt stable
-        // across frames.
+        // across frames. Prompts without an attributed exe are NOT
+        // grouped: two unattributed programs are not "the same app",
+        // and one window's close button must not dismiss the other's
+        // request.
         self.prompts
             .sort_by(|a, b| (&a.conn.exe_path, a.id).cmp(&(&b.conn.exe_path, b.id)));
         let mut groups: Vec<(usize, usize)> = Vec::new(); // (start, len)
         for (i, p) in self.prompts.iter().enumerate() {
             match groups.last_mut() {
                 Some((start, len))
-                    if self.prompts[*start].conn.exe_path == p.conn.exe_path =>
+                    if self.prompts[*start].conn.exe_path.is_some()
+                        && self.prompts[*start].conn.exe_path == p.conn.exe_path =>
                 {
                     *len += 1;
                 }
@@ -440,10 +494,14 @@ impl HallpassApp {
                 .map(|p| p.id)
                 .collect();
             let p = &mut self.prompts[start];
-            // Keyed by exe rather than prompt id, so the window survives
-            // its front prompt being answered and shows the next one.
-            let viewport_id =
-                egui::ViewportId::from_hash_of(("hallpass-prompt-app", &p.conn.exe_path));
+            let viewport_id = match &p.conn.exe_path {
+                // Keyed by exe rather than prompt id, so the window
+                // survives its front prompt being answered and shows
+                // the next one.
+                Some(exe) => egui::ViewportId::from_hash_of(("hallpass-prompt-app", exe)),
+                // Unattributed: one window per prompt.
+                None => egui::ViewportId::from_hash_of(("hallpass-prompt-anon", p.id)),
+            };
             let builder = egui::ViewportBuilder::default()
                 .with_title("Connection request")
                 .with_inner_size([440.0, 330.0])
