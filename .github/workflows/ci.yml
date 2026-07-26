@@ -40,11 +40,13 @@ jobs:
         run: cargo install bpf-linker --locked
       - name: Build eBPF object
         run: cargo xtask build-ebpf
-      # Only hallpassd changes under the feature, and no test is gated on
-      # it (the btf tests run in the plain test job via cfg(any(test,
-      # feature))), so clippy of the feature build is the whole check.
       - name: Clippy (ebpf feature)
         run: cargo clippy -p hallpassd --all-targets --features ebpf -- -D warnings
+      # The plain test job never enables the feature, so the tests gated
+      # on it (attribution/ebpf.rs unit tests) only run here. The e2e
+      # suite stays #[ignore]-gated and runs in the e2e job.
+      - name: Test (ebpf feature)
+        run: cargo test -p hallpassd --features ebpf
 
   e2e:
     name: e2e (root + netns)
@@ -57,10 +59,17 @@ jobs:
         # iproute2 and python3 ship with the runner image; the suite also
         # needs nft and nc.
         run: sudo apt-get update && sudo apt-get install -y nftables netcat-openbsd
+      # The uprobe test needs the ebpf feature, and the skip-marker guard
+      # below treats any skip as a broken environment, so the binary must
+      # be built with the feature (which needs the eBPF object first).
+      - name: Install bpf-linker
+        run: cargo install bpf-linker --locked
+      - name: Build eBPF object
+        run: cargo xtask build-ebpf
       # Build unprivileged so the cache and target/ stay runner-user-owned;
       # only the test run itself needs root.
       - name: Build e2e test binary
-        run: cargo test -p hallpassd --test e2e --no-run
+        run: cargo test -p hallpassd --test e2e --features ebpf --no-run
       - name: Run e2e tests
         # --test-threads=1: the tests share fixed namespace names.
         # The suite skips gracefully (and passes) when the environment is
@@ -69,7 +78,7 @@ jobs:
         # the harness hides stderr of passing tests.
         shell: bash
         run: |
-          sudo -E "$(command -v cargo)" test -p hallpassd --test e2e -- --ignored --test-threads=1 --nocapture 2>&1 | tee e2e.log
+          sudo -E "$(command -v cargo)" test -p hallpassd --test e2e --features ebpf -- --ignored --test-threads=1 --nocapture 2>&1 | tee e2e.log
           ! grep -q 'SKIP e2e' e2e.log
 
   deny:
