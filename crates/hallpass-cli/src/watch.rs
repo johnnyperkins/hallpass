@@ -113,6 +113,8 @@ pub async fn watch(mut client: Client) -> Result<(), CliError> {
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     let mut queue: VecDeque<Pending> = VecDeque::new();
     let mut current: Option<(Pending, Stage)> = None;
+    // Whether the Subscribe request has been acked.
+    let mut subscribed = false;
 
     println!("watching for connection prompts (Ctrl-C to quit)");
     loop {
@@ -137,8 +139,22 @@ pub async fn watch(mut client: Client) -> Result<(), CliError> {
                         println!("prompt #{id} expired");
                     }
                 }
+                Some(Ok(DaemonMsg::Ok)) => {
+                    // First Ok is the Subscribe ack; later ones answer
+                    // prompt replies.
+                    subscribed = true;
+                }
                 Some(Ok(DaemonMsg::Err { message })) => {
-                    return Err(CliError::Daemon(message));
+                    // Before the Subscribe ack an Err means watch cannot
+                    // work at all (protocol trouble, or another handler
+                    // holds the prompt slot). After it, an Err is about
+                    // one reply - typically a race with prompt expiry -
+                    // and must not kill the whole session, which would
+                    // silently release the handler slot.
+                    if !subscribed {
+                        return Err(CliError::Daemon(message));
+                    }
+                    eprintln!("daemon error: {message}");
                 }
                 Some(Ok(_)) => {}
             },
