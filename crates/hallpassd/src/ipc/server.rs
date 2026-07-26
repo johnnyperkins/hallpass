@@ -203,16 +203,11 @@ async fn message_loop(
                 message: "duplicate Hello".into(),
             },
             ClientMsg::Subscribe { events, prompts } => {
-                if prompts && !deps.prompts.set_handler(out_tx.clone()) {
-                    send(
-                        out_tx,
-                        DaemonMsg::Err {
-                            message: "a prompt handler is already connected".into(),
-                        },
-                    )
-                    .await;
-                    continue;
-                }
+                // The two subscriptions are independent: a taken prompt
+                // slot must not silently drop the events half of the
+                // same request, so events are wired up either way and
+                // the reply reports the prompt-slot outcome.
+                let prompt_denied = prompts && !deps.prompts.set_handler(out_tx.clone());
                 if events {
                     let mut rx = deps.events.subscribe();
                     let tx = out_tx.clone();
@@ -236,7 +231,13 @@ async fn message_loop(
                         }
                     });
                 }
-                DaemonMsg::Ok
+                if prompt_denied {
+                    DaemonMsg::Err {
+                        message: "a prompt handler is already connected".into(),
+                    }
+                } else {
+                    DaemonMsg::Ok
+                }
             }
             ClientMsg::PromptReply {
                 id,
@@ -253,8 +254,15 @@ async fn message_loop(
             ClientMsg::RuleList => DaemonMsg::Rules(deps.store.list()),
             ClientMsg::RuleAdd(rule) => {
                 tracing::info!(?peer_uid, rule = %rule.name, "rule add");
-                match deps.store.add(rule) {
-                    Ok(()) => DaemonMsg::Ok,
+                match deps.store.add(rule.clone()) {
+                    Ok(()) => {
+                        // Same sweep the prompt-reply path does: prompts
+                        // already on screen that this rule covers must
+                        // resolve with its action, not sit until the
+                        // timeout applies the default verdict.
+                        deps.prompts.resolve_covered_by(&rule);
+                        DaemonMsg::Ok
+                    }
                     Err(message) => DaemonMsg::Err { message },
                 }
             }
