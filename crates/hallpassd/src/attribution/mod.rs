@@ -71,7 +71,17 @@ impl AttributionChain {
     /// negative results) are cached to avoid /proc scan storms.
     pub fn attribute(&self, tuple: &FlowTuple) -> Option<ProcInfo> {
         if let Some(cached) = self.cache.get(tuple) {
-            return cached;
+            match &cached {
+                None => return None,
+                // Source ports are reused: a new connection can carry
+                // the tuple of a flow whose owner has since exited, and
+                // serving that entry would hand the old process's
+                // identity (and its allow rules) to whatever owns the
+                // port now. Trust a positive hit only while its process
+                // still runs its recorded executable.
+                Some(info) if cached_still_valid(info) => return cached,
+                _ => {}
+            }
         }
         let info = self.sources.iter().find_map(|s| s.attribute(tuple));
         self.cache.put(*tuple, info.clone());
@@ -98,6 +108,21 @@ impl AttributionChain {
             iface: None,
         }
     }
+}
+
+/// Whether a cached positive attribution still describes a live process:
+/// the pid exists and its exe symlink reads the same as when cached (a
+/// failed readlink counts as None on both sides, matching how the entry
+/// was captured). Without a pid there is nothing to verify against.
+fn cached_still_valid(info: &ProcInfo) -> bool {
+    let Some(pid) = info.pid else {
+        return false;
+    };
+    let base = std::path::Path::new("/proc").join(pid.to_string());
+    if !base.exists() {
+        return false;
+    }
+    std::fs::read_link(base.join("exe")).ok() == info.exe_path
 }
 
 #[cfg(test)]

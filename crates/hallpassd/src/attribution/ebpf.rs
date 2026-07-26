@@ -35,10 +35,16 @@ use super::{procfs, Attributor, ProcInfo};
 /// build-ebpf` produced, in that order.
 static EBPF_OBJ: &[u8] = aya::include_bytes_aligned!(env!("HALLPASS_EBPF_OBJ"));
 
+/// Details snapshotted at exec time, plus the starttime of the process
+/// they were read from.
+type ProcDetails = (Option<PathBuf>, Option<String>, Option<PathBuf>);
+
 /// pid -> details snapshotted at exec time. Exit events are the primary
 /// eviction path, but they are lossy (the ring buffer drops under
-/// pressure), so the LRU cap is the backstop against unbounded growth.
-type ProcCache = Arc<Mutex<LruCache<u32, (Option<PathBuf>, Option<String>, Option<PathBuf>)>>>;
+/// pressure), so the LRU cap is the backstop against unbounded growth
+/// and the starttime check in [`EbpfAttributor::details_for`] is the
+/// guard against a stale entry outliving its pid.
+type ProcCache = Arc<Mutex<LruCache<u32, (ProcDetails, Option<u64>)>>>;
 
 const PID_CACHE_CAP: usize = 4096;
 
@@ -135,14 +141,21 @@ impl EbpfAttributor {
         })
     }
 
-    fn details_for(&self, pid: u32) -> (Option<PathBuf>, Option<String>, Option<PathBuf>) {
-        if let Some(d) = self.cache.lock().unwrap().get(&pid) {
-            return d.clone();
+    fn details_for(&self, pid: u32) -> ProcDetails {
+        // Exit events are lossy and fork-without-exec emits no exec
+        // event, so a cache hit may describe a previous occupant of
+        // this pid; only serve it while the starttime still matches
+        // the process the snapshot was taken from.
+        let now_start = procfs::starttime_of(Path::new("/proc"), pid);
+        if let Some((d, cached_start)) = self.cache.lock().unwrap().get(&pid) {
+            if now_start.is_some() && *cached_start == now_start {
+                return d.clone();
+            }
         }
-        // Not seen via the exec tracepoint (started before the daemon);
-        // snapshot now and remember it. The exit event evicts it.
+        // Not seen via the exec tracepoint (started before the daemon)
+        // or stale; snapshot now and remember it.
         let d = procfs::proc_snapshot(Path::new("/proc"), pid);
-        self.cache.lock().unwrap().put(pid, d.clone());
+        self.cache.lock().unwrap().put(pid, (d.clone(), now_start));
         d
     }
 }
@@ -389,7 +402,8 @@ fn spawn_event_reader(ring: RingBuf<MapData>, cache: ProcCache, stop: StopRx) {
         };
         if ev.kind == EVENT_EXEC {
             let d = procfs::proc_snapshot(Path::new("/proc"), ev.pid);
-            cache.lock().unwrap().put(ev.pid, d);
+            let start = procfs::starttime_of(Path::new("/proc"), ev.pid);
+            cache.lock().unwrap().put(ev.pid, (d, start));
         } else {
             cache.lock().unwrap().pop(&ev.pid);
         }

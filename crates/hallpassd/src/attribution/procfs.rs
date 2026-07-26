@@ -208,6 +208,17 @@ pub(super) fn parent_exe_of(proc_root: &Path, pid: u32) -> Option<PathBuf> {
     (ppid_of(proc_root, pid) == Some(ppid)).then_some(exe)
 }
 
+/// Process start time (clock ticks since boot) from /proc/pid/stat field
+/// 22, parsed after the comm field's closing paren like [`ppid_of`]. The
+/// (pid, starttime) pair identifies one process incarnation: a recycled
+/// pid gets a new starttime.
+#[cfg_attr(not(feature = "ebpf"), allow(dead_code))]
+pub(super) fn starttime_of(proc_root: &Path, pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(proc_root.join(pid.to_string()).join("stat")).ok()?;
+    let after_comm = stat.rsplit_once(')')?.1;
+    after_comm.split_whitespace().nth(19)?.parse().ok()
+}
+
 /// Exe, cmdline, and parent exe for `pid`, snapshotted together. Used by
 /// the eBPF attributor at exec-event time, while the parent is certainly
 /// alive.
