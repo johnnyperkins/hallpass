@@ -263,17 +263,33 @@ async fn main() {
 
     // Wait for SIGTERM, SIGINT, or a fatal queue-loop error.
     let mut sigterm = signal(SignalKind::terminate()).expect("install SIGTERM handler");
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => tracing::info!("SIGINT received"),
-        _ = sigterm.recv() => tracing::info!("SIGTERM received"),
-        _ = fatal_rx.recv() => tracing::error!("nfqueue loop died, shutting down"),
-    }
+    let fatal = tokio::select! {
+        _ = tokio::signal::ctrl_c() => {
+            tracing::info!("SIGINT received");
+            false
+        }
+        _ = sigterm.recv() => {
+            tracing::info!("SIGTERM received");
+            false
+        }
+        _ = fatal_rx.recv() => {
+            tracing::error!("nfqueue loop died, shutting down");
+            true
+        }
+    };
 
     tracing::info!("shutting down");
     shutdown.store(true, Ordering::Relaxed);
     ipc_task.abort();
-    if nft_installed {
+    // Same rule as the panic hook: in fail-closed mode the table IS the
+    // enforcement, so a daemon dying unexpectedly must leave it standing.
+    // Tearing it down here handed an operator who chose queue_bypass = false
+    // the opposite of what that setting promises.
+    let keep_table_for_enforcement = fatal && !cfg.queue_bypass;
+    if nft_installed && !keep_table_for_enforcement {
         nft::teardown();
+    } else if keep_table_for_enforcement {
+        tracing::warn!("leaving nftables table installed: fail-closed enforcement holds until restart");
     }
     if let Err(e) = std::fs::remove_file(&cfg.socket_path) {
         if e.kind() != std::io::ErrorKind::NotFound {
@@ -284,4 +300,9 @@ async fn main() {
         let _ = t.join();
     }
     tracing::info!("hallpassd stopped");
+    // A clean return is exit status 0, which Restart=on-failure ignores. The
+    // queue loop dying is a failure and must earn a restart.
+    if fatal {
+        std::process::exit(1);
+    }
 }
