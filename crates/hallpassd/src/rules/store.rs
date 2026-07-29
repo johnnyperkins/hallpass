@@ -51,6 +51,44 @@ pub(crate) fn effective_uid() -> Option<u32> {
     std::fs::metadata("/proc/self").map(|m| m.uid()).ok()
 }
 
+/// Confine a rule's match-list paths to `dir`.
+///
+/// Rules on disk are authored by root and may name any path. Rules arriving
+/// over IPC are authored by any member of the `hallpass` group, whose granted
+/// authority is managing rules and answering prompts, not reading root-only
+/// files. Compiling a rule opens its list files as root, so an unconfined
+/// path turned every root-readable, non-group-writable file (`/etc/shadow`,
+/// `/proc/1/environ`) into something a group member could name and have the
+/// daemon read.
+///
+/// Every rejection returns the same message: distinguishing "outside the
+/// directory" from "does not exist" would leave a path-existence oracle.
+fn list_paths_within(rule: &Rule, dir: &Path) -> Result<(), String> {
+    let m = &rule.matcher;
+    let fields = [
+        ("domains_file", m.domains_file.as_deref()),
+        ("ips_file", m.ips_file.as_deref()),
+        ("hashes_file", m.hashes_file.as_deref()),
+    ];
+    if fields.iter().all(|(_, p)| p.is_none()) {
+        return Ok(());
+    }
+    let canon_dir = dir
+        .canonicalize()
+        .map_err(|e| format!("cannot resolve rules dir {}: {e}", dir.display()))?;
+    for (field, path) in fields {
+        let Some(path) = path else { continue };
+        let rejected = || format!("{field} must name a file in {}", canon_dir.display());
+        // canonicalize resolves `..` and symlinks, so neither traversal nor a
+        // link planted inside the directory escapes it.
+        let canon = path.canonicalize().map_err(|_| rejected())?;
+        if canon.parent() != Some(canon_dir.as_path()) {
+            return Err(rejected());
+        }
+    }
+    Ok(())
+}
+
 /// Turn a rule name into a safe file stem.
 fn sanitize_filename(name: &str) -> String {
     let stem: String = name
@@ -215,10 +253,15 @@ impl RuleStore {
     }
 
     /// Add or replace a rule by name. Forever rules are persisted to disk.
+    ///
+    /// This is the entry point for rules that did not come from disk (IPC
+    /// `RuleAdd` and prompt replies), so match-list paths are confined here.
     pub fn add(&self, rule: Rule) -> Result<(), String> {
         if rule.name.is_empty() {
             return Err("rule name must not be empty".into());
         }
+        // Before compile: compiling opens the list files as root.
+        list_paths_within(&rule, &self.rules_dir)?;
         CompiledRule::compile(&rule)?;
         // Persist while holding the entries lock: the directory watcher's
         // reload_disk() takes the same lock, so it cannot observe the new
@@ -452,6 +495,59 @@ mod tests {
         let td = TestDir::new(&format!("store-{tag}"));
         let path = td.path().to_path_buf();
         (td, path)
+    }
+
+    fn rule_with_ips_file(path: &Path) -> Rule {
+        let mut r = rule("listy", RuleDuration::Session);
+        r.matcher.ips_file = Some(path.to_path_buf());
+        r
+    }
+
+    /// A list path outside the rules directory is refused before anything
+    /// opens it, so an IPC client cannot aim the root daemon at /etc/shadow.
+    #[test]
+    fn add_refuses_list_file_outside_rules_dir() {
+        let (_td, dir) = tmpdir("outside-list");
+        let outside = dir.join("elsewhere");
+        std::fs::create_dir_all(&outside).unwrap();
+        let list = outside.join("ips.list");
+        std::fs::write(&list, "10.0.0.1\n").unwrap();
+
+        let store = RuleStore::new(dir.join("rules.d"));
+        std::fs::create_dir_all(dir.join("rules.d")).unwrap();
+        let err = store.add(rule_with_ips_file(&list)).unwrap_err();
+        assert!(err.contains("ips_file must name a file in"), "{err}");
+    }
+
+    /// The rejection for a nonexistent path is byte-identical to the one for
+    /// a path outside the directory: no path-existence oracle.
+    #[test]
+    fn add_list_file_rejection_does_not_leak_existence() {
+        let (_td, dir) = tmpdir("oracle-list");
+        let rules_dir = dir.join("rules.d");
+        std::fs::create_dir_all(&rules_dir).unwrap();
+        let store = RuleStore::new(rules_dir);
+
+        let real_but_outside = dir.join("real.list");
+        std::fs::write(&real_but_outside, "10.0.0.1\n").unwrap();
+        let missing = dir.join("definitely-absent.list");
+
+        let a = store.add(rule_with_ips_file(&real_but_outside)).unwrap_err();
+        let b = store.add(rule_with_ips_file(&missing)).unwrap_err();
+        assert_eq!(a, b, "existing and missing paths must be indistinguishable");
+    }
+
+    /// A list file inside the rules directory still works.
+    #[test]
+    fn add_accepts_list_file_inside_rules_dir() {
+        let (_td, dir) = tmpdir("inside-list");
+        let rules_dir = dir.join("rules.d");
+        std::fs::create_dir_all(&rules_dir).unwrap();
+        let list = rules_dir.join("ips.list");
+        std::fs::write(&list, "10.0.0.1\n").unwrap();
+
+        let store = RuleStore::new(rules_dir);
+        store.add(rule_with_ips_file(&list)).expect("in-dir list accepted");
     }
 
     #[test]
