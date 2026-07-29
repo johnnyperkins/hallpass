@@ -92,11 +92,17 @@ static DOMAIN_CACHE: LazyLock<ListCache<DomainSet>> = LazyLock::new(ListCache::n
 static IP_CACHE: LazyLock<ListCache<IpSet>> = LazyLock::new(ListCache::new);
 static HASH_CACHE: LazyLock<ListCache<HashSet256>> = LazyLock::new(ListCache::new);
 
-/// Content lines with `#` comments and blanks stripped.
-fn content_lines(text: &str) -> impl Iterator<Item = &str> {
+/// Content lines with `#` comments and blanks stripped, each paired with its
+/// 1-based physical line number.
+///
+/// Parse errors report the number, never the text. These files are opened by
+/// a root daemon and the error string reaches an IPC client, so echoing a
+/// line back would turn any root-readable file into a disclosure oracle.
+fn content_lines(text: &str) -> impl Iterator<Item = (usize, &str)> {
     text.lines()
-        .map(|l| l.split('#').next().unwrap_or("").trim())
-        .filter(|l| !l.is_empty())
+        .enumerate()
+        .map(|(i, l)| (i + 1, l.split('#').next().unwrap_or("").trim()))
+        .filter(|(_, l)| !l.is_empty())
 }
 
 /// Domains from a hosts-format ("0.0.0.0 ads.example.com") or
@@ -110,7 +116,7 @@ impl DomainSet {
     pub fn load(path: &Path) -> Result<Arc<DomainSet>, String> {
         DOMAIN_CACHE.load(path, |text, path| {
             let mut domains = HashSet::new();
-            for line in content_lines(text) {
+            for (_, line) in content_lines(text) {
                 let mut tokens = line.split_whitespace();
                 let first = tokens.next().unwrap_or("");
                 // Hosts format: an address followed by one or more names.
@@ -160,13 +166,16 @@ impl IpSet {
         IP_CACHE.load(path, |text, path| {
             let mut hosts = HashSet::new();
             let mut nets = Vec::new();
-            for line in content_lines(text) {
+            for (no, line) in content_lines(text) {
                 if let Ok(ip) = line.parse::<IpAddr>() {
                     hosts.insert(ip);
                 } else if let Ok(net) = line.parse::<IpNet>() {
                     nets.push(net);
                 } else {
-                    return Err(format!("{}: bad entry {line:?}", path.display()));
+                    return Err(format!(
+                        "{}: line {no} is not an IP address or CIDR block",
+                        path.display()
+                    ));
                 }
             }
             tracing::debug!(
@@ -194,9 +203,16 @@ impl HashSet256 {
     pub fn load(path: &Path) -> Result<Arc<HashSet256>, String> {
         HASH_CACHE.load(path, |text, path| {
             let mut hashes = HashSet::new();
-            for line in content_lines(text) {
-                hashes
-                    .insert(parse_sha256_hex(line).map_err(|e| format!("{}: {e}", path.display()))?);
+            for (no, line) in content_lines(text) {
+                // parse_sha256_hex echoes the value, which is right for the
+                // client-supplied exe_sha256 field but not for file content.
+                let hash = parse_sha256_hex(line).map_err(|_| {
+                    format!(
+                        "{}: line {no} is not a 64-digit hex SHA-256",
+                        path.display()
+                    )
+                })?;
+                hashes.insert(hash);
             }
             tracing::debug!(file = %path.display(), count = hashes.len(), "hash list loaded");
             Ok(HashSet256 { hashes })
@@ -218,6 +234,24 @@ mod tests {
         let path = dir.path().join(name);
         std::fs::write(&path, text).unwrap();
         path
+    }
+
+    /// Parse errors name a line number, never its text. The error string
+    /// reaches an IPC client, so echoing content would disclose the file.
+    #[test]
+    fn parse_errors_never_echo_file_content() {
+        let d = TestDir::new("lists-no-echo");
+        let secret = "root:$6$SUPERSECRETHASH:19000:0:99999:7:::";
+
+        let ips = write(&d, "ips.list", &format!("# comment\n{secret}\n"));
+        let err = IpSet::load(&ips).unwrap_err();
+        assert!(!err.contains("SUPERSECRETHASH"), "leaked content: {err}");
+        assert!(err.contains("line 2"), "should name the line: {err}");
+
+        let hashes = write(&d, "hashes.list", &format!("{secret}\n"));
+        let err = HashSet256::load(&hashes).unwrap_err();
+        assert!(!err.contains("SUPERSECRETHASH"), "leaked content: {err}");
+        assert!(err.contains("line 1"), "should name the line: {err}");
     }
 
     #[test]
