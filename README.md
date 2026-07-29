@@ -128,7 +128,7 @@ install -Dm755 target/release/hallpassd  /usr/bin/hallpassd
 install -Dm755 target/release/hallpass-cli /usr/bin/hallpass-cli
 install -Dm755 target/release/hallpass-ui  /usr/bin/hallpass-ui
 install -Dm644 etc/config.toml           /etc/hallpass/config.toml
-install -Dm644 etc/rules.d/example-allow-dns.toml /etc/hallpass/rules.d/example-allow-dns.toml
+install -Dm644 etc/rules.d/example-allow-dns.toml /etc/hallpass/rules.d/example-allow-dns.toml  # ships disabled
 install -Dm644 etc/hallpassd.service     /etc/systemd/system/hallpassd.service
 install -Dm644 etc/hallpass-ui.desktop   /usr/share/applications/hallpass-ui.desktop
 
@@ -172,7 +172,17 @@ proto = "udp"
 # hashes_file = "/etc/hallpass/rules.d/bad.sha256"  # exe SHA-256s, one per line
 ```
 
-The directory is watched; edits apply without a restart.
+The directory is watched; edits apply without a restart. Unknown keys are
+rejected: a file with a misspelled operand is skipped with a warning rather
+than loaded with a wider match than you wrote.
+
+The one rule the installer drops in, `example-allow-dns.toml`, ships with
+`enabled = false`. Matching on port and protocol alone would let every local
+process send arbitrary UDP to port 53 on any host, which is a standard
+exfiltration channel, so scope it (with `dest` or `exe`) before enabling it.
+Reinstalling never overwrites it, so your edits survive upgrades. **If you
+installed before this changed, check that file:** the old copy shipped
+`enabled = true` and an upgrade will not touch it.
 
 Decided connections can also be exported to syslog (local socket or a
 remote collector) for SIEM ingestion, as RFC 5424 structured data or JSON:

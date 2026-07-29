@@ -53,10 +53,13 @@ install -Dm755 target/release/hallpassd   /usr/bin/hallpassd
 install -Dm755 target/release/hallpass-cli /usr/bin/hallpass-cli
 install -Dm755 target/release/hallpass-ui  /usr/bin/hallpass-ui
 
-# Config and example rule: never clobber an existing admin-edited config.
+# Config and example rule: never clobber admin-edited policy. The example
+# rule is guarded like the config, so editing it (or deleting it outright)
+# survives a reinstall instead of being silently restored.
 install -d /etc/hallpass /etc/hallpass/rules.d
 [ -f /etc/hallpass/config.toml ] || install -m644 etc/config.toml /etc/hallpass/config.toml
-install -Dm644 etc/rules.d/example-allow-dns.toml /etc/hallpass/rules.d/example-allow-dns.toml
+[ -e /etc/hallpass/rules.d/example-allow-dns.toml ] \
+  || install -m644 etc/rules.d/example-allow-dns.toml /etc/hallpass/rules.d/example-allow-dns.toml
 
 # systemd unit and desktop entries.
 install -Dm644 etc/hallpassd.service   /etc/systemd/system/hallpassd.service
