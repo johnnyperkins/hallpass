@@ -602,6 +602,38 @@ fn allow_rule_permits_connection() {
     );
 }
 
+/// A reject verdict must actually stop the connection, and must stop it with
+/// an RST rather than a silent drop. Reinjection from NFQUEUE resumes at the
+/// next base chain, so reject rules sharing the queuing chain are dead code
+/// and every reject verdict becomes an allow; that regression passes a plain
+/// "did it connect" assertion only if the timing is checked too.
+#[test]
+#[ignore = "requires root and network namespaces"]
+fn reject_rule_refuses_connection_promptly() {
+    let Some(mut env) = TestEnv::setup("reject") else { return };
+    env.start_listener(19015);
+    env.start_daemon("allow", &[&rule("e2e-reject", Action::Reject, 19015)]);
+    env.assert_daemon_alive();
+
+    let started = Instant::now();
+    let connected = env.connect(19015);
+    let elapsed = started.elapsed();
+
+    assert!(
+        !connected,
+        "connection should be refused by the reject rule; daemon log:\n{}",
+        env.daemon_log()
+    );
+    // `connect()` gives nc a 3s timeout. An RST returns immediately; a drop
+    // burns the whole timeout, which is what a misplaced reject rule looks
+    // like when the default verdict happens to also block.
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "reject should return an RST immediately, took {elapsed:?} (silent drop?); daemon log:\n{}",
+        env.daemon_log()
+    );
+}
+
 #[test]
 #[ignore = "requires root and network namespaces"]
 fn no_rule_default_allow_permits() {

@@ -1,6 +1,6 @@
 //! nftables ruleset install/teardown via the `nft` binary.
 //!
-//! Table `inet hallpass` with two chains and two queues:
+//! Table `inet hallpass` with three chains and two queues:
 //! - output, verdict queue: new connections wait for an allow/deny verdict.
 //! - output, snoop queue: established outbound DNS queries (the first query
 //!   on a flow is `ct state new` and arrives via the verdict queue).
@@ -10,11 +10,19 @@
 //! records them so responses can be validated against observed queries.
 //!
 //! A [`Verdict::Reject`](hallpass_types::Verdict) is delivered by accepting
-//! the packet back into the output chain with [`REJECT_MARK`] set on it; two
-//! rules right after the verdict queue turn a marked packet into a TCP RST
-//! (for TCP) or an ICMP port-unreachable (everything else). The verdict
-//! queue itself can only accept or drop, so the reject cannot be issued from
-//! the nfqueue thread directly.
+//! the packet with [`REJECT_MARK`] set on it; two rules in a *separate* base
+//! chain turn a marked packet into a TCP RST (for TCP) or an ICMP
+//! port-unreachable (everything else). The verdict queue itself can only
+//! accept or drop, so the reject cannot be issued from the nfqueue thread
+//! directly.
+//!
+//! The reject rules must live in their own base chain at a later priority,
+//! not after the queue rule in the chain that queued the packet. A verdict
+//! of accept from NFQUEUE resumes traversal at the *next base chain* in the
+//! hook (the kernel's `nf_reinject` advances the hook index), never at the
+//! next rule of the chain the packet left. Reject rules sharing the queuing
+//! chain are unreachable for every reinjected packet, which silently turns
+//! every reject verdict into an allow.
 //!
 //! The snoop queues always use `bypass`: they are purely observational
 //! (packets are accepted immediately), so dropping DNS when the daemon is
@@ -43,17 +51,21 @@ fn ruleset(queue_num: u16, verdict_bypass: bool) -> String {
     let snoop = snoop_queue(queue_num);
     let mark = REJECT_MARK;
     let bypass = if verdict_bypass { " bypass" } else { "" };
-    // The reject rules sit right after the verdict queue: a packet the
-    // daemon accepts with REJECT_MARK resumes chain traversal here and is
-    // rejected; unmarked (allowed) packets fall through untouched.
+    // `reject` is its own base chain at a later priority than `output`, so a
+    // packet the daemon accepted with REJECT_MARK reaches it: reinjection
+    // resumes at the next base chain in the hook, not inside `output`.
+    // Unmarked (allowed) packets traverse it and fall through untouched.
     format!(
         "table inet hallpass {{\n\
          \tchain output {{\n\
          \t\ttype filter hook output priority mangle; policy accept;\n\
          \t\tct state new queue num {queue_num}{bypass}\n\
+         \t\tudp dport 53 ct state != new queue num {snoop} bypass\n\
+         \t}}\n\
+         \tchain reject {{\n\
+         \t\ttype filter hook output priority filter; policy accept;\n\
          \t\tmeta mark {mark} meta l4proto tcp reject with tcp reset\n\
          \t\tmeta mark {mark} reject\n\
-         \t\tudp dport 53 ct state != new queue num {snoop} bypass\n\
          \t}}\n\
          \tchain input {{\n\
          \t\ttype filter hook input priority mangle; policy accept;\n\
@@ -118,6 +130,30 @@ mod tests {
         assert!(r.contains("udp dport 53 ct state != new queue num 4 bypass"));
         assert!(r.contains("type filter hook input priority mangle; policy accept;"));
         assert!(r.contains("udp sport 53 queue num 4 bypass"));
+    }
+
+    /// A reinjected accept resumes at the next base chain, so the reject
+    /// rules are only reachable from a chain the queue rule does not own.
+    #[test]
+    fn reject_rules_live_in_their_own_later_chain() {
+        let r = ruleset(3, true);
+        let output = r
+            .split("\tchain reject {")
+            .next()
+            .expect("output chain precedes the reject chain");
+        assert!(
+            !output.contains(&format!("meta mark {REJECT_MARK}")),
+            "reject rules must not sit in the chain that queues packets:\n{r}"
+        );
+        assert!(r.contains("\tchain reject {\n\t\ttype filter hook output priority filter;"));
+        // The mark rules must both be inside the reject chain.
+        let reject = r
+            .split("\tchain reject {")
+            .nth(1)
+            .and_then(|s| s.split("\t}").next())
+            .expect("reject chain body");
+        assert!(reject.contains(&format!("meta mark {REJECT_MARK} meta l4proto tcp reject with tcp reset")));
+        assert!(reject.contains(&format!("meta mark {REJECT_MARK} reject")));
     }
 
     #[test]
