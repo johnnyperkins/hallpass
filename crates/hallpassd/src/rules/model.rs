@@ -85,6 +85,17 @@ impl CompiledRule {
     /// Compile a rule, validating cidr/glob/range fields.
     pub fn compile(rule: &Rule) -> Result<CompiledRule, String> {
         let m = &rule.matcher;
+        // A criteria-free matcher matches every connection. That is a valid
+        // thing to want (a final catch-all), but it is never a thing to want
+        // by accident, so say so at a level the operator will see.
+        if *m == hallpass_types::RuleMatch::default() {
+            tracing::warn!(
+                rule = %rule.name,
+                action = ?rule.action,
+                priority = rule.priority,
+                "rule has no match criteria and will match every connection"
+            );
+        }
         let dest = m.dest.as_deref().map(|s| parse_net("dest", s)).transpose()?;
         let src = m.src.as_deref().map(|s| parse_net("src", s)).transpose()?;
         let exe_glob = match &m.exe_glob {

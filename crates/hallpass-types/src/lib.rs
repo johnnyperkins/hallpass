@@ -107,7 +107,14 @@ pub enum RuleDuration {
 
 /// Match criteria for a rule. All fields are optional; every present field
 /// must match (they are AND-ed together).
+///
+/// `deny_unknown_fields` matters most here. A matcher with no recognized
+/// criteria matches every connection, so one misspelled operand (`exe_path`
+/// for `exe`, `prt` for `port`) used to turn a narrowly scoped rule into an
+/// unconditional allow or deny at its priority, with nothing logged and
+/// `hallpass-cli rules` still displaying it as though it were scoped.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RuleMatch {
     /// Exact executable path.
     pub exe: Option<PathBuf>,
@@ -164,7 +171,13 @@ pub struct RuleMatch {
 }
 
 /// A firewall rule.
+///
+/// `deny_unknown_fields` because a rule file is policy: silently discarding a
+/// key the daemon does not recognize widens the rule, and widening is exactly
+/// the direction that fails open. Failing to parse means the file is skipped
+/// with a warning and counted, which is loud and safe.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Rule {
     /// Unique rule name.
     pub name: String,

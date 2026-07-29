@@ -494,10 +494,10 @@ impl Drop for TestEnv {
 /// whatever else the test is exercising.
 ///
 /// Rules are constructed typed and serialized, never written as a TOML
-/// literal: [`RuleMatch`] does not reject unknown keys, so a misspelled
-/// operand in a hand-written string would silently degrade the rule to a
-/// port-only match. Every "should block" assertion here would still pass
-/// while testing nothing.
+/// literal, so a misspelled operand is a compile error rather than a test
+/// that quietly asserts nothing. [`RuleMatch`] now also rejects unknown keys
+/// at parse time, which covers hand-written rule files on disk; keeping the
+/// tests typed keeps the failure at build time instead of run time.
 fn rule_with(
     name: &str,
     action: Action,

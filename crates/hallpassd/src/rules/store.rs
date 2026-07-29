@@ -689,6 +689,38 @@ mod tests {
         assert_eq!(store.rules_skipped(), 1);
     }
 
+    /// A misspelled match operand must fail the file, not silently drop the
+    /// criterion. Dropping every criterion leaves a matcher that matches all
+    /// connections, so `exe_path` for `exe` used to promote a narrow allow
+    /// into an unconditional one at that rule's priority.
+    #[test]
+    fn misspelled_match_operand_skips_the_rule_file() {
+        let (_td, dir) = tmpdir("typo-operand");
+        let text = "name = \"typo\"\naction = \"allow\"\nduration = \"forever\"\n\
+                    priority = 100\nenabled = true\n[match]\n\
+                    exe_path = \"/usr/bin/curl\"\nprt = 443\n";
+        std::fs::write(dir.join("typo.toml"), text).unwrap();
+        let store = RuleStore::new(dir);
+        assert!(
+            store.list().is_empty(),
+            "a rule with unknown match keys must not load: {:?}",
+            store.list()
+        );
+        assert_eq!(store.rules_skipped(), 1);
+    }
+
+    /// An unknown key at the top level of a rule file is refused too.
+    #[test]
+    fn unknown_top_level_rule_key_skips_the_rule_file() {
+        let (_td, dir) = tmpdir("typo-toplevel");
+        let text = "name = \"t\"\naction = \"deny\"\nduration = \"forever\"\n\
+                    priority = 1\nenabled = true\nprioritee = 9\n[match]\nport = 25\n";
+        std::fs::write(dir.join("t.toml"), text).unwrap();
+        let store = RuleStore::new(dir);
+        assert!(store.list().is_empty());
+        assert_eq!(store.rules_skipped(), 1);
+    }
+
     #[test]
     fn replacing_disk_rule_with_session_rule_removes_file() {
         let (_td, dir) = tmpdir("replace");
