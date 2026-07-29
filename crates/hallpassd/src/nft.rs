@@ -33,7 +33,9 @@
 //! the queue overflows (fail closed).
 
 use std::io::Write;
+use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::OnceLock;
 
 /// Packet mark the nfqueue thread sets to ask nftables to reject a packet.
 /// A large, distinctive value ("HALP") to avoid colliding with the small
@@ -91,8 +93,32 @@ pub fn teardown() {
     }
 }
 
+/// Absolute path of the `nft` binary.
+///
+/// Resolved from a fixed list instead of an inherited `PATH`. This runs as
+/// root, so a `PATH` entry any unprivileged user can write would be root code
+/// execution, and the daemon should not depend on its launcher having set a
+/// sane `PATH`. Distributions that keep `nft` somewhere else still work: the
+/// last resort is a bare name, resolved by `PATH`, with a warning saying so.
+fn nft_binary() -> &'static str {
+    static RESOLVED: OnceLock<&'static str> = OnceLock::new();
+    RESOLVED.get_or_init(|| {
+        const CANDIDATES: &[&str] = &["/usr/sbin/nft", "/sbin/nft", "/usr/bin/nft", "/bin/nft"];
+        match CANDIDATES.iter().copied().find(|p| Path::new(p).is_file()) {
+            Some(p) => p,
+            None => {
+                tracing::warn!(
+                    "nft not found at a standard path; falling back to PATH lookup, \
+                     which trusts the environment this daemon was started with"
+                );
+                "nft"
+            }
+        }
+    })
+}
+
 fn run_nft(args: &[&str], stdin: Option<&str>) -> std::io::Result<()> {
-    let mut cmd = Command::new("nft");
+    let mut cmd = Command::new(nft_binary());
     cmd.args(args)
         .stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::null())

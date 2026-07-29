@@ -6,7 +6,7 @@
 //! reads rules lock-free.
 
 use std::io::Read;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -89,6 +89,11 @@ fn list_paths_within(rule: &Rule, dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// `O_NOFOLLOW` on Linux. Spelled out rather than pulled from libc: this
+/// crate takes no libc dependency (see [`effective_uid`]), and the value is
+/// stable ABI on every Linux architecture.
+const O_NOFOLLOW: i32 = 0o400_000;
+
 /// Turn a rule name into a safe file stem.
 fn sanitize_filename(name: &str) -> String {
     let stem: String = name
@@ -150,8 +155,14 @@ fn load_dir(dir: &Path) -> LoadResult {
         }
         // Identity and content both come from this fd, as in lists.rs: no
         // window where the trust-checked file and the parsed bytes could
-        // differ.
-        let mut file = match std::fs::File::open(&path) {
+        // differ. O_NOFOLLOW makes the refusal above race-free: the
+        // file_type() check reads the directory entry, so on its own a rename
+        // between that check and this open could still substitute a link.
+        let mut file = match std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(O_NOFOLLOW)
+            .open(&path)
+        {
             Ok(f) => f,
             Err(e) => {
                 tracing::warn!(file = %path.display(), "cannot open rule file: {e}");
