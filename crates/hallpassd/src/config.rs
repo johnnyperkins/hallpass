@@ -1,12 +1,41 @@
 //! Daemon configuration: /etc/hallpass/config.toml plus a --config override.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use hallpass_types::Verdict;
 use serde::Deserialize;
 
 /// Default location of the daemon config file.
 pub const DEFAULT_CONFIG_PATH: &str = "/etc/hallpass/config.toml";
+
+/// Read the config only if it is as trustworthy as a rule file.
+///
+/// Rule files and match-list files are refused unless owned by root (or the
+/// daemon's own euid) and not group/world-writable, but the config itself was
+/// read unconditionally. It is the more sensitive of the two: it sets
+/// `default_verdict`, `queue_bypass`, `unhandled_proto_verdict`, the socket
+/// path, and the rules directory, so anyone who can write it can disable
+/// enforcement outright rather than adjust one rule.
+///
+/// Ownership and content come from the same descriptor, so the file that was
+/// checked is the file that is parsed. A `NotFound` error is passed through
+/// unchanged, because the caller distinguishes it.
+fn read_trusted(path: &Path) -> std::io::Result<String> {
+    use std::io::Read;
+    use std::os::unix::fs::MetadataExt;
+
+    let mut file = std::fs::File::open(path)?;
+    let meta = file.metadata()?;
+    let self_uid = crate::rules::store::effective_uid().unwrap_or(u32::MAX);
+    if !crate::rules::store::file_perms_ok(meta.uid(), meta.mode(), self_uid) {
+        return Err(std::io::Error::other(
+            "must be owned by root and not group/world-writable",
+        ));
+    }
+    let mut text = String::new();
+    file.read_to_string(&mut text)?;
+    Ok(text)
+}
 
 /// Where the config should come from, and whether the operator said so.
 ///
@@ -81,7 +110,7 @@ impl Config {
     /// denied. Only an unspecified path may fall back.
     pub fn load(arg: &ConfigArg) -> Result<Config, String> {
         let path = arg.path.as_path();
-        let cfg: Config = match std::fs::read_to_string(path) {
+        let cfg: Config = match read_trusted(path) {
             Ok(text) => {
                 toml::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?
             }

@@ -46,6 +46,13 @@ struct ListCache<T> {
 
 const LIST_CACHE_BOUND: usize = 64;
 
+/// Largest match-list file that will be read, in bytes.
+///
+/// Generous for the intended use (a domain blocklist of a few hundred
+/// thousand entries fits well inside it) while keeping an unbounded read out
+/// of a root daemon. Blocklists are the reason this is megabytes not kilobytes.
+const MAX_LIST_BYTES: u64 = 64 * 1024 * 1024;
+
 impl<T> ListCache<T> {
     fn new() -> ListCache<T> {
         ListCache {
@@ -71,12 +78,29 @@ impl<T> ListCache<T> {
                 path.display()
             ));
         }
+        // A FIFO or a character device passes the ownership check (/dev/random
+        // is root-owned 0644) and then blocks or never ends, wedging whichever
+        // thread is loading rules. Only a regular file has a meaningful size.
+        if !meta.is_file() {
+            return Err(format!("{}: not a regular file", path.display()));
+        }
+        if meta.len() > MAX_LIST_BYTES {
+            return Err(format!(
+                "{}: {} bytes exceeds the {MAX_LIST_BYTES}-byte list limit",
+                path.display(),
+                meta.len()
+            ));
+        }
         let id = FileId::of(&meta);
         if let Some(parsed) = self.entries.lock().unwrap().get(&id) {
             return Ok(Arc::clone(parsed));
         }
         let mut text = String::new();
-        file.read_to_string(&mut text)
+        // Bounded independently of the stat above: the size could have grown
+        // between the two, and this read happens in a root daemon.
+        std::io::Read::by_ref(&mut file)
+            .take(MAX_LIST_BYTES)
+            .read_to_string(&mut text)
             .map_err(|e| format!("{}: {e}", path.display()))?;
         let parsed = Arc::new(parse(&text, path)?);
         let mut entries = self.entries.lock().unwrap();
@@ -234,6 +258,21 @@ mod tests {
         let path = dir.path().join(name);
         std::fs::write(&path, text).unwrap();
         path
+    }
+
+    /// A non-regular file is refused before it is read. Reading a FIFO blocks
+    /// forever and reading a character device never ends, either of which
+    /// stalls rule loading in a root daemon.
+    #[test]
+    fn non_regular_list_file_is_refused() {
+        let d = TestDir::new("lists-not-a-file");
+        let dir_as_list = d.path().join("subdir");
+        std::fs::create_dir(&dir_as_list).unwrap();
+        let err = IpSet::load(&dir_as_list).unwrap_err();
+        assert!(
+            err.contains("not a regular file") || err.contains("Is a directory"),
+            "{err}"
+        );
     }
 
     /// Parse errors name a line number, never its text. The error string
