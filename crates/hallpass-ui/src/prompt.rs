@@ -1,6 +1,8 @@
 //! State and pure helpers for prompt popup windows.
 
-use hallpass_types::{ClientMsg, Connection, PromptScope, RuleDuration, Verdict};
+use hallpass_types::{
+    sanitize_for_display, ClientMsg, Connection, PromptScope, RuleDuration, Verdict,
+};
 
 /// State of one pending prompt popup (one immediate viewport each).
 pub struct PromptState {
@@ -78,12 +80,20 @@ pub fn exe_name(conn: &Connection) -> String {
     conn.exe_path
         .as_deref()
         .and_then(|p| p.file_name())
-        .map(|n| n.to_string_lossy().into_owned())
+        .map(|n| sanitize_for_display(&n.to_string_lossy()).into_owned())
         .unwrap_or_else(|| "unknown".to_string())
 }
 
 /// Truncate a string for single-line display, appending "..." when cut.
+///
+/// Also sanitizes: every field routed through here (command line, executable
+/// path, resolved domain) is chosen by the process being judged, and the
+/// operator reads it to decide. Bidi overrides and zero-width characters
+/// would otherwise reshape a label without changing its length, and the
+/// truncation itself counts characters, so hazards must go before the cut.
 pub fn truncate(s: &str, max_chars: usize) -> String {
+    let s = sanitize_for_display(s);
+    let s = s.as_ref();
     if s.chars().count() <= max_chars {
         s.to_string()
     } else {

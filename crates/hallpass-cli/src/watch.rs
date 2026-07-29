@@ -74,7 +74,12 @@ fn format_prompt(p: &Pending, now_ms: u64) -> String {
     let remaining = p.deadline_ms.saturating_sub(now_ms) / 1000;
     let mut out = format!("prompt #{}: {exe} (pid {pid}, uid {uid})\n", p.id);
     if let Some(cmdline) = &c.cmdline {
-        out.push_str(&format!("  cmdline: {cmdline}\n"));
+        // A process writes its own argv, and this line sits right above the
+        // allow/deny question. Raw, it could erase and rewrite the exe line.
+        out.push_str(&format!(
+            "  cmdline: {}\n",
+            hallpass_types::sanitize_for_display(cmdline)
+        ));
     }
     out.push_str(&format!(
         "  dest:    {} ({}) {}\n",
@@ -154,7 +159,12 @@ pub async fn watch(mut client: Client) -> Result<(), CliError> {
                     if !subscribed {
                         return Err(CliError::Daemon(message));
                     }
-                    eprintln!("daemon error: {message}");
+                    // Daemon errors quote paths and rule names, so they can
+                    // carry whatever a rule file or a process put there.
+                    eprintln!(
+                        "daemon error: {}",
+                        hallpass_types::sanitize_for_display(&message)
+                    );
                 }
                 Some(Ok(_)) => {}
             },
@@ -261,6 +271,45 @@ mod tests {
         assert_eq!(parse_scope("h"), Some(PromptScope::ThisHost));
         assert_eq!(parse_scope("a"), Some(PromptScope::AppAnywhere));
         assert_eq!(parse_scope(""), None);
+    }
+
+    /// A process controls its own argv and the path it runs from, and this
+    /// block is what the operator reads before typing allow or deny. Nothing
+    /// in it may carry a control character: a CR plus a cursor-up sequence
+    /// would let the cmdline line overwrite the executable line above it and
+    /// present a different binary as the one asking.
+    #[test]
+    fn hostile_metadata_cannot_forge_the_prompt_block() {
+        let mut p = Pending {
+            id: 9,
+            conn: Connection {
+                tuple: FlowTuple {
+                    proto: Proto::Tcp,
+                    src: "127.0.0.1:50000".parse::<SocketAddr>().unwrap(),
+                    dst: "93.184.216.34:443".parse::<SocketAddr>().unwrap(),
+                },
+                uid: Some(1000),
+                pid: Some(1),
+                exe_path: Some(PathBuf::from("/tmp/evil\r\x1b[A/usr/bin/firefox")),
+                cmdline: Some("evil\r\x1b[2Kcmdline: curl https://example.org".into()),
+                parent_exe: None,
+                domain: Some("bank.example\u{202e}moc.reknatta".into()),
+                iface: None,
+            },
+            deadline_ms: 30_000,
+        };
+        let out = format_prompt(&p, 5_000);
+        assert!(!out.contains('\r'), "CR reached the terminal: {out:?}");
+        assert!(!out.contains('\x1b'), "ESC reached the terminal: {out:?}");
+        assert!(!out.contains('\u{202e}'), "bidi override survived: {out:?}");
+        // Exactly the lines format_prompt writes, no extras smuggled in.
+        assert_eq!(out.lines().count(), 4, "{out:?}");
+
+        // Without a cmdline the exe line is still the only exe line.
+        p.conn.cmdline = None;
+        let out = format_prompt(&p, 5_000);
+        assert_eq!(out.lines().count(), 3, "{out:?}");
+        assert!(!out.contains('\x1b'), "{out:?}");
     }
 
     #[test]

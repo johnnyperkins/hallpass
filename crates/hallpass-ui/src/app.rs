@@ -546,7 +546,10 @@ fn prompt_ui(
         ui.label(format!("wants to connect ({})", conn.tuple.proto));
     });
     if let Some(exe) = &conn.exe_path {
-        ui.label(RichText::new(exe.display().to_string()).small().monospace());
+        // Full path, sanitized: this is the line the operator checks to see
+        // which binary is actually asking.
+        let text = prompt::truncate(&exe.display().to_string(), 200);
+        ui.label(RichText::new(text).small().monospace());
     }
     if let Some(cmdline) = &conn.cmdline {
         ui.label(RichText::new(prompt::truncate(cmdline, 100)).small());

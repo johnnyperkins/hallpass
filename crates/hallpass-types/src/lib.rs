@@ -379,6 +379,45 @@ impl RuleMatch {
     }
 }
 
+/// True for characters that let text reshape how it renders.
+///
+/// Control characters (C0, DEL, C1) move the cursor and clear lines; the bidi
+/// marks and overrides reverse runs of text; the zero-width characters and the
+/// BOM hide where one string ends and the next begins.
+fn is_display_hazard(c: char) -> bool {
+    c.is_control()
+        || matches!(c,
+            '\u{00ad}'                // soft hyphen
+            | '\u{061c}'              // arabic letter mark
+            | '\u{200b}'..='\u{200f}' // zero width, LRM, RLM
+            | '\u{202a}'..='\u{202e}' // bidi embeddings and overrides
+            | '\u{2066}'..='\u{2069}' // bidi isolates
+            | '\u{feff}'              // BOM / zero width no-break space
+        )
+}
+
+/// Replace characters that could forge or reshape rendered output.
+///
+/// Connection metadata is chosen by the process being judged: it rewrites its
+/// own argv, it picks the path it runs from, and it can resolve a name it
+/// controls. All of it is then shown to the operator who is about to allow or
+/// deny that connection. Rendered raw, a CR or a cursor-movement escape
+/// overwrites the line being read, so a process can display someone else's
+/// executable path as its own and be approved on that basis.
+///
+/// Hazards become U+FFFD, which is visible rather than silent. Borrowing when
+/// there is nothing to replace keeps the common path allocation-free.
+pub fn sanitize_for_display(s: &str) -> std::borrow::Cow<'_, str> {
+    if !s.chars().any(is_display_hazard) {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    std::borrow::Cow::Owned(
+        s.chars()
+            .map(|c| if is_display_hazard(c) { '\u{fffd}' } else { c })
+            .collect(),
+    )
+}
+
 /// Current wall clock as Unix milliseconds.
 pub fn unix_ms_now() -> u64 {
     std::time::SystemTime::now()
@@ -421,6 +460,54 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
     let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
     (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+#[cfg(test)]
+mod display_tests {
+    use super::*;
+
+    #[test]
+    fn clean_text_is_borrowed_unchanged() {
+        let s = "/usr/bin/curl https://example.org";
+        assert!(matches!(sanitize_for_display(s), std::borrow::Cow::Borrowed(_)));
+        assert_eq!(sanitize_for_display(s), s);
+    }
+
+    /// The attack this exists for: a cmdline that erases the line above it and
+    /// prints a different executable path must not reach the terminal intact.
+    #[test]
+    fn terminal_escapes_are_neutralized() {
+        let hostile = "evil\r\x1b[A\x1b[2K/usr/bin/firefox";
+        let out = sanitize_for_display(hostile);
+        assert!(!out.contains('\r'), "{out:?}");
+        assert!(!out.contains('\x1b'), "{out:?}");
+        assert!(!out.contains('\n'), "{out:?}");
+        // The real text survives, just defanged.
+        assert!(out.contains("evil"), "{out:?}");
+        assert!(out.contains("firefox"), "{out:?}");
+    }
+
+    #[test]
+    fn bidi_and_zero_width_are_neutralized() {
+        for hostile in [
+            "gpj.\u{202e}exe.evil",   // RTL override
+            "curl\u{200b}\u{200b}x",  // zero width space
+            "a\u{feff}b",             // BOM
+            "a\u{2066}b\u{2069}c",    // bidi isolates
+        ] {
+            let out = sanitize_for_display(hostile);
+            assert!(
+                out.chars().all(|c| !is_display_hazard(c)),
+                "{hostile:?} -> {out:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn c1_controls_and_del_are_neutralized() {
+        let out = sanitize_for_display("a\u{7f}b\u{9b}c");
+        assert_eq!(out, "a\u{fffd}b\u{fffd}c");
+    }
 }
 
 #[cfg(test)]

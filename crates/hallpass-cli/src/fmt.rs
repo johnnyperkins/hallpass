@@ -2,7 +2,9 @@
 
 use std::fmt::Write;
 
-use hallpass_types::{format_ts, ConnEvent, Connection, PromptScope, Rule, Stats, Verdict};
+use hallpass_types::{
+    format_ts, sanitize_for_display, ConnEvent, Connection, PromptScope, Rule, Stats, Verdict,
+};
 
 /// Human-readable verdict name (uppercase, for event lines).
 pub fn verdict_str(v: Verdict) -> &'static str {
@@ -107,18 +109,27 @@ pub fn format_rules(rules: &[Rule]) -> String {
 }
 
 /// Display string for a connection's executable path, or "?" if unknown.
+///
+/// Sanitized: the path is chosen by the process being judged, and this string
+/// is what the operator reads before allowing or denying it.
 pub fn exe_display(conn: &Connection) -> String {
     conn.exe_path
         .as_ref()
-        .map(|p| p.display().to_string())
+        .map(|p| sanitize_for_display(&p.display().to_string()).into_owned())
         .unwrap_or_else(|| "?".to_string())
 }
 
 /// Display string for a connection destination: `domain:port` when the
 /// domain is known, otherwise `ip:port`.
+///
+/// The domain comes from snooped DNS, so it is attacker-chosen too.
 pub fn dst_display(conn: &Connection) -> String {
     match &conn.domain {
-        Some(domain) => format!("{domain}:{}", conn.tuple.dst.port()),
+        Some(domain) => format!(
+            "{}:{}",
+            sanitize_for_display(domain),
+            conn.tuple.dst.port()
+        ),
         None => conn.tuple.dst.to_string(),
     }
 }
