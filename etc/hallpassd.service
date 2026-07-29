@@ -3,6 +3,10 @@ Description=Hallpass interactive application firewall daemon
 Documentation=https://github.com/hallpass/hallpass
 After=network-pre.target
 Wants=network-pre.target
+# Never stop retrying. The default start limit gives up after 5 attempts in
+# 10s, which with queue_bypass = false leaves the table standing with no
+# daemon to answer its queue, dropping every new connection indefinitely.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -10,9 +14,11 @@ ExecStart=/usr/bin/hallpassd --config /etc/hallpass/config.toml
 Restart=on-failure
 RestartSec=2
 
-# Runtime directory for the client socket.
+# Runtime directory for the client socket. 0750 so the directory is not
+# world-traversable before the daemon starts; the daemon re-applies this
+# mode and sets the group to hallpass, which is what grants group access.
 RuntimeDirectory=hallpass
-RuntimeDirectoryMode=0755
+RuntimeDirectoryMode=0750
 
 # Hardening
 ProtectSystem=strict
@@ -22,9 +28,36 @@ NoNewPrivileges=yes
 RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6
 MemoryDenyWriteExecute=yes
 ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectKernelLogs=yes
 ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
 RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
 LockPersonality=yes
+PrivateTmp=yes
+UMask=0077
+SystemCallArchitectures=native
+
+# ProtectProc is deliberately NOT set: attribution reads /proc/<pid>/exe and
+# /proc/<pid>/fd for processes owned by other users, which invisible or
+# ptraceable would hide, silently degrading every exe-scoped rule.
+#
+# Two further restrictions are worth adding but need a live root test first,
+# because both fail as a silent loss of enforcement quality rather than a
+# clean error. Verify eBPF attribution still loads and that a hallpass-group
+# client can still reach the socket, then uncomment:
+#
+#   CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_DAC_READ_SEARCH CAP_CHOWN CAP_BPF CAP_PERFMON CAP_SYS_RESOURCE
+#   SystemCallFilter=@system-service bpf perf_event_open
+#   SystemCallFilter=~@clock @cpu-emulation @debug @module @obsolete @raw-io @reboot @swap
+#
+# CAP_CHOWN is required: the daemon chowns the socket and its directory to the
+# hallpass group, and without it they stay root-only. On kernels before 5.8
+# bpf() needs CAP_SYS_ADMIN rather than CAP_BPF, so eBPF attribution there
+# falls back to procfs unless CAP_SYS_ADMIN is added.
 
 [Install]
 WantedBy=multi-user.target

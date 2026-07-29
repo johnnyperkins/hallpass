@@ -58,6 +58,25 @@ pub fn bind(path: &Path) -> std::io::Result<UnixListener> {
             .mode(0o750)
             .create(parent)?;
     }
+    // Enforce the mode whether or not this call created the directory. Under
+    // the shipped unit it never does: systemd's RuntimeDirectory= has already
+    // made /run/hallpass, so the mode above was dead code and the directory
+    // kept RuntimeDirectoryMode. 0750 needs the group set too, or the group
+    // the socket is for could not traverse the directory holding it.
+    std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o750))?;
+    match lookup_gid("hallpass") {
+        Some(gid) => {
+            if let Err(e) = std::os::unix::fs::chown(parent, None, Some(gid)) {
+                tracing::warn!("chown {} to group hallpass failed: {e}", parent.display());
+            }
+        }
+        // Same tradeoff as the socket below: no group means owner-only, which
+        // is tighter than intended rather than looser.
+        None => tracing::warn!(
+            "group 'hallpass' not found; directory {} stays root-only",
+            parent.display()
+        ),
+    }
 
     // Bind inside a staging directory only root can enter, then move the
     // finished socket into place. `bind` applies the umask to the new
