@@ -1,12 +1,24 @@
 //! Daemon configuration: /etc/hallpass/config.toml plus a --config override.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use hallpass_types::Verdict;
 use serde::Deserialize;
 
 /// Default location of the daemon config file.
 pub const DEFAULT_CONFIG_PATH: &str = "/etc/hallpass/config.toml";
+
+/// Where the config should come from, and whether the operator said so.
+///
+/// The distinction matters because the two cases have opposite safe
+/// behaviours for a missing file: an unspecified path may fall back to
+/// defaults, an explicitly named one must not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigArg {
+    pub path: PathBuf,
+    /// True when `--config` named the path, making a missing file fatal.
+    pub explicit: bool,
+}
 
 /// Longest usable unix socket path: `sun_path` is 108 bytes including the
 /// terminating NUL.
@@ -59,14 +71,21 @@ impl Default for Config {
 }
 
 impl Config {
-    /// Load config from `path`. A missing file yields defaults with a
-    /// warning; a malformed file is a hard error.
-    pub fn load(path: &Path) -> Result<Config, String> {
+    /// Load config from `arg`. A malformed file is always a hard error, and
+    /// so is a missing one that `--config` named explicitly.
+    ///
+    /// The defaults are fail-open on every axis (allow, allow, bypass), so
+    /// silently substituting them for a file the operator asked for turns a
+    /// hardened deployment into an unenforced one that still looks healthy:
+    /// the unit starts, the socket answers, prompts appear, and nothing is
+    /// denied. Only an unspecified path may fall back.
+    pub fn load(arg: &ConfigArg) -> Result<Config, String> {
+        let path = arg.path.as_path();
         let cfg: Config = match std::fs::read_to_string(path) {
             Ok(text) => {
                 toml::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && !arg.explicit => {
                 tracing::warn!(path = %path.display(), "config file not found, using defaults");
                 Config::default()
             }
@@ -109,21 +128,26 @@ impl Config {
 
 /// Parse command line arguments. Only `--config <path>` / `--config=<path>`
 /// are recognized. Returns the config file path to use.
-pub fn parse_args<I: Iterator<Item = String>>(mut args: I) -> Result<PathBuf, String> {
-    let mut path = PathBuf::from(DEFAULT_CONFIG_PATH);
+pub fn parse_args<I: Iterator<Item = String>>(mut args: I) -> Result<ConfigArg, String> {
+    let mut arg_out = ConfigArg {
+        path: PathBuf::from(DEFAULT_CONFIG_PATH),
+        explicit: false,
+    };
     while let Some(arg) = args.next() {
         if arg == "--config" {
-            path = args
+            arg_out.path = args
                 .next()
                 .map(PathBuf::from)
                 .ok_or("--config requires a path argument")?;
+            arg_out.explicit = true;
         } else if let Some(v) = arg.strip_prefix("--config=") {
-            path = PathBuf::from(v);
+            arg_out.path = PathBuf::from(v);
+            arg_out.explicit = true;
         } else {
             return Err(format!("unknown argument: {arg} (usage: hallpassd [--config <path>])"));
         }
     }
-    Ok(path)
+    Ok(arg_out)
 }
 
 #[cfg(test)]
@@ -195,10 +219,41 @@ mod tests {
     #[test]
     fn args_default_and_override() {
         let a = |v: &[&str]| parse_args(v.iter().map(|s| s.to_string()));
-        assert_eq!(a(&[]).unwrap(), PathBuf::from(DEFAULT_CONFIG_PATH));
-        assert_eq!(a(&["--config", "/x.toml"]).unwrap(), PathBuf::from("/x.toml"));
-        assert_eq!(a(&["--config=/y.toml"]).unwrap(), PathBuf::from("/y.toml"));
+        let d = a(&[]).unwrap();
+        assert_eq!(d.path, PathBuf::from(DEFAULT_CONFIG_PATH));
+        assert!(!d.explicit, "the default path is not operator-specified");
+
+        for form in [&["--config", "/x.toml"][..], &["--config=/x.toml"][..]] {
+            let got = a(form).unwrap();
+            assert_eq!(got.path, PathBuf::from("/x.toml"));
+            assert!(got.explicit, "{form:?} names the path explicitly");
+        }
         assert!(a(&["--config"]).is_err());
         assert!(a(&["--frob"]).is_err());
+    }
+
+    /// A config the operator named must not be silently replaced by the
+    /// defaults, which are fail-open on every axis.
+    #[test]
+    fn missing_explicit_config_is_fatal_but_missing_default_is_not() {
+        let missing = PathBuf::from("/nonexistent/hallpass/config.toml");
+
+        let err = Config::load(&ConfigArg {
+            path: missing.clone(),
+            explicit: true,
+        })
+        .expect_err("an explicitly named missing config must fail");
+        assert!(err.contains("config.toml"), "{err}");
+
+        let cfg = Config::load(&ConfigArg {
+            path: missing,
+            explicit: false,
+        })
+        .expect("an unspecified path may fall back to defaults");
+        // Spelled out rather than compared to Config::default(), to show
+        // exactly what the explicit case refuses to substitute silently.
+        assert_eq!(cfg.default_verdict, Verdict::Allow);
+        assert_eq!(cfg.unhandled_proto_verdict, Verdict::Allow);
+        assert!(cfg.queue_bypass);
     }
 }

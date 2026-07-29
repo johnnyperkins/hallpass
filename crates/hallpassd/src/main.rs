@@ -45,14 +45,14 @@ async fn main() {
         )
         .init();
 
-    let config_path = match config::parse_args(std::env::args().skip(1)) {
-        Ok(p) => p,
+    let config_arg = match config::parse_args(std::env::args().skip(1)) {
+        Ok(a) => a,
         Err(e) => {
             eprintln!("{e}");
             std::process::exit(2);
         }
     };
-    let cfg = match config::Config::load(&config_path) {
+    let cfg = match config::Config::load(&config_arg) {
         Ok(c) => c,
         Err(e) => {
             tracing::error!("failed to load config: {e}");
