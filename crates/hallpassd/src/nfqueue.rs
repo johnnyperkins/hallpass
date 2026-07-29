@@ -176,7 +176,10 @@ pub fn run(mut queue: Queue, queue_num: u16, mut deps: QueueDeps) -> std::io::Re
             Ok(msg) => {
                 busy = true;
                 recv_errors = 0;
-                let parsed = packet::parse(msg.get_payload());
+                // get_original_len is the on-wire length; the payload is
+                // capped by the queue's copy range, so the two differ for an
+                // oversized packet and parsing must tolerate the missing tail.
+                let parsed = packet::parse(msg.get_payload(), msg.get_original_len());
 
                 // Snoop-queue packets (established DNS queries, DNS replies)
                 // are only recorded, never held for a verdict.
