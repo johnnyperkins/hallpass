@@ -307,6 +307,23 @@ attacker with root, who can delete the nftables table outright.
   by IP/port/exe only.
 - Only new connections (`ct state new`) are evaluated; established flows are
   never re-checked.
+- **A process can choose which executable it is attributed to.** Attribution
+  resolves the executable from `/proc/<pid>/exe` after the connection is
+  observed, and a socket descriptor survives `execve`. So a process can start
+  a non-blocking `connect()` (or send a UDP datagram), immediately exec a
+  different binary, and be attributed to that binary instead; it can retry
+  until it wins the race. The eBPF path records the pid at connect time,
+  which is more precise than the procfs scan, but the executable is still
+  resolved afterwards, so it is affected too. Rules keyed on `exe`,
+  `exe_glob`, or `exe_sha256` are therefore a scoping convenience against
+  ordinary software, not a boundary against a process that is actively
+  evading them. The same caveat already applies for a different reason to
+  `cmdline_contains` and `parent_exe`, which a process controls outright.
+- **Only the `output` and `input` hooks are filtered.** Traffic that is
+  *forwarded* rather than locally generated, which is what containers, VMs,
+  and other network namespaces bridged to the host produce, traverses the
+  `forward` hook and is not seen at all. Hallpass polices what this host
+  originates.
 - Rules only model TCP and UDP. Other transports (SCTP, ICMP, ...) are not
   matched against rules; they are counted and resolved by the
   `unhandled_proto_verdict` policy (`allow` by default, `deny` in the

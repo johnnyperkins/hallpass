@@ -30,6 +30,11 @@ use sha2::{Digest, Sha256};
 
 const CLI_IP: &str = "10.99.77.1";
 const SRV_IP: &str = "10.99.77.2";
+/// The same veth pair also carries IPv6. The nft table is `inet`, so one
+/// ruleset is meant to cover both families; nothing proved it for v6, which
+/// on a dual-stack host is the default route to most destinations.
+const CLI_IP6: &str = "fd00:99:77::1";
+const SRV_IP6: &str = "fd00:99:77::2";
 /// The subnet both namespaces sit in, for `ips_file` lists.
 const SUBNET: &str = "10.99.77.0/24";
 /// veth endpoint names, in the cli and srv namespaces respectively. The
@@ -192,10 +197,25 @@ impl TestEnv {
         );
         assert_ok(&run("ip", &["link", "set", DEV_CLI, "netns", &ns_cli]), "veth to cli");
         assert_ok(&run("ip", &["link", "set", DEV_SRV, "netns", &ns_srv]), "veth to srv");
-        for (ns, dev, ip) in [(&ns_cli, DEV_CLI, CLI_IP), (&ns_srv, DEV_SRV, SRV_IP)] {
+        for (ns, dev, ip, ip6) in [
+            (&ns_cli, DEV_CLI, CLI_IP, CLI_IP6),
+            (&ns_srv, DEV_SRV, SRV_IP, SRV_IP6),
+        ] {
             assert_ok(
                 &run("ip", &["-n", ns, "addr", "add", &format!("{ip}/24"), "dev", dev]),
                 "addr add",
+            );
+            // nodad: duplicate address detection would otherwise hold the
+            // address in "tentative" for a second, and binding it fails until
+            // it leaves that state.
+            assert_ok(
+                &run(
+                    "ip",
+                    &[
+                        "-n", ns, "addr", "add", &format!("{ip6}/64"), "dev", dev, "nodad",
+                    ],
+                ),
+                "addr add v6",
             );
             assert_ok(&run("ip", &["-n", ns, "link", "set", dev, "up"]), "link up");
             assert_ok(&run("ip", &["-n", ns, "link", "set", "lo", "up"]), "lo up");
@@ -332,12 +352,26 @@ impl TestEnv {
     /// fresh listener in between, or the second probe is refused rather
     /// than filtered, which from here looks exactly like a block.
     fn start_listener(&mut self, port: u16) {
+        self.start_listener_family(port, false);
+    }
+
+    /// [`TestEnv::start_listener`] bound to IPv6 only, so a test cannot pass
+    /// by accidentally reaching an IPv4 listener.
+    fn start_listener6(&mut self, port: u16) {
+        self.start_listener_family(port, true);
+    }
+
+    fn start_listener_family(&mut self, port: u16, v6: bool) {
         // Which form this nc accepts is a property of the host, not of
         // the port, so probing it once keeps a test that needs four
         // listeners from paying the discovery timeout four times.
         static FORM: OnceLock<usize> = OnceLock::new();
         let port_s = port.to_string();
-        let all: [&[&str]; 2] = [&["nc", "-l", "-p", &port_s], &["nc", "-l", &port_s]];
+        let all: [&[&str]; 2] = if v6 {
+            [&["nc", "-6", "-l", "-p", &port_s], &["nc", "-6", "-l", &port_s]]
+        } else {
+            [&["nc", "-l", "-p", &port_s], &["nc", "-l", &port_s]]
+        };
         let forms: Vec<(usize, &[&str])> = match FORM.get() {
             Some(&i) => vec![(i, all[i])],
             None => all.into_iter().enumerate().collect(),
@@ -439,10 +473,27 @@ impl TestEnv {
         .success()
     }
 
+    /// [`TestEnv::connect`] over IPv6.
+    fn connect6(&self, port: u16) -> bool {
+        ns_run(
+            &self.ns_cli,
+            &["nc", "-6", "-z", "-w", "3", SRV_IP6, &port.to_string()],
+        )
+        .status
+        .success()
+    }
+
     /// One ICMP echo from the cli namespace. ICMP is neither TCP nor UDP,
     /// so it is what `unhandled_proto_verdict` decides.
     fn ping(&self) -> bool {
         ns_run(&self.ns_cli, &["ping", "-c", "1", "-W", "3", SRV_IP])
+            .status
+            .success()
+    }
+
+    /// [`TestEnv::ping`] over ICMPv6.
+    fn ping6(&self) -> bool {
+        ns_run(&self.ns_cli, &["ping", "-6", "-c", "1", "-W", "3", SRV_IP6])
             .status
             .success()
     }
@@ -630,6 +681,51 @@ fn reject_rule_refuses_connection_promptly() {
     assert!(
         elapsed < Duration::from_secs(2),
         "reject should return an RST immediately, took {elapsed:?} (silent drop?); daemon log:\n{}",
+        env.daemon_log()
+    );
+}
+
+/// The nft table is `inet`, so one ruleset should police IPv4 and IPv6 alike.
+/// Nothing proved that for v6, which on a dual-stack host is the default path
+/// to most destinations, so a v6-only regression would have been invisible.
+///
+/// Both halves run against one daemon on purpose. Asserting only that a denied
+/// v6 port is unreachable would also pass if IPv6 never worked here at all, so
+/// the permitted port establishes that the path is live first.
+#[test]
+#[ignore = "requires root and network namespaces"]
+fn rules_apply_to_ipv6_connections() {
+    let Some(mut env) = TestEnv::setup("ipv6") else { return };
+    const OPEN: u16 = 19016;
+    const BLOCKED: u16 = 19017;
+    env.start_listener6(OPEN);
+    env.start_listener6(BLOCKED);
+    env.start_daemon("allow", &[&rule("e2e-deny-v6", Action::Deny, BLOCKED)]);
+    env.assert_daemon_alive();
+
+    assert!(
+        env.connect6(OPEN),
+        "IPv6 must reach an unmatched port under default allow, \
+         otherwise the block below proves nothing; daemon log:\n{}",
+        env.daemon_log()
+    );
+    assert!(
+        !env.connect6(BLOCKED),
+        "the deny rule must apply to IPv6 too; daemon log:\n{}",
+        env.daemon_log()
+    );
+}
+
+/// ICMPv6 is decided by `unhandled_proto_verdict`, like ICMP over IPv4.
+#[test]
+#[ignore = "requires root and network namespaces"]
+fn unhandled_proto_verdict_denies_icmpv6() {
+    let Some(mut env) = TestEnv::setup("icmp6") else { return };
+    env.start_daemon_with("allow", &[], "unhandled_proto_verdict = \"deny\"\n");
+    env.assert_daemon_alive();
+    assert!(
+        !env.ping6(),
+        "ICMPv6 should be dropped by unhandled_proto_verdict; daemon log:\n{}",
         env.daemon_log()
     );
 }
