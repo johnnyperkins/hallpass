@@ -265,7 +265,7 @@ async fn message_loop(
                 scope,
             } => {
                 tracing::info!(?peer_uid, id, ?verdict, "prompt reply");
-                match deps.prompts.reply(id, verdict, duration, scope) {
+                match deps.prompts.reply(out_tx, id, verdict, duration, scope) {
                     Ok(()) => DaemonMsg::Ok,
                     Err(message) => DaemonMsg::Err { message },
                 }

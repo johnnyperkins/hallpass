@@ -194,16 +194,23 @@ impl PromptTable {
     }
 
     /// Apply a client's decision to a pending prompt.
+    ///
+    /// `tx` is the replying client's outbound channel, and it must be the one
+    /// registered as the prompt handler. Only one client holds that slot, and
+    /// `set_handler` refuses to hand it over while the current holder is live,
+    /// but nothing checked it here: prompt ids are a monotonic counter from 1,
+    /// so any connected client could guess an id and answer a prompt that was
+    /// never sent to it, including racing the GUI to allow what the operator
+    /// was about to deny.
     pub fn reply(
         &self,
+        tx: &Sender<DaemonMsg>,
         id: u64,
         verdict: Verdict,
         duration: RuleDuration,
         scope: PromptScope,
     ) -> Result<(), String> {
-        let pending = self
-            .take(id)
-            .ok_or_else(|| format!("unknown or expired prompt id {id}"))?;
+        let pending = self.take_as_handler(tx, id)?;
 
         let mut rule_name = None;
         let mut added_rule = None;
@@ -307,6 +314,23 @@ impl PromptTable {
         let pending = inner.by_id.remove(&id)?;
         inner.by_key.remove(&pending.key);
         Some(pending)
+    }
+
+    /// Take a prompt only for the client currently holding the handler slot.
+    ///
+    /// The handler check and the removal share one lock acquisition, so a
+    /// client cannot pass the check and then have the slot change under it.
+    fn take_as_handler(&self, tx: &Sender<DaemonMsg>, id: u64) -> Result<Pending, String> {
+        let mut inner = self.inner.lock().unwrap();
+        if !inner.handler.as_ref().is_some_and(|h| h.same_channel(tx)) {
+            return Err("not the registered prompt handler".to_string());
+        }
+        let pending = inner
+            .by_id
+            .remove(&id)
+            .ok_or_else(|| format!("unknown or expired prompt id {id}"))?;
+        inner.by_key.remove(&pending.key);
+        Ok(pending)
     }
 
     /// Release all held packets with `verdict` and emit one event for the
@@ -424,6 +448,38 @@ mod tests {
         assert_eq!(h.verdict_rx.recv().await, Some((7, Verdict::Deny)));
     }
 
+    /// Prompt ids are a monotonic counter from 1, so they are trivially
+    /// guessable. Only the client holding the handler slot may answer, or any
+    /// other connected client could race the GUI and allow what the operator
+    /// was about to deny.
+    #[tokio::test]
+    async fn only_the_registered_handler_may_reply() {
+        let mut h = harness("reply-authz", 4, Verdict::Deny);
+        let (tx, mut prompt_rx) = mpsc::channel(16);
+        assert!(h.table.set_handler(tx.clone()));
+        // A second client connects but does not hold the slot.
+        let (other, _other_rx) = mpsc::channel(16);
+        assert!(!h.table.set_handler(other.clone()), "slot is exclusive");
+
+        h.table.handle_new(conn("/bin/a", "1.1.1.1:443"), 1);
+        let DaemonMsg::PromptRequest { id, .. } = prompt_rx.recv().await.unwrap() else {
+            panic!("expected PromptRequest");
+        };
+
+        let err = h
+            .table
+            .reply(&other, id, Verdict::Allow, RuleDuration::Once, PromptScope::ThisPort)
+            .expect_err("a non-handler must not answer");
+        assert!(err.contains("prompt handler"), "{err}");
+        // The prompt is untouched: no verdict released, still answerable.
+        assert!(h.verdict_rx.try_recv().is_err());
+
+        h.table
+            .reply(&tx, id, Verdict::Deny, RuleDuration::Once, PromptScope::ThisPort)
+            .expect("the handler may answer");
+        assert_eq!(h.verdict_rx.recv().await, Some((1, Verdict::Deny)));
+    }
+
     #[tokio::test]
     async fn reply_resolves_all_coalesced_packets() {
         let mut h = harness("coalesce", 4, Verdict::Allow);
@@ -440,13 +496,13 @@ mod tests {
         assert!(prompt_rx.try_recv().is_err(), "second packet coalesced");
 
         h.table
-            .reply(id, Verdict::Deny, RuleDuration::Once, PromptScope::ThisPort)
+            .reply(&tx, id, Verdict::Deny, RuleDuration::Once, PromptScope::ThisPort)
             .unwrap();
         assert_eq!(h.verdict_rx.recv().await, Some((1, Verdict::Deny)));
         assert_eq!(h.verdict_rx.recv().await, Some((2, Verdict::Deny)));
         // Once: no rule created.
         assert!(h.store.list().is_empty());
-        assert!(h.table.reply(id, Verdict::Allow, RuleDuration::Once, PromptScope::ThisPort).is_err());
+        assert!(h.table.reply(&tx, id, Verdict::Allow, RuleDuration::Once, PromptScope::ThisPort).is_err());
     }
 
     #[tokio::test]
@@ -458,7 +514,7 @@ mod tests {
         // flow prompts again.
         let mut h = harness("udp-once", 4, Verdict::Deny);
         let (tx, mut prompt_rx) = mpsc::channel(16);
-        assert!(h.table.set_handler(tx));
+        assert!(h.table.set_handler(tx.clone()));
         let mut c = conn("/usr/bin/dig", "9.9.9.9:53");
         c.tuple.proto = Proto::Udp;
         h.table.handle_new(c, 1);
@@ -466,7 +522,7 @@ mod tests {
             panic!("expected PromptRequest");
         };
         h.table
-            .reply(id, Verdict::Allow, RuleDuration::Once, PromptScope::ThisHost)
+            .reply(&tx, id, Verdict::Allow, RuleDuration::Once, PromptScope::ThisHost)
             .unwrap();
         assert_eq!(h.verdict_rx.recv().await, Some((1, Verdict::Allow)));
         assert!(h.store.list().is_empty(), "Once creates no rule for UDP either");
@@ -479,7 +535,7 @@ mod tests {
     async fn broad_reply_resolves_other_prompts_it_covers() {
         let mut h = harness("sweep", 8, Verdict::Deny);
         let (tx, mut prompt_rx) = mpsc::channel(16);
-        assert!(h.table.set_handler(tx));
+        assert!(h.table.set_handler(tx.clone()));
 
         // One app, three endpoints; another app, one endpoint.
         h.table.handle_new(conn("/usr/bin/chrome", "1.1.1.1:443"), 1);
@@ -495,7 +551,7 @@ mod tests {
 
         // Allow the app anywhere: every chrome prompt resolves allow.
         h.table
-            .reply(first, Verdict::Allow, RuleDuration::Session, PromptScope::AppAnywhere)
+            .reply(&tx, first, Verdict::Allow, RuleDuration::Session, PromptScope::AppAnywhere)
             .unwrap();
         let mut released = std::collections::HashMap::new();
         for _ in 0..3 {
@@ -521,7 +577,7 @@ mod tests {
         assert!(h.verdict_rx.try_recv().is_err());
         let other_id = first + 3;
         h.table
-            .reply(other_id, Verdict::Deny, RuleDuration::Once, PromptScope::ThisPort)
+            .reply(&tx, other_id, Verdict::Deny, RuleDuration::Once, PromptScope::ThisPort)
             .unwrap();
         assert_eq!(h.verdict_rx.recv().await, Some((4, Verdict::Deny)));
     }
@@ -532,7 +588,7 @@ mod tests {
     async fn narrow_reply_leaves_other_prompts_open() {
         let mut h = harness("narrow", 8, Verdict::Deny);
         let (tx, mut prompt_rx) = mpsc::channel(16);
-        assert!(h.table.set_handler(tx));
+        assert!(h.table.set_handler(tx.clone()));
         h.table.handle_new(conn("/usr/bin/chrome", "1.1.1.1:443"), 1);
         h.table.handle_new(conn("/usr/bin/chrome", "2.2.2.2:443"), 2);
         let DaemonMsg::PromptRequest { id: first, .. } = prompt_rx.recv().await.unwrap() else {
@@ -541,7 +597,7 @@ mod tests {
         let _ = prompt_rx.recv().await.unwrap();
 
         h.table
-            .reply(first, Verdict::Allow, RuleDuration::Session, PromptScope::ThisPort)
+            .reply(&tx, first, Verdict::Allow, RuleDuration::Session, PromptScope::ThisPort)
             .unwrap();
         assert_eq!(h.verdict_rx.recv().await, Some((1, Verdict::Allow)));
         // The second endpoint's prompt is still pending: no verdict, no
@@ -556,7 +612,7 @@ mod tests {
     async fn different_protocols_prompt_separately() {
         let mut h = harness("proto", 4, Verdict::Allow);
         let (tx, mut prompt_rx) = mpsc::channel(16);
-        assert!(h.table.set_handler(tx));
+        assert!(h.table.set_handler(tx.clone()));
         h.table.handle_new(conn("/bin/a", "1.1.1.1:443"), 1);
         let mut udp = conn("/bin/a", "1.1.1.1:443");
         udp.tuple.proto = Proto::Udp;
@@ -571,13 +627,13 @@ mod tests {
         assert_ne!(tcp_id, udp_id);
 
         h.table
-            .reply(tcp_id, Verdict::Deny, RuleDuration::Once, PromptScope::ThisPort)
+            .reply(&tx, tcp_id, Verdict::Deny, RuleDuration::Once, PromptScope::ThisPort)
             .unwrap();
         assert_eq!(h.verdict_rx.recv().await, Some((1, Verdict::Deny)));
         // The UDP prompt is untouched and still answerable.
         assert!(h.verdict_rx.try_recv().is_err());
         h.table
-            .reply(udp_id, Verdict::Allow, RuleDuration::Once, PromptScope::ThisPort)
+            .reply(&tx, udp_id, Verdict::Allow, RuleDuration::Once, PromptScope::ThisPort)
             .unwrap();
         assert_eq!(h.verdict_rx.recv().await, Some((2, Verdict::Allow)));
     }
@@ -598,14 +654,15 @@ mod tests {
         // The handler dies without answering; a new one takes the slot.
         drop(rx1);
         let (tx2, mut rx2) = mpsc::channel(16);
-        assert!(h.table.set_handler(tx2));
+        assert!(h.table.set_handler(tx2.clone()));
         let DaemonMsg::PromptRequest { id: redelivered, .. } = rx2.recv().await.unwrap() else {
             panic!("expected the pending prompt to be re-delivered");
         };
         assert_eq!(redelivered, id);
 
+        // The new handler owns the slot now, so it is the one that may answer.
         h.table
-            .reply(id, Verdict::Deny, RuleDuration::Once, PromptScope::ThisPort)
+            .reply(&tx2, id, Verdict::Deny, RuleDuration::Once, PromptScope::ThisPort)
             .unwrap();
         assert_eq!(h.verdict_rx.recv().await, Some((1, Verdict::Deny)));
     }
@@ -614,7 +671,7 @@ mod tests {
     async fn overflow_applies_default() {
         let mut h = harness("overflow", 1, Verdict::Deny);
         let (tx, mut prompt_rx) = mpsc::channel(16);
-        assert!(h.table.set_handler(tx));
+        assert!(h.table.set_handler(tx.clone()));
         h.table.handle_new(conn("/bin/a", "1.1.1.1:443"), 1);
         let _ = prompt_rx.recv().await.unwrap();
         // Different key while table is full.
@@ -626,7 +683,7 @@ mod tests {
     async fn timeout_applies_default_and_notifies() {
         let mut h = harness("timeout", 4, Verdict::Deny);
         let (tx, mut prompt_rx) = mpsc::channel(16);
-        assert!(h.table.set_handler(tx));
+        assert!(h.table.set_handler(tx.clone()));
         h.table.handle_new(conn("/bin/a", "1.1.1.1:443"), 9);
         let DaemonMsg::PromptRequest { id, .. } = prompt_rx.recv().await.unwrap() else {
             panic!("expected PromptRequest");
@@ -640,13 +697,13 @@ mod tests {
     async fn reply_with_duration_creates_scoped_rule() {
         let mut h = harness("rule", 4, Verdict::Allow);
         let (tx, mut prompt_rx) = mpsc::channel(16);
-        assert!(h.table.set_handler(tx));
+        assert!(h.table.set_handler(tx.clone()));
         h.table.handle_new(conn("/usr/bin/curl", "9.9.9.9:853"), 1);
         let DaemonMsg::PromptRequest { id, .. } = prompt_rx.recv().await.unwrap() else {
             panic!("expected PromptRequest");
         };
         h.table
-            .reply(id, Verdict::Allow, RuleDuration::Session, PromptScope::ThisHost)
+            .reply(&tx, id, Verdict::Allow, RuleDuration::Session, PromptScope::ThisHost)
             .unwrap();
         assert_eq!(h.verdict_rx.recv().await, Some((1, Verdict::Allow)));
 
