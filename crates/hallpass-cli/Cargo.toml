@@ -7,6 +7,8 @@ description = "Hallpass application firewall CLI"
 
 [dependencies]
 hallpass-types = { path = "../hallpass-types" }
+serde = { workspace = true }
+serde_json = { workspace = true }
 tokio = { workspace = true, features = [
     "rt",
     "net",

@@ -3,17 +3,30 @@
 use std::net::IpAddr;
 use std::path::PathBuf;
 
-use hallpass_types::{Action, Proto, Rule, RuleDuration, RuleMatch};
+use hallpass_types::{Action, ConnEvent, Proto, Rule, RuleDuration, RuleMatch, Verdict};
 
 /// Default daemon socket path.
 pub const DEFAULT_SOCKET: &str = "/run/hallpass/hallpass.sock";
+
+/// Largest `events --last N` accepted; larger values are clamped to it.
+///
+/// The daemon returns the whole reply in one frame and the CLI holds it in
+/// memory before printing, so the request cannot be unbounded just because a
+/// digit was typed twice. The daemon clamps again to its ring capacity.
+pub const MAX_HISTORY: u32 = 10_000;
+
+/// Most rows `top --top N` will show; larger values are clamped to it.
+pub const MAX_TOP_ROWS: usize = 1000;
+
+/// Shortest `top --interval SECS`; smaller values are clamped to it.
+pub const MIN_INTERVAL_SECS: u64 = 1;
 
 /// Usage text printed for `--help` and on parse errors.
 pub const USAGE: &str = "\
 hallpass-cli - client for the hallpass application firewall
 
 USAGE:
-    hallpass-cli [--socket PATH] <COMMAND>
+    hallpass-cli [GLOBAL OPTIONS] <COMMAND>
 
 COMMANDS:
     status                       Show daemon statistics
@@ -21,8 +34,27 @@ COMMANDS:
     rules add [OPTIONS]          Add a rule
     rules rm NAME                Delete a rule
     rules toggle NAME on|off     Enable or disable a rule
-    events                       Stream connection events until Ctrl-C
+    events [OPTIONS]             Stream connection events until Ctrl-C
+    top [OPTIONS]                Live aggregate view of connection activity
     watch                        Interactively answer connection prompts
+
+EVENTS OPTIONS:
+    --last N                     Replay the last N decided connections before
+                                 streaming (clamped to 10000)
+    --no-follow                  With --last, print the replay and exit
+    --exe SUBSTR                 Only events whose executable path contains
+                                 SUBSTR (repeatable, any of them matches)
+    --domain SUBSTR              Only events whose destination domain contains
+                                 SUBSTR (repeatable, any of them matches)
+    --verdict allow|deny|reject|blocked
+                                 Only these verdicts (repeatable; 'blocked'
+                                 means deny or reject)
+
+TOP OPTIONS:
+    --group-by exe|domain|host|port|rule
+                                 What each row counts (default: exe)
+    --interval SECS              Redraw period (default: 2, minimum 1)
+    --top N                      Rows to show (default: 20, maximum 1000)
 
 RULES ADD OPTIONS:
     --name NAME                  Rule name (required)
@@ -52,7 +84,142 @@ RULES ADD OPTIONS:
 
 GLOBAL OPTIONS:
     --socket PATH                Daemon socket (default: /run/hallpass/hallpass.sock)
+    --json                       Machine-readable JSON for status, rules,
+                                 events (one object per line) and top
+    --color auto|always|never    Colorize output (default: auto, meaning only
+                                 on a terminal with NO_COLOR unset)
     -h, --help                   Show this help";
+
+/// When to emit ANSI color.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ColorChoice {
+    /// Color only when stdout is a terminal and `NO_COLOR` is unset.
+    #[default]
+    Auto,
+    /// Always color, even when piped.
+    Always,
+    /// Never color.
+    Never,
+}
+
+/// What each `top` row counts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GroupBy {
+    /// Executable path of the initiating process.
+    #[default]
+    Exe,
+    /// Destination domain, falling back to the destination IP when unknown.
+    Domain,
+    /// Destination IP address.
+    Host,
+    /// Destination port.
+    Port,
+    /// Name of the rule that decided the connection.
+    Rule,
+}
+
+impl GroupBy {
+    /// Lowercase name, as accepted by `--group-by`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            GroupBy::Exe => "exe",
+            GroupBy::Domain => "domain",
+            GroupBy::Host => "host",
+            GroupBy::Port => "port",
+            GroupBy::Rule => "rule",
+        }
+    }
+
+    /// Header for the key column of the `top` table.
+    pub fn column(self) -> &'static str {
+        match self {
+            GroupBy::Exe => "EXE",
+            GroupBy::Domain => "DOMAIN",
+            GroupBy::Host => "HOST",
+            GroupBy::Port => "PORT",
+            GroupBy::Rule => "RULE",
+        }
+    }
+}
+
+/// Client-side event filters for `events`.
+///
+/// Empty means "no restriction". Within one kind the terms are OR-ed (any
+/// `--exe` may match); across kinds they are AND-ed.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Filters {
+    /// Substrings matched against the executable path.
+    pub exe: Vec<String>,
+    /// Substrings matched against the destination domain.
+    pub domain: Vec<String>,
+    /// Verdicts to keep. Matches the policy verdict, so observe-mode
+    /// "would-deny" events are kept by `--verdict deny`.
+    pub verdict: Vec<Verdict>,
+}
+
+impl Filters {
+    /// Whether `ev` passes every filter.
+    ///
+    /// Matched against the raw metadata rather than its sanitized form: the
+    /// operator typed the substring they expect to find in the path, and
+    /// sanitizing first would make a hostile name unmatchable by the very
+    /// filter written to hunt for it. Only the display path sanitizes.
+    pub fn matches(&self, ev: &ConnEvent) -> bool {
+        if !self.verdict.is_empty() && !self.verdict.contains(&ev.verdict) {
+            return false;
+        }
+        if !self.exe.is_empty() {
+            let exe = ev
+                .conn
+                .exe_path
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default();
+            if !self.exe.iter().any(|want| exe.contains(want.as_str())) {
+                return false;
+            }
+        }
+        if !self.domain.is_empty() {
+            let domain = ev.conn.domain.as_deref().unwrap_or("");
+            if !self.domain.iter().any(|want| domain.contains(want.as_str())) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// Options for `events`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct EventsOpts {
+    /// Replay this many past events first; None to only stream.
+    pub last: Option<u32>,
+    /// Whether to keep streaming after any replay.
+    pub follow: bool,
+    /// Filters applied to both the replay and the live stream.
+    pub filters: Filters,
+}
+
+/// Options for `top`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TopOpts {
+    /// What each row counts.
+    pub group_by: GroupBy,
+    /// Seconds between redraws.
+    pub interval_secs: u64,
+    /// Rows to show.
+    pub top_n: usize,
+}
+
+impl Default for TopOpts {
+    fn default() -> TopOpts {
+        TopOpts {
+            group_by: GroupBy::Exe,
+            interval_secs: 2,
+            top_n: 20,
+        }
+    }
+}
 
 /// A parsed command.
 // One short-lived value per process; see `Parsed` below.
@@ -77,8 +244,10 @@ pub enum Cmd {
         /// New enabled state.
         enabled: bool,
     },
-    /// `events`
-    Events,
+    /// `events [OPTIONS]`
+    Events(EventsOpts),
+    /// `top [OPTIONS]`
+    Top(TopOpts),
     /// `watch`
     Watch,
 }
@@ -88,6 +257,10 @@ pub enum Cmd {
 pub struct Cli {
     /// Daemon socket path.
     pub socket: PathBuf,
+    /// Whether to emit JSON instead of tables.
+    pub json: bool,
+    /// When to emit ANSI color.
+    pub color: ColorChoice,
     /// The command to run.
     pub cmd: Cmd,
 }
@@ -106,16 +279,30 @@ pub enum Parsed {
 /// Parse arguments (excluding argv[0]).
 pub fn parse(argv: &[String]) -> Result<Parsed, String> {
     let mut socket = PathBuf::from(DEFAULT_SOCKET);
+    let mut json = false;
+    let mut color = ColorChoice::Auto;
     let mut rest: Vec<&str> = Vec::new();
 
     let mut it = argv.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "-h" | "--help" => return Ok(Parsed::Help),
+            "--json" => json = true,
             "--socket" => {
                 socket = PathBuf::from(
                     it.next().ok_or_else(|| "--socket requires a value".to_string())?,
                 );
+            }
+            "--color" => {
+                let value = it
+                    .next()
+                    .ok_or_else(|| "--color requires a value".to_string())?;
+                color = match value.as_str() {
+                    "auto" => ColorChoice::Auto,
+                    "always" => ColorChoice::Always,
+                    "never" => ColorChoice::Never,
+                    other => return Err(format!("invalid --color '{other}'")),
+                };
             }
             other => rest.push(other),
         }
@@ -124,11 +311,12 @@ pub fn parse(argv: &[String]) -> Result<Parsed, String> {
     let cmd = match rest.split_first() {
         None => return Err("no command given".into()),
         Some((&"status", [])) => Cmd::Status,
-        Some((&"events", [])) => Cmd::Events,
         Some((&"watch", [])) => Cmd::Watch,
+        Some((&"events", flags)) => Cmd::Events(parse_events(flags)?),
+        Some((&"top", flags)) => Cmd::Top(parse_top(flags)?),
         Some((&"rules", sub)) => parse_rules(sub)?,
         Some((&cmd, extra)) => {
-            return Err(if matches!(cmd, "status" | "events" | "watch") {
+            return Err(if matches!(cmd, "status" | "watch") {
                 format!("unexpected arguments after '{cmd}': {extra:?}")
             } else {
                 format!("unknown command '{cmd}'")
@@ -136,7 +324,101 @@ pub fn parse(argv: &[String]) -> Result<Parsed, String> {
         }
     };
 
-    Ok(Parsed::Cli(Cli { socket, cmd }))
+    Ok(Parsed::Cli(Cli {
+        socket,
+        json,
+        color,
+        cmd,
+    }))
+}
+
+fn parse_events(flags: &[&str]) -> Result<EventsOpts, String> {
+    let mut opts = EventsOpts {
+        last: None,
+        follow: true,
+        filters: Filters::default(),
+    };
+
+    let mut it = flags.iter();
+    while let Some(flag) = it.next() {
+        if *flag == "--no-follow" {
+            opts.follow = false;
+            continue;
+        }
+        let value = *it
+            .next()
+            .ok_or_else(|| format!("{flag} requires a value"))?;
+        match *flag {
+            "--last" => {
+                let n: u32 = value
+                    .parse()
+                    .map_err(|_| format!("invalid --last '{value}'"))?;
+                if n == 0 {
+                    return Err("--last must be at least 1".into());
+                }
+                opts.last = Some(n.min(MAX_HISTORY));
+            }
+            "--exe" => opts.filters.exe.push(value.to_string()),
+            "--domain" => opts.filters.domain.push(value.to_string()),
+            "--verdict" => match value {
+                "allow" => opts.filters.verdict.push(Verdict::Allow),
+                "deny" => opts.filters.verdict.push(Verdict::Deny),
+                "reject" => opts.filters.verdict.push(Verdict::Reject),
+                "blocked" => opts
+                    .filters
+                    .verdict
+                    .extend([Verdict::Deny, Verdict::Reject]),
+                other => return Err(format!("invalid --verdict '{other}'")),
+            },
+            other => return Err(format!("unknown flag '{other}'")),
+        }
+    }
+
+    // Without a replay there would be nothing to print and nothing to stream,
+    // so treat it as the typo it almost certainly is.
+    if !opts.follow && opts.last.is_none() {
+        return Err("--no-follow requires --last N".into());
+    }
+    Ok(opts)
+}
+
+fn parse_top(flags: &[&str]) -> Result<TopOpts, String> {
+    let mut opts = TopOpts::default();
+
+    let mut it = flags.iter();
+    while let Some(flag) = it.next() {
+        let value = *it
+            .next()
+            .ok_or_else(|| format!("{flag} requires a value"))?;
+        match *flag {
+            "--group-by" => {
+                opts.group_by = match value {
+                    "exe" => GroupBy::Exe,
+                    "domain" => GroupBy::Domain,
+                    "host" => GroupBy::Host,
+                    "port" => GroupBy::Port,
+                    "rule" => GroupBy::Rule,
+                    other => return Err(format!("invalid --group-by '{other}'")),
+                };
+            }
+            "--interval" => {
+                let secs: u64 = value
+                    .parse()
+                    .map_err(|_| format!("invalid --interval '{value}'"))?;
+                // Clamped, not rejected: a busy operator typing 0 wants "as
+                // fast as it goes", and one redraw per second is that.
+                opts.interval_secs = secs.max(MIN_INTERVAL_SECS);
+            }
+            "--top" => {
+                let n: usize = value
+                    .parse()
+                    .map_err(|_| format!("invalid --top '{value}'"))?;
+                opts.top_n = n.clamp(1, MAX_TOP_ROWS);
+            }
+            other => return Err(format!("unknown flag '{other}'")),
+        }
+    }
+    Ok(opts)
 }
 
 fn parse_rules(sub: &[&str]) -> Result<Cmd, String> {
@@ -275,6 +557,7 @@ fn validate_net(s: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hallpass_types::{Connection, FlowTuple};
 
     fn parse_ok(args: &[&str]) -> Cli {
         let argv: Vec<String> = args.iter().map(|s| s.to_string()).collect();
@@ -292,9 +575,164 @@ mod tests {
     #[test]
     fn simple_commands() {
         assert_eq!(parse_ok(&["status"]).cmd, Cmd::Status);
-        assert_eq!(parse_ok(&["events"]).cmd, Cmd::Events);
         assert_eq!(parse_ok(&["watch"]).cmd, Cmd::Watch);
         assert_eq!(parse_ok(&["rules"]).cmd, Cmd::RulesList);
+        assert_eq!(
+            parse_ok(&["events"]).cmd,
+            Cmd::Events(EventsOpts {
+                last: None,
+                follow: true,
+                filters: Filters::default(),
+            })
+        );
+        assert_eq!(parse_ok(&["top"]).cmd, Cmd::Top(TopOpts::default()));
+    }
+
+    #[test]
+    fn global_output_flags() {
+        let cli = parse_ok(&["status"]);
+        assert!(!cli.json);
+        assert_eq!(cli.color, ColorChoice::Auto);
+        // Accepted on either side of the command, like --socket.
+        let cli = parse_ok(&["--json", "top", "--color", "never"]);
+        assert!(cli.json);
+        assert_eq!(cli.color, ColorChoice::Never);
+        assert_eq!(parse_ok(&["status", "--color", "always"]).color, ColorChoice::Always);
+        assert!(parse_err(&["status", "--color", "maybe"]).contains("invalid --color"));
+        assert!(parse_err(&["status", "--color"]).contains("requires a value"));
+    }
+
+    #[test]
+    fn events_flags() {
+        let Cmd::Events(opts) = parse_ok(&[
+            "events", "--last", "50", "--no-follow", "--exe", "curl", "--exe", "wget",
+            "--domain", "example.org", "--verdict", "blocked",
+        ])
+        .cmd
+        else {
+            panic!("expected Events");
+        };
+        assert_eq!(opts.last, Some(50));
+        assert!(!opts.follow);
+        assert_eq!(opts.filters.exe, vec!["curl".to_string(), "wget".to_string()]);
+        assert_eq!(opts.filters.domain, vec!["example.org".to_string()]);
+        assert_eq!(opts.filters.verdict, vec![Verdict::Deny, Verdict::Reject]);
+    }
+
+    /// `--last` is clamped rather than rejected, so an absurd value still
+    /// bounds what the daemon has to encode and the CLI has to hold.
+    #[test]
+    fn events_last_is_clamped() {
+        let Cmd::Events(opts) = parse_ok(&["events", "--last", "99999999"]).cmd else {
+            panic!("expected Events");
+        };
+        assert_eq!(opts.last, Some(MAX_HISTORY));
+        assert!(parse_err(&["events", "--last", "0"]).contains("at least 1"));
+        assert!(parse_err(&["events", "--last", "x"]).contains("invalid --last"));
+        assert!(parse_err(&["events", "--no-follow"]).contains("--last"));
+        assert!(parse_err(&["events", "--verdict", "maybe"]).contains("invalid --verdict"));
+        assert!(parse_err(&["events", "--nope", "1"]).contains("unknown flag"));
+    }
+
+    #[test]
+    fn top_flags_and_clamps() {
+        let cases: [(&[&str], TopOpts); 4] = [
+            (
+                &["top", "--group-by", "domain", "--interval", "5", "--top", "3"],
+                TopOpts { group_by: GroupBy::Domain, interval_secs: 5, top_n: 3 },
+            ),
+            // Interval floor: 0 would be a redraw loop with no sleep.
+            (
+                &["top", "--interval", "0"],
+                TopOpts { interval_secs: MIN_INTERVAL_SECS, ..TopOpts::default() },
+            ),
+            (
+                &["top", "--top", "99999"],
+                TopOpts { top_n: MAX_TOP_ROWS, ..TopOpts::default() },
+            ),
+            (
+                &["top", "--top", "0"],
+                TopOpts { top_n: 1, ..TopOpts::default() },
+            ),
+        ];
+        for (argv, want) in cases {
+            assert_eq!(parse_ok(argv).cmd, Cmd::Top(want), "{argv:?}");
+        }
+        for group in ["exe", "domain", "host", "port", "rule"] {
+            let Cmd::Top(opts) = parse_ok(&["top", "--group-by", group]).cmd else {
+                panic!("expected Top");
+            };
+            assert_eq!(opts.group_by.as_str(), group);
+        }
+        assert!(parse_err(&["top", "--group-by", "pid"]).contains("invalid --group-by"));
+        assert!(parse_err(&["top", "--interval", "soon"]).contains("invalid --interval"));
+        assert!(parse_err(&["top", "--top"]).contains("requires a value"));
+    }
+
+    #[test]
+    fn filter_matching() {
+        let ev = |exe: Option<&str>, domain: Option<&str>, verdict| ConnEvent {
+            conn: Connection {
+                tuple: FlowTuple {
+                    proto: Proto::Tcp,
+                    src: "127.0.0.1:1".parse().unwrap(),
+                    dst: "93.184.216.34:443".parse().unwrap(),
+                },
+                uid: None,
+                pid: None,
+                exe_path: exe.map(PathBuf::from),
+                cmdline: None,
+                parent_exe: None,
+                domain: domain.map(String::from),
+                iface: None,
+            },
+            verdict,
+            rule_name: None,
+            unix_ms: 0,
+            enforced: true,
+        };
+        let curl = ev(Some("/usr/bin/curl"), Some("example.org"), Verdict::Allow);
+        let nc = ev(Some("/usr/bin/nc"), None, Verdict::Deny);
+
+        // Empty filters keep everything.
+        assert!(Filters::default().matches(&curl));
+
+        let exe_only = Filters { exe: vec!["curl".into()], ..Default::default() };
+        assert!(exe_only.matches(&curl));
+        assert!(!exe_only.matches(&nc));
+
+        // Repeated terms of one kind are OR-ed.
+        let either = Filters {
+            exe: vec!["curl".into(), "/nc".into()],
+            ..Default::default()
+        };
+        assert!(either.matches(&curl));
+        assert!(either.matches(&nc));
+
+        // Kinds are AND-ed, and a missing domain never matches a domain term.
+        let both = Filters {
+            exe: vec!["curl".into()],
+            domain: vec!["example.org".into()],
+            ..Default::default()
+        };
+        assert!(both.matches(&curl));
+        assert!(!both.matches(&nc));
+
+        let denied = Filters {
+            verdict: vec![Verdict::Deny, Verdict::Reject],
+            ..Default::default()
+        };
+        assert!(!denied.matches(&curl));
+        assert!(denied.matches(&nc));
+
+        // An unenforced deny is still a deny for filtering: the operator
+        // asking for denies wants to see what observe mode would have blocked.
+        let mut would = nc.clone();
+        would.enforced = false;
+        assert!(denied.matches(&would));
+
+        // An unknown executable is not silently kept by an --exe filter.
+        assert!(!exe_only.matches(&ev(None, None, Verdict::Allow)));
     }
 
     #[test]

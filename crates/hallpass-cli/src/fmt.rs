@@ -1,4 +1,4 @@
-//! Output formatting: tables, event lines, timestamps.
+//! Output formatting: tables, event lines, timestamps, and the color palette.
 
 use std::fmt::Write;
 
@@ -6,12 +6,118 @@ use hallpass_types::{
     format_ts, sanitize_for_display, ConnEvent, Connection, PromptScope, Rule, Stats, Verdict,
 };
 
-/// Human-readable verdict name (uppercase, for event lines).
-pub fn verdict_str(v: Verdict) -> &'static str {
-    match v {
-        Verdict::Allow => "ALLOW",
-        Verdict::Deny => "DENY",
-        Verdict::Reject => "REJECT",
+use crate::args::ColorChoice;
+
+/// Widest verdict label (`WOULD-REJECT`), so event lines stay in columns
+/// whether or not the daemon is enforcing.
+pub const VERDICT_WIDTH: usize = 12;
+
+/// What a piece of text means, rather than what color it is.
+///
+/// Every ANSI sequence in the CLI comes from [`Palette::paint`], so the
+/// palette is the only place that has to be reviewed when the output has to
+/// stay readable on a given terminal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Style {
+    /// An allowed connection.
+    Allow,
+    /// A connection that was dropped.
+    Deny,
+    /// A connection that was actively rejected.
+    Reject,
+    /// A verdict that was recorded but not applied (observe mode).
+    Would,
+    /// A heading or summary line.
+    Header,
+    /// Something the operator needs to notice.
+    Warn,
+}
+
+impl Style {
+    /// SGR parameters for this style.
+    fn code(self) -> &'static str {
+        match self {
+            Style::Allow => "32",
+            Style::Deny => "31",
+            Style::Reject => "35",
+            Style::Would => "33",
+            Style::Header => "1",
+            Style::Warn => "1;33",
+        }
+    }
+}
+
+/// Whether output is colorized, and the only source of ANSI color escapes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Palette {
+    enabled: bool,
+}
+
+impl Palette {
+    /// Palette that colors, or does not.
+    pub fn new(enabled: bool) -> Palette {
+        Palette { enabled }
+    }
+
+    /// Whether this palette emits escapes.
+    pub fn enabled(self) -> bool {
+        self.enabled
+    }
+
+    /// `text` in `style`, or unchanged when color is off.
+    ///
+    /// The reset is unconditional (`0m` rather than a per-attribute reset) so
+    /// no style can leak into the next line if the terminal drops a sequence.
+    pub fn paint(self, style: Style, text: &str) -> String {
+        if !self.enabled {
+            return text.to_string();
+        }
+        format!("\x1b[{}m{text}\x1b[0m", style.code())
+    }
+}
+
+/// `text` painted in `style` and padded to `width` characters.
+///
+/// The padding is computed from the unpainted text: escape bytes take no space
+/// on screen, so counting them would eat into the column and misalign every
+/// column after it.
+pub fn cell(pal: Palette, style: Style, text: &str, width: usize) -> String {
+    let mut out = pal.paint(style, text);
+    for _ in 0..width.saturating_sub(text.chars().count()) {
+        out.push(' ');
+    }
+    out
+}
+
+/// How output is rendered, resolved once at startup and passed down.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Output {
+    /// Emit machine-readable JSON instead of human tables.
+    pub json: bool,
+    /// Whether stdout is a terminal, which decides in-place redraws.
+    pub tty: bool,
+    /// The color palette for human output.
+    pub palette: Palette,
+}
+
+impl Output {
+    /// Resolve the output mode. `tty` is whether stdout is a terminal, and
+    /// `no_color` whether `NO_COLOR` is set to a non-empty value.
+    ///
+    /// JSON is never colorized: the escapes would land inside string values
+    /// and every consumer that parses them would carry them along.
+    pub fn resolve(json: bool, color: ColorChoice, tty: bool, no_color: bool) -> Output {
+        let colorize = !json
+            && match color {
+                ColorChoice::Always => true,
+                ColorChoice::Never => false,
+                ColorChoice::Auto => tty && !no_color,
+            };
+        Output {
+            json,
+            tty,
+            palette: Palette::new(colorize),
+        }
     }
 }
 
@@ -24,24 +130,51 @@ pub fn scope_str(s: PromptScope) -> &'static str {
     }
 }
 
+/// Warning printed by [`format_stats`] and the `top` header when the daemon
+/// is evaluating policy without applying it.
+pub const OBSERVE_WARNING: &str = "OBSERVE MODE: nothing is being blocked";
+
 /// Format daemon stats as an aligned key/value table.
-pub fn format_stats(s: &Stats) -> String {
+///
+/// `mode` leads the table, and observe mode also gets a trailing warning: a
+/// reader who skims a healthy-looking row of counters would otherwise walk
+/// away believing traffic is being filtered when none of it is.
+pub fn format_stats(s: &Stats, pal: Palette) -> String {
     let rows = [
+        (
+            "mode",
+            if s.enforcing {
+                "enforcing".to_string()
+            } else {
+                pal.paint(Style::Warn, "observe (not enforcing)")
+            },
+        ),
         ("connections", s.connections_total.to_string()),
         ("allowed", s.allowed.to_string()),
         ("denied", s.denied.to_string()),
+        ("observed only", s.observed_only.to_string()),
         ("prompted", s.prompted.to_string()),
         ("rules loaded", s.rules_loaded.to_string()),
         ("rules skipped", s.rules_skipped.to_string()),
         ("dns spoofed", s.dns_spoof_rejected.to_string()),
+        ("dns snoop dropped", s.dns_snoop_dropped.to_string()),
         ("prompt overflows", s.prompts_overflowed.to_string()),
         ("other protocols", s.other_proto_total.to_string()),
         ("uptime", format_uptime(s.uptime_secs)),
     ];
+    // Keys are ASCII literals, so bytes and characters agree here; the value
+    // column is last and never padded, so a painted value cannot misalign it.
     let width = rows.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
     let mut out = String::new();
     for (k, v) in rows {
         let _ = writeln!(out, "{k:width$}  {v}");
+    }
+    if !s.enforcing {
+        let _ = writeln!(out, "{}", pal.paint(Style::Warn, OBSERVE_WARNING));
+        let _ = writeln!(
+            out,
+            "policy is evaluated and recorded, but every packet is let through"
+        );
     }
     out
 }
@@ -141,14 +274,29 @@ pub fn dst_display(conn: &Connection) -> String {
     }
 }
 
+/// Color role for an event's verdict.
+fn verdict_style(ev: &ConnEvent) -> Style {
+    match (ev.enforced, ev.verdict) {
+        (_, Verdict::Allow) => Style::Allow,
+        (true, Verdict::Deny) => Style::Deny,
+        (true, Verdict::Reject) => Style::Reject,
+        (false, _) => Style::Would,
+    }
+}
+
 /// Format one connection event line:
 /// `TIMESTAMP VERDICT exe -> dst rule=NAME`.
-pub fn format_event(ev: &ConnEvent) -> String {
+///
+/// The verdict comes from [`ConnEvent::verdict_label`], so an unenforced deny
+/// reads `WOULD-DENY`. Printing `DENY` for a connection that in fact went out
+/// tells the reader the opposite of what happened.
+pub fn format_event(ev: &ConnEvent, pal: Palette) -> String {
     let rule = ev.rule_name.as_deref().unwrap_or("-");
+    let label = ev.verdict_label().to_uppercase();
     format!(
-        "{} {:6} {} -> {} rule={}",
+        "{} {} {} -> {} rule={}",
         format_ts(ev.unix_ms),
-        verdict_str(ev.verdict),
+        cell(pal, verdict_style(ev), &label, VERDICT_WIDTH),
         exe_display(&ev.conn),
         dst_display(&ev.conn),
         sanitize_for_display(rule)
@@ -195,6 +343,10 @@ mod tests {
         assert_eq!(format_uptime(86_400), "1d 0h 0m 0s");
     }
 
+    fn plain() -> Palette {
+        Palette::new(false)
+    }
+
     #[test]
     fn event_line_with_domain() {
         let ev = ConnEvent {
@@ -202,10 +354,12 @@ mod tests {
             verdict: Verdict::Allow,
             rule_name: Some("allow-curl".into()),
             unix_ms: 1_720_000_000_000,
+            enforced: true,
         };
         assert_eq!(
-            format_event(&ev),
-            "2024-07-03 09:46:40 ALLOW  /usr/bin/curl -> example.org:443 rule=allow-curl"
+            format_event(&ev, plain()),
+            "2024-07-03 09:46:40 ALLOW        /usr/bin/curl -> example.org:443 \
+             rule=allow-curl"
         );
     }
 
@@ -218,16 +372,86 @@ mod tests {
             verdict: Verdict::Reject,
             rule_name: None,
             unix_ms: 0,
+            enforced: true,
         };
         assert_eq!(
-            format_event(&ev),
-            "1970-01-01 00:00:00 REJECT ? -> 93.184.216.34:443 rule=-"
+            format_event(&ev, plain()),
+            "1970-01-01 00:00:00 REJECT       ? -> 93.184.216.34:443 rule=-"
         );
     }
 
+    /// An unenforced deny must read WOULD-DENY: the packet went out, and a
+    /// reader shown DENY would conclude the opposite.
     #[test]
-    fn stats_table() {
-        let s = Stats {
+    fn observe_mode_event_lines_say_would() {
+        let mk = |verdict, enforced| ConnEvent {
+            conn: conn(Some("example.org")),
+            verdict,
+            rule_name: Some("r".into()),
+            unix_ms: 0,
+            enforced,
+        };
+        let cases = [
+            (Verdict::Deny, false, "WOULD-DENY"),
+            (Verdict::Reject, false, "WOULD-REJECT"),
+            (Verdict::Deny, true, "DENY"),
+            (Verdict::Reject, true, "REJECT"),
+            (Verdict::Allow, false, "ALLOW"),
+        ];
+        for (verdict, enforced, want) in cases {
+            let line = format_event(&mk(verdict, enforced), plain());
+            let field = line.split_whitespace().nth(2).expect("verdict field");
+            assert_eq!(field, want, "{line}");
+        }
+    }
+
+    /// Color is opt-in, lands only on the verdict, and is padded on the
+    /// unpainted text so the columns after it still line up.
+    #[test]
+    fn color_only_when_enabled_and_does_not_shift_columns() {
+        let ev = ConnEvent {
+            conn: conn(Some("example.org")),
+            verdict: Verdict::Deny,
+            rule_name: None,
+            unix_ms: 0,
+            enforced: true,
+        };
+        let bare = format_event(&ev, plain());
+        assert!(!bare.contains('\x1b'));
+
+        let painted = format_event(&ev, Palette::new(true));
+        assert!(painted.contains("\x1b[31mDENY\x1b[0m"), "{painted:?}");
+        // Same text once the escapes are removed: color adds nothing else.
+        let stripped: String = painted.replace("\x1b[31m", "").replace("\x1b[0m", "");
+        assert_eq!(stripped, bare);
+    }
+
+    #[test]
+    fn color_choice_resolution() {
+        let cases = [
+            // (json, choice, tty, no_color, colorize)
+            (false, ColorChoice::Auto, true, false, true),
+            (false, ColorChoice::Auto, false, false, false),
+            (false, ColorChoice::Auto, true, true, false),
+            (false, ColorChoice::Always, false, true, true),
+            (false, ColorChoice::Never, true, false, false),
+            // JSON is never colorized, however loudly it was asked for.
+            (true, ColorChoice::Always, true, false, false),
+        ];
+        for (json, choice, tty, no_color, want) in cases {
+            let out = Output::resolve(json, choice, tty, no_color);
+            assert_eq!(
+                out.palette.enabled(),
+                want,
+                "json={json} choice={choice:?} tty={tty} no_color={no_color}"
+            );
+            assert_eq!(out.tty, tty);
+            assert_eq!(out.json, json);
+        }
+    }
+
+    fn stats(enforcing: bool) -> Stats {
+        Stats {
             connections_total: 100,
             allowed: 80,
             denied: 15,
@@ -238,14 +462,37 @@ mod tests {
             rules_skipped: 2,
             prompts_overflowed: 1,
             other_proto_total: 0,
-        };
-        let out = format_stats(&s);
-        assert!(out.contains("connections       100\n"));
-        assert!(out.contains("rules loaded      3\n"));
-        assert!(out.contains("rules skipped     2\n"));
-        assert!(out.contains("dns spoofed       7\n"));
-        assert!(out.contains("prompt overflows  1\n"));
-        assert!(out.contains("uptime            1h 0m 0s\n"));
+            observed_only: 4,
+            dns_snoop_dropped: 6,
+            enforcing,
+        }
+    }
+
+    #[test]
+    fn stats_table() {
+        let out = format_stats(&stats(true), plain());
+        assert!(out.contains("mode               enforcing\n"), "{out}");
+        assert!(out.contains("connections        100\n"), "{out}");
+        assert!(out.contains("observed only      4\n"), "{out}");
+        assert!(out.contains("rules loaded       3\n"), "{out}");
+        assert!(out.contains("rules skipped      2\n"), "{out}");
+        assert!(out.contains("dns spoofed        7\n"), "{out}");
+        assert!(out.contains("dns snoop dropped  6\n"), "{out}");
+        assert!(out.contains("prompt overflows   1\n"), "{out}");
+        assert!(out.contains("uptime             1h 0m 0s\n"), "{out}");
+        // No warning while enforcing.
+        assert!(!out.contains("OBSERVE"), "{out}");
+    }
+
+    /// A status table that looks healthy while nothing is filtered is the
+    /// worst possible output, so observe mode says so twice: in the mode row
+    /// and in a trailing line.
+    #[test]
+    fn stats_table_flags_observe_mode() {
+        let out = format_stats(&stats(false), plain());
+        assert!(out.contains("mode               observe (not enforcing)\n"), "{out}");
+        assert!(out.contains(OBSERVE_WARNING), "{out}");
+        assert!(out.contains("every packet is let through"), "{out}");
     }
 
     /// The rule listing is what an operator reads to audit policy, and rule
