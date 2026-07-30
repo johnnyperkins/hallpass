@@ -640,6 +640,38 @@ fn deny_rule_blocks_connection() {
     );
 }
 
+/// Observe mode has exactly one promise: nothing is blocked. The unit tests
+/// cover the verdict-selection helper, but only this path proves the promise
+/// against a real kernel queue, and getting it wrong takes a host offline
+/// after its operator was told it would not.
+///
+/// The rule here is the same one `deny_rule_blocks_connection` proves does
+/// block, so the two together isolate the mode as the only difference.
+#[test]
+#[ignore = "requires root and network namespaces"]
+fn observe_mode_records_but_does_not_block() {
+    let Some(mut env) = TestEnv::setup("observe") else { return };
+    env.start_listener(19031);
+    env.start_daemon_with(
+        "allow",
+        &[&rule("e2e-observe-deny", Action::Deny, 19031)],
+        "mode = \"observe\"\n",
+    );
+    env.assert_daemon_alive();
+    assert!(
+        env.connect(19031),
+        "observe mode must not block a connection a deny rule matched; daemon log:\n{}",
+        env.daemon_log()
+    );
+    // The operator's only warning at startup that this daemon is not
+    // filtering. A silent observe mode is the dangerous one.
+    let log = env.daemon_log();
+    assert!(
+        log.contains("observe mode"),
+        "startup must warn that nothing is enforced; daemon log:\n{log}"
+    );
+}
+
 #[test]
 #[ignore = "requires root and network namespaces"]
 fn allow_rule_permits_connection() {
