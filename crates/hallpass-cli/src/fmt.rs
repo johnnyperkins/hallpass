@@ -73,19 +73,26 @@ pub fn format_rules(rules: &[Rule]) -> String {
         .iter()
         .map(|r| {
             [
-                r.name.clone(),
+                // Both of these carry attacker-influenced text: a generated
+                // rule name embeds an executable stem, and the summary quotes
+                // exe, domain and cmdline operands. This listing is what an
+                // operator reads to audit policy, so a rule must not be able
+                // to erase or rewrite the row it is displayed on.
+                sanitize_for_display(&r.name).into_owned(),
                 r.action.as_str().to_string(),
                 r.duration.describe(),
                 r.priority.to_string(),
                 if r.enabled { "yes" } else { "no" }.to_string(),
-                r.matcher.summary(),
+                sanitize_for_display(&r.matcher.summary()).into_owned(),
             ]
         })
         .collect();
     let mut widths: [usize; 6] = header.map(str::len);
     for row in &rows {
         for (w, cell) in widths.iter_mut().zip(row.iter()) {
-            *w = (*w).max(cell.len());
+            // Character count, not bytes: a multibyte name would otherwise
+            // over-pad and misalign every following column.
+            *w = (*w).max(cell.chars().count());
         }
     }
     let mut out = String::new();
@@ -144,7 +151,7 @@ pub fn format_event(ev: &ConnEvent) -> String {
         verdict_str(ev.verdict),
         exe_display(&ev.conn),
         dst_display(&ev.conn),
-        rule
+        sanitize_for_display(rule)
     )
 }
 
@@ -239,6 +246,61 @@ mod tests {
         assert!(out.contains("dns spoofed       7\n"));
         assert!(out.contains("prompt overflows  1\n"));
         assert!(out.contains("uptime            1h 0m 0s\n"));
+    }
+
+    /// The rule listing is what an operator reads to audit policy, and rule
+    /// names carry an executable stem while summaries quote exe, domain and
+    /// cmdline operands. A rule must not be able to erase or rewrite its row.
+    #[test]
+    fn rule_listing_cannot_rewrite_the_terminal() {
+        let rules = vec![Rule {
+            name: "evil\x1b[A\x1b[2K".into(),
+            action: Action::Allow,
+            duration: RuleDuration::Forever,
+            priority: 100,
+            enabled: true,
+            matcher: RuleMatch {
+                domain: Some("a\r\nb.example.org".into()),
+                cmdline_contains: Some("x\x1b[2Ky".into()),
+                ..Default::default()
+            },
+        }];
+        let out = format_rules(&rules);
+        assert!(!out.contains('\x1b'), "escape reached the terminal: {out:?}");
+        assert!(!out.contains('\r'), "CR reached the terminal: {out:?}");
+        // Header plus exactly one row: nothing smuggled in extra lines.
+        assert_eq!(out.lines().count(), 2, "{out:?}");
+    }
+
+    /// Column widths are measured in characters; bytes would over-pad a
+    /// multibyte name and misalign every column after it.
+    #[test]
+    fn multibyte_rule_name_keeps_columns_aligned() {
+        let mk = |name: &str| Rule {
+            name: name.into(),
+            action: Action::Deny,
+            duration: RuleDuration::Forever,
+            priority: 1,
+            enabled: true,
+            matcher: RuleMatch {
+                port: Some(25),
+                ..Default::default()
+            },
+        };
+        // Same character count, very different byte count.
+        let out = format_rules(&[mk("日本語テスト"), mk("abcdef")]);
+        let rows: Vec<&str> = out.lines().skip(1).collect();
+        // Character offset, not the byte offset `find` returns: the point is
+        // where the column appears on screen.
+        let col = |line: &str| {
+            let byte = line.find("deny").expect("action column");
+            line[..byte].chars().count()
+        };
+        assert_eq!(
+            col(rows[0]),
+            col(rows[1]),
+            "action column must line up:\n{out}"
+        );
     }
 
     #[test]

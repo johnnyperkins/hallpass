@@ -35,10 +35,16 @@ impl CliError {
 
 impl fmt::Display for CliError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Daemon messages quote rule names and paths, so they can carry
+        // whatever a rule file or a process put there. Sanitizing in Display
+        // covers every printer of these errors at once, rather than relying on
+        // each call site to remember (watch.rs did; the plain command paths in
+        // lib.rs did not).
+        use hallpass_types::sanitize_for_display as clean;
         match self {
-            CliError::Connect(e) => write!(f, "{e} - is hallpassd running?"),
-            CliError::Daemon(m) => write!(f, "daemon: {m}"),
-            CliError::Protocol(m) => write!(f, "{m}"),
+            CliError::Connect(e) => write!(f, "{} - is hallpassd running?", clean(e)),
+            CliError::Daemon(m) => write!(f, "daemon: {}", clean(m)),
+            CliError::Protocol(m) => write!(f, "{}", clean(m)),
         }
     }
 }

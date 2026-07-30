@@ -67,10 +67,16 @@ fn remaining_fraction(start_ms: u64, deadline_ms: u64, now_ms: u64) -> f32 {
 
 /// Format a destination as "domain (ip):port" when the domain is known,
 /// otherwise "ip:port".
+///
+/// The domain is bounded and sanitized like every other untrusted field: this
+/// is the row the operator judges, and the prompt viewport is not resizable,
+/// so an unbounded or multi-line value here pushes the allow and deny buttons
+/// out of view. The literal address is always shown alongside, so a name that
+/// had to be shortened cannot hide where the connection actually goes.
 pub fn format_dest(conn: &Connection) -> String {
     let dst = conn.tuple.dst;
     match &conn.domain {
-        Some(domain) => format!("{domain} ({}):{}", dst.ip(), dst.port()),
+        Some(domain) => format!("{} ({}):{}", truncate(domain, 80), dst.ip(), dst.port()),
         None => dst.to_string(),
     }
 }
@@ -82,6 +88,19 @@ pub fn exe_name(conn: &Connection) -> String {
         .and_then(|p| p.file_name())
         .map(|n| sanitize_for_display(&n.to_string_lossy()).into_owned())
         .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// Default bound for a daemon-supplied string used as a label or title.
+const UI_TEXT_MAX: usize = 120;
+
+/// Make a daemon-supplied string safe to use as a label or a window title.
+///
+/// egui does not interpret ANSI, so the risk here is not terminal spoofing but
+/// layout: an unbounded or multi-line value expands its cell and distorts the
+/// view an operator is reading, and zero-width or bidi characters let two
+/// different rules render identically in the list used to audit policy.
+pub fn ui_text(s: &str) -> String {
+    truncate(s, UI_TEXT_MAX)
 }
 
 /// Truncate a string for single-line display, appending "..." when cut.

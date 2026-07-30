@@ -235,7 +235,7 @@ impl RuleEditor {
         let mut open = true;
         let mut saved = None;
         let title = match &self.editing {
-            Some(name) => format!("Edit rule: {name}"),
+            Some(name) => format!("Edit rule: {}", crate::prompt::ui_text(name)),
             None => "Add rule".to_string(),
         };
         egui::Window::new(title)
@@ -260,7 +260,10 @@ impl RuleEditor {
     /// The daemon rejected the save: show its message, allow another try.
     pub fn ack_err(&mut self, message: &str) {
         self.awaiting = false;
-        self.error = Some(format!("daemon rejected the rule: {message}"));
+        self.error = Some(format!(
+            "daemon rejected the rule: {}",
+            crate::prompt::ui_text(message)
+        ));
     }
 
     /// The save never reached the daemon (connection lost): re-enable

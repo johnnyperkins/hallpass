@@ -275,7 +275,7 @@ impl HallpassApp {
                 }
                 if let Some(err) = &self.last_error {
                     ui.separator();
-                    ui.colored_label(DENY_COLOR, format!("daemon error: {err}"));
+                    ui.colored_label(DENY_COLOR, format!("daemon error: {}", prompt::ui_text(err)));
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("Quit").clicked() {
@@ -324,7 +324,7 @@ impl HallpassApp {
                                 ev.conn.tuple.proto,
                                 prompt::format_dest(&ev.conn)
                             ));
-                            ui.label(ev.rule_name.as_deref().unwrap_or("-"));
+                            ui.label(prompt::ui_text(ev.rule_name.as_deref().unwrap_or("-")));
                             ui.end_row();
                         }
                     });
@@ -370,10 +370,10 @@ impl HallpassApp {
                             if ui.checkbox(&mut enabled, "").changed() {
                                 toggle = Some((rule.name.clone(), enabled));
                             }
-                            ui.label(&rule.name);
+                            ui.label(prompt::ui_text(&rule.name));
                             let v = Verdict::from(rule.action);
                             ui.colored_label(verdict_color(v), verdict_label(v));
-                            ui.monospace(rule.matcher.summary());
+                            ui.monospace(prompt::ui_text(&rule.matcher.summary()));
                             ui.label(rule.priority.to_string());
                             if ui.button("Edit").clicked() {
                                 edit = Some(RuleEditor::edit(rule));
