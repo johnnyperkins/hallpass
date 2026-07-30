@@ -135,10 +135,25 @@ pub struct HallpassApp {
 }
 
 impl HallpassApp {
+    /// The eframe entry point: connect to `socket` on the network thread.
+    ///
+    /// The creation context contributes exactly one thing, the [`egui::Context`]
+    /// the network thread wakes the event loop with.
     pub fn new(cc: &eframe::CreationContext<'_>, socket: PathBuf) -> Self {
         let (to_daemon, from_ui) = tokio::sync::mpsc::unbounded_channel();
         let (to_ui, from_net) = std::sync::mpsc::channel();
         net::spawn(socket, to_ui, from_ui, cc.egui_ctx.clone());
+        Self::with_channels(to_daemon, from_net)
+    }
+
+    /// An app wired to nothing but this channel pair.
+    ///
+    /// That pair is the whole daemon-facing surface: everything the window
+    /// knows arrives as a [`UiEvent`] and everything it decides leaves as a
+    /// [`ClientMsg`]. Owning both ends is what lets the state logic be
+    /// exercised with no socket, no daemon and no display, which is where
+    /// this project's GUI defects have actually lived.
+    fn with_channels(to_daemon: UnboundedSender<ClientMsg>, from_net: Receiver<UiEvent>) -> Self {
         Self {
             to_daemon,
             from_net,
@@ -316,6 +331,26 @@ impl HallpassApp {
         self.events.push_back(ev);
     }
 
+    /// The events currently passing the filter, oldest first.
+    ///
+    /// The feed and the traffic aggregate fold the same iterator, so the
+    /// count in the traffic header and the rows in the list cannot disagree
+    /// about what the filter selected.
+    fn filtered(&self) -> impl Iterator<Item = &ConnEvent> + '_ {
+        self.events
+            .iter()
+            .filter(|ev| traffic::matches_filter(ev, &self.filter))
+    }
+
+    /// Whether the observe-mode banner belongs on screen.
+    ///
+    /// Only once the daemon has said so: before the first stats reply there
+    /// is nothing to report, and reporting it anyway would announce that
+    /// nothing is being blocked on a daemon that is blocking.
+    fn observe_banner(&self) -> bool {
+        self.stats.is_some_and(|s| !s.enforcing)
+    }
+
     fn select_tab(&mut self, tab: Tab) {
         if self.tab != tab {
             self.tab = tab;
@@ -392,7 +427,7 @@ impl HallpassApp {
             // Nothing is being blocked while this is showing, and every
             // other signal (a WOULD- prefix on a verdict, a line in Stats)
             // is only visible to someone already looking at the right pane.
-            if self.stats.is_some_and(|s| !s.enforcing) {
+            if self.observe_banner() {
                 ui.colored_label(
                     REJECT_COLOR,
                     "OBSERVE MODE: policy is evaluated and recorded, nothing is blocked",
@@ -423,11 +458,7 @@ impl HallpassApp {
         }
         // Filtering copies references, not events: the feed is capped at
         // MAX_EVENTS, so this is bounded work per frame.
-        let shown: Vec<&ConnEvent> = self
-            .events
-            .iter()
-            .filter(|ev| traffic::matches_filter(ev, &self.filter))
-            .collect();
+        let shown: Vec<&ConnEvent> = self.filtered().collect();
         if shown.is_empty() {
             ui.label("No events match the filter.");
             return;
@@ -499,12 +530,7 @@ impl HallpassApp {
         // Rebuilt per frame from the capped feed rather than folded
         // incrementally, so changing the grouping or the filter cannot leave
         // stale counts behind. MAX_EVENTS bounds the cost.
-        let agg = traffic::Aggregate::rebuild(
-            self.events
-                .iter()
-                .filter(|ev| traffic::matches_filter(ev, &self.filter)),
-            self.group_by,
-        );
+        let agg = traffic::Aggregate::rebuild(self.filtered(), self.group_by);
         if agg.total == 0 {
             ui.label("No traffic recorded yet.");
             return;

@@ -72,9 +72,6 @@ pub struct Aggregate {
     pub overflow: u64,
     /// Connections counted, including those that overflowed.
     pub total: u64,
-    /// True once any event arrived unenforced, which means the daemon is
-    /// evaluating policy without applying it.
-    pub observing: bool,
 }
 
 impl Aggregate {
@@ -93,9 +90,6 @@ impl Aggregate {
     pub fn add(&mut self, ev: &ConnEvent, group_by: GroupBy) {
         let key = sanitize_for_display(&raw_key(ev, group_by)).into_owned();
         self.total += 1;
-        if !ev.enforced {
-            self.observing = true;
-        }
         // Cap on insert only, so a flood of fresh keys cannot stop the rows
         // the operator is watching from updating.
         if !self.rows.contains_key(&key) && self.rows.len() >= MAX_ROWS {
@@ -223,7 +217,6 @@ mod tests {
         assert_eq!(rows[0].blocked, 1);
         assert_eq!(rows[0].would_block, 1);
         assert_eq!(rows[0].peers, 3);
-        assert!(agg.observing, "an unenforced event means observe mode");
     }
 
     #[test]
