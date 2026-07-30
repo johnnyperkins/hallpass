@@ -683,8 +683,11 @@ fn observe_mode_records_but_does_not_block() {
     // The operator's only warning at startup that this daemon is not
     // filtering. A silent observe mode is the dangerous one.
     let log = env.daemon_log();
+    // The exact startup warning: the unhandled-packet path logs its own line
+    // containing "observe mode", so matching only that would not say which
+    // message was seen.
     assert!(
-        log.contains("observe mode"),
+        log.contains("NOT enforced"),
         "startup must warn that nothing is enforced; daemon log:\n{log}"
     );
 }

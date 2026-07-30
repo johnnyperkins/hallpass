@@ -69,6 +69,22 @@ install -d -m755 /etc/hallpass /etc/hallpass/rules.d
 [ -e /etc/hallpass/rules.d/example-allow-dns.toml ] \
   || install -m644 etc/rules.d/example-allow-dns.toml /etc/hallpass/rules.d/example-allow-dns.toml
 
+# Shell completions and the man page. These are package files, not policy, so
+# unlike the config above they are replaced on every reinstall.
+#
+# Each completion is gated on its shell's share directory already existing:
+# install -D would happily create /usr/share/fish on a machine with no fish,
+# leaving a tree nothing will ever read. The man page is not gated, because
+# /usr/share/man is where a man page belongs whether or not a reader is
+# installed yet.
+[ -d /usr/share/bash-completion ] && install -Dm644 \
+  etc/completions/hallpass-cli.bash /usr/share/bash-completion/completions/hallpass-cli
+[ -d /usr/share/zsh ] && install -Dm644 \
+  etc/completions/_hallpass-cli /usr/share/zsh/site-functions/_hallpass-cli
+[ -d /usr/share/fish ] && install -Dm644 \
+  etc/completions/hallpass-cli.fish /usr/share/fish/vendor_completions.d/hallpass-cli.fish
+install -Dm644 etc/hallpass-cli.1 /usr/share/man/man1/hallpass-cli.1
+
 # systemd unit and desktop entries.
 install -Dm644 etc/hallpassd.service   /etc/systemd/system/hallpassd.service
 install -Dm644 etc/hallpass-ui.desktop /usr/share/applications/hallpass-ui.desktop
@@ -88,3 +104,5 @@ echo ">> Done. hallpassd is running."
 echo "   - Log out and back in once so '$target_user' picks up the 'hallpass' group."
 echo "   - The Hallpass UI autostarts on next login and pops up connection prompts."
 echo "   - Terminal client: hallpass-cli status | rules | events | watch"
+echo "   - Full reference: man hallpass-cli (tab completion is installed for"
+echo "     each of bash, zsh and fish that this machine already has)."

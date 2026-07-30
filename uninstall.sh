@@ -39,6 +39,14 @@ rm -f /etc/systemd/system/hallpassd.service
 rm -f /usr/share/applications/hallpass-ui.desktop
 rm -f /etc/xdg/autostart/hallpass-ui.desktop
 
+# Completions and the man page. Only the files install.sh wrote: the
+# directories holding them are shared with every other package, so nothing
+# here removes a directory.
+rm -f /usr/share/bash-completion/completions/hallpass-cli
+rm -f /usr/share/zsh/site-functions/_hallpass-cli
+rm -f /usr/share/fish/vendor_completions.d/hallpass-cli.fish
+rm -f /usr/share/man/man1/hallpass-cli.1
+
 systemctl daemon-reload
 
 if [ "$purge" = "1" ]; then

@@ -1,0 +1,154 @@
+#compdef hallpass-cli
+
+# zsh completion for hallpass-cli.
+#
+# Hand-maintained alongside crates/hallpass-cli/src/args.rs. That parser is
+# hand-rolled, so there is no generator to regenerate this from: every command,
+# flag and value set below has to be kept in step with it by hand.
+#
+# Rule names are deliberately not completed. Offering them would mean opening
+# the daemon socket on every Tab, and that socket is often absent (daemon not
+# running) or unreadable (user not in the hallpass group). A completion that
+# blocks or spills an error into the prompt is worse than one that stays quiet.
+
+_hallpass-cli_commands() {
+    local -a commands
+    commands=(
+        'status:show daemon statistics'
+        'rules:list, add, remove, toggle, export or import rules'
+        'events:stream connection events until Ctrl-C'
+        'top:live aggregate view of connection activity'
+        'watch:interactively answer connection prompts'
+        'explain:say what policy would do with a hypothetical connection'
+    )
+    _describe -t commands 'hallpass-cli command' commands
+}
+
+_hallpass-cli_rules_commands() {
+    local -a subcommands
+    subcommands=(
+        'add:add a rule'
+        'rm:delete a rule'
+        'toggle:enable or disable a rule'
+        'export:write the ruleset to stdout as one TOML document'
+        'import:add every rule in such a document'
+    )
+    _describe -t rules-commands 'rules subcommand' subcommands
+}
+
+_hallpass-cli() {
+    local curcontext="$curcontext" state line ret=1
+
+    # The parser strips these wherever they appear, so they stay on offer
+    # inside every command rather than only before the command word.
+    local -a global_args
+    global_args=(
+        '--socket[daemon socket path]:socket file:_files'
+        '--json[machine-readable JSON output]'
+        '--color[when to colorize output]:when:(auto always never)'
+        '(- *)-h[show usage and exit]'
+        '(- *)--help[show usage and exit]'
+    )
+
+    _arguments -C -s $global_args \
+        '1: :_hallpass-cli_commands' \
+        '*::arg:->arg' && ret=0
+
+    if [[ $state != arg ]]; then
+        return $ret
+    fi
+
+    case $words[1] in
+    status|watch)
+        _arguments -s $global_args && ret=0
+        ;;
+    events)
+        _arguments -s $global_args \
+            '--last[replay the last N decided connections before streaming]:count:' \
+            '--no-follow[with --last, print the replay and exit]' \
+            '*--exe[only events whose executable path contains this substring]:substring:' \
+            '*--domain[only events whose destination domain contains this substring]:substring:' \
+            '*--verdict[only these verdicts]:verdict:(allow deny reject blocked)' \
+            && ret=0
+        ;;
+    top)
+        _arguments -s $global_args \
+            '--group-by[what each row counts]:key:(exe domain host port rule)' \
+            '--interval[redraw period in seconds]:seconds:' \
+            '--top[rows to show]:count:' \
+            && ret=0
+        ;;
+    explain)
+        _arguments -s $global_args \
+            '--dest[destination IP address, required]:ip address:' \
+            '--port[destination port, required]:port:' \
+            '--proto[transport protocol]:proto:(tcp udp)' \
+            '--exe[executable path of the hypothetical process]:executable:_files' \
+            '--cmdline[its full command line]:command line:' \
+            '--parent-exe[executable path of its parent]:executable:_files' \
+            '--exe-sha256[SHA-256 to use for hash operands, 64 hex digits]:hash:' \
+            '--domain[destination domain as DNS snooping would annotate it]:domain:' \
+            '--user[UID of the hypothetical process]:uid:_users' \
+            '--src[source IP address]:ip address:' \
+            '--src-port[source port]:port:' \
+            '--iface[outbound network interface]:interface:_net_interfaces' \
+            && ret=0
+        ;;
+    rules)
+        _arguments -C -s $global_args \
+            '--stats[add per-rule hit counts to the listing]' \
+            '1: :_hallpass-cli_rules_commands' \
+            '*::rules-arg:->rules-arg' && ret=0
+
+        if [[ $state != rules-arg ]]; then
+            return $ret
+        fi
+
+        case $words[1] in
+        add)
+            _arguments -s $global_args \
+                '--name[rule name, required]:name:' \
+                '--action[action on match, required]:action:(allow deny reject)' \
+                '--exe[exact executable path]:executable:_files' \
+                '--exe-glob[glob matched against the executable path]:glob:' \
+                '--exe-sha256[SHA-256 of the executable, 64 hex digits]:hash:' \
+                '--dest[destination IP address or CIDR block]:ip or cidr:' \
+                '--port[destination port]:port:' \
+                '--domain[domain, exact or star-dot suffix]:domain:' \
+                '--user[UID of the initiating process]:uid:_users' \
+                '--proto[transport protocol]:proto:(tcp udp)' \
+                '--cmdline-contains[substring of the process command line]:substring:' \
+                '--parent-exe[exact executable path of the parent process]:executable:_files' \
+                '--src[source IP address or CIDR block]:ip or cidr:' \
+                '--src-port[source port]:port:' \
+                '--iface[outbound network interface]:interface:_net_interfaces' \
+                '--domains-file[file of domains, hosts format or one per line]:file:_files' \
+                '--ips-file[file of destination IPs or CIDRs, one per line]:file:_files' \
+                '--hashes-file[file of executable SHA-256 hashes, one per line]:file:_files' \
+                '--duration[rule lifetime, or a timespan such as 30s, 5m, 2h, 1d]:duration:(session forever)' \
+                '--priority[priority, higher wins]:priority:' \
+                && ret=0
+            ;;
+        rm)
+            _arguments -s $global_args '1:rule name:' && ret=0
+            ;;
+        toggle)
+            _arguments -s $global_args \
+                '1:rule name:' \
+                '2:state:(on off)' \
+                && ret=0
+            ;;
+        import)
+            _arguments -s $global_args '1:rule document:_files' && ret=0
+            ;;
+        export)
+            _arguments -s $global_args && ret=0
+            ;;
+        esac
+        ;;
+    esac
+
+    return $ret
+}
+
+_hallpass-cli "$@"

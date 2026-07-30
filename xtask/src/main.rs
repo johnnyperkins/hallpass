@@ -126,7 +126,7 @@ fn check() -> Result<(), String> {
         .args(["check", "--workspace", "--all-targets"])
         .current_dir(workspace_root()))?;
     run(Command::new(cargo())
-        .args(["check", "-p", "hallpassd", "--features", "ebpf"])
+        .args(["check", "-p", "hallpassd", "--features", "ebpf,dev-fixtures"])
         .current_dir(workspace_root()))
 }
 
@@ -147,8 +147,10 @@ fn test_ebpf_feature() -> Result<(), String> {
 /// Every lint gate CI has, in one command.
 ///
 /// Three invocations are needed rather than one: the workspace run cannot see
-/// code behind the `ebpf` feature, and neither run can see crates/hallpass-ebpf
-/// at all because it is not a workspace member.
+/// code behind a feature, and neither run can see crates/hallpass-ebpf at all
+/// because it is not a workspace member. `dev-fixtures` rides along with
+/// `ebpf` for the same reason `clippy-ebpf` exists: code nothing lints is
+/// code that rots, and this is the feature that fabricates events.
 fn lint() -> Result<(), String> {
     run(Command::new(cargo())
         .args(["clippy", "--workspace", "--all-targets", "--", "-D", "warnings"])
@@ -160,7 +162,7 @@ fn lint() -> Result<(), String> {
             "hallpassd",
             "--all-targets",
             "--features",
-            "ebpf",
+            "ebpf,dev-fixtures",
             "--",
             "-D",
             "warnings",
