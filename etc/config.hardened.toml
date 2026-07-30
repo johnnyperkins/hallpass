@@ -5,6 +5,12 @@
 # dead or overloaded daemon (`queue_bypass = false`). The residual gap is
 # an attacker with root, who can delete the nftables table outright.
 
+# Stated rather than left to the default, because this file is the one an
+# operator copies to declare a posture: "observe" here would evaluate every
+# rule below and block nothing, and a hardened config that silently does
+# not enforce is the worst outcome this project has.
+mode = "enforce"
+
 # Block when no rule matches and no client answers the prompt in time.
 default_verdict = "deny"
 
