@@ -534,7 +534,24 @@ impl Drop for TestEnv {
         let _ = ns_run(&self.ns_cli, &["nft", "delete", "table", "inet", "hallpass"]);
         let _ = run("ip", &["netns", "del", &self.ns_cli]);
         let _ = run("ip", &["netns", "del", &self.ns_srv]);
-        let _ = std::fs::remove_dir_all(&self.tmp);
+        // Keep the evidence when the test that owned this environment
+        // failed. The daemon log is the single best diagnostic this suite
+        // produces, and assertions can only embed the slice of it they
+        // thought to quote; a post-mortem wants the rendered config and the
+        // rules directory too. HALLPASS_E2E_KEEP forces it for a passing
+        // run, which is how you find out what a test actually configured.
+        let keep = std::thread::panicking() || std::env::var_os("HALLPASS_E2E_KEEP").is_some();
+        if keep {
+            // Root-owned after a sudo run, which is worth saying once here
+            // rather than discovering at the first permission denied.
+            eprintln!(
+                "e2e: keeping {} (hallpassd.log, config.toml, rules.d); \
+                 owned by the user that ran the test",
+                self.tmp.display()
+            );
+        } else {
+            let _ = std::fs::remove_dir_all(&self.tmp);
+        }
         // Written outside the namespace, so namespace teardown does not
         // reclaim it.
         let _ = std::fs::remove_dir_all(netns_etc(&self.ns_cli));
