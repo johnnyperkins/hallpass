@@ -728,9 +728,14 @@ pub struct RuleHit {
 pub struct ExplainRequest {
     /// The connection as the client describes it.
     pub conn: Connection,
-    /// Hash to use for `exe_sha256` and `hashes_file` operands. When None,
-    /// the daemon hashes `conn.exe_path` if it can read it, exactly as it
-    /// would on the packet path.
+    /// Hash to use for `exe_sha256` and `hashes_file` operands.
+    ///
+    /// The daemon never computes this itself. Every field of this request is
+    /// chosen by the caller, so hashing on its behalf would mean opening a
+    /// caller-named path as root on a runtime thread, and a character device
+    /// never finishes. When None, hash-pinning rules simply report
+    /// `exe_sha256` as the criterion that did not hold; compute it client
+    /// side to see past them.
     pub exe_sha256: Option<String>,
 }
 

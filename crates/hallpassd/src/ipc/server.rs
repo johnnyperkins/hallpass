@@ -13,7 +13,6 @@ use hallpass_types::{wire, ClientMsg, DaemonMsg, PROTOCOL_VERSION};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc;
 
-use crate::attribution::hash::ExeHashCache;
 use crate::events::EventBus;
 use crate::prompt::PromptTable;
 use crate::rules::store::RuleStore;
@@ -25,9 +24,6 @@ pub struct IpcDeps {
     pub prompts: Arc<PromptTable>,
     pub events: Arc<EventBus>,
     pub stats: Arc<Counters>,
-    /// Shared with the verdict path, so an explain request hashes an
-    /// executable the same way and reuses the same cached result.
-    pub exe_hash: Arc<ExeHashCache>,
 }
 
 /// Look up a group's GID in /etc/group.
@@ -193,14 +189,16 @@ async fn handle_conn(stream: UnixStream, deps: Arc<IpcDeps>) -> Result<(), wire:
 /// would be worse than none.
 fn explain(req: &hallpass_types::ExplainRequest, deps: &IpcDeps) -> hallpass_types::Explanation {
     let set = deps.store.ruleset();
-    // Hash on the same terms as the packet path: only when a hash-pinning
-    // rule could apply, and only if the client did not state one.
-    let hash = match &req.exe_sha256 {
-        Some(h) => Some(h.clone()),
-        None if set.wants_exe_hash_for(&req.conn) => deps.exe_hash.for_connection(&req.conn),
-        None => None,
-    };
-    let result = set.explain(&req.conn, hash.as_deref());
+    // The hash is whatever the client stated, and nothing else. Hashing on
+    // the client's behalf looks like a convenience and is not: every input
+    // here is chosen by the caller, so it would mean opening a path this
+    // process picked for it, as root, on a runtime thread. `/dev/zero` never
+    // finishes; a large file blocks for as long as it takes to read; a pid
+    // names another user's binary; and success or failure alone answers
+    // "does root have this file" for any path. None of that is worth saving
+    // the caller a call to sha256sum, and a hash-pinning rule simply reports
+    // exe_sha256 as the criterion that did not hold.
+    let result = set.explain(&req.conn, req.exe_sha256.as_deref());
     let default_verdict = deps.prompts.default_verdict();
     let (verdict, rule_name) = match result.matched {
         Some((name, verdict)) => (verdict, Some(name)),
@@ -448,7 +446,6 @@ mod tests {
                 prompts,
                 events,
                 stats,
-                exe_hash: Arc::new(ExeHashCache::default()),
             }),
             dir,
         )

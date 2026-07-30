@@ -257,10 +257,7 @@ async fn main() {
     // before the nftables install. None means interception is off for
     // this run (no privileges); rule management still works over IPC.
     //
-    // The hash cache is shared with the IPC server so an explain request
-    // resolves an executable exactly as the verdict path would.
     let shutdown = Arc::new(AtomicBool::new(false));
-    let exe_hash = Arc::new(attribution::hash::ExeHashCache::default());
     let queue_thread = queue.map(|queue| {
         nfqueue::spawn(
             queue,
@@ -274,7 +271,7 @@ async fn main() {
                 verdict_rx,
                 dns_tx,
                 dns_cache,
-                exe_hash: Arc::clone(&exe_hash),
+                exe_hash: Arc::new(attribution::hash::ExeHashCache::default()),
                 unhandled_verdict: cfg.unhandled_proto_verdict,
                 enforcing,
                 default_verdict: cfg.default_verdict,
@@ -298,7 +295,6 @@ async fn main() {
         prompts,
         events,
         stats: counters,
-        exe_hash,
     });
     let ipc_task = tokio::spawn(async move {
         if let Err(e) = ipc::server::serve(ipc_listener, ipc_deps).await {
