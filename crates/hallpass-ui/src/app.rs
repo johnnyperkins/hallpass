@@ -185,11 +185,15 @@ impl HallpassApp {
             DaemonMsg::PromptExpired { id } => {
                 self.prompts.retain(|p| p.id != id);
             }
-            DaemonMsg::Event(ev) => {
-                if self.events.len() >= MAX_EVENTS {
-                    self.events.pop_front();
+            DaemonMsg::Event(ev) => self.push_event(ev),
+            // Backfill from the daemon's short history, so a window opened
+            // after the traffic shows what already happened instead of an
+            // apparently idle machine. Oldest first, same order as the live
+            // stream continues in.
+            DaemonMsg::Events(events) => {
+                for ev in events {
+                    self.push_event(ev);
                 }
-                self.events.push_back(ev);
             }
             DaemonMsg::Rules(rules) => self.rules = rules,
             DaemonMsg::Stats(stats) => self.stats = stats,
@@ -214,8 +218,23 @@ impl HallpassApp {
                     self.editor = None;
                 }
             }
+            // Neither is requested by this client yet. Ignoring them keeps
+            // the connection alive: the alternative on an unexpected reply
+            // would be tearing down the stream that carries prompts.
+            DaemonMsg::RuleHits(_) | DaemonMsg::Explanation(_) => {}
             DaemonMsg::HelloAck { .. } => {}
         }
+    }
+
+    /// Append one decided connection to the bounded feed.
+    ///
+    /// Events are attacker-feedable at line rate, so the ring is capped and
+    /// the oldest is evicted rather than letting the window grow.
+    fn push_event(&mut self, ev: hallpass_types::ConnEvent) {
+        if self.events.len() >= MAX_EVENTS {
+            self.events.pop_front();
+        }
+        self.events.push_back(ev);
     }
 
     fn select_tab(&mut self, tab: Tab) {
