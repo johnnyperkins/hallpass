@@ -41,23 +41,38 @@ PrivateTmp=yes
 UMask=0077
 SystemCallArchitectures=native
 
+# Everything root would otherwise carry, dropped to what the daemon uses:
+#   NET_ADMIN        install the nftables table, bind the NFQUEUE netlink socket
+#   DAC_READ_SEARCH  read /proc/<pid>/{exe,cmdline,fd} for other users' processes
+#   CHOWN            chgrp the IPC socket and its directory to the hallpass group
+#   BPF, PERFMON     load the eBPF programs, attach kprobes and uprobes
+#   SYS_RESOURCE     raise RLIMIT_MEMLOCK for BPF maps (kernels before 5.11)
+# Deliberately absent: SYS_ADMIN. On kernels before 5.8, bpf() needs it rather
+# than CAP_BPF, so eBPF attribution there falls back to procfs and says so in
+# the journal ("eBPF attribution unavailable, using procfs fallback"). Granting
+# SYS_ADMIN is close to granting root, so it is opt-in for old kernels rather
+# than the default. NET_RAW is absent too: NFQUEUE is netlink, not a raw
+# socket, and a wrong guess there fails loudly at "nfqueue bind failed".
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_DAC_READ_SEARCH CAP_CHOWN CAP_BPF CAP_PERFMON CAP_SYS_RESOURCE
+
+# Allow-list only, deliberately with no matching "~" deny line. Mixing the two
+# forms subtracts the deny set from the allow set, and perf_event_open belongs
+# to @debug, so a "~@debug" line would revoke the perf_event_open granted here
+# and break uprobe-based DNS snooping. @system-service already excludes @clock,
+# @module, @obsolete, @raw-io, @reboot and @swap, so such a line bought almost
+# nothing while risking exactly that. bpf and perf_event_open are both outside
+# @system-service and so must be named explicitly.
+SystemCallFilter=@system-service bpf perf_event_open
+
 # ProtectProc is deliberately NOT set: attribution reads /proc/<pid>/exe and
 # /proc/<pid>/fd for processes owned by other users, which invisible or
 # ptraceable would hide, silently degrading every exe-scoped rule.
 #
-# Two further restrictions are worth adding but need a live root test first,
-# because both fail as a silent loss of enforcement quality rather than a
-# clean error. Verify eBPF attribution still loads and that a hallpass-group
-# client can still reach the socket, then uncomment:
-#
-#   CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_DAC_READ_SEARCH CAP_CHOWN CAP_BPF CAP_PERFMON CAP_SYS_RESOURCE
-#   SystemCallFilter=@system-service bpf perf_event_open
-#   SystemCallFilter=~@clock @cpu-emulation @debug @module @obsolete @raw-io @reboot @swap
-#
-# CAP_CHOWN is required: the daemon chowns the socket and its directory to the
-# hallpass group, and without it they stay root-only. On kernels before 5.8
-# bpf() needs CAP_SYS_ADMIN rather than CAP_BPF, so eBPF attribution there
-# falls back to procfs unless CAP_SYS_ADMIN is added.
+# To confirm the two restrictions above on a host, after starting the unit
+# check that the journal shows no SIGSYS and no "Operation not permitted", that
+# `hallpass-cli status` works as a hallpass-group member (which proves CAP_CHOWN
+# applied), and, with the ebpf feature built in, that the journal says "eBPF
+# attribution active" rather than the procfs-fallback warning.
 
 [Install]
 WantedBy=multi-user.target

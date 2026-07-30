@@ -282,10 +282,14 @@ attacker with root, who can delete the nftables table outright.
   limited to `/etc/hallpass` and `/run/hallpass`. `StartLimitIntervalSec=0`
   so a crash loop never leaves a bypass-less queue with no daemon behind it.
   `ProtectProc` is deliberately unset, because attribution reads
-  `/proc/<pid>/exe` for processes it does not own. A `CapabilityBoundingSet`
-  and a `SystemCallFilter` are drafted in the unit but commented out: both
-  fail as silent loss of attribution quality rather than a clean error, so
-  they want a live root test first.
+  `/proc/<pid>/exe` for processes it does not own.
+- **Reduced privilege**: although the daemon runs as root, its
+  `CapabilityBoundingSet` is narrowed to the six capabilities it actually
+  uses (`NET_ADMIN`, `DAC_READ_SEARCH`, `CHOWN`, `BPF`, `PERFMON`,
+  `SYS_RESOURCE`), and `SystemCallFilter` allows only `@system-service` plus
+  `bpf` and `perf_event_open`. `CAP_SYS_ADMIN` is deliberately excluded, so on
+  kernels older than 5.8, where `bpf()` requires it, eBPF attribution falls
+  back to procfs and logs why; add it back there if you want the eBPF path.
 - **Config file trust**: the config is read under the same ownership and
   permission policy as rule files. It sets `default_verdict`, `queue_bypass`,
   and the rules directory, so it is the most security-relevant file on disk.
