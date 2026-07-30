@@ -312,7 +312,16 @@ async fn main() {
             tracing::info!("SIGTERM received");
             false
         }
-        _ = fatal_rx.recv() => {
+        // `Some(())`, not `_`: a closed channel is not a dead loop. The
+        // sender lives in `QueueDeps`, which is never built when the queue
+        // could not be bound, so `recv()` returned None immediately and the
+        // daemon shut itself down the instant it started. That is exactly
+        // the unprivileged development run this code path exists to
+        // support, and the error it logged on the way out named a loop that
+        // had never been started. A non-matching pattern disables this
+        // branch and leaves the two signal branches waiting, which is the
+        // wanted behaviour: with no queue there is nothing that can die.
+        Some(()) = fatal_rx.recv() => {
             tracing::error!("nfqueue loop died, shutting down");
             true
         }
