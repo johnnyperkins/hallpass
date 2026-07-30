@@ -73,8 +73,15 @@ static SOCK_MAP: LruHashMap<FlowKey, FlowVal> = LruHashMap::with_max_entries(819
 
 /// tcp_connect entry scratch: pid_tgid -> sock pointer, consumed by the
 /// kretprobe of the same call.
+///
+/// LRU for the same reason as [`DNS_SCRATCH`]: a return probe can be missed
+/// (kretprobe maxactive exhausted by enough concurrent connects, or the thread
+/// killed mid-call) and the entry then has nothing to consume it. A plain hash
+/// map fills up with those leaked entries, after which every insert fails, no
+/// flow is ever recorded in [`SOCK_MAP`], and eBPF attribution stops working
+/// host-wide until restart. LRU evicts instead, so inserts keep succeeding.
 #[map]
-static PROC_SCRATCH: HashMap<u64, u64> = HashMap::with_max_entries(512, 0);
+static PROC_SCRATCH: LruHashMap<u64, u64> = LruHashMap::with_max_entries(512, 0);
 
 /// Process exec/exit events for the userspace cache.
 #[map]

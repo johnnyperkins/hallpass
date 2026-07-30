@@ -119,10 +119,27 @@ pub fn bind(path: &Path) -> std::io::Result<UnixListener> {
 
 /// Accept loop over an already-bound listener. Runs until the daemon
 /// shuts down (task is aborted).
+///
+/// An accept error must never end the loop. Returning here would retire the
+/// control channel for the lifetime of the process while enforcement carried
+/// on, which is exactly the state [`bind`] exists to prevent: no client could
+/// reconnect, so every unmatched connection would fall to the default verdict
+/// with the unit still reporting healthy. Per-connection fd limits make this
+/// reachable without any privilege, since EMFILE is a transient accept error.
 pub async fn serve(listener: UnixListener, deps: Arc<IpcDeps>) -> std::io::Result<()> {
     tracing::info!("IPC listening");
     loop {
-        let (stream, _addr) = listener.accept().await?;
+        let stream = match listener.accept().await {
+            Ok((stream, _addr)) => stream,
+            Err(e) => {
+                // Back off before retrying: a persistent cause (fd exhaustion)
+                // would otherwise spin this loop at full speed and starve the
+                // runtime it shares with the verdict path.
+                tracing::warn!("IPC accept failed, retrying: {e}");
+                tokio::time::sleep(ACCEPT_RETRY_DELAY).await;
+                continue;
+            }
+        };
         let deps = Arc::clone(&deps);
         tokio::spawn(async move {
             if let Err(e) = handle_conn(stream, deps).await {
@@ -131,6 +148,9 @@ pub async fn serve(listener: UnixListener, deps: Arc<IpcDeps>) -> std::io::Resul
         });
     }
 }
+
+/// Pause after a failed `accept` before trying again.
+const ACCEPT_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// Per-client outbound queue depth. Bounded so a client that stops
 /// reading cannot grow daemon memory; events are dropped when full and
@@ -207,6 +227,13 @@ async fn message_loop(
         }
     }
 
+    // One event forwarder per connection. Each Subscribe used to spawn another
+    // task and another broadcast receiver unconditionally, so a client looping
+    // Subscribe created unbounded tasks and receivers, and every EventBus::emit
+    // runs on the verdict path and must walk that receiver set: one socket
+    // became a per-packet multiplier on the loop that decides every connection.
+    let mut events_subscribed = false;
+
     loop {
         let msg = match wire::read_msg::<ClientMsg, _>(reader).await {
             Ok(m) => m,
@@ -227,7 +254,8 @@ async fn message_loop(
                 // same request, so events are wired up either way and
                 // the reply reports the prompt-slot outcome.
                 let prompt_denied = prompts && !deps.prompts.set_handler(out_tx.clone());
-                if events {
+                if events && !events_subscribed {
+                    events_subscribed = true;
                     let mut rx = deps.events.subscribe();
                     let tx = out_tx.clone();
                     tokio::spawn(async move {

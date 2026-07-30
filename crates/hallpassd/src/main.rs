@@ -30,6 +30,11 @@ use std::time::Duration;
 
 use tokio::signal::unix::{signal, SignalKind};
 
+/// Depth of the observed-DNS queue between the verdict thread and the snoop
+/// consumer. Deep enough to absorb a normal resolution burst, shallow enough
+/// that a flood costs bounded memory instead of the process.
+const DNS_SNOOP_QUEUE_CAP: usize = 1024;
+
 use crate::attribution::AttributionChain;
 use crate::events::EventBus;
 use crate::prompt::PromptTable;
@@ -159,8 +164,16 @@ async fn main() {
     let (prompt_tx, mut prompt_rx) =
         tokio::sync::mpsc::unbounded_channel::<nfqueue::PromptTask>();
     let (verdict_tx, verdict_rx) = tokio::sync::mpsc::unbounded_channel();
+    // Bounded, unlike the two above. Those carry one item per packet the
+    // daemon is already holding, so the kernel queue length bounds them. This
+    // one carries observed DNS traffic, and the input snoop rule queues any
+    // UDP packet with source port 53, so anything that can send to this host
+    // can feed it at line rate while the consumer does strictly more work per
+    // item (parse plus cache locking) than the producer. Unbounded, that grew
+    // until the OOM killer took a root daemon, which under queue_bypass=false
+    // blackholes every new connection on the host.
     let (dns_tx, mut dns_rx) =
-        tokio::sync::mpsc::unbounded_channel::<(hallpass_types::FlowTuple, Vec<u8>)>();
+        tokio::sync::mpsc::channel::<(hallpass_types::FlowTuple, Vec<u8>)>(DNS_SNOOP_QUEUE_CAP);
     // Signalled by the queue thread when its loop dies on a persistent
     // error: the daemon must then shut down (tearing nftables down on the
     // way) rather than keep queueing traffic nobody drains.

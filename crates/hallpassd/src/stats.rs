@@ -15,6 +15,10 @@ pub struct Counters {
     dns_spoof_rejected: AtomicU64,
     prompts_overflowed: AtomicU64,
     other_proto_total: AtomicU64,
+    /// Snoop packets dropped because the DNS queue was full. Internal only:
+    /// adding a field to the `Stats` wire type would bump the protocol, since
+    /// postcard encodes structs positionally.
+    dns_snoop_dropped: AtomicU64,
 }
 
 impl Default for Counters {
@@ -28,6 +32,7 @@ impl Default for Counters {
             dns_spoof_rejected: AtomicU64::new(0),
             prompts_overflowed: AtomicU64::new(0),
             other_proto_total: AtomicU64::new(0),
+            dns_snoop_dropped: AtomicU64::new(0),
         }
     }
 }
@@ -57,6 +62,19 @@ impl Counters {
     /// full.
     pub fn record_prompt_overflow(&self) {
         self.prompts_overflowed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Count a DNS snoop packet dropped because the queue was full.
+    ///
+    /// Costs a domain annotation, never a verdict: snoop packets are accepted
+    /// immediately and no rule decision waits on this queue. Logged on the
+    /// first drop and then at each power of ten, so a flood is visible without
+    /// the log itself becoming the flood.
+    pub fn record_dns_snoop_dropped(&self) {
+        let n = self.dns_snoop_dropped.fetch_add(1, Ordering::Relaxed) + 1;
+        if n.is_power_of_two() || n % 10_000 == 0 {
+            tracing::warn!(dropped = n, "DNS snoop queue full, dropping observed DNS");
+        }
     }
 
     /// Count a packet with a transport the rule engine does not model

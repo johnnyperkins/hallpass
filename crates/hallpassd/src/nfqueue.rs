@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use nfq::{Queue, Verdict as NfqVerdict};
 use hallpass_types::{Connection, FlowTuple, Verdict};
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::{Sender, UnboundedReceiver, UnboundedSender};
 
 use crate::attribution::hash::ExeHashCache;
 use crate::attribution::AttributionChain;
@@ -49,7 +49,11 @@ pub struct QueueDeps {
     pub verdict_rx: UnboundedReceiver<(u64, Verdict)>,
     /// Raw DNS packets (queries and replies) out to the snoop consumer,
     /// with their flow tuple for direction and query/response matching.
-    pub dns_tx: UnboundedSender<(FlowTuple, Vec<u8>)>,
+    /// Bounded: observed DNS is attacker-feedable at line rate, so a full
+    /// queue must drop packets rather than grow. Dropping costs a domain
+    /// annotation, never a verdict, since snoop packets are accepted
+    /// immediately and the rule engine never waits on this.
+    pub dns_tx: Sender<(FlowTuple, Vec<u8>)>,
     /// IP -> domain cache filled by the DNS snoop consumer.
     pub dns_cache: Arc<IpDomainCache>,
     /// Executable hash cache, consulted only when a rule pins a hash.
@@ -185,7 +189,11 @@ pub fn run(mut queue: Queue, queue_num: u16, mut deps: QueueDeps) -> std::io::Re
                 // are only recorded, never held for a verdict.
                 if msg.get_queue_num() == snoop_queue {
                     if let packet::Parsed::Flow(t) = parsed {
-                        let _ = deps.dns_tx.send((t, msg.get_payload().to_vec()));
+                        // try_send: this runs on the verdict thread, which
+                        // must never block on the DNS consumer.
+                        if deps.dns_tx.try_send((t, msg.get_payload().to_vec())).is_err() {
+                            deps.stats.record_dns_snoop_dropped();
+                        }
                     }
                     apply_verdict(&mut queue, msg, Verdict::Allow);
                     continue;
@@ -215,7 +223,9 @@ pub fn run(mut queue: Queue, queue_num: u16, mut deps: QueueDeps) -> std::io::Re
                 // The first query on a DNS flow is `ct state new` and thus
                 // arrives on the verdict queue; snoop it before deciding.
                 if packet::is_dns_query(&tuple) {
-                    let _ = deps.dns_tx.send((tuple, msg.get_payload().to_vec()));
+                    if deps.dns_tx.try_send((tuple, msg.get_payload().to_vec())).is_err() {
+                        deps.stats.record_dns_snoop_dropped();
+                    }
                 }
 
                 let iface = iface_map.name(msg.get_outdev());
