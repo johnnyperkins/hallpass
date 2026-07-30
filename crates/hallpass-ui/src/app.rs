@@ -77,6 +77,20 @@ fn needs_refresh(kind: Option<AckKind>) -> bool {
     matches!(kind, Some(AckKind::RuleToggle) | Some(AckKind::RuleDelete))
 }
 
+/// Identity of one decided connection, for telling a replayed event from one
+/// already held.
+///
+/// The daemon assigns no event id, so identity is the decision itself: when
+/// it happened, which flow, and what was decided. Two genuinely distinct
+/// connections colliding on all of that in the same millisecond would have
+/// to reuse the source port, which the kernel does not do while the first is
+/// live.
+type EventKey = (u64, hallpass_types::FlowTuple, Verdict);
+
+fn event_key(ev: &ConnEvent) -> EventKey {
+    (ev.unix_ms, ev.conn.tuple, ev.verdict)
+}
+
 /// The ack, if any, the daemon will send for `msg`.
 fn ack_kind(msg: &ClientMsg) -> Option<AckKind> {
     match msg {
@@ -98,7 +112,14 @@ pub struct HallpassApp {
     prompts: Vec<PromptState>,
     events: VecDeque<ConnEvent>,
     rules: Vec<Rule>,
-    stats: Stats,
+    /// None until the daemon has answered once.
+    ///
+    /// Not `Stats::default()`: `enforcing` would then be false before any
+    /// answer arrived, and the window would announce that nothing is being
+    /// blocked on a daemon that is enforcing, or on one it has not even
+    /// reached yet. The whole value of that flag is that the claim is
+    /// trustworthy, so it is only made once the daemon has made it.
+    stats: Option<Stats>,
     last_error: Option<String>,
     /// Set by the Quit button; lets the main viewport actually close instead
     /// of hiding.
@@ -126,7 +147,7 @@ impl HallpassApp {
             prompts: Vec::new(),
             events: VecDeque::new(),
             rules: Vec::new(),
-            stats: Stats::default(),
+            stats: None,
             last_error: None,
             quit_requested: false,
             editor: None,
@@ -164,8 +185,9 @@ impl HallpassApp {
                     // happens next, so a window opened after the traffic
                     // would show an apparently idle machine. Requested after
                     // Subscribe so nothing that arrives in between is lost;
-                    // the feed tolerates the duplicate ordering because it is
-                    // a display, not an audit trail.
+                    // `push_history_event` drops what this client already
+                    // holds, which matters on a reconnect where the daemon
+                    // did not restart and its whole ring comes back.
                     self.send(ClientMsg::EventHistory {
                         limit: EVENT_HISTORY_LIMIT,
                     });
@@ -234,12 +256,21 @@ impl HallpassApp {
             // apparently idle machine. Oldest first, same order as the live
             // stream continues in.
             DaemonMsg::Events(events) => {
+                // Every reconnect asks again, and a daemon that did not
+                // restart still holds everything this client already has.
+                // Appending it a second time duplicated rows in the feed and
+                // inflated every count in the traffic view, which rebuilds
+                // from this ring each frame.
+                let held: std::collections::HashSet<EventKey> =
+                    self.events.iter().map(event_key).collect();
                 for ev in events {
-                    self.push_event(ev);
+                    if !held.contains(&event_key(&ev)) {
+                        self.push_event(ev);
+                    }
                 }
             }
             DaemonMsg::Rules(rules) => self.rules = rules,
-            DaemonMsg::Stats(stats) => self.stats = stats,
+            DaemonMsg::Stats(stats) => self.stats = Some(stats),
             // Replies arrive in request order on the one IPC stream;
             // `pending_acks` records what each was for, so a save's ack
             // is told apart from a toggle's or a prompt reply's: keep
@@ -361,7 +392,7 @@ impl HallpassApp {
             // Nothing is being blocked while this is showing, and every
             // other signal (a WOULD- prefix on a verdict, a line in Stats)
             // is only visible to someone already looking at the right pane.
-            if !self.stats.enforcing {
+            if self.stats.is_some_and(|s| !s.enforcing) {
                 ui.colored_label(
                     REJECT_COLOR,
                     "OBSERVE MODE: policy is evaluated and recorded, nothing is blocked",
@@ -613,7 +644,10 @@ impl HallpassApp {
             self.send(ClientMsg::Stats);
         }
         ui.separator();
-        let s = self.stats;
+        let Some(s) = self.stats else {
+            ui.label("Waiting for the daemon...");
+            return;
+        };
         egui::Grid::new("stats_grid").num_columns(2).show(ui, |ui| {
             ui.label("Total connections");
             ui.monospace(s.connections_total.to_string());
@@ -970,5 +1004,41 @@ mod tests {
         assert_eq!(ack_kind(&ClientMsg::RuleList), None);
         assert_eq!(ack_kind(&ClientMsg::Stats), None);
         assert_eq!(ack_kind(&ClientMsg::EventHistory { limit: 10 }), None);
+    }
+
+    /// Every reconnect asks for history again, and a daemon that did not
+    /// restart still holds what this client already has. Appending it twice
+    /// duplicated feed rows and inflated every traffic count, which is
+    /// rebuilt from this ring each frame.
+    #[test]
+    fn replayed_history_events_are_recognized() {
+        let mk = |ms: u64, verdict| ConnEvent {
+            conn: Connection {
+                tuple: hallpass_types::FlowTuple {
+                    proto: hallpass_types::Proto::Tcp,
+                    src: "10.0.0.1:40000".parse().unwrap(),
+                    dst: "1.1.1.1:443".parse().unwrap(),
+                },
+                uid: None,
+                pid: None,
+                exe_path: None,
+                cmdline: None,
+                parent_exe: None,
+                domain: None,
+                iface: None,
+            },
+            verdict,
+            rule_name: None,
+            unix_ms: ms,
+            enforced: true,
+        };
+        let a = mk(1000, Verdict::Allow);
+        assert_eq!(event_key(&a), event_key(&a.clone()), "the same decision");
+        // A different time, flow or verdict is a different decision.
+        assert_ne!(event_key(&a), event_key(&mk(1001, Verdict::Allow)));
+        assert_ne!(event_key(&a), event_key(&mk(1000, Verdict::Deny)));
+        let mut other_flow = mk(1000, Verdict::Allow);
+        other_flow.conn.tuple.src = "10.0.0.1:40001".parse().unwrap();
+        assert_ne!(event_key(&a), event_key(&other_flow));
     }
 }
