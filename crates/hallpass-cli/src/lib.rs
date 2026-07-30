@@ -10,12 +10,14 @@ pub mod args;
 pub mod client;
 pub mod fmt;
 pub mod json;
+pub mod rules_file;
 pub mod top;
 pub mod watch;
 
 use std::io::IsTerminal;
+use std::path::Path;
 
-use hallpass_types::{ClientMsg, ConnEvent, DaemonMsg};
+use hallpass_types::{sanitize_for_display, ClientMsg, ConnEvent, DaemonMsg, ExplainRequest};
 
 use crate::args::{Cmd, EventsOpts};
 use crate::client::{CliError, Client};
@@ -62,15 +64,18 @@ pub async fn run(argv: &[String]) -> i32 {
 
     let result = match cli.cmd {
         Cmd::Status => status(&mut client, out).await,
-        Cmd::RulesList => rules_list(&mut client, out).await,
+        Cmd::RulesList { stats } => rules_list(&mut client, stats, out).await,
         Cmd::RulesAdd(rule) => expect_ok(&mut client, ClientMsg::RuleAdd(rule)).await,
         Cmd::RulesRm { name } => expect_ok(&mut client, ClientMsg::RuleDelete { name }).await,
         Cmd::RulesToggle { name, enabled } => {
             expect_ok(&mut client, ClientMsg::RuleToggle { name, enabled }).await
         }
+        Cmd::RulesExport => rules_export(&mut client).await,
+        Cmd::RulesImport { path } => rules_import(&mut client, &path).await,
         Cmd::Events(opts) => events(client, opts, out).await,
         Cmd::Top(opts) => top::top(client, opts, out.json, out.palette).await,
         Cmd::Watch => watch::watch(client).await,
+        Cmd::Explain(req) => explain(&mut client, req, out).await,
     };
 
     match result {
@@ -98,13 +103,94 @@ async fn status(client: &mut Client, out: Output) -> Result<(), CliError> {
     }
 }
 
-async fn rules_list(client: &mut Client, out: Output) -> Result<(), CliError> {
+async fn rules_list(client: &mut Client, stats: bool, out: Output) -> Result<(), CliError> {
+    let rules = match client.request(ClientMsg::RuleList).await? {
+        DaemonMsg::Rules(rules) => rules,
+        other => return Err(CliError::unexpected(&other)),
+    };
+    // Two requests rather than one: the counters are the daemon's runtime
+    // accounting and are deliberately not part of a rule. An error here is
+    // not degraded into a plain listing - the counts are what was asked for.
+    let hits = if stats {
+        match client.request(ClientMsg::RuleStats).await? {
+            DaemonMsg::RuleHits(hits) => Some(hits),
+            other => return Err(CliError::unexpected(&other)),
+        }
+    } else {
+        None
+    };
+    match (&hits, out.json) {
+        (Some(hits), true) => println!("{}", json::rules_with_hits(&rules, hits)?),
+        (Some(hits), false) => print!("{}", fmt::format_rules_with_hits(&rules, hits)),
+        (None, true) => println!("{}", json::rules(&rules)?),
+        (None, false) => print!("{}", fmt::format_rules(&rules)),
+    }
+    Ok(())
+}
+
+/// Write the whole ruleset to stdout as one TOML document.
+///
+/// Always TOML, never JSON: this output exists to be saved, diffed and fed
+/// back to `rules import`, and `--json` already covers the "pipe it into a
+/// program" case through `rules --json`.
+async fn rules_export(client: &mut Client) -> Result<(), CliError> {
     match client.request(ClientMsg::RuleList).await? {
         DaemonMsg::Rules(rules) => {
+            print!("{}", rules_file::export(&rules)?);
+            Ok(())
+        }
+        other => Err(CliError::unexpected(&other)),
+    }
+}
+
+/// Add every rule in `path`, one request each.
+///
+/// A rejected rule does not stop the import. Half a ruleset plus a list of
+/// exactly which entries the daemon refused is something an operator can act
+/// on; aborting on the first failure leaves them re-running the whole file to
+/// discover the next problem. Only a broken connection stops it, because
+/// after that there is nobody left to ask.
+async fn rules_import(client: &mut Client, path: &Path) -> Result<(), CliError> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| CliError::Input(format!("cannot read {}: {e}", path.display())))?;
+    let rules = rules_file::import(&text)
+        .map_err(|e| CliError::Input(format!("cannot parse {}: {e}", path.display())))?;
+
+    let total = rules.len();
+    let mut failed = 0usize;
+    for rule in rules {
+        // The document was not necessarily written on this machine, and this
+        // name is about to be printed either way.
+        let name = sanitize_for_display(&rule.name).into_owned();
+        match client.request(ClientMsg::RuleAdd(rule)).await {
+            Ok(DaemonMsg::Ok) => println!("added {name}"),
+            Ok(other) => return Err(CliError::unexpected(&other)),
+            Err(e @ CliError::Daemon(_)) => {
+                failed += 1;
+                eprintln!("error: rule '{name}': {e}");
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    println!("imported {} of {total} rules", total - failed);
+    if failed > 0 {
+        return Err(CliError::Input(format!("{failed} of {total} rules failed")));
+    }
+    Ok(())
+}
+
+/// Ask what policy would do with a hypothetical connection.
+async fn explain(
+    client: &mut Client,
+    req: ExplainRequest,
+    out: Output,
+) -> Result<(), CliError> {
+    match client.request(ClientMsg::Explain(req)).await? {
+        DaemonMsg::Explanation(exp) => {
             if out.json {
-                println!("{}", json::rules(&rules)?);
+                println!("{}", json::explanation(&exp)?);
             } else {
-                print!("{}", fmt::format_rules(&rules));
+                print!("{}", fmt::format_explanation(&exp, out.palette));
             }
             Ok(())
         }

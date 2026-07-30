@@ -9,6 +9,9 @@ description = "Hallpass application firewall CLI"
 hallpass-types = { path = "../hallpass-types" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# Same version the daemon reads rule files with, so `rules export` cannot
+# emit a document the daemon's own parser would reject.
+toml = "0.8"
 tokio = { workspace = true, features = [
     "rt",
     "net",

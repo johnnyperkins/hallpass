@@ -1,9 +1,12 @@
 //! Hand-rolled argument parsing for the hallpass CLI.
 
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 
-use hallpass_types::{Action, ConnEvent, Proto, Rule, RuleDuration, RuleMatch, Verdict};
+use hallpass_types::{
+    Action, ConnEvent, Connection, ExplainRequest, FlowTuple, Proto, Rule, RuleDuration,
+    RuleMatch, Verdict,
+};
 
 /// Default daemon socket path.
 pub const DEFAULT_SOCKET: &str = "/run/hallpass/hallpass.sock";
@@ -30,13 +33,19 @@ USAGE:
 
 COMMANDS:
     status                       Show daemon statistics
-    rules                        List rules
+    rules [--stats]              List rules; --stats adds hit counts
     rules add [OPTIONS]          Add a rule
     rules rm NAME                Delete a rule
     rules toggle NAME on|off     Enable or disable a rule
+    rules export                 Write the ruleset to stdout as one TOML
+                                 document (always TOML, never JSON)
+    rules import PATH            Add every rule in such a document, reporting
+                                 each one; exits non-zero if any failed
     events [OPTIONS]             Stream connection events until Ctrl-C
     top [OPTIONS]                Live aggregate view of connection activity
     watch                        Interactively answer connection prompts
+    explain [OPTIONS]            Say what policy would do with a hypothetical
+                                 connection, and which rule decides it
 
 EVENTS OPTIONS:
     --last N                     Replay the last N decided connections before
@@ -55,6 +64,22 @@ TOP OPTIONS:
                                  What each row counts (default: exe)
     --interval SECS              Redraw period (default: 2, minimum 1)
     --top N                      Rows to show (default: 20, maximum 1000)
+
+EXPLAIN OPTIONS:
+    --dest IP                    Destination IP address (required)
+    --port PORT                  Destination port (required)
+    --proto tcp|udp              Transport protocol (default: tcp)
+    --exe PATH                   Executable path of the hypothetical process
+    --cmdline STR                Its full command line
+    --parent-exe PATH            Executable path of its parent
+    --exe-sha256 HEX             SHA-256 to use for hash operands (64 hex
+                                 digits); otherwise the daemon hashes --exe
+    --domain NAME                Destination domain, as DNS snooping would
+                                 have annotated it
+    --user UID                   UID of the hypothetical process
+    --src IP                     Source IP address (default: unspecified)
+    --src-port PORT              Source port (default: 0)
+    --iface NAME                 Outbound network interface (e.g. eth0)
 
 RULES ADD OPTIONS:
     --name NAME                  Rule name (required)
@@ -85,7 +110,8 @@ RULES ADD OPTIONS:
 GLOBAL OPTIONS:
     --socket PATH                Daemon socket (default: /run/hallpass/hallpass.sock)
     --json                       Machine-readable JSON for status, rules,
-                                 events (one object per line) and top
+                                 events (one object per line), top and
+                                 explain
     --color auto|always|never    Colorize output (default: auto, meaning only
                                  on a terminal with NO_COLOR unset)
     -h, --help                   Show this help";
@@ -228,8 +254,11 @@ impl Default for TopOpts {
 pub enum Cmd {
     /// `status`
     Status,
-    /// `rules`
-    RulesList,
+    /// `rules [--stats]`
+    RulesList {
+        /// Whether to fetch and show per-rule hit counts.
+        stats: bool,
+    },
     /// `rules add ...`
     RulesAdd(Rule),
     /// `rules rm NAME`
@@ -244,12 +273,21 @@ pub enum Cmd {
         /// New enabled state.
         enabled: bool,
     },
+    /// `rules export`
+    RulesExport,
+    /// `rules import PATH`
+    RulesImport {
+        /// Path of the TOML document to read.
+        path: PathBuf,
+    },
     /// `events [OPTIONS]`
     Events(EventsOpts),
     /// `top [OPTIONS]`
     Top(TopOpts),
     /// `watch`
     Watch,
+    /// `explain [OPTIONS]`
+    Explain(ExplainRequest),
 }
 
 /// Fully parsed command line.
@@ -314,6 +352,7 @@ pub fn parse(argv: &[String]) -> Result<Parsed, String> {
         Some((&"watch", [])) => Cmd::Watch,
         Some((&"events", flags)) => Cmd::Events(parse_events(flags)?),
         Some((&"top", flags)) => Cmd::Top(parse_top(flags)?),
+        Some((&"explain", flags)) => Cmd::Explain(parse_explain(flags)?),
         Some((&"rules", sub)) => parse_rules(sub)?,
         Some((&cmd, extra)) => {
             return Err(if matches!(cmd, "status" | "watch") {
@@ -421,10 +460,131 @@ fn parse_top(flags: &[&str]) -> Result<TopOpts, String> {
     Ok(opts)
 }
 
+/// Parse the flags describing the hypothetical connection for `explain`.
+///
+/// The flag spellings overlap `rules add` on purpose: an operator debugging a
+/// rule should not have to translate `--dest`/`--port`/`--exe` into a second
+/// vocabulary to ask about the connection that rule is meant to catch.
+///
+/// Nothing here is verified against the running system. This describes a
+/// connection that does not exist, so `--exe` is a claim, not a lookup.
+fn parse_explain(flags: &[&str]) -> Result<ExplainRequest, String> {
+    let mut dest: Option<IpAddr> = None;
+    let mut port: Option<u16> = None;
+    let mut proto = Proto::Tcp;
+    let mut src: Option<IpAddr> = None;
+    let mut src_port: u16 = 0;
+    let mut exe: Option<PathBuf> = None;
+    let mut cmdline: Option<String> = None;
+    let mut parent_exe: Option<PathBuf> = None;
+    let mut domain: Option<String> = None;
+    let mut user: Option<u32> = None;
+    let mut iface: Option<String> = None;
+    let mut exe_sha256: Option<String> = None;
+
+    let mut it = flags.iter();
+    while let Some(flag) = it.next() {
+        let value = *it
+            .next()
+            .ok_or_else(|| format!("{flag} requires a value"))?;
+        match *flag {
+            "--dest" => dest = Some(parse_addr("--dest", value)?),
+            "--port" => {
+                port = Some(
+                    value.parse::<u16>().map_err(|_| format!("invalid port '{value}'"))?,
+                );
+            }
+            "--proto" => {
+                proto = match value {
+                    "tcp" => Proto::Tcp,
+                    "udp" => Proto::Udp,
+                    other => return Err(format!("invalid proto '{other}'")),
+                };
+            }
+            "--src" => src = Some(parse_addr("--src", value)?),
+            "--src-port" => {
+                src_port = value
+                    .parse::<u16>()
+                    .map_err(|_| format!("invalid src-port '{value}'"))?;
+            }
+            "--exe" => exe = Some(PathBuf::from(value)),
+            "--cmdline" => cmdline = Some(value.to_string()),
+            "--parent-exe" => parent_exe = Some(PathBuf::from(value)),
+            "--domain" => domain = Some(value.to_string()),
+            "--user" => {
+                user = Some(
+                    value.parse::<u32>().map_err(|_| format!("invalid uid '{value}'"))?,
+                );
+            }
+            "--iface" => iface = Some(value.to_string()),
+            "--exe-sha256" => exe_sha256 = Some(parse_sha256(value)?),
+            other => return Err(format!("unknown flag '{other}'")),
+        }
+    }
+
+    let dest = dest.ok_or_else(|| "--dest is required".to_string())?;
+    let port = port.ok_or_else(|| "--port is required".to_string())?;
+    // Default the source to the unspecified address of the destination's own
+    // family. A `src` operand is written for one family, and defaulting to
+    // 0.0.0.0 against an IPv6 destination would report it as failing to match
+    // for a reason the operator never asked about.
+    let src = src.unwrap_or(if dest.is_ipv4() {
+        IpAddr::from(Ipv4Addr::UNSPECIFIED)
+    } else {
+        IpAddr::from(Ipv6Addr::UNSPECIFIED)
+    });
+
+    Ok(ExplainRequest {
+        conn: Connection {
+            tuple: FlowTuple {
+                proto,
+                src: SocketAddr::new(src, src_port),
+                dst: SocketAddr::new(dest, port),
+            },
+            uid: user,
+            // No process exists to have a pid, and no matcher operand reads
+            // one, so stating a number here would only look authoritative.
+            pid: None,
+            exe_path: exe,
+            cmdline,
+            parent_exe,
+            domain,
+            iface,
+        },
+        exe_sha256,
+    })
+}
+
+/// Parse a bare IP address for `explain`, which describes one connection
+/// rather than a range: a CIDR block has no single address to send from or to.
+fn parse_addr(flag: &str, value: &str) -> Result<IpAddr, String> {
+    value
+        .parse()
+        .map_err(|_| format!("invalid {flag} '{value}': expected an IP address"))
+}
+
+/// Validate a SHA-256 operand and return it unchanged.
+fn parse_sha256(value: &str) -> Result<String, String> {
+    if value.len() != 64 || !value.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(format!("invalid exe-sha256 '{value}': expected 64 hex digits"));
+    }
+    Ok(value.to_string())
+}
+
 fn parse_rules(sub: &[&str]) -> Result<Cmd, String> {
     match sub.split_first() {
-        None => Ok(Cmd::RulesList),
+        None => Ok(Cmd::RulesList { stats: false }),
+        Some((&"--stats", [])) => Ok(Cmd::RulesList { stats: true }),
+        Some((&"--stats", extra)) => {
+            Err(format!("unexpected arguments after '--stats': {extra:?}"))
+        }
         Some((&"add", flags)) => Ok(Cmd::RulesAdd(parse_rule_add(flags)?)),
+        Some((&"export", [])) => Ok(Cmd::RulesExport),
+        Some((&"export", _)) => Err("usage: rules export".into()),
+        Some((&"import", [path])) => Ok(Cmd::RulesImport {
+            path: PathBuf::from(*path),
+        }),
+        Some((&"import", _)) => Err("usage: rules import PATH".into()),
         Some((&"rm", [name])) => Ok(Cmd::RulesRm {
             name: (*name).to_string(),
         }),
@@ -466,12 +626,7 @@ fn parse_rule_add(flags: &[&str]) -> Result<Rule, String> {
             }
             "--exe" => matcher.exe = Some(PathBuf::from(value)),
             "--exe-glob" => matcher.exe_glob = Some(value.to_string()),
-            "--exe-sha256" => {
-                if value.len() != 64 || !value.bytes().all(|b| b.is_ascii_hexdigit()) {
-                    return Err(format!("invalid exe-sha256 '{value}': expected 64 hex digits"));
-                }
-                matcher.exe_sha256 = Some(value.to_string());
-            }
+            "--exe-sha256" => matcher.exe_sha256 = Some(parse_sha256(value)?),
             "--dest" => {
                 validate_net(value)?;
                 matcher.dest = Some(value.to_string());
@@ -576,7 +731,7 @@ mod tests {
     fn simple_commands() {
         assert_eq!(parse_ok(&["status"]).cmd, Cmd::Status);
         assert_eq!(parse_ok(&["watch"]).cmd, Cmd::Watch);
-        assert_eq!(parse_ok(&["rules"]).cmd, Cmd::RulesList);
+        assert_eq!(parse_ok(&["rules"]).cmd, Cmd::RulesList { stats: false });
         assert_eq!(
             parse_ok(&["events"]).cmd,
             Cmd::Events(EventsOpts {
@@ -772,6 +927,99 @@ mod tests {
             }
         );
         assert!(parse_err(&["rules", "toggle", "foo", "maybe"]).contains("on"));
+    }
+
+    #[test]
+    fn rules_list_stats_export_import() {
+        assert_eq!(
+            parse_ok(&["rules", "--stats"]).cmd,
+            Cmd::RulesList { stats: true }
+        );
+        assert_eq!(parse_ok(&["rules", "export"]).cmd, Cmd::RulesExport);
+        assert_eq!(
+            parse_ok(&["rules", "import", "/tmp/r.toml"]).cmd,
+            Cmd::RulesImport {
+                path: PathBuf::from("/tmp/r.toml")
+            }
+        );
+        assert!(parse_err(&["rules", "import"]).contains("rules import PATH"));
+        assert!(parse_err(&["rules", "import", "a", "b"]).contains("rules import PATH"));
+        assert!(parse_err(&["rules", "export", "now"]).contains("rules export"));
+        assert!(parse_err(&["rules", "--stats", "x"]).contains("unexpected arguments"));
+    }
+
+    #[test]
+    fn explain_full() {
+        let hash = "ab".repeat(32);
+        let Cmd::Explain(req) = parse_ok(&[
+            "explain", "--exe", "/usr/bin/curl", "--cmdline", "curl https://example.org",
+            "--parent-exe", "/bin/bash", "--dest", "93.184.216.34", "--port", "443",
+            "--proto", "udp", "--domain", "example.org", "--user", "1000", "--src",
+            "10.0.0.5", "--src-port", "51000", "--iface", "wg0", "--exe-sha256", &hash,
+        ])
+        .cmd
+        else {
+            panic!("expected Explain");
+        };
+        let conn = &req.conn;
+        assert_eq!(conn.tuple.proto, Proto::Udp);
+        assert_eq!(conn.tuple.dst, "93.184.216.34:443".parse().unwrap());
+        assert_eq!(conn.tuple.src, "10.0.0.5:51000".parse().unwrap());
+        assert_eq!(conn.exe_path, Some(PathBuf::from("/usr/bin/curl")));
+        assert_eq!(conn.cmdline.as_deref(), Some("curl https://example.org"));
+        assert_eq!(conn.parent_exe, Some(PathBuf::from("/bin/bash")));
+        assert_eq!(conn.domain.as_deref(), Some("example.org"));
+        assert_eq!(conn.uid, Some(1000));
+        assert_eq!(conn.iface.as_deref(), Some("wg0"));
+        // The hash rides beside the connection: it is what the daemon should
+        // use for hash operands, not a property of the flow.
+        assert_eq!(req.exe_sha256.as_deref(), Some(hash.as_str()));
+        // Nothing here describes a real process, so no pid is invented.
+        assert_eq!(conn.pid, None);
+    }
+
+    /// Only the destination is required, and the source defaults to the
+    /// unspecified address of the destination's own family.
+    #[test]
+    fn explain_defaults() {
+        let cases = [
+            ("93.184.216.34", "0.0.0.0:0"),
+            ("2606:4700::1111", "[::]:0"),
+        ];
+        for (dest, want_src) in cases {
+            let Cmd::Explain(req) = parse_ok(&["explain", "--dest", dest, "--port", "53"]).cmd
+            else {
+                panic!("expected Explain");
+            };
+            assert_eq!(req.conn.tuple.src, want_src.parse().unwrap(), "{dest}");
+            assert_eq!(req.conn.tuple.proto, Proto::Tcp);
+            assert_eq!(req.conn.tuple.dst.port(), 53);
+            assert_eq!(req.conn.exe_path, None);
+            assert_eq!(req.exe_sha256, None);
+        }
+    }
+
+    #[test]
+    fn explain_bad_values() {
+        let cases: [(&[&str], &str); 8] = [
+            (&["explain", "--port", "443"], "--dest is required"),
+            (&["explain", "--dest", "1.2.3.4"], "--port is required"),
+            // A block has no single address to send to; explain describes one
+            // connection, not a range.
+            (&["explain", "--dest", "10.0.0.0/8", "--port", "1"], "invalid --dest"),
+            (&["explain", "--dest", "example.org", "--port", "1"], "invalid --dest"),
+            (&["explain", "--dest", "1.2.3.4", "--port", "99999"], "invalid port"),
+            (&["explain", "--dest", "1.2.3.4", "--port", "1", "--proto", "icmp"],
+             "invalid proto"),
+            (&["explain", "--dest", "1.2.3.4", "--port", "1", "--exe-sha256", "beef"],
+             "64 hex digits"),
+            (&["explain", "--dest"], "requires a value"),
+        ];
+        for (argv, want) in cases {
+            let err = parse_err(argv);
+            assert!(err.contains(want), "{argv:?}: {err}");
+        }
+        assert!(parse_err(&["explain", "--pid", "1"]).contains("unknown flag"));
     }
 
     #[test]

@@ -16,6 +16,9 @@ pub enum CliError {
     Daemon(String),
     /// The daemon replied with something unexpected. Exit code 1.
     Protocol(String),
+    /// Something the operator supplied was unusable: a file that cannot be
+    /// read or parsed, or a partly failed import. Exit code 1.
+    Input(String),
 }
 
 impl CliError {
@@ -23,7 +26,9 @@ impl CliError {
     pub fn exit_code(&self) -> i32 {
         match self {
             CliError::Connect(_) => crate::EXIT_CONN,
-            CliError::Daemon(_) | CliError::Protocol(_) => crate::EXIT_ERR,
+            CliError::Daemon(_) | CliError::Protocol(_) | CliError::Input(_) => {
+                crate::EXIT_ERR
+            }
         }
     }
 
@@ -44,7 +49,9 @@ impl fmt::Display for CliError {
         match self {
             CliError::Connect(e) => write!(f, "{} - is hallpassd running?", clean(e)),
             CliError::Daemon(m) => write!(f, "daemon: {}", clean(m)),
-            CliError::Protocol(m) => write!(f, "{}", clean(m)),
+            // Sanitized like the rest: an import error quotes the file it came
+            // from, and that file was not necessarily written here.
+            CliError::Protocol(m) | CliError::Input(m) => write!(f, "{}", clean(m)),
         }
     }
 }

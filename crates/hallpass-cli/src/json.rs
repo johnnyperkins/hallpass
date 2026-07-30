@@ -14,7 +14,10 @@
 
 use std::path::PathBuf;
 
-use hallpass_types::{sanitize_for_display, ConnEvent, Connection, Rule, RuleMatch, Stats};
+use hallpass_types::{
+    sanitize_for_display, ConnEvent, Connection, Explanation, Rule, RuleHit, RuleMatch,
+    RuleTrace, Stats, TraceOutcome,
+};
 use serde::Serialize;
 
 use crate::client::CliError;
@@ -39,6 +42,76 @@ pub fn stats(s: &Stats) -> Result<String, CliError> {
 pub fn rules(rules: &[Rule]) -> Result<String, CliError> {
     let clean: Vec<Rule> = rules.iter().map(sanitized_rule).collect();
     to_json(&clean)
+}
+
+/// A rule with its hit counters, for `rules --stats --json`.
+///
+/// Flattened so a consumer sees one object per rule with two extra keys,
+/// rather than having to reach through a wrapper for the fields it already
+/// knows from plain `rules --json`.
+#[derive(Debug, Serialize)]
+struct RuleWithHits {
+    #[serde(flatten)]
+    rule: Rule,
+    /// Connections this rule decided since the daemon started.
+    hits: u64,
+    /// When it last decided one, or None if never.
+    last_hit_ms: Option<u64>,
+}
+
+/// The rule list as a JSON array, each rule carrying its hit counters.
+///
+/// A rule the daemon reported no counter for gets `0` and `null`, so every
+/// element has the same shape whether or not the rule has ever matched.
+pub fn rules_with_hits(rules: &[Rule], hits: &[RuleHit]) -> Result<String, CliError> {
+    // Keyed on the raw name, which is what the daemon accounts against.
+    let by_name: std::collections::HashMap<&str, &RuleHit> =
+        hits.iter().map(|h| (h.name.as_str(), h)).collect();
+    let clean: Vec<RuleWithHits> = rules
+        .iter()
+        .map(|r| {
+            let hit = by_name.get(r.name.as_str());
+            RuleWithHits {
+                rule: sanitized_rule(r),
+                hits: hit.map_or(0, |h| h.hits),
+                last_hit_ms: hit.and_then(|h| h.last_hit_ms),
+            }
+        })
+        .collect();
+    to_json(&clean)
+}
+
+/// One explanation as a JSON object.
+pub fn explanation(e: &Explanation) -> Result<String, CliError> {
+    to_json(&sanitized_explanation(e))
+}
+
+/// Copy of `e` with every daemon-supplied string sanitized. The trace is not
+/// truncated the way the human rendering is: a consumer that asked for the
+/// whole evaluation would rather have it than a silently shortened list.
+pub fn sanitized_explanation(e: &Explanation) -> Explanation {
+    Explanation {
+        verdict: e.verdict,
+        rule_name: clean_opt(&e.rule_name),
+        would_prompt: e.would_prompt,
+        enforced: e.enforced,
+        trace: e
+            .trace
+            .iter()
+            .map(|t| RuleTrace {
+                name: clean(&t.name),
+                priority: t.priority,
+                outcome: match &t.outcome {
+                    // The field name is one of a fixed set today, but it
+                    // arrives over a socket like every other string here.
+                    TraceOutcome::NoMatch { field } => TraceOutcome::NoMatch {
+                        field: clean(field),
+                    },
+                    other => other.clone(),
+                },
+            })
+            .collect(),
+    }
 }
 
 /// One event as a JSON object, for the JSON Lines event stream.
@@ -211,6 +284,76 @@ mod tests {
         assert!(out.contains("\"observed_only\":4"), "{out}");
         assert!(out.contains("\"dns_snoop_dropped\":2"), "{out}");
         assert!(out.contains("\"enforcing\":false"), "{out}");
+    }
+
+    /// The counters ride alongside the rule's own fields, and a rule the
+    /// daemon reported nothing for still gets both keys: a consumer should not
+    /// have to tell "never matched" apart from "field absent".
+    #[test]
+    fn rules_with_hits_json_carries_the_counters() {
+        let rule = |name: &str| Rule {
+            name: name.into(),
+            action: Action::Deny,
+            duration: RuleDuration::Forever,
+            priority: 1,
+            enabled: true,
+            matcher: RuleMatch::default(),
+        };
+        let out = rules_with_hits(
+            &[rule("busy"), rule("never")],
+            &[RuleHit {
+                name: "busy".into(),
+                hits: 12,
+                last_hit_ms: Some(1_720_000_000_123),
+            }],
+        )
+        .expect("encode");
+        assert!(out.contains(r#""name":"busy""#), "{out}");
+        assert!(out.contains(r#""hits":12"#), "{out}");
+        assert!(out.contains(r#""last_hit_ms":1720000000123"#), "{out}");
+        assert!(out.contains(r#""hits":0"#), "{out}");
+        assert!(out.contains(r#""last_hit_ms":null"#), "{out}");
+        // Flattened, not wrapped: the rule's own fields stay where a consumer
+        // of plain `rules --json` already expects them.
+        assert!(out.contains(r#""priority":1"#), "{out}");
+        assert!(!out.contains(r#""rule":"#), "{out}");
+    }
+
+    /// The usual consumer of this decodes the strings and prints them, so a
+    /// hostile rule name in a trace reaches a terminal one hop later.
+    #[test]
+    fn hostile_explanation_json_is_one_sanitized_line() {
+        let exp = Explanation {
+            verdict: Verdict::Deny,
+            rule_name: Some("evil\x1b[2K".into()),
+            would_prompt: false,
+            enforced: false,
+            trace: vec![
+                RuleTrace {
+                    name: "evil\x1b[2K".into(),
+                    priority: 100,
+                    outcome: TraceOutcome::Matched,
+                },
+                RuleTrace {
+                    name: "second\r\nforged".into(),
+                    priority: 0,
+                    outcome: TraceOutcome::NoMatch {
+                        field: "port\n".into(),
+                    },
+                },
+            ],
+        };
+        let line = explanation(&exp).expect("encode");
+        assert_eq!(line.lines().count(), 1, "{line:?}");
+        for bad in ["\\u001b", "\\r", "\\n"] {
+            assert!(!line.contains(bad), "{bad} survived: {line:?}");
+        }
+        assert!(line.contains(r#""would_prompt":false"#), "{line}");
+        assert!(line.contains(r#""enforced":false"#), "{line}");
+        assert!(line.contains(r#""verdict":"deny""#), "{line}");
+        // The whole trace is there: a machine consumer asked for all of it.
+        assert!(line.contains("\"priority\":100"), "{line}");
+        assert!(line.contains("NoMatch"), "{line}");
     }
 
     /// A non-UTF-8 exe path must not break the pipeline: `PathBuf`'s
