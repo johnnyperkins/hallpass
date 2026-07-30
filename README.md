@@ -290,8 +290,11 @@ went out, and printing `DENY` would say the opposite of what happened.
 
 The GUI (`hallpass-ui`) connects to the same socket, pops up a dialog for each
 unmatched connection (allow/deny, scope, duration), and offers a management
-window for rules, live events, and statistics. Only one client at a time can
-hold the prompt-handler role.
+window for rules, live events, and statistics. Deny leads the dialog's
+keyboard traversal, and closing a prompt window denies every connection it
+covers rather than leaving them to the timeout: dismissing a decision is a
+decision, and it is the one the operator can undo. The deny is `Once`, so it
+writes no rule. Only one client at a time can hold the prompt-handler role.
 
 ## Security model
 

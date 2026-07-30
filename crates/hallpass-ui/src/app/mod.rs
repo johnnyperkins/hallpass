@@ -351,6 +351,24 @@ impl HallpassApp {
         self.stats.is_some_and(|s| !s.enforcing)
     }
 
+    /// Hand `ids` back to the daemon as denied.
+    ///
+    /// A prompt this client accepted is its responsibility until it answers
+    /// or gives it up, and giving one up quietly is not neutral: the daemon
+    /// times it out and applies `default_verdict`, which is allow unless the
+    /// operator changed it. So every way of abandoning a prompt routes
+    /// through here rather than just dropping it, and denies once, for this
+    /// port only. Ids no longer pending are skipped, so an answer made in
+    /// the same frame is never overwritten by the dismissal that follows it.
+    fn dismiss_prompts(&mut self, ids: impl IntoIterator<Item = u64>) {
+        for id in ids {
+            if self.prompts.iter().any(|p| p.id == id) {
+                self.send(prompt::close_reply(id));
+                self.prompts.retain(|p| p.id != id);
+            }
+        }
+    }
+
     fn select_tab(&mut self, tab: Tab) {
         if self.tab != tab {
             self.tab = tab;
@@ -417,6 +435,15 @@ impl HallpassApp {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("Quit").clicked() {
                         self.quit_requested = true;
+                        // Leaving with prompts on screen abandons them the
+                        // same way closing their window does, so it answers
+                        // them the same way. Best effort by nature: the
+                        // replies are queued to the network thread and the
+                        // process may exit before it writes them, in which
+                        // case the daemon's timeout still decides. Queuing
+                        // them costs nothing and is right whenever it wins.
+                        let pending: Vec<u64> = self.prompts.iter().map(|p| p.id).collect();
+                        self.dismiss_prompts(pending);
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     }
                 });
@@ -731,7 +758,7 @@ impl HallpassApp {
         }
 
         let mut answered: Vec<(u64, ClientMsg)> = Vec::new();
-        let mut closed: Vec<u64> = Vec::new();
+        let mut dismissed: Vec<u64> = Vec::new();
 
         for (start, len) in groups {
             let rest: Vec<String> = self.prompts[start + 1..start + len]
@@ -761,20 +788,24 @@ impl HallpassApp {
                     prompt_ui(ui, p, now_ms, &rest, &mut answered);
                 });
                 if ui.ctx().input(|i| i.viewport().close_requested()) {
-                    // Closed without answering: dismiss the whole app's
-                    // queue, or the window would reopen next frame for
-                    // the next prompt. The daemon's timeout applies its
-                    // default to each, exactly as before.
-                    closed.extend(&group_ids);
+                    // Closing the window is a decision, not the absence of
+                    // one; `dismiss_prompts` is what that decision means.
+                    // The whole group goes, because one window carries the
+                    // whole app's queue and leaving the rest would just
+                    // reopen it next frame for the next one.
+                    dismissed.extend(&group_ids);
                 }
             });
         }
 
         for (id, reply) in answered {
             self.send(reply);
-            closed.push(id);
+            self.prompts.retain(|p| p.id != id);
         }
-        self.prompts.retain(|p| !closed.contains(&p.id));
+        // After the answers, so that clicking one in the same frame its
+        // window closed keeps the operator's verdict: `dismiss_prompts`
+        // only speaks for prompts still pending.
+        self.dismiss_prompts(dismissed);
     }
 }
 
@@ -887,11 +918,17 @@ fn prompt_ui(
         let deny = egui::Button::new(RichText::new("Deny").color(Color32::WHITE).strong())
             .fill(DENY_COLOR)
             .min_size(egui::vec2(100.0, 28.0));
-        if ui.add(allow).clicked() {
-            answered.push((p.id, p.reply(Verdict::Allow)));
-        }
+        // Deny is added first, so it leads keyboard traversal: egui hands
+        // focus out in the order widgets are added. This window interrupts
+        // whatever the operator was doing, and the answer given without
+        // reading it has to be the recoverable one - a wrong deny costs a
+        // retry, a wrong allow costs the connection the prompt existed to
+        // stop.
         if ui.add(deny).clicked() {
             answered.push((p.id, p.reply(Verdict::Deny)));
+        }
+        if ui.add(allow).clicked() {
+            answered.push((p.id, p.reply(Verdict::Allow)));
         }
     });
     ui.add_space(6.0);

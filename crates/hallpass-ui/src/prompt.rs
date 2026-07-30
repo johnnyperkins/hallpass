@@ -55,6 +55,23 @@ impl PromptState {
     }
 }
 
+/// The reply a closed prompt window sends for prompt `id`.
+///
+/// Deny, once, this port. Closing the window is a decision about the
+/// connection on screen and about nothing else, so it deliberately ignores
+/// the duration and scope pickers: inheriting them would let a dismissed
+/// window write a permanent, app-wide rule the operator never confirmed.
+/// [`RuleDuration::Once`] creates no rule at all; it only settles the
+/// packets the daemon is holding.
+pub fn close_reply(id: u64) -> ClientMsg {
+    ClientMsg::PromptReply {
+        id,
+        verdict: Verdict::Deny,
+        duration: RuleDuration::Once,
+        scope: PromptScope::ThisPort,
+    }
+}
+
 /// Remaining fraction of a countdown in `[0.0, 1.0]`.
 fn remaining_fraction(start_ms: u64, deadline_ms: u64, now_ms: u64) -> f32 {
     let total = deadline_ms.saturating_sub(start_ms);
