@@ -100,7 +100,20 @@ fn read_name(buf: &[u8], mut pos: usize) -> Option<(String, usize)> {
         // DNS names on the wire are ASCII (IDNs arrive punycoded);
         // non-ASCII bytes map byte-for-byte, which keeps comparisons
         // consistent even for out-of-spec labels.
-        for b in label {
+        //
+        // Control and whitespace bytes are the exception and reject the whole
+        // name, matching normalize_domain() on the uprobe path so both
+        // snoopers agree on what a cached domain may contain. No real hostname
+        // carries one, and the parsed name travels into rule matching, logs,
+        // and both clients' prompt displays: a label of newlines rendered into
+        // the fixed-size prompt window pushes the allow/deny buttons out of
+        // view, and an escape sequence rewrites a terminal line. Refusing here
+        // keeps such a reply out of the cache entirely, which is safer than
+        // carrying it and having to escape it at every consumer.
+        for &b in label {
+            if b <= b' ' || b == 0x7f {
+                return None;
+            }
             name.push(b.to_ascii_lowercase() as char);
         }
         if name.len() > 253 {
@@ -390,6 +403,36 @@ mod tests {
     /// Pointer back to the question name at offset 12.
     fn ptr_to_question() -> Vec<u8> {
         vec![0xC0, 12]
+    }
+
+    /// A label full of control bytes rejects the whole name, so the reply
+    /// never reaches the cache, rule matching, logs, or a prompt display.
+    ///
+    /// Left unchecked, a process resolving a name it owns could put newlines
+    /// in a label and blow the destination row of the fixed-size prompt window
+    /// past the allow/deny buttons, or put an escape sequence there and rewrite
+    /// a line of `hallpass-cli watch` output.
+    #[test]
+    fn control_bytes_in_a_label_reject_the_name() {
+        for hostile in ["ev\nil.example.com", "ev\x1b[2Kil.example.com", "a\rb.example.com"] {
+            let mut msg = header(0x8180, 1, 1);
+            msg.extend(question(hostile));
+            msg.extend(record(ptr_to_question(), TYPE_A, 300, &[93, 184, 216, 34]));
+            assert!(
+                parse_response(&msg).is_none(),
+                "control bytes must reject the name: {hostile:?}"
+            );
+
+            let mut q = header(0x0100, 1, 0);
+            q.extend(question(hostile));
+            assert!(parse_query(&q).is_none(), "query too: {hostile:?}");
+        }
+        // The same shape without control bytes still parses, so the check is
+        // rejecting the bytes rather than the construction.
+        let mut ok = header(0x8180, 1, 1);
+        ok.extend(question("evil.example.com"));
+        ok.extend(record(ptr_to_question(), TYPE_A, 300, &[93, 184, 216, 34]));
+        assert!(parse_response(&ok).is_some());
     }
 
     fn simple_a_response() -> Vec<u8> {

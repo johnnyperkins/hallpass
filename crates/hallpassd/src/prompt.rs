@@ -352,6 +352,29 @@ impl PromptTable {
 }
 
 /// Build the rule a prompt reply asks for. `None` when the connection has
+/// Longest executable stem carried into a generated rule name.
+const MAX_RULE_STEM_CHARS: usize = 40;
+
+/// Reduce an executable stem to characters that are safe in a rule name.
+///
+/// Conservative on purpose: alphanumerics plus `.`, `_` and `-`, which is the
+/// same set [`crate::rules::store`] already accepts in a rule filename, so a
+/// generated name never needs rewriting to become one. Everything else becomes
+/// `_` rather than being dropped, so two different executables cannot collapse
+/// to the same rule name.
+fn sanitize_rule_stem(raw: &str) -> String {
+    raw.chars()
+        .take(MAX_RULE_STEM_CHARS)
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
 /// no attributed executable (a rule would then match far too broadly).
 fn rule_from_reply(
     id: u64,
@@ -361,9 +384,16 @@ fn rule_from_reply(
     scope: PromptScope,
 ) -> Option<Rule> {
     let exe = conn.exe_path.clone()?;
+    // The stem becomes part of the rule's persisted name, which the CLI and
+    // GUI both list back to the operator when auditing policy. A filename may
+    // contain any byte but '/' and NUL, so a process can pick one carrying an
+    // escape sequence and have it replayed into that listing. Keep the name to
+    // characters that cannot reshape output, and cap it so one rule cannot
+    // dominate the display.
     let stem = exe
         .file_stem()
-        .map(|s| s.to_string_lossy().into_owned())
+        .map(|s| sanitize_rule_stem(&s.to_string_lossy()))
+        .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "app".to_string());
     let dst = conn.tuple.dst;
     let mut matcher = RuleMatch {
@@ -446,6 +476,44 @@ mod tests {
         let mut h = harness("nohandler", 4, Verdict::Deny);
         h.table.handle_new(conn("/bin/a", "1.1.1.1:443"), 7);
         assert_eq!(h.verdict_rx.recv().await, Some((7, Verdict::Deny)));
+    }
+
+    /// A filename may hold any byte but '/' and NUL, and the stem lands in a
+    /// persisted rule name that both clients list back when auditing policy.
+    /// An escape sequence there would rewrite that listing.
+    #[test]
+    fn rule_names_from_hostile_exe_stems_are_inert() {
+        let hostile = "/tmp/x\x1b[2K\rprompt-firefox-1";
+        let mut c = conn(hostile, "1.1.1.1:443");
+        c.exe_path = Some(PathBuf::from(hostile));
+        let rule = rule_from_reply(
+            7,
+            &c,
+            Verdict::Deny,
+            RuleDuration::Forever,
+            PromptScope::ThisPort,
+        )
+        .expect("a rule is generated");
+        assert!(!rule.name.contains('\x1b'), "{:?}", rule.name);
+        assert!(!rule.name.contains('\r'), "{:?}", rule.name);
+        assert!(
+            rule.name.chars().all(|ch| ch.is_ascii_alphanumeric()
+                || matches!(ch, '.' | '_' | '-')),
+            "{:?}",
+            rule.name
+        );
+        // The exe criterion keeps the real path: only the name is reduced.
+        assert_eq!(rule.matcher.exe, Some(PathBuf::from(hostile)));
+    }
+
+    /// Two executables differing only in stripped characters must not collapse
+    /// onto one rule name, or answering for one would silently cover the other.
+    #[test]
+    fn distinct_hostile_stems_do_not_collide() {
+        let a = sanitize_rule_stem("ev\x1bil");
+        let b = sanitize_rule_stem("ev\ril");
+        assert_eq!(a, b, "same shape maps the same way");
+        assert_ne!(sanitize_rule_stem("evil"), a, "dropped chars would collide");
     }
 
     /// Prompt ids are a monotonic counter from 1, so they are trivially
