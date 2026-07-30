@@ -142,8 +142,24 @@ systemctl enable --now hallpassd
 </details>
 
 Configuration lives in `/etc/hallpass/config.toml` (default verdict, prompt
-timeout, queue number, socket path, rules directory). Persistent rules are
-TOML files in `/etc/hallpass/rules.d/`, one rule per file:
+timeout, queue number, socket path, rules directory).
+
+Setting `mode = "observe"` there evaluates policy and records what it
+decided without applying any of it. Nothing is blocked: a rule that would
+deny is recorded as a deny and the connection goes out anyway, and unmatched
+connections record `default_verdict` and never prompt, because answering a
+dialog that changes nothing would be misleading. It exists because the honest
+answer to "what will this policy break" cannot be read off the rule files; it
+depends on what the host actually talks to. So the way to size a rollout is
+to run in observe mode, watch `hallpass-cli top` and `hallpass-cli events`
+for a while, and only then enforce. The mode is visible in `hallpass-cli
+status`, in every event as an unenforced verdict (a recorded block reads
+`WOULD-DENY`, never `DENY`), on syslog export as `enforced="false"`, and in a
+warning at startup. **It is not a security posture.** While it is on, this
+host is not filtered.
+
+Persistent rules are TOML files in `/etc/hallpass/rules.d/`, one rule per
+file:
 
 ```toml
 name = "allow-dns"
@@ -211,8 +227,29 @@ hallpass-cli rules add --name block-smtp --action deny --port 25 --duration fore
 hallpass-cli rules rm block-smtp
 hallpass-cli rules toggle allow-dns off
 hallpass-cli events                        # stream connection events
+hallpass-cli top                           # live aggregate of current activity
 hallpass-cli watch                         # answer prompts in the terminal
 ```
+
+`top` answers "what is this machine talking to" rather than "what happened
+next": it folds the event stream into a live table, seeded from the daemon's
+history so it is populated the moment it opens. What a row counts is chosen
+with `--group-by`, one of `exe`, `domain`, `host`, `port`, or `rule`, since
+the interesting grouping differs per question. Rows and per-row peer sets are
+capped, and events that did not fit under the row cap are reported rather
+than silently dropped.
+
+`events` streams from the moment it starts, which makes a freshly opened
+monitor look like an idle machine, so `--last N` replays the last N decided
+connections first (`--no-follow` to print the replay and stop). `--exe`,
+`--domain`, and `--verdict` filter the replay and the live stream alike;
+repeating one ORs the terms, mixing kinds ANDs them.
+
+Both accept the global `--json` (wire types, one object per line for
+streams) and `--color auto|always|never` (`auto` colors only on a terminal
+with `NO_COLOR` unset). A verdict the daemon recorded but did not apply,
+which is what observe mode produces, renders as `WOULD-DENY`: the connection
+went out, and printing `DENY` would say the opposite of what happened.
 
 The GUI (`hallpass-ui`) connects to the same socket, pops up a dialog for each
 unmatched connection (allow/deny, scope, duration), and offers a management
@@ -368,6 +405,12 @@ License compliance is checked with [cargo-deny](https://github.com/EmbarkStudios
 ```sh
 cargo deny check
 ```
+
+`cargo xtask ci` runs everything above that does not need root, cheapest
+failure first. [CONTRIBUTING.md](CONTRIBUTING.md) has the full verification
+matrix, what each part covers, and the dev loop for working on the clients
+without privileges; [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) has the
+startup ordering invariants and the debugging landmines.
 
 ## License
 
