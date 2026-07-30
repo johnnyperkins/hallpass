@@ -8,8 +8,9 @@
 use std::io::Read;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
@@ -38,7 +39,28 @@ pub struct RuleStore {
     /// Cumulative count of disk rule files skipped across every load
     /// (bad permissions, unparsable, or duplicate name).
     rules_skipped: AtomicU64,
+    /// Per-rule-name hit accounting. Deliberately keyed by name and kept
+    /// outside the entry list so a rules-directory reload does not reset
+    /// it: an operator editing one rule file should not lose the answer to
+    /// "is anything hitting this".
+    hits: RwLock<HashMap<String, Hit>>,
 }
+
+/// Hit accounting for one rule name.
+struct Hit {
+    count: AtomicU64,
+    /// Unix milliseconds of the most recent hit.
+    last_ms: AtomicU64,
+}
+
+/// Most rule names tracked at once.
+///
+/// The map is keyed by name and outlives the rules themselves, so a client
+/// looping add-then-delete with fresh names would otherwise grow it without
+/// bound. Past the cap new names simply go uncounted: losing accounting for
+/// a rule is a cosmetic failure, while refusing the rule or evicting a
+/// live one would change enforcement, and this runs on the verdict path.
+const MAX_TRACKED_RULE_NAMES: usize = 4096;
 
 /// A rule (or list) file is trusted when owned by root (or by the daemon's
 /// own euid, for non-root development runs) and not group/world-writable.
@@ -242,6 +264,7 @@ impl RuleStore {
             entries: Mutex::new(loaded.entries),
             rules_dir,
             rules_skipped: AtomicU64::new(loaded.skipped),
+            hits: RwLock::new(HashMap::new()),
         };
         store.rebuild();
         store
@@ -261,6 +284,68 @@ impl RuleStore {
     /// All rules, for `RuleList` replies.
     pub fn list(&self) -> Vec<Rule> {
         self.entries.lock().unwrap().iter().map(|e| e.rule.clone()).collect()
+    }
+
+    /// Count one connection decided by the rule named `name`.
+    ///
+    /// Runs on the verdict thread for every decided packet, so the common
+    /// path (a name already tracked) takes only a read lock and two relaxed
+    /// atomics. The write lock is reached once per rule name, ever.
+    pub fn record_hit(&self, name: &str) {
+        let now = hallpass_types::unix_ms_now();
+        {
+            let map = self.hits.read().unwrap_or_else(|e| e.into_inner());
+            if let Some(hit) = map.get(name) {
+                hit.count.fetch_add(1, Ordering::Relaxed);
+                hit.last_ms.store(now, Ordering::Relaxed);
+                return;
+            }
+        }
+        let mut map = self.hits.write().unwrap_or_else(|e| e.into_inner());
+        // Re-check: another thread may have inserted between the two locks.
+        if let Some(hit) = map.get(name) {
+            hit.count.fetch_add(1, Ordering::Relaxed);
+            hit.last_ms.store(now, Ordering::Relaxed);
+            return;
+        }
+        if map.len() >= MAX_TRACKED_RULE_NAMES {
+            return;
+        }
+        map.insert(
+            name.to_string(),
+            Hit {
+                count: AtomicU64::new(1),
+                last_ms: AtomicU64::new(now),
+            },
+        );
+    }
+
+    /// Hit counts for every currently loaded rule, in [`RuleStore::list`]
+    /// order.
+    ///
+    /// Loaded rules only: a name that has hits but no longer exists would
+    /// read as policy that is not there. Rules that never fired report zero
+    /// rather than being omitted, since "this rule has never matched" is the
+    /// interesting answer.
+    pub fn hits(&self) -> Vec<hallpass_types::RuleHit> {
+        let entries = self.entries.lock().unwrap();
+        let map = self.hits.read().unwrap_or_else(|e| e.into_inner());
+        entries
+            .iter()
+            .map(|e| {
+                let (hits, last) = map.get(&e.rule.name).map_or((0, 0), |h| {
+                    (
+                        h.count.load(Ordering::Relaxed),
+                        h.last_ms.load(Ordering::Relaxed),
+                    )
+                });
+                hallpass_types::RuleHit {
+                    name: e.rule.name.clone(),
+                    hits,
+                    last_hit_ms: (last > 0).then_some(last),
+                }
+            })
+            .collect()
     }
 
     /// Add or replace a rule by name. Forever rules are persisted to disk.
@@ -790,6 +875,49 @@ mod tests {
         assert!(store.sweep_expired());
         assert!(store.list().is_empty());
         assert!(!dir.join("stale.toml").exists(), "expired rule file should be deleted");
+    }
+
+    #[test]
+    fn hits_count_per_name_and_survive_reload() {
+        let (_td, dir) = tmpdir("hits");
+        let store = RuleStore::new(dir.clone());
+        store.add(rule("a", RuleDuration::Forever)).unwrap();
+        store.add(rule("b", RuleDuration::Forever)).unwrap();
+
+        store.record_hit("a");
+        store.record_hit("a");
+        let hits = store.hits();
+        assert_eq!(hits.len(), 2, "every loaded rule is reported");
+        let a = hits.iter().find(|h| h.name == "a").unwrap();
+        assert_eq!(a.hits, 2);
+        assert!(a.last_hit_ms.is_some());
+        // A rule that never fired reports zero rather than vanishing: that
+        // is the interesting answer when auditing dead policy.
+        let b = hits.iter().find(|h| h.name == "b").unwrap();
+        assert_eq!(b.hits, 0);
+        assert_eq!(b.last_hit_ms, None);
+
+        // Editing rules on disk must not reset the accounting.
+        store.reload_disk();
+        assert_eq!(store.hits().iter().find(|h| h.name == "a").unwrap().hits, 2);
+
+        // A name with no loaded rule is not reported: it would read as
+        // policy that is not there.
+        store.record_hit("ghost");
+        assert!(store.hits().iter().all(|h| h.name != "ghost"));
+    }
+
+    /// The counter map outlives the rules it counts, so a client looping
+    /// add-then-delete with fresh names must not grow it without bound.
+    #[test]
+    fn hit_tracking_is_capped() {
+        let (_td, dir) = tmpdir("hitcap");
+        let store = RuleStore::new(dir.clone());
+        for i in 0..(MAX_TRACKED_RULE_NAMES + 100) {
+            store.record_hit(&format!("r{i}"));
+        }
+        let tracked = store.hits.read().unwrap().len();
+        assert_eq!(tracked, MAX_TRACKED_RULE_NAMES);
     }
 
     #[test]

@@ -1,5 +1,17 @@
 # Hallpass daemon configuration.
 
+# "enforce" (default) applies every verdict. "observe" evaluates policy,
+# records what it decided, and lets every packet through anyway: nothing is
+# blocked while it is on.
+#
+# Observe mode answers "what would this policy break" without the outage,
+# and it is the fastest way to find out what a host talks to at all. Watch
+# it with `hallpass-cli top` or `hallpass-cli events`; a recorded block
+# shows up as WOULD-DENY, and `hallpass-cli status` reports the mode.
+# Unmatched connections are recorded as default_verdict and never prompt,
+# since answering a prompt that changes nothing would be misleading.
+mode = "enforce"
+
 # Verdict applied when no rule matches and no client answers the prompt
 # in time: "allow", "deny", or "reject".
 default_verdict = "allow"

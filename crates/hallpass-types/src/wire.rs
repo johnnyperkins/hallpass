@@ -97,6 +97,16 @@ mod tests {
         }
     }
 
+    fn sample_event(verdict: Verdict, enforced: bool) -> ConnEvent {
+        ConnEvent {
+            conn: sample_conn(),
+            verdict,
+            rule_name: Some("block-all".to_string()),
+            unix_ms: 1_720_000_000_123,
+            enforced,
+        }
+    }
+
     fn sample_rule() -> Rule {
         Rule {
             name: "allow-curl".to_string(),
@@ -170,6 +180,12 @@ mod tests {
                 enabled: false,
             },
             ClientMsg::Stats,
+            ClientMsg::EventHistory { limit: 200 },
+            ClientMsg::RuleStats,
+            ClientMsg::Explain(ExplainRequest {
+                conn: sample_conn(),
+                exe_sha256: Some("b".repeat(64)),
+            }),
         ];
         for msg in &msgs {
             let back = roundtrip(msg).await;
@@ -189,12 +205,7 @@ mod tests {
                 deadline_ms: 1_720_000_000_000,
             },
             DaemonMsg::PromptExpired { id: 1 },
-            DaemonMsg::Event(ConnEvent {
-                conn: sample_conn(),
-                verdict: Verdict::Reject,
-                rule_name: Some("block-all".to_string()),
-                unix_ms: 1_720_000_000_123,
-            }),
+            DaemonMsg::Event(sample_event(Verdict::Reject, true)),
             DaemonMsg::Rules(vec![sample_rule()]),
             DaemonMsg::Stats(Stats {
                 connections_total: 100,
@@ -207,11 +218,53 @@ mod tests {
                 rules_skipped: 1,
                 prompts_overflowed: 4,
                 other_proto_total: 6,
+                observed_only: 9,
+                dns_snoop_dropped: 11,
+                enforcing: false,
             }),
             DaemonMsg::Ok,
             DaemonMsg::Err {
                 message: "no such rule".to_string(),
             },
+            DaemonMsg::Events(vec![
+                sample_event(Verdict::Allow, true),
+                sample_event(Verdict::Deny, false),
+            ]),
+            DaemonMsg::RuleHits(vec![RuleHit {
+                name: "allow-curl".to_string(),
+                hits: 12,
+                last_hit_ms: Some(1_720_000_000_123),
+            }]),
+            DaemonMsg::Explanation(Explanation {
+                verdict: Verdict::Deny,
+                rule_name: Some("block-all".to_string()),
+                would_prompt: false,
+                enforced: true,
+                trace: vec![
+                    RuleTrace {
+                        name: "off".to_string(),
+                        priority: 9,
+                        outcome: TraceOutcome::Disabled,
+                    },
+                    RuleTrace {
+                        name: "narrow".to_string(),
+                        priority: 5,
+                        outcome: TraceOutcome::NoMatch {
+                            field: "port".to_string(),
+                        },
+                    },
+                    RuleTrace {
+                        name: "block-all".to_string(),
+                        priority: 0,
+                        outcome: TraceOutcome::Matched,
+                    },
+                    RuleTrace {
+                        name: "later".to_string(),
+                        priority: 0,
+                        outcome: TraceOutcome::NotReached,
+                    },
+                ],
+            }),
         ];
         for msg in &msgs {
             let back = roundtrip(msg).await;

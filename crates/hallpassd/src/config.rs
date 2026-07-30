@@ -53,6 +53,36 @@ pub struct ConfigArg {
 /// terminating NUL.
 const MAX_SOCKET_PATH: usize = 107;
 
+/// Whether the daemon applies its verdicts or only records them.
+///
+/// Observe mode exists because the honest answer to "what will this policy
+/// break" is unknowable from the rule files alone: it depends on what the
+/// machine actually talks to. Running the real evaluation path and recording
+/// the verdict without applying it answers that question with no outage risk,
+/// and it is also the fastest way to discover what a host reaches at all.
+///
+/// It is not a security posture. Nothing is blocked while it is on, so the
+/// daemon says so at startup, every event it emits carries
+/// `enforced = false`, and `Stats::enforcing` reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Mode {
+    /// Apply every verdict. Rules block traffic.
+    #[default]
+    Enforce,
+    /// Evaluate policy and record what it decided, then let the packet
+    /// through regardless. Unmatched connections are recorded as the
+    /// configured `default_verdict` and never raise a prompt.
+    Observe,
+}
+
+impl Mode {
+    /// True when verdicts are applied to packets.
+    pub fn enforcing(self) -> bool {
+        matches!(self, Mode::Enforce)
+    }
+}
+
 /// Daemon configuration. Every field has a default so a missing or partial
 /// file still yields a usable config.
 #[derive(Debug, Clone, Deserialize)]
@@ -81,6 +111,8 @@ pub struct Config {
     /// daemon is dead or the queue is full. `false` fails closed: those
     /// packets are dropped, trading availability for enforcement.
     pub queue_bypass: bool,
+    /// `"enforce"` (default) or `"observe"`. See [`Mode`].
+    pub mode: Mode,
 }
 
 impl Default for Config {
@@ -95,6 +127,7 @@ impl Default for Config {
             unhandled_proto_verdict: Verdict::Allow,
             syslog: None,
             queue_bypass: true,
+            mode: Mode::Enforce,
         }
     }
 }

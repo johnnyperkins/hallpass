@@ -19,7 +19,12 @@ use serde::{Deserialize, Serialize};
 ///
 /// v2: added `RuleMatch::exe_sha256` (postcard encodes structs positionally,
 /// so new fields are incompatible).
-pub const PROTOCOL_VERSION: u32 = 2;
+///
+/// v3: observability. `ConnEvent::enforced`, three new [`Stats`] fields, and
+/// the [`ClientMsg::EventHistory`], [`ClientMsg::RuleStats`] and
+/// [`ClientMsg::Explain`] request/reply pairs. Appended enum variants alone
+/// would not need a bump; the struct fields do.
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// Transport-layer protocol of a connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -511,6 +516,44 @@ mod display_tests {
 }
 
 #[cfg(test)]
+mod event_tests {
+    use super::*;
+
+    /// An unenforced deny must never render as a deny: the connection went
+    /// out, and a reader shown "DENY" would believe the opposite.
+    #[test]
+    fn observe_mode_labels_say_would() {
+        let mk = |verdict, enforced| ConnEvent {
+            conn: Connection {
+                tuple: FlowTuple {
+                    proto: Proto::Tcp,
+                    src: "127.0.0.1:1".parse().unwrap(),
+                    dst: "127.0.0.1:2".parse().unwrap(),
+                },
+                uid: None,
+                pid: None,
+                exe_path: None,
+                cmdline: None,
+                parent_exe: None,
+                domain: None,
+                iface: None,
+            },
+            verdict,
+            rule_name: None,
+            unix_ms: 0,
+            enforced,
+        };
+        assert_eq!(mk(Verdict::Deny, true).verdict_label(), "deny");
+        assert_eq!(mk(Verdict::Reject, true).verdict_label(), "reject");
+        assert_eq!(mk(Verdict::Deny, false).verdict_label(), "would-deny");
+        assert_eq!(mk(Verdict::Reject, false).verdict_label(), "would-reject");
+        // Allow is the same outcome either way, so it is never prefixed.
+        assert_eq!(mk(Verdict::Allow, true).verdict_label(), "allow");
+        assert_eq!(mk(Verdict::Allow, false).verdict_label(), "allow");
+    }
+}
+
+#[cfg(test)]
 mod time_tests {
     use super::*;
 
@@ -586,13 +629,38 @@ mod duration_tests {
 pub struct ConnEvent {
     /// The connection that was decided.
     pub conn: Connection,
-    /// The verdict applied.
+    /// The verdict policy arrived at. In observe mode this is what *would*
+    /// have happened; see [`ConnEvent::enforced`].
     pub verdict: Verdict,
     /// Name of the rule that decided it, if any (None for default verdict
     /// or interactive prompt decisions).
     pub rule_name: Option<String>,
     /// Decision time as Unix milliseconds.
     pub unix_ms: u64,
+    /// Whether [`ConnEvent::verdict`] was actually applied to the packet.
+    ///
+    /// False only in observe mode, where policy is evaluated and recorded but
+    /// every packet is let through. A reader that treats `verdict` as what
+    /// happened would report a blocked connection that in fact went out, so
+    /// anything rendering an event for a human must show this.
+    pub enforced: bool,
+}
+
+impl ConnEvent {
+    /// Verdict label for display: the plain verdict when it was enforced,
+    /// and a "would" form when observe mode only recorded it.
+    ///
+    /// Allow is never prefixed: an allowed connection went out either way,
+    /// so "would allow" would be a distinction without a difference.
+    pub fn verdict_label(&self) -> &'static str {
+        match (self.enforced, self.verdict) {
+            (true, Verdict::Allow) | (false, Verdict::Allow) => "allow",
+            (true, Verdict::Deny) => "deny",
+            (true, Verdict::Reject) => "reject",
+            (false, Verdict::Deny) => "would-deny",
+            (false, Verdict::Reject) => "would-reject",
+        }
+    }
 }
 
 /// Daemon runtime statistics.
@@ -623,6 +691,92 @@ pub struct Stats {
     /// ICMP, ...) or that failed to parse, resolved by the
     /// `unhandled_proto_verdict` config instead of rules.
     pub other_proto_total: u64,
+    /// Connections whose deny/reject verdict was recorded but not applied
+    /// because the daemon runs in observe mode. Zero while enforcing.
+    pub observed_only: u64,
+    /// Observed-DNS packets dropped because the snoop queue was full. Costs
+    /// a domain annotation on later connections, never a verdict.
+    pub dns_snoop_dropped: u64,
+    /// False in observe mode: rules are evaluated and events recorded, but
+    /// nothing is blocked. A status display that omits this shows a healthy
+    /// firewall that is not filtering.
+    pub enforcing: bool,
+}
+
+/// How often one rule has decided a connection, for [`ClientMsg::RuleStats`].
+///
+/// Accounting is per rule *name* and survives a rules-directory reload, so
+/// editing a rule file keeps its history. It resets when the daemon restarts:
+/// these counters answer "is this rule doing anything", not "audit log".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuleHit {
+    /// Rule name.
+    pub name: String,
+    /// Connections this rule decided since the daemon started.
+    pub hits: u64,
+    /// When it last decided one, as Unix milliseconds. None if never.
+    pub last_hit_ms: Option<u64>,
+}
+
+/// A hypothetical connection to evaluate against the loaded ruleset, without
+/// sending a packet.
+///
+/// The connection is described entirely by the client, so an explanation says
+/// what policy does with the *stated* facts. It is a policy debugger, not
+/// evidence about a real process: nothing here is verified against /proc.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExplainRequest {
+    /// The connection as the client describes it.
+    pub conn: Connection,
+    /// Hash to use for `exe_sha256` and `hashes_file` operands. When None,
+    /// the daemon hashes `conn.exe_path` if it can read it, exactly as it
+    /// would on the packet path.
+    pub exe_sha256: Option<String>,
+}
+
+/// Why one rule did or did not decide a connection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuleTrace {
+    /// Rule name.
+    pub name: String,
+    /// Rule priority, so the evaluation order is readable.
+    pub priority: u32,
+    /// What happened when this rule was considered.
+    pub outcome: TraceOutcome,
+}
+
+/// The per-rule result inside a [`RuleTrace`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TraceOutcome {
+    /// This rule matched and decided the connection.
+    Matched,
+    /// Skipped without evaluating: the rule is disabled.
+    Disabled,
+    /// Evaluated and did not match; `field` names the first operand that
+    /// failed, which is the one to edit.
+    NoMatch {
+        /// Operand name, as written in a rule file (`exe`, `port`, ...).
+        field: String,
+    },
+    /// Never evaluated: a higher-priority rule already decided.
+    NotReached,
+}
+
+/// Result of [`ClientMsg::Explain`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Explanation {
+    /// The verdict this connection would get.
+    pub verdict: Verdict,
+    /// Rule that decided it; None when no rule matched.
+    pub rule_name: Option<String>,
+    /// True when no rule matched, so the connection would raise a prompt and
+    /// [`Explanation::verdict`] is the configured default applied if nobody
+    /// answers in time.
+    pub would_prompt: bool,
+    /// False in observe mode: the verdict would be recorded, not applied.
+    pub enforced: bool,
+    /// Every rule in evaluation order, with why it did or did not decide.
+    pub trace: Vec<RuleTrace>,
 }
 
 /// Scope of the rule generated from an interactive prompt reply.
@@ -690,6 +844,22 @@ pub enum ClientMsg {
     },
     /// Request current daemon statistics.
     Stats,
+    /// Request recently decided connections from the daemon's in-memory
+    /// ring, newest last. Answered with [`DaemonMsg::Events`].
+    ///
+    /// Lets a client show what already happened instead of only what happens
+    /// next: [`ClientMsg::Subscribe`] delivers events from the moment it is
+    /// sent, so a monitor started after the traffic saw nothing.
+    EventHistory {
+        /// Maximum events to return, newest first. Clamped by the daemon to
+        /// its ring capacity.
+        limit: u32,
+    },
+    /// Request per-rule hit counts. Answered with [`DaemonMsg::RuleHits`].
+    RuleStats,
+    /// Ask what policy would do with a hypothetical connection. Answered
+    /// with [`DaemonMsg::Explanation`].
+    Explain(ExplainRequest),
 }
 
 /// Messages sent from the daemon to a client.
@@ -733,4 +903,11 @@ pub enum DaemonMsg {
         /// Human-readable error description.
         message: String,
     },
+    /// Response to [`ClientMsg::EventHistory`], oldest first so a client can
+    /// print it as a continuation of the live stream.
+    Events(Vec<ConnEvent>),
+    /// Response to [`ClientMsg::RuleStats`].
+    RuleHits(Vec<RuleHit>),
+    /// Response to [`ClientMsg::Explain`].
+    Explanation(Explanation),
 }

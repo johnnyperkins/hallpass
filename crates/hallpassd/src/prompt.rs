@@ -89,6 +89,13 @@ impl PromptTable {
         }
     }
 
+    /// Verdict applied to a connection no rule matched and no client
+    /// answered in time. Also what an explain request reports for a
+    /// connection that would raise a prompt.
+    pub fn default_verdict(&self) -> Verdict {
+        self.default_verdict
+    }
+
     /// Claim the prompt-handler slot. Returns false if already claimed.
     pub fn set_handler(&self, tx: Sender<DaemonMsg>) -> bool {
         let mut inner = self.inner.lock().unwrap();

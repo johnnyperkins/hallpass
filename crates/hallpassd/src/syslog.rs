@@ -162,6 +162,14 @@ impl std::fmt::Write for FieldWriter<'_> {
 fn for_each_field(ev: &ConnEvent, mut visit: impl FnMut(&'static str, &dyn std::fmt::Display)) {
     let c = &ev.conn;
     visit("verdict", &ev.verdict.as_str());
+    // Only emitted in observe mode, and deliberately not folded into
+    // `verdict`: a collector matching verdict="deny" keeps working, and a
+    // line without this field means the verdict was applied. Silently
+    // exporting an unenforced deny as a plain deny would put blocks that
+    // never happened into an audit trail.
+    if !ev.enforced {
+        visit("enforced", &"false");
+    }
     visit("proto", &c.tuple.proto);
     visit("src", &c.tuple.src);
     visit("dst", &c.tuple.dst);
@@ -369,6 +377,7 @@ mod tests {
             verdict: Verdict::Deny,
             rule_name: Some("block-example".into()),
             unix_ms: 1_720_000_000_123,
+            enforced: true,
         }
     }
 

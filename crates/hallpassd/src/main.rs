@@ -66,6 +66,18 @@ async fn main() {
     };
     tracing::info!(?cfg, "hallpassd starting");
 
+    let enforcing = cfg.mode.enforcing();
+    if !enforcing {
+        // Loud, and once at startup where an operator reading the journal
+        // after a restart will see it: every other signal (events marked
+        // unenforced, `enforcing` in the stats) is only visible to someone
+        // already looking.
+        tracing::warn!(
+            "observe mode: policy is evaluated and recorded but NOT enforced, \
+             nothing will be blocked"
+        );
+    }
+
     if rules::store::effective_uid() != Some(0) {
         tracing::warn!(
             "not running as root: nftables install and packet interception will likely fail"
@@ -148,9 +160,12 @@ async fn main() {
         std::process::exit(101);
     }));
 
-    // Shared state.
-    let events = Arc::new(EventBus::default());
-    let counters = Arc::new(Counters::default());
+    // Shared state. Observe mode is threaded through both of these rather
+    // than checked at every use: the event bus stamps `enforced` onto every
+    // event it emits, and the counters report `enforcing` in every snapshot,
+    // so no consumer has to be told about the mode separately.
+    let events = Arc::new(EventBus::new(enforcing));
+    let counters = Arc::new(Counters::new(enforcing));
     let store = Arc::new(RuleStore::new(cfg.rules_dir.clone()));
     if let Err(e) = rules::store::spawn_watcher(Arc::clone(&store)) {
         tracing::warn!("rules dir watcher unavailable: {e}");
@@ -239,7 +254,11 @@ async fn main() {
     // Blocking nfqueue loop on its own thread, over the queue bound
     // before the nftables install. None means interception is off for
     // this run (no privileges); rule management still works over IPC.
+    //
+    // The hash cache is shared with the IPC server so an explain request
+    // resolves an executable exactly as the verdict path would.
     let shutdown = Arc::new(AtomicBool::new(false));
+    let exe_hash = Arc::new(attribution::hash::ExeHashCache::default());
     let queue_thread = queue.map(|queue| {
         nfqueue::spawn(
             queue,
@@ -253,8 +272,10 @@ async fn main() {
                 verdict_rx,
                 dns_tx,
                 dns_cache,
-                exe_hash: Arc::new(attribution::hash::ExeHashCache::default()),
+                exe_hash: Arc::clone(&exe_hash),
                 unhandled_verdict: cfg.unhandled_proto_verdict,
+                enforcing,
+                default_verdict: cfg.default_verdict,
                 shutdown: Arc::clone(&shutdown),
                 fatal_tx,
             },
@@ -267,6 +288,7 @@ async fn main() {
         prompts,
         events,
         stats: counters,
+        exe_hash,
     });
     let ipc_task = tokio::spawn(async move {
         if let Err(e) = ipc::server::serve(ipc_listener, ipc_deps).await {

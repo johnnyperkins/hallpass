@@ -60,6 +60,13 @@ pub struct QueueDeps {
     pub exe_hash: Arc<ExeHashCache>,
     /// Verdict for packets rules cannot model (SCTP, ICMP, malformed).
     pub unhandled_verdict: Verdict,
+    /// False in observe mode: policy is evaluated and every decision is
+    /// recorded, but the packet is accepted whatever the verdict says.
+    pub enforcing: bool,
+    /// Verdict recorded for an unmatched connection in observe mode, where
+    /// nothing is held for a prompt. Matches what the prompt path would
+    /// apply if nobody answered.
+    pub default_verdict: Verdict,
     pub shutdown: Arc<AtomicBool>,
     /// Signalled when the loop dies on a persistent error, so the daemon
     /// shuts down (and tears nftables down) instead of running on looking
@@ -88,6 +95,46 @@ fn apply_verdict(queue: &mut Queue, mut msg: nfq::Message, verdict: Verdict) {
     if let Err(e) = queue.verdict(msg) {
         tracing::warn!("verdict delivery failed: {e}");
     }
+}
+
+/// The verdict actually handed to the kernel for a policy `verdict`.
+///
+/// Observe mode has exactly one job: never change what reaches the wire. Every
+/// path that hands a packet back goes through here so that stays true as paths
+/// are added, because a single missed call site would block traffic on a host
+/// whose operator was told nothing would be.
+fn applied_verdict(verdict: Verdict, enforcing: bool) -> Verdict {
+    if enforcing {
+        verdict
+    } else {
+        Verdict::Allow
+    }
+}
+
+/// Commit a decision: count it, record it as an event, and hand the packet
+/// back to the kernel.
+///
+/// The verdict that is recorded and the verdict that is applied are the same
+/// thing only while enforcing. In observe mode the packet is always accepted,
+/// so the event carries what policy decided (marked unenforced by the event
+/// bus) and the operator gets the rollout number without the outage.
+fn commit(
+    queue: &mut Queue,
+    msg: nfq::Message,
+    verdict: Verdict,
+    rule_name: Option<String>,
+    conn: Connection,
+    deps: &QueueDeps,
+) {
+    deps.stats.record_verdict(verdict);
+    if let Some(name) = &rule_name {
+        deps.rules.record_hit(name);
+    }
+    if !deps.enforcing && verdict != Verdict::Allow {
+        deps.stats.record_observed_only();
+    }
+    deps.events.emit(conn, verdict, rule_name);
+    apply_verdict(queue, msg, applied_verdict(verdict, deps.enforcing));
 }
 
 /// What to do with one received flow packet.
@@ -204,9 +251,11 @@ pub fn run(mut queue: Queue, queue_num: u16, mut deps: QueueDeps) -> std::io::Re
                 // they are counted and resolved by the configured policy.
                 let packet::Parsed::Flow(tuple) = parsed else {
                     deps.stats.record_other_proto();
+                    // These carry no Connection, so there is no event to
+                    // emit and observe mode can only note it in the log.
                     if deps.unhandled_verdict == Verdict::Allow {
                         tracing::debug!(?parsed, "unhandled packet allowed by policy");
-                    } else {
+                    } else if deps.enforcing {
                         // Blocked traffic must be findable without debug
                         // logging: this is the only trace of e.g. a dead
                         // ping under the hardened policy.
@@ -215,8 +264,15 @@ pub fn run(mut queue: Queue, queue_num: u16, mut deps: QueueDeps) -> std::io::Re
                             verdict = deps.unhandled_verdict.as_str(),
                             "unhandled packet blocked by policy"
                         );
+                    } else {
+                        tracing::info!(
+                            ?parsed,
+                            verdict = deps.unhandled_verdict.as_str(),
+                            "observe mode: unhandled packet would be blocked by policy"
+                        );
                     }
-                    apply_verdict(&mut queue, msg, deps.unhandled_verdict);
+                    let applied = applied_verdict(deps.unhandled_verdict, deps.enforcing);
+                    apply_verdict(&mut queue, msg, applied);
                     continue;
                 };
 
@@ -237,9 +293,16 @@ pub fn run(mut queue: Queue, queue_num: u16, mut deps: QueueDeps) -> std::io::Re
                 };
                 match decide(tuple, iface, &ctx) {
                     Decision::Verdict(verdict, rule_name, conn) => {
-                        deps.stats.record_verdict(verdict);
-                        deps.events.emit(conn, verdict, Some(rule_name));
-                        apply_verdict(&mut queue, msg, verdict);
+                        commit(&mut queue, msg, verdict, Some(rule_name), conn, &deps);
+                    }
+                    // Observe mode never holds a packet for a prompt: the
+                    // operator would be asked to decide something that is
+                    // not going to be applied, and answering would build
+                    // policy from a dialog that changed nothing. Record the
+                    // configured default instead, which is what an
+                    // unanswered prompt resolves to anyway.
+                    Decision::Prompt(conn) if !deps.enforcing => {
+                        commit(&mut queue, msg, deps.default_verdict, None, conn, &deps);
                     }
                     Decision::Prompt(conn) => {
                         let seq = next_seq;
@@ -390,6 +453,21 @@ mod tests {
                 assert_eq!(conn.domain, None);
             }
             _ => panic!("expected prompt"),
+        }
+    }
+
+    /// Observe mode must never change what reaches the wire, whatever policy
+    /// decided. The recorded verdict is a separate question, carried by the
+    /// event.
+    #[test]
+    fn observe_mode_applies_allow_to_every_verdict() {
+        for verdict in [Verdict::Allow, Verdict::Deny, Verdict::Reject] {
+            assert_eq!(applied_verdict(verdict, true), verdict, "enforcing");
+            assert_eq!(
+                applied_verdict(verdict, false),
+                Verdict::Allow,
+                "observe mode must accept {verdict:?}"
+            );
         }
     }
 

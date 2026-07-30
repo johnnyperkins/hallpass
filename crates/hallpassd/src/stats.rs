@@ -15,14 +15,25 @@ pub struct Counters {
     dns_spoof_rejected: AtomicU64,
     prompts_overflowed: AtomicU64,
     other_proto_total: AtomicU64,
-    /// Snoop packets dropped because the DNS queue was full. Internal only:
-    /// adding a field to the `Stats` wire type would bump the protocol, since
-    /// postcard encodes structs positionally.
+    /// Snoop packets dropped because the DNS queue was full.
     dns_snoop_dropped: AtomicU64,
+    /// Deny/reject verdicts recorded but not applied, in observe mode.
+    observed_only: AtomicU64,
+    /// False in observe mode. Reported so a client cannot read `denied` as
+    /// "blocked" when nothing was blocked.
+    enforcing: bool,
 }
 
 impl Default for Counters {
     fn default() -> Self {
+        Counters::new(true)
+    }
+}
+
+impl Counters {
+    /// Fresh counters. `enforcing` is false in observe mode and is reported
+    /// verbatim in the [`Stats`] snapshot.
+    pub fn new(enforcing: bool) -> Self {
         Counters {
             start: Instant::now(),
             connections_total: AtomicU64::new(0),
@@ -33,11 +44,11 @@ impl Default for Counters {
             prompts_overflowed: AtomicU64::new(0),
             other_proto_total: AtomicU64::new(0),
             dns_snoop_dropped: AtomicU64::new(0),
+            observed_only: AtomicU64::new(0),
+            enforcing,
         }
     }
-}
 
-impl Counters {
     /// Count a decided connection.
     pub fn record_verdict(&self, verdict: Verdict) {
         self.connections_total.fetch_add(1, Ordering::Relaxed);
@@ -83,6 +94,14 @@ impl Counters {
         self.other_proto_total.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Count a deny or reject that observe mode recorded without applying.
+    ///
+    /// This is the number an operator sizes a rollout by: it is exactly what
+    /// would have broken had the same policy been enforced.
+    pub fn record_observed_only(&self) {
+        self.observed_only.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Snapshot for the IPC reply. `rules_loaded` and `rules_skipped` come
     /// from the rule store.
     pub fn snapshot(&self, rules_loaded: u32, rules_skipped: u64) -> Stats {
@@ -97,6 +116,9 @@ impl Counters {
             rules_skipped,
             prompts_overflowed: self.prompts_overflowed.load(Ordering::Relaxed),
             other_proto_total: self.other_proto_total.load(Ordering::Relaxed),
+            observed_only: self.observed_only.load(Ordering::Relaxed),
+            dns_snoop_dropped: self.dns_snoop_dropped.load(Ordering::Relaxed),
+            enforcing: self.enforcing,
         }
     }
 }
@@ -124,5 +146,23 @@ mod tests {
         assert_eq!(s.dns_spoof_rejected, 1);
         assert_eq!(s.rules_skipped, 4);
         assert_eq!(s.prompts_overflowed, 2);
+        assert_eq!(s.observed_only, 0);
+        assert!(s.enforcing);
+    }
+
+    /// Observe mode has to be visible in the snapshot: `denied` counts what
+    /// policy decided, and without `enforcing` a client would render that as
+    /// traffic it stopped.
+    #[test]
+    fn observe_mode_is_reported() {
+        let c = Counters::new(false);
+        c.record_verdict(Verdict::Deny);
+        c.record_observed_only();
+        c.record_dns_snoop_dropped();
+        let s = c.snapshot(0, 0);
+        assert!(!s.enforcing);
+        assert_eq!(s.denied, 1);
+        assert_eq!(s.observed_only, 1);
+        assert_eq!(s.dns_snoop_dropped, 1);
     }
 }

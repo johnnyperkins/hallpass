@@ -1,8 +1,17 @@
 //! First-match-wins rule evaluation over a compiled, sorted rule set.
 
-use hallpass_types::{Connection, Rule, Verdict};
+use hallpass_types::{Connection, Rule, RuleTrace, TraceOutcome, Verdict};
 
 use super::model::CompiledRule;
+
+/// Outcome of an explain evaluation: the deciding rule if any, plus why
+/// every rule did or did not decide, in evaluation order.
+pub struct ExplainResult {
+    /// Name and verdict of the deciding rule; None when nothing matched.
+    pub matched: Option<(String, Verdict)>,
+    /// Per-rule trace in evaluation order (highest priority first).
+    pub trace: Vec<RuleTrace>,
+}
 
 /// Immutable snapshot of compiled rules, ordered for evaluation:
 /// higher priority first, ties broken by name for determinism.
@@ -56,6 +65,58 @@ impl RuleSet {
     /// Number of compiled rules (enabled or not).
     pub fn rule_count(&self) -> usize {
         self.rules.len()
+    }
+
+    /// Evaluate `conn` exactly as [`RuleSet::match_conn`] does, recording
+    /// why each rule did or did not decide.
+    ///
+    /// An explanation that disagrees with enforcement is worse than none, so
+    /// this shares everything that can decide the outcome with `match_conn`:
+    /// the same `rules` vector in the same order, the same `enabled` filter,
+    /// and the same predicate, since [`CompiledRule::matches`] is defined as
+    /// [`CompiledRule::first_failing_field`] returning None. The only thing
+    /// added here is the reason, which cannot influence the verdict.
+    ///
+    /// Cost is one pass over the rules plus one allocation per rule for the
+    /// trace, which is fine for an operator request and is why the packet
+    /// path calls `match_conn` instead.
+    pub fn explain(&self, conn: &Connection, exe_sha256: Option<&str>) -> ExplainResult {
+        let mut matched: Option<(String, Verdict)> = None;
+        let mut trace = Vec::with_capacity(self.rules.len());
+        for rule in &self.rules {
+            let outcome = if matched.is_some() {
+                // First match wins, so these were never consulted. Reporting
+                // them as non-matching would invite the operator to "fix" a
+                // rule that nothing asked about.
+                TraceOutcome::NotReached
+            } else if !rule.enabled {
+                TraceOutcome::Disabled
+            } else {
+                match rule.first_failing_field(conn, exe_sha256) {
+                    Some(field) => TraceOutcome::NoMatch {
+                        field: field.to_string(),
+                    },
+                    None => {
+                        matched = Some((rule.name.clone(), Verdict::from(rule.action)));
+                        TraceOutcome::Matched
+                    }
+                }
+            };
+            trace.push(RuleTrace {
+                name: rule.name.clone(),
+                priority: rule.priority,
+                outcome,
+            });
+        }
+        // Cheap insurance in tests and debug builds against a future edit
+        // that splits the two walks apart again.
+        debug_assert_eq!(
+            matched.as_ref().map(|(name, verdict)| (name.as_str(), *verdict)),
+            self.match_conn(conn, exe_sha256)
+                .map(|(rule, verdict)| (rule.name.as_str(), verdict)),
+            "explain disagreed with match_conn"
+        );
+        ExplainResult { matched, trace }
     }
 
     /// True when some enabled hash-pinning rule could apply to `conn`
@@ -122,9 +183,12 @@ mod tests {
         expect: Option<(&'static str, Verdict)>,
     }
 
-    #[test]
-    fn table_driven_matching() {
-        let cases = vec![
+    /// The shared corpus: every case feeds both enforcement
+    /// ([`table_driven_matching`]) and the explainer
+    /// ([`explain_agrees_with_match_conn`]), so a case added for one is
+    /// automatically checked against the other.
+    fn cases() -> Vec<Case> {
+        vec![
             Case {
                 name: "higher priority wins",
                 rules: vec![
@@ -314,9 +378,30 @@ mod tests {
                 conn: curl(),
                 expect: Some(("ok", Verdict::Allow)),
             },
-        ];
+            Case {
+                name: "hash-pinned rule does not match without a hash",
+                rules: vec![
+                    rule(
+                        "pinned",
+                        Action::Allow,
+                        10,
+                        true,
+                        RuleMatch {
+                            exe_sha256: Some("ab".repeat(32)),
+                            ..Default::default()
+                        },
+                    ),
+                    rule("fallback", Action::Deny, 1, true, RuleMatch::default()),
+                ],
+                conn: curl(),
+                expect: Some(("fallback", Verdict::Deny)),
+            },
+        ]
+    }
 
-        for case in cases {
+    #[test]
+    fn table_driven_matching() {
+        for case in cases() {
             let set = RuleSet::compile(&case.rules);
             let got = set
                 .match_conn(&case.conn, None)
@@ -326,10 +411,189 @@ mod tests {
         }
     }
 
+    /// The explainer must name the deciding rule the enforcement path would
+    /// name, for every case in the shared corpus: priority order, the name
+    /// tiebreak, disabled rules, and the invalid-rule skip. An explanation
+    /// that disagrees with enforcement is worse than none.
+    #[test]
+    fn explain_agrees_with_match_conn() {
+        for case in cases() {
+            let set = RuleSet::compile(&case.rules);
+            let enforced = set
+                .match_conn(&case.conn, None)
+                .map(|(r, v)| (r.name.clone(), v));
+            let explained = set.explain(&case.conn, None);
+            assert_eq!(explained.matched, enforced, "case: {}", case.name);
+
+            // The trace must tell the same story as the verdict: one Matched
+            // entry, and it is the deciding rule.
+            let flagged: Vec<&str> = explained
+                .trace
+                .iter()
+                .filter(|t| t.outcome == TraceOutcome::Matched)
+                .map(|t| t.name.as_str())
+                .collect();
+            let want: Vec<&str> = enforced.iter().map(|(n, _)| n.as_str()).collect();
+            assert_eq!(flagged, want, "case: {}", case.name);
+            assert_eq!(
+                explained.trace.len(),
+                set.rule_count(),
+                "every compiled rule is traced, case: {}",
+                case.name
+            );
+        }
+    }
+
+    /// The trace distinguishes "did not match" from "was never consulted",
+    /// and blames the operand the operator has to edit.
+    #[test]
+    fn explain_trace_outcomes() {
+        struct TraceCase {
+            name: &'static str,
+            rules: Vec<Rule>,
+            expect: Vec<(&'static str, u32, TraceOutcome)>,
+        }
+        let no_match = |field: &str| TraceOutcome::NoMatch {
+            field: field.to_string(),
+        };
+        let cases = vec![
+            TraceCase {
+                name: "rules below the decision were not consulted",
+                rules: vec![
+                    rule("high", Action::Deny, 10, true, RuleMatch::default()),
+                    rule("low", Action::Allow, 1, true, RuleMatch::default()),
+                ],
+                expect: vec![
+                    ("high", 10, TraceOutcome::Matched),
+                    ("low", 1, TraceOutcome::NotReached),
+                ],
+            },
+            TraceCase {
+                name: "a disabled rule is never evaluated",
+                rules: vec![
+                    rule("off", Action::Deny, 10, false, RuleMatch::default()),
+                    rule("on", Action::Allow, 5, true, RuleMatch::default()),
+                ],
+                expect: vec![
+                    ("off", 10, TraceOutcome::Disabled),
+                    ("on", 5, TraceOutcome::Matched),
+                ],
+            },
+            TraceCase {
+                name: "the first failing operand is named",
+                rules: vec![
+                    rule(
+                        "wrong-port",
+                        Action::Deny,
+                        10,
+                        true,
+                        RuleMatch {
+                            port: Some(80),
+                            ..Default::default()
+                        },
+                    ),
+                    rule(
+                        "wrong-exe",
+                        Action::Deny,
+                        9,
+                        true,
+                        RuleMatch {
+                            exe: Some("/usr/bin/wget".into()),
+                            port: Some(443),
+                            ..Default::default()
+                        },
+                    ),
+                    rule("catch-all", Action::Allow, 1, true, RuleMatch::default()),
+                ],
+                expect: vec![
+                    ("wrong-port", 10, no_match("port")),
+                    ("wrong-exe", 9, no_match("exe")),
+                    ("catch-all", 1, TraceOutcome::Matched),
+                ],
+            },
+            TraceCase {
+                name: "nothing matches: every enabled rule reports a reason",
+                rules: vec![
+                    rule(
+                        "dom",
+                        Action::Deny,
+                        10,
+                        true,
+                        RuleMatch {
+                            domain: Some("*.example.com".into()),
+                            ..Default::default()
+                        },
+                    ),
+                    rule(
+                        "sub",
+                        Action::Deny,
+                        5,
+                        true,
+                        RuleMatch {
+                            src: Some("192.168.0.0/16".into()),
+                            ..Default::default()
+                        },
+                    ),
+                ],
+                expect: vec![("dom", 10, no_match("domain")), ("sub", 5, no_match("src"))],
+            },
+        ];
+
+        for case in cases {
+            let set = RuleSet::compile(&case.rules);
+            let got: Vec<(String, u32, TraceOutcome)> = set
+                .explain(&curl(), None)
+                .trace
+                .into_iter()
+                .map(|t| (t.name, t.priority, t.outcome))
+                .collect();
+            let want: Vec<(String, u32, TraceOutcome)> = case
+                .expect
+                .into_iter()
+                .map(|(n, p, o)| (n.to_string(), p, o))
+                .collect();
+            assert_eq!(got, want, "case: {}", case.name);
+        }
+    }
+
+    /// A hash-pinned rule is explained with the hash the caller supplies,
+    /// exactly as the packet path would evaluate it.
+    #[test]
+    fn explain_uses_the_supplied_hash() {
+        let rules = vec![rule(
+            "pinned",
+            Action::Allow,
+            1,
+            true,
+            RuleMatch {
+                exe_sha256: Some("ab".repeat(32)),
+                ..Default::default()
+            },
+        )];
+        let set = RuleSet::compile(&rules);
+        let hash = "ab".repeat(32);
+        assert_eq!(
+            set.explain(&curl(), Some(&hash)).matched,
+            Some(("pinned".to_string(), Verdict::Allow))
+        );
+        let other = "cd".repeat(32);
+        let missed = set.explain(&curl(), Some(&other));
+        assert_eq!(missed.matched, None);
+        assert_eq!(
+            missed.trace[0].outcome,
+            TraceOutcome::NoMatch {
+                field: "exe_sha256".to_string()
+            }
+        );
+    }
+
     #[test]
     fn empty_set() {
         let set = RuleSet::compile(&[]);
         assert_eq!(set.rule_count(), 0);
         assert!(set.match_conn(&curl(), None).is_none());
+        let explained = set.explain(&curl(), None);
+        assert!(explained.matched.is_none());
+        assert!(explained.trace.is_empty());
     }
 }

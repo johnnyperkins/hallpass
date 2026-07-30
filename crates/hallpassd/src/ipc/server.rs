@@ -13,6 +13,7 @@ use hallpass_types::{wire, ClientMsg, DaemonMsg, PROTOCOL_VERSION};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc;
 
+use crate::attribution::hash::ExeHashCache;
 use crate::events::EventBus;
 use crate::prompt::PromptTable;
 use crate::rules::store::RuleStore;
@@ -24,6 +25,9 @@ pub struct IpcDeps {
     pub prompts: Arc<PromptTable>,
     pub events: Arc<EventBus>,
     pub stats: Arc<Counters>,
+    /// Shared with the verdict path, so an explain request hashes an
+    /// executable the same way and reuses the same cached result.
+    pub exe_hash: Arc<ExeHashCache>,
 }
 
 /// Look up a group's GID in /etc/group.
@@ -180,6 +184,39 @@ async fn handle_conn(stream: UnixStream, deps: Arc<IpcDeps>) -> Result<(), wire:
     result
 }
 
+/// Answer "what would policy do with this connection, and why".
+///
+/// The connection is described entirely by the client, so this reports what
+/// the rules say about the stated facts. It deliberately reuses the same
+/// ruleset snapshot, the same hash cache, and the same evaluation order the
+/// verdict path uses: an explanation that could disagree with enforcement
+/// would be worse than none.
+fn explain(req: &hallpass_types::ExplainRequest, deps: &IpcDeps) -> hallpass_types::Explanation {
+    let set = deps.store.ruleset();
+    // Hash on the same terms as the packet path: only when a hash-pinning
+    // rule could apply, and only if the client did not state one.
+    let hash = match &req.exe_sha256 {
+        Some(h) => Some(h.clone()),
+        None if set.wants_exe_hash_for(&req.conn) => deps.exe_hash.for_connection(&req.conn),
+        None => None,
+    };
+    let result = set.explain(&req.conn, hash.as_deref());
+    let default_verdict = deps.prompts.default_verdict();
+    let (verdict, rule_name) = match result.matched {
+        Some((name, verdict)) => (verdict, Some(name)),
+        // No rule matched, so the connection would raise a prompt and the
+        // configured default is what applies if nobody answers in time.
+        None => (default_verdict, None),
+    };
+    hallpass_types::Explanation {
+        verdict,
+        would_prompt: rule_name.is_none(),
+        rule_name,
+        enforced: deps.events.enforcing(),
+        trace: result.trace,
+    }
+}
+
 /// Queue a reply for the writer task. Replies use the awaiting send: the
 /// queue only fills if the client stops reading, and then blocking this
 /// client's own request loop is the correct backpressure.
@@ -332,6 +369,11 @@ async fn message_loop(
                 let skipped = deps.store.rules_skipped();
                 DaemonMsg::Stats(deps.stats.snapshot(rules, skipped))
             }
+            ClientMsg::EventHistory { limit } => {
+                DaemonMsg::Events(deps.events.history(limit as usize))
+            }
+            ClientMsg::RuleStats => DaemonMsg::RuleHits(deps.store.hits()),
+            ClientMsg::Explain(req) => DaemonMsg::Explanation(explain(&req, deps)),
         };
         send(out_tx, reply).await;
     }
@@ -406,6 +448,7 @@ mod tests {
                 prompts,
                 events,
                 stats,
+                exe_hash: Arc::new(ExeHashCache::default()),
             }),
             dir,
         )

@@ -165,112 +165,141 @@ impl CompiledRule {
     /// True when every present criterion matches (AND semantics). A rule
     /// with no criteria matches everything. `exe_sha256` is the hash of
     /// the connection's executable, if it was computed (lowercase hex).
+    ///
+    /// Inlined so the packet path keeps the shape it had before the
+    /// explainer shared this predicate: a discarded `&'static str`.
+    #[inline]
     pub fn matches(&self, conn: &Connection, exe_sha256: Option<&str>) -> bool {
-        if !self.matches_ignoring_hash(conn) {
-            return false;
+        self.first_failing_field(conn, exe_sha256).is_none()
+    }
+
+    /// The first criterion `conn` fails, named as the key the operator would
+    /// edit in the rule file (`exe`, `port_range`, `hashes_file`, ...), or
+    /// None when the rule matches.
+    ///
+    /// This is the only implementation of the match predicate: [`matches`]
+    /// is defined as "nothing failed", so the policy explainer cannot blame
+    /// a field that enforcement disagreed about. A `&'static str` keeps it
+    /// allocation-free, so the packet path pays nothing for the detail.
+    ///
+    /// [`matches`]: CompiledRule::matches
+    pub fn first_failing_field(
+        &self,
+        conn: &Connection,
+        exe_sha256: Option<&str>,
+    ) -> Option<&'static str> {
+        if let Some(field) = self.first_failing_non_hash_field(conn) {
+            return Some(field);
         }
         if let Some(want) = &self.exe_sha256 {
             // Hashes are produced lowercase on both sides; direct compare.
             match exe_sha256 {
                 Some(have) if have == want.as_str() => {}
-                _ => return false,
+                _ => return Some("exe_sha256"),
             }
         }
         if let Some(hashes) = &self.hashes_file {
             match exe_sha256 {
                 Some(have) if hashes.contains(have) => {}
-                _ => return false,
+                _ => return Some("hashes_file"),
             }
         }
-        true
+        None
     }
 
     /// All criteria except the executable hash. Split out so the packet
     /// path can decide whether hashing is worth doing for a connection
     /// before paying for it.
+    #[inline]
     pub fn matches_ignoring_hash(&self, conn: &Connection) -> bool {
+        self.first_failing_non_hash_field(conn).is_none()
+    }
+
+    /// [`CompiledRule::first_failing_field`] without the hash criteria, which
+    /// are the ones that need a hash the caller may not have computed yet.
+    fn first_failing_non_hash_field(&self, conn: &Connection) -> Option<&'static str> {
         let dst = conn.tuple.dst;
         if let Some(exe) = &self.exe {
             if conn.exe_path.as_deref() != Some(exe) {
-                return false;
+                return Some("exe");
             }
         }
         if let Some(glob) = &self.exe_glob {
             match &conn.exe_path {
                 Some(path) if glob.is_match(path) => {}
-                _ => return false,
+                _ => return Some("exe_glob"),
             }
         }
         if let Some(net) = &self.dest {
             if !net.contains(&dst.ip()) {
-                return false;
+                return Some("dest");
             }
         }
         if let Some(port) = self.port {
             if dst.port() != port {
-                return false;
+                return Some("port");
             }
         }
         if let Some((lo, hi)) = self.port_range {
             if !(lo..=hi).contains(&dst.port()) {
-                return false;
+                return Some("port_range");
             }
         }
         if let Some(pattern) = &self.domain {
             match &conn.domain {
                 Some(d) if pattern.matches(d) => {}
-                _ => return false,
+                _ => return Some("domain"),
             }
         }
         if let Some(user) = self.user {
             if conn.uid != Some(user) {
-                return false;
+                return Some("user");
             }
         }
         if let Some(proto) = self.proto {
             if conn.tuple.proto != proto {
-                return false;
+                return Some("proto");
             }
         }
         if let Some(domains) = &self.domains_file {
             match &conn.domain {
                 Some(d) if domains.contains(d) => {}
-                _ => return false,
+                _ => return Some("domains_file"),
             }
         }
         if let Some(ips) = &self.ips_file {
             if !ips.contains(&dst.ip()) {
-                return false;
+                return Some("ips_file");
             }
         }
         if let Some(needle) = &self.cmdline_contains {
             match &conn.cmdline {
                 Some(cmdline) if cmdline.contains(needle.as_str()) => {}
-                _ => return false,
+                _ => return Some("cmdline_contains"),
             }
         }
         if let Some(parent) = &self.parent_exe {
             if conn.parent_exe.as_deref() != Some(parent) {
-                return false;
+                return Some("parent_exe");
             }
         }
         if let Some(net) = &self.src {
             if !net.contains(&conn.tuple.src.ip()) {
-                return false;
+                return Some("src");
             }
         }
         if let Some(port) = self.src_port {
             if conn.tuple.src.port() != port {
-                return false;
+                return Some("src_port");
             }
         }
         if let Some(iface) = &self.iface {
             match &conn.iface {
                 Some(have) if have == iface => {}
-                _ => return false,
+                _ => return Some("iface"),
             }
         }
-        true
+        None
     }
 }
 
@@ -461,6 +490,198 @@ mod tests {
             ..Default::default()
         }))
         .is_err());
+    }
+
+    /// The reported field is the TOML key the operator has to edit, and it
+    /// is the *first* failing one so the report is deterministic. A name
+    /// that drifts from the key (an internal field name, say) sends the
+    /// operator looking for something their rule file does not contain.
+    #[test]
+    fn first_failing_field_names_the_toml_key() {
+        let conn = Connection {
+            tuple: hallpass_types::FlowTuple {
+                proto: Proto::Tcp,
+                src: "192.168.1.5:40000".parse().unwrap(),
+                dst: "1.2.3.4:443".parse().unwrap(),
+            },
+            uid: Some(1000),
+            pid: Some(1),
+            exe_path: Some("/usr/bin/curl".into()),
+            cmdline: Some("curl https://example.org".into()),
+            parent_exe: Some("/usr/bin/bash".into()),
+            domain: Some("example.org".into()),
+            iface: Some("wg0".into()),
+        };
+
+        struct Case {
+            name: &'static str,
+            matcher: RuleMatch,
+            expect: Option<&'static str>,
+        }
+        let m = RuleMatch::default;
+        let cases = vec![
+            Case { name: "no criteria matches", matcher: m(), expect: None },
+            Case {
+                name: "exe",
+                matcher: RuleMatch { exe: Some("/usr/bin/wget".into()), ..m() },
+                expect: Some("exe"),
+            },
+            Case {
+                name: "exe_glob",
+                matcher: RuleMatch { exe_glob: Some("/opt/*".into()), ..m() },
+                expect: Some("exe_glob"),
+            },
+            Case {
+                name: "exe_sha256",
+                matcher: RuleMatch { exe_sha256: Some("ab".repeat(32)), ..m() },
+                expect: Some("exe_sha256"),
+            },
+            Case {
+                name: "dest",
+                matcher: RuleMatch { dest: Some("10.0.0.0/8".into()), ..m() },
+                expect: Some("dest"),
+            },
+            Case {
+                name: "port",
+                matcher: RuleMatch { port: Some(80), ..m() },
+                expect: Some("port"),
+            },
+            Case {
+                name: "port_range",
+                matcher: RuleMatch { port_range: Some((1, 100)), ..m() },
+                expect: Some("port_range"),
+            },
+            Case {
+                name: "domain",
+                matcher: RuleMatch { domain: Some("*.example.com".into()), ..m() },
+                expect: Some("domain"),
+            },
+            Case {
+                name: "user",
+                matcher: RuleMatch { user: Some(0), ..m() },
+                expect: Some("user"),
+            },
+            Case {
+                name: "proto",
+                matcher: RuleMatch { proto: Some(Proto::Udp), ..m() },
+                expect: Some("proto"),
+            },
+            Case {
+                name: "cmdline_contains",
+                matcher: RuleMatch { cmdline_contains: Some("wget".into()), ..m() },
+                expect: Some("cmdline_contains"),
+            },
+            Case {
+                name: "parent_exe",
+                matcher: RuleMatch { parent_exe: Some("/usr/bin/zsh".into()), ..m() },
+                expect: Some("parent_exe"),
+            },
+            Case {
+                name: "src",
+                matcher: RuleMatch { src: Some("10.0.0.0/8".into()), ..m() },
+                expect: Some("src"),
+            },
+            Case {
+                name: "src_port",
+                matcher: RuleMatch { src_port: Some(1234), ..m() },
+                expect: Some("src_port"),
+            },
+            Case {
+                name: "iface",
+                matcher: RuleMatch { iface: Some("eth0".into()), ..m() },
+                expect: Some("iface"),
+            },
+            Case {
+                name: "earliest failing operand wins over later ones",
+                matcher: RuleMatch {
+                    dest: Some("10.0.0.0/8".into()),
+                    port: Some(80),
+                    proto: Some(Proto::Udp),
+                    ..m()
+                },
+                expect: Some("dest"),
+            },
+            Case {
+                name: "a satisfied operand is not blamed",
+                matcher: RuleMatch { port: Some(443), user: Some(0), ..m() },
+                expect: Some("user"),
+            },
+        ];
+
+        for case in cases {
+            let compiled = CompiledRule::compile(&rule_with(case.matcher)).unwrap();
+            let got = compiled.first_failing_field(&conn, None);
+            assert_eq!(got, case.expect, "case: {}", case.name);
+            // matches() is this method's is_none(), so they cannot disagree;
+            // assert it anyway to catch a future re-split.
+            assert_eq!(
+                compiled.matches(&conn, None),
+                case.expect.is_none(),
+                "case: {}",
+                case.name
+            );
+        }
+    }
+
+    /// The list-file operands are reported by their own keys, and a hash
+    /// operand is only blamed once the non-hash criteria have passed.
+    #[test]
+    fn first_failing_field_for_list_operands() {
+        use crate::testutil::TestDir;
+        let dir = TestDir::new("model-fail-fields");
+        let domains = dir.path().join("ads.list");
+        std::fs::write(&domains, "ads.example.com\n").unwrap();
+        let ips = dir.path().join("bad.list");
+        std::fs::write(&ips, "10.0.0.0/8\n").unwrap();
+        let hashes = dir.path().join("h.sha256");
+        std::fs::write(&hashes, format!("{}\n", "ab".repeat(32))).unwrap();
+
+        let conn = Connection {
+            tuple: hallpass_types::FlowTuple {
+                proto: Proto::Tcp,
+                src: "10.0.0.1:40000".parse().unwrap(),
+                dst: "1.2.3.4:443".parse().unwrap(),
+            },
+            uid: None,
+            pid: None,
+            exe_path: None,
+            cmdline: None,
+            parent_exe: None,
+            domain: Some("example.org".into()),
+            iface: None,
+        };
+
+        let compiled = CompiledRule::compile(&rule_with(RuleMatch {
+            domains_file: Some(domains),
+            ..Default::default()
+        }))
+        .unwrap();
+        assert_eq!(compiled.first_failing_field(&conn, None), Some("domains_file"));
+
+        let compiled = CompiledRule::compile(&rule_with(RuleMatch {
+            ips_file: Some(ips),
+            ..Default::default()
+        }))
+        .unwrap();
+        assert_eq!(compiled.first_failing_field(&conn, None), Some("ips_file"));
+
+        // port fails first, so the missing hash is not what the operator
+        // is told to fix.
+        let compiled = CompiledRule::compile(&rule_with(RuleMatch {
+            port: Some(80),
+            hashes_file: Some(hashes),
+            ..Default::default()
+        }))
+        .unwrap();
+        assert_eq!(compiled.first_failing_field(&conn, None), Some("port"));
+        let compiled = CompiledRule::compile(&rule_with(RuleMatch {
+            port: Some(443),
+            hashes_file: Some(dir.path().join("h.sha256")),
+            ..Default::default()
+        }))
+        .unwrap();
+        assert_eq!(compiled.first_failing_field(&conn, None), Some("hashes_file"));
+        assert_eq!(compiled.first_failing_field(&conn, Some(&"ab".repeat(32))), None);
     }
 
     #[test]
