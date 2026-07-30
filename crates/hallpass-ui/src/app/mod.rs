@@ -1016,92 +1016,12 @@ fn format_uptime(secs: u64) -> String {
     format!("{h}h {m:02}m {s:02}s")
 }
 
+/// Headless state tests: the app driven through its own channels, with no
+/// socket, no daemon and no display.
 #[cfg(test)]
-mod tests {
-    use super::*;
+mod tests;
 
-    #[test]
-    fn uptime_formatting() {
-        assert_eq!(format_uptime(0), "0h 00m 00s");
-        assert_eq!(format_uptime(3661), "1h 01m 01s");
-        assert_eq!(format_uptime(86400), "24h 00m 00s");
-    }
-
-    #[test]
-    fn labels() {
-        assert_eq!(duration_label(RuleDuration::Session), "Session");
-        assert_eq!(scope_label(PromptScope::AppAnywhere), "App anywhere");
-        assert_eq!(verdict_label(Verdict::Reject), "reject");
-    }
-
-    /// A rejected toggle or delete must send the operator back to the
-    /// daemon's view. Both outcomes refetch, because nothing here can tell
-    /// an accepted change from a refused one, and the wrong guess leaves an
-    /// enforced rule looking disabled or invisible.
-    #[test]
-    fn toggle_and_delete_acks_force_a_refresh() {
-        assert!(needs_refresh(Some(AckKind::RuleToggle)));
-        assert!(needs_refresh(Some(AckKind::RuleDelete)));
-        // A rule save reconciles through the editor, and the editor sends
-        // its own RuleList; refetching here too would be noise.
-        assert!(!needs_refresh(Some(AckKind::RuleSave)));
-        assert!(!needs_refresh(Some(AckKind::Other)));
-        assert!(!needs_refresh(None));
-    }
-
-    /// Toggles and deletes must not share an ack kind with anything else:
-    /// the FIFO is how a reply is matched to its request, so a miscategorized
-    /// request reconciles the wrong thing.
-    #[test]
-    fn ack_kinds_are_distinct_per_request() {
-        let toggle = ClientMsg::RuleToggle { name: "r".into(), enabled: false };
-        let delete = ClientMsg::RuleDelete { name: "r".into() };
-        assert_eq!(ack_kind(&toggle), Some(AckKind::RuleToggle));
-        assert_eq!(ack_kind(&delete), Some(AckKind::RuleDelete));
-        assert_eq!(
-            ack_kind(&ClientMsg::Subscribe { events: true, prompts: true }),
-            Some(AckKind::Other)
-        );
-        // Requests answered with data, not an ack, must not enter the FIFO
-        // at all or every later reply is matched to the wrong request.
-        assert_eq!(ack_kind(&ClientMsg::RuleList), None);
-        assert_eq!(ack_kind(&ClientMsg::Stats), None);
-        assert_eq!(ack_kind(&ClientMsg::EventHistory { limit: 10 }), None);
-    }
-
-    /// Every reconnect asks for history again, and a daemon that did not
-    /// restart still holds what this client already has. Appending it twice
-    /// duplicated feed rows and inflated every traffic count, which is
-    /// rebuilt from this ring each frame.
-    #[test]
-    fn replayed_history_events_are_recognized() {
-        let mk = |ms: u64, verdict| ConnEvent {
-            conn: Connection {
-                tuple: hallpass_types::FlowTuple {
-                    proto: hallpass_types::Proto::Tcp,
-                    src: "10.0.0.1:40000".parse().unwrap(),
-                    dst: "1.1.1.1:443".parse().unwrap(),
-                },
-                uid: None,
-                pid: None,
-                exe_path: None,
-                cmdline: None,
-                parent_exe: None,
-                domain: None,
-                iface: None,
-            },
-            verdict,
-            rule_name: None,
-            unix_ms: ms,
-            enforced: true,
-        };
-        let a = mk(1000, Verdict::Allow);
-        assert_eq!(event_key(&a), event_key(&a.clone()), "the same decision");
-        // A different time, flow or verdict is a different decision.
-        assert_ne!(event_key(&a), event_key(&mk(1001, Verdict::Allow)));
-        assert_ne!(event_key(&a), event_key(&mk(1000, Verdict::Deny)));
-        let mut other_flow = mk(1000, Verdict::Allow);
-        other_flow.conn.tuple.src = "10.0.0.1:40001".parse().unwrap();
-        assert_ne!(event_key(&a), event_key(&other_flow));
-    }
-}
+/// Tests of properties only a real widget tree can express, through
+/// `egui_kittest`.
+#[cfg(test)]
+mod widget_tests;

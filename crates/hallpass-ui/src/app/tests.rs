@@ -1,0 +1,707 @@
+//! Headless state tests for [`HallpassApp`].
+//!
+//! Every GUI defect this branch produced was state logic that happened to
+//! live behind a window: an edit applied before the daemon agreed to it, a
+//! backfill appended twice, a claim about enforcement made before anything
+//! had said so. None of them needed pixels to reproduce, only the app's two
+//! channels, which is what these tests drive. No socket, no daemon, no
+//! display, so they run in the ordinary workspace suite.
+
+use std::time::Duration;
+
+use hallpass_types::{Action, DaemonMsg, FlowTuple, Proto, RuleMatch};
+
+use super::*;
+
+/// An app plus the ends of its channel pair the network thread would own.
+struct TestApp {
+    app: HallpassApp,
+    /// Where the network thread would deliver from.
+    to_ui: std::sync::mpsc::Sender<UiEvent>,
+    /// What the network thread would write to the daemon.
+    from_ui: tokio::sync::mpsc::UnboundedReceiver<ClientMsg>,
+}
+
+impl TestApp {
+    fn new() -> Self {
+        let (to_daemon, from_ui) = tokio::sync::mpsc::unbounded_channel();
+        let (to_ui, from_net) = std::sync::mpsc::channel();
+        Self {
+            app: HallpassApp::with_channels(to_daemon, from_net),
+            to_ui,
+            from_ui,
+        }
+    }
+
+    /// Deliver one network event and let the app consume it, as a frame would.
+    fn feed(&mut self, ev: UiEvent) {
+        self.to_ui.send(ev).expect("the app holds the receiver");
+        self.app.drain_net();
+    }
+
+    /// Deliver one message from the daemon.
+    fn daemon(&mut self, msg: DaemonMsg) {
+        self.feed(UiEvent::Daemon(msg));
+    }
+
+    /// Everything the app has sent since this was last called.
+    fn sent(&mut self) -> Vec<ClientMsg> {
+        drain(&mut self.from_ui)
+    }
+
+    /// Open the rule editor with a save already in flight, the state the
+    /// window is in between clicking Save and the daemon answering.
+    fn editor_awaiting_ack(&mut self) {
+        let mut editor = RuleEditor::add();
+        editor.mark_sent();
+        self.app.editor = Some(editor);
+        self.app.send(ClientMsg::RuleAdd(rule("pending", true)));
+        self.sent();
+    }
+}
+
+/// Everything queued on the app's outgoing channel, in send order. Shared
+/// with the widget tests, which hold the receiver directly.
+pub(super) fn drain(from_ui: &mut tokio::sync::mpsc::UnboundedReceiver<ClientMsg>) -> Vec<ClientMsg> {
+    let mut out = Vec::new();
+    while let Ok(msg) = from_ui.try_recv() {
+        out.push(msg);
+    }
+    out
+}
+
+pub(super) fn conn(exe: &str, dst: &str) -> Connection {
+    Connection {
+        tuple: FlowTuple {
+            proto: Proto::Tcp,
+            src: "10.0.0.1:40000".parse().expect("source address"),
+            dst: dst.parse().expect("destination address"),
+        },
+        uid: Some(1000),
+        pid: Some(4242),
+        exe_path: Some(std::path::PathBuf::from(exe)),
+        cmdline: None,
+        parent_exe: None,
+        domain: None,
+        iface: None,
+    }
+}
+
+fn event(exe: &str, dst: &str, unix_ms: u64) -> ConnEvent {
+    ConnEvent {
+        conn: conn(exe, dst),
+        verdict: Verdict::Allow,
+        rule_name: None,
+        unix_ms,
+        enforced: true,
+    }
+}
+
+fn rule(name: &str, enabled: bool) -> Rule {
+    Rule {
+        name: name.to_string(),
+        action: Action::Deny,
+        duration: RuleDuration::Forever,
+        priority: 10,
+        enabled,
+        matcher: RuleMatch {
+            port: Some(443),
+            ..RuleMatch::default()
+        },
+    }
+}
+
+fn stats(enforcing: bool) -> Stats {
+    Stats {
+        enforcing,
+        ..Stats::default()
+    }
+}
+
+fn err(message: &str) -> DaemonMsg {
+    DaemonMsg::Err {
+        message: message.to_string(),
+    }
+}
+
+fn prompt_request(id: u64, exe: &str) -> DaemonMsg {
+    DaemonMsg::PromptRequest {
+        id,
+        conn: conn(exe, "93.184.216.34:443"),
+        deadline_ms: hallpass_types::unix_ms_now() + 30_000,
+    }
+}
+
+// ---- rule changes are the daemon's to make (662ea63) ---------------------
+
+/// A refused toggle leaves the rule enforced, so the screen has to go back
+/// to the daemon rather than keep the change it displayed. The list is only
+/// ever what the daemon last reported: it changes when the refetch lands and
+/// at no other time.
+///
+/// (That the checkbox itself does not edit the row is a property of the
+/// rules tab, tested where it lives; see the widget tests.)
+#[test]
+fn a_refused_toggle_sends_the_screen_back_to_the_daemon() {
+    let mut t = TestApp::new();
+    t.daemon(DaemonMsg::Rules(vec![rule("block-telemetry", true)]));
+    t.app.send(ClientMsg::RuleToggle {
+        name: "block-telemetry".to_string(),
+        enabled: false,
+    });
+    t.sent();
+
+    t.daemon(err("rules.d is read-only"));
+    assert_eq!(t.sent(), vec![ClientMsg::RuleList]);
+    assert!(t.app.rules[0].enabled, "a refused toggle changed the screen");
+}
+
+/// An accepted toggle refetches too: nothing on this side can tell the two
+/// outcomes apart, so both ask.
+#[test]
+fn an_accepted_toggle_refetches_rather_than_guessing() {
+    let mut t = TestApp::new();
+    t.daemon(DaemonMsg::Rules(vec![rule("block-telemetry", true)]));
+    t.app.send(ClientMsg::RuleToggle {
+        name: "block-telemetry".to_string(),
+        enabled: false,
+    });
+    t.sent();
+
+    t.daemon(DaemonMsg::Ok);
+    assert_eq!(t.sent(), vec![ClientMsg::RuleList]);
+    assert!(
+        t.app.rules[0].enabled,
+        "the row changes when the refetch lands, not before"
+    );
+
+    t.daemon(DaemonMsg::Rules(vec![rule("block-telemetry", false)]));
+    assert!(!t.app.rules[0].enabled);
+}
+
+/// Same for a delete: dropping the row on a refusal would hide a rule that
+/// still exists and is still enforced.
+#[test]
+fn a_refused_delete_leaves_the_rule_on_screen() {
+    let mut t = TestApp::new();
+    t.daemon(DaemonMsg::Rules(vec![rule("block-telemetry", true)]));
+    t.app.send(ClientMsg::RuleDelete {
+        name: "block-telemetry".to_string(),
+    });
+    t.sent();
+
+    t.daemon(err("no such rule"));
+    assert_eq!(t.sent(), vec![ClientMsg::RuleList]);
+    assert_eq!(t.app.rules.len(), 1, "a refused delete emptied the screen");
+}
+
+/// Toggles and deletes must not share an ack kind with anything else:
+/// the FIFO is how a reply is matched to its request, so a miscategorized
+/// request reconciles the wrong thing.
+#[test]
+fn ack_kinds_are_distinct_per_request() {
+    let toggle = ClientMsg::RuleToggle { name: "r".into(), enabled: false };
+    let delete = ClientMsg::RuleDelete { name: "r".into() };
+    assert_eq!(ack_kind(&toggle), Some(AckKind::RuleToggle));
+    assert_eq!(ack_kind(&delete), Some(AckKind::RuleDelete));
+    assert_eq!(
+        ack_kind(&ClientMsg::Subscribe { events: true, prompts: true }),
+        Some(AckKind::Other)
+    );
+    assert_eq!(ack_kind(&ClientMsg::PromptReply {
+        id: 1,
+        verdict: Verdict::Deny,
+        duration: RuleDuration::Once,
+        scope: PromptScope::ThisPort,
+    }), Some(AckKind::Other));
+    // Requests answered with data, not an ack, must not enter the FIFO
+    // at all or every later reply is matched to the wrong request.
+    assert_eq!(ack_kind(&ClientMsg::RuleList), None);
+    assert_eq!(ack_kind(&ClientMsg::Stats), None);
+    assert_eq!(ack_kind(&ClientMsg::EventHistory { limit: 10 }), None);
+    assert_eq!(ack_kind(&ClientMsg::RuleStats), None);
+}
+
+// ---- the ack FIFO --------------------------------------------------------
+
+/// The editor holds everything typed into it, so it closes only when the
+/// daemon has actually taken the rule.
+#[test]
+fn a_saved_rule_closes_the_form_only_on_ok() {
+    let mut t = TestApp::new();
+    t.editor_awaiting_ack();
+    t.daemon(DaemonMsg::Ok);
+    assert!(t.app.editor.is_none(), "an accepted save closes the form");
+    assert!(t.app.last_error.is_none());
+}
+
+/// A rejected save keeps the form and routes the daemon's complaint into
+/// it, rather than to the status bar where the retry is not.
+#[test]
+fn a_rejected_save_keeps_the_form_open() {
+    let mut t = TestApp::new();
+    t.editor_awaiting_ack();
+    t.daemon(err("dest: invalid CIDR"));
+    let editor = t.app.editor.as_ref().expect("the form survives a rejection");
+    assert!(!editor.awaiting_ack(), "the form is editable again");
+    assert!(
+        t.app.last_error.is_none(),
+        "the message belongs in the form, not the status bar"
+    );
+    assert!(t.sent().is_empty(), "a save reconciles through the editor");
+}
+
+/// The whole ack matrix: every kind, crossed with Ok and with Err. Only
+/// toggles and deletes refetch; with no form waiting, every Err is the
+/// status bar's. The two tests above cover where a save's ack goes when
+/// there is a form waiting for it.
+#[test]
+fn every_ack_kind_crossed_with_ok_and_err() {
+    let refetch = [
+        (
+            ClientMsg::RuleToggle { name: "r".to_string(), enabled: true },
+            true,
+        ),
+        (ClientMsg::RuleDelete { name: "r".to_string() }, true),
+        (ClientMsg::RuleAdd(rule("r", true)), false),
+        (
+            ClientMsg::Subscribe { events: true, prompts: true },
+            false,
+        ),
+    ];
+    for (request, expected) in refetch {
+        for outcome in [DaemonMsg::Ok, err("no")] {
+            let mut t = TestApp::new();
+            t.app.send(request.clone());
+            t.sent();
+            let is_err = matches!(outcome, DaemonMsg::Err { .. });
+            t.daemon(outcome);
+            let refetched = t.sent() == vec![ClientMsg::RuleList];
+            assert_eq!(refetched, expected, "{request:?} refetch after err={is_err}");
+            assert!(
+                t.app.pending_acks.is_empty(),
+                "{request:?} left an ack in the FIFO"
+            );
+            // Without an editor waiting, an Err is the status bar's.
+            assert_eq!(t.app.last_error.is_some(), is_err, "{request:?}");
+        }
+    }
+}
+
+/// Replies arrive in request order on the one IPC stream, so the FIFO is
+/// the only thing that says which request an Ok belongs to. Answer them out
+/// of order and a save's ack would close a form the daemon never took.
+#[test]
+fn acks_are_matched_to_requests_in_send_order() {
+    let mut t = TestApp::new();
+    t.app.send(ClientMsg::RuleToggle { name: "first".to_string(), enabled: false });
+    t.editor_awaiting_ack();
+    assert_eq!(
+        Vec::from(t.app.pending_acks.clone()),
+        vec![AckKind::RuleToggle, AckKind::RuleSave]
+    );
+
+    t.daemon(DaemonMsg::Ok);
+    assert_eq!(t.sent(), vec![ClientMsg::RuleList], "the toggle's ack");
+    assert!(t.app.editor.is_some(), "the save is still in flight");
+
+    t.daemon(DaemonMsg::Ok);
+    assert!(t.app.editor.is_none(), "the save's ack");
+    assert!(t.sent().is_empty(), "a save does not refetch here");
+}
+
+/// An unsolicited Ok or Err (a daemon bug, or a reply to a request this
+/// client did not make) must not pop an ack that belongs to something else,
+/// and must not be mistaken for a rule change.
+#[test]
+fn an_ack_with_an_empty_queue_reconciles_nothing() {
+    let mut t = TestApp::new();
+    t.daemon(DaemonMsg::Ok);
+    assert!(t.sent().is_empty());
+    t.daemon(err("unexpected"));
+    assert!(t.sent().is_empty());
+    assert_eq!(t.app.last_error.as_deref(), Some("unexpected"));
+}
+
+/// A message the network thread dropped will never be acked, so its slot in
+/// the FIFO has to go with it or every later reply answers the wrong
+/// request.
+#[test]
+fn a_dropped_message_keeps_the_queue_aligned() {
+    let mut t = TestApp::new();
+    t.app.send(ClientMsg::RuleToggle { name: "gone".to_string(), enabled: false });
+    t.sent();
+    assert_eq!(t.app.pending_acks.len(), 1);
+
+    t.feed(UiEvent::SendFailed {
+        msg: ClientMsg::RuleToggle {
+            name: "gone".to_string(),
+            enabled: false,
+        },
+    });
+    assert!(t.app.pending_acks.is_empty(), "the dead ack was left queued");
+    assert!(
+        t.app
+            .last_error
+            .as_deref()
+            .is_some_and(|e| e.contains("rule toggle")),
+        "a lost rule change must be visible: {:?}",
+        t.app.last_error
+    );
+
+    // The next ack answers the next request, not the dropped one.
+    t.app.send(ClientMsg::Subscribe {
+        events: true,
+        prompts: true,
+    });
+    t.sent();
+    t.daemon(DaemonMsg::Ok);
+    assert!(t.sent().is_empty(), "an Other ack refetched the rule list");
+}
+
+/// A lost prompt reply is the one the daemon backstops with its default
+/// verdict, so it says so rather than failing silently.
+#[test]
+fn a_dropped_prompt_reply_says_what_happens_next() {
+    let mut t = TestApp::new();
+    t.feed(UiEvent::SendFailed {
+        msg: prompt::close_reply(7),
+    });
+    assert!(
+        t.app
+            .last_error
+            .as_deref()
+            .is_some_and(|e| e.contains("default action")),
+        "{:?}",
+        t.app.last_error
+    );
+}
+
+/// Everything in flight dies with the connection: prompt ids the daemon
+/// will reissue, acks that will never arrive, and a save whose answer is
+/// gone. The form keeps what was typed.
+#[test]
+fn a_lost_connection_clears_what_cannot_survive_it() {
+    let mut t = TestApp::new();
+    t.daemon(prompt_request(1, "/usr/bin/curl"));
+    t.editor_awaiting_ack();
+    assert_eq!(t.app.prompts.len(), 1);
+
+    t.feed(UiEvent::Disconnected {
+        retry_in: Duration::from_secs(1),
+    });
+    assert!(t.app.prompts.is_empty());
+    assert!(t.app.pending_acks.is_empty());
+    let editor = t.app.editor.as_ref().expect("the form survives");
+    assert!(!editor.awaiting_ack(), "nothing is coming to answer it");
+}
+
+/// Subscribe has to be sent before the history request, or events decided
+/// between the two are in neither and vanish. Rules and stats prime the
+/// views the window opens on.
+#[test]
+fn connecting_subscribes_before_asking_for_history() {
+    let mut t = TestApp::new();
+    t.feed(UiEvent::Connected);
+    assert_eq!(
+        t.sent(),
+        vec![
+            ClientMsg::Subscribe {
+                events: true,
+                prompts: true,
+            },
+            ClientMsg::RuleList,
+            ClientMsg::Stats,
+            ClientMsg::EventHistory {
+                limit: EVENT_HISTORY_LIMIT,
+            },
+        ]
+    );
+    // Only Subscribe is acked; the other three are answered with data.
+    assert_eq!(Vec::from(t.app.pending_acks.clone()), vec![AckKind::Other]);
+}
+
+// ---- the event feed (5c2c1a8) --------------------------------------------
+
+/// Every reconnect asks for history again, and a daemon that did not
+/// restart still holds everything this client already has. Appending it a
+/// second time duplicated rows in the feed and inflated every count in the
+/// traffic view, which rebuilds from this ring each frame.
+#[test]
+fn a_replayed_history_is_not_counted_twice() {
+    let mut t = TestApp::new();
+    let history = vec![
+        event("/usr/bin/curl", "1.1.1.1:443", 1_000),
+        event("/usr/bin/curl", "1.1.1.2:443", 2_000),
+        event("/usr/bin/wget", "1.1.1.3:80", 3_000),
+    ];
+    t.daemon(DaemonMsg::Events(history.clone()));
+    assert_eq!(t.app.events.len(), 3);
+
+    t.daemon(DaemonMsg::Events(history));
+    assert_eq!(t.app.events.len(), 3, "the backfill was appended twice");
+    let agg = traffic::Aggregate::rebuild(t.app.filtered(), traffic::GroupBy::Exe);
+    assert_eq!(agg.total, 3, "the traffic view double-counted the replay");
+}
+
+/// The live stream and the backfill overlap by design: the subscription is
+/// sent first so nothing is lost in between, which means the history reply
+/// can contain what already arrived live.
+#[test]
+fn a_live_event_is_not_re_added_by_the_backfill() {
+    let mut t = TestApp::new();
+    let live = event("/usr/bin/curl", "1.1.1.1:443", 1_000);
+    let later = event("/usr/bin/curl", "1.1.1.2:443", 2_000);
+    t.daemon(DaemonMsg::Event(live.clone()));
+    t.daemon(DaemonMsg::Events(vec![live, later]));
+    assert_eq!(t.app.events.len(), 2);
+}
+
+/// Replay detection must not swallow genuinely distinct decisions. Identity
+/// is the decision itself: when it happened, which flow, and what was
+/// decided.
+#[test]
+fn distinct_decisions_are_not_mistaken_for_replays() {
+    let base = event("/usr/bin/curl", "1.1.1.1:443", 1_000);
+    let mut later = base.clone();
+    later.unix_ms = 1_001;
+    let mut denied = base.clone();
+    denied.verdict = Verdict::Deny;
+    let mut other_flow = base.clone();
+    other_flow.conn.tuple.src = "10.0.0.1:40001".parse().expect("source address");
+
+    let mut t = TestApp::new();
+    t.daemon(DaemonMsg::Events(vec![base, later, denied, other_flow]));
+    assert_eq!(t.app.events.len(), 4);
+}
+
+/// Events are attacker-feedable at line rate, so the feed is capped and the
+/// oldest goes rather than the window growing.
+#[test]
+fn the_feed_evicts_the_oldest_event() {
+    let mut t = TestApp::new();
+    let overflow = 50;
+    let mut ev = event("/usr/bin/curl", "1.1.1.1:443", 0);
+    for i in 0..(MAX_EVENTS + overflow) as u64 {
+        ev.unix_ms = 1_000 + i;
+        t.daemon(DaemonMsg::Event(ev.clone()));
+    }
+    assert_eq!(t.app.events.len(), MAX_EVENTS);
+    assert_eq!(
+        t.app.events.front().expect("a full feed").unix_ms,
+        1_000 + overflow as u64,
+        "the surviving window is the newest one"
+    );
+    assert_eq!(
+        t.app.events.back().expect("a full feed").unix_ms,
+        1_000 + (MAX_EVENTS + overflow - 1) as u64
+    );
+}
+
+/// The feed and the traffic view fold the same filtered iterator, so a row
+/// count and the rows themselves cannot disagree. The filter is checked
+/// against every field the operator can see.
+#[test]
+fn the_filter_selects_across_exe_domain_rule_and_destination() {
+    let mut t = TestApp::new();
+    let mut by_domain = event("/usr/bin/firefox", "93.184.216.34:443", 2_000);
+    by_domain.conn.domain = Some("example.org".to_string());
+    let mut by_rule = event("/usr/bin/wget", "10.0.0.9:80", 3_000);
+    by_rule.rule_name = Some("allow-web".to_string());
+    t.daemon(DaemonMsg::Events(vec![
+        event("/usr/bin/curl", "1.1.1.1:443", 1_000),
+        by_domain,
+        by_rule,
+    ]));
+
+    assert_eq!(t.app.filtered().count(), 3, "an empty filter keeps everything");
+    for (needle, expected) in [
+        ("curl", 1),
+        ("EXAMPLE.ORG", 1),
+        ("allow-web", 1),
+        ("10.0.0.9", 1),
+        ("/usr/bin/", 3),
+        ("nothing-matches-this", 0),
+    ] {
+        t.app.filter = needle.to_string();
+        assert_eq!(t.app.filtered().count(), expected, "filter {needle:?}");
+        let agg = traffic::Aggregate::rebuild(t.app.filtered(), traffic::GroupBy::Exe);
+        assert_eq!(
+            agg.total as usize, expected,
+            "the traffic view disagreed with the feed on {needle:?}"
+        );
+    }
+}
+
+// ---- what the window claims about enforcement (5c2c1a8) ------------------
+
+/// The banner is the only signal an operator gets that nothing is being
+/// blocked, so it must never be shown on a guess. Before the first stats
+/// reply there is nothing to report, and a daemon that cannot be reached
+/// has reported nothing either.
+#[test]
+fn observe_mode_is_not_announced_before_the_daemon_says_so() {
+    let mut t = TestApp::new();
+    assert!(
+        !t.app.observe_banner(),
+        "announced observe mode with no answer from the daemon"
+    );
+
+    t.feed(UiEvent::Disconnected {
+        retry_in: Duration::from_secs(1),
+    });
+    assert!(
+        !t.app.observe_banner(),
+        "announced observe mode on a daemon it never reached"
+    );
+
+    t.daemon(DaemonMsg::Stats(stats(true)));
+    assert!(!t.app.observe_banner(), "the daemon is enforcing");
+
+    t.daemon(DaemonMsg::Stats(stats(false)));
+    assert!(t.app.observe_banner(), "the daemon said it is not enforcing");
+}
+
+/// Opening a data tab refreshes what it shows, rather than rendering
+/// whatever was current when the window last asked. The traffic tab reads
+/// the enforcement flag for its wording, so it refreshes the stats too.
+#[test]
+fn opening_a_data_tab_refetches_it() {
+    let mut t = TestApp::new();
+    for (tab, expected) in [
+        (Tab::Rules, vec![ClientMsg::RuleList]),
+        (Tab::Traffic, vec![ClientMsg::Stats]),
+        (Tab::Stats, vec![ClientMsg::Stats]),
+        (Tab::Events, vec![]),
+    ] {
+        t.app.select_tab(tab);
+        assert_eq!(t.sent(), expected, "opening {tab:?}");
+        t.app.select_tab(tab);
+        assert!(t.sent().is_empty(), "reselecting {tab:?} refetched again");
+    }
+}
+
+// ---- prompts -------------------------------------------------------------
+
+/// The daemon reissues a prompt request when a second handler subscribes,
+/// and a duplicate must not become a second window over the same decision.
+#[test]
+fn a_repeated_prompt_request_does_not_stack() {
+    let mut t = TestApp::new();
+    t.daemon(prompt_request(1, "/usr/bin/curl"));
+    t.daemon(prompt_request(1, "/usr/bin/curl"));
+    assert_eq!(t.app.prompts.len(), 1);
+
+    t.daemon(prompt_request(2, "/usr/bin/curl"));
+    assert_eq!(t.app.prompts.len(), 2);
+}
+
+/// A prompt answered elsewhere, timed out, or resolved by a rule that
+/// covers it comes back as PromptExpired; its window has to go with it.
+#[test]
+fn an_expired_prompt_is_dropped() {
+    let mut t = TestApp::new();
+    t.daemon(prompt_request(1, "/usr/bin/curl"));
+    t.daemon(prompt_request(2, "/usr/bin/curl"));
+    t.daemon(DaemonMsg::PromptExpired { id: 1 });
+    assert_eq!(
+        t.app.prompts.iter().map(|p| p.id).collect::<Vec<_>>(),
+        vec![2]
+    );
+}
+
+/// Giving up a prompt denies, and denies once: it settles the connection on
+/// screen without writing policy for any future one. Pinned as a literal
+/// because every field is a decision - a wider scope or a lasting duration
+/// would make dismissing a window an act of policy.
+#[test]
+fn a_dismissed_prompt_is_denied_for_this_connection_only() {
+    assert_eq!(
+        prompt::close_reply(7),
+        ClientMsg::PromptReply {
+            id: 7,
+            verdict: Verdict::Deny,
+            duration: RuleDuration::Once,
+            scope: PromptScope::ThisPort,
+        }
+    );
+}
+
+/// Abandoning prompts answers them. Whichever way the client gives one up,
+/// silence would leave it to the daemon's timeout and `default_verdict`,
+/// which is allow unless the operator changed it.
+#[test]
+fn dismissing_prompts_answers_every_one_of_them() {
+    let mut t = TestApp::new();
+    for id in 1..=3 {
+        t.daemon(prompt_request(id, "/usr/bin/curl"));
+    }
+    t.app.dismiss_prompts([1, 3]);
+
+    assert_eq!(t.sent(), vec![prompt::close_reply(1), prompt::close_reply(3)]);
+    assert_eq!(
+        t.app.prompts.iter().map(|p| p.id).collect::<Vec<_>>(),
+        vec![2],
+        "a dismissed prompt leaves the queue, an untouched one stays"
+    );
+}
+
+/// An id that is no longer pending has already been decided: replying again
+/// would draw a daemon error, and could overwrite an answer the operator
+/// gave in the same frame the window closed.
+#[test]
+fn dismissing_skips_prompts_that_are_no_longer_pending() {
+    let mut t = TestApp::new();
+    t.daemon(prompt_request(1, "/usr/bin/curl"));
+    t.daemon(DaemonMsg::PromptExpired { id: 1 });
+    t.app.dismiss_prompts([1, 99]);
+    assert!(t.sent().is_empty());
+}
+
+// ---- replies this client does not ask for --------------------------------
+
+/// Rule hits and explanations are answers to requests the window never
+/// makes. Ignoring them keeps the connection alive; the alternative on an
+/// unexpected reply is tearing down the stream that carries prompts.
+#[test]
+fn unrequested_replies_are_ignored_rather_than_fatal() {
+    let mut t = TestApp::new();
+    t.daemon(DaemonMsg::RuleHits(Vec::new()));
+    t.daemon(DaemonMsg::HelloAck { version: 3 });
+    assert!(t.sent().is_empty());
+    assert!(t.app.last_error.is_none());
+    assert!(t.app.pending_acks.is_empty());
+}
+
+// ---- display helpers -----------------------------------------------------
+
+#[test]
+fn uptime_formatting() {
+    assert_eq!(format_uptime(0), "0h 00m 00s");
+    assert_eq!(format_uptime(3661), "1h 01m 01s");
+    assert_eq!(format_uptime(86400), "24h 00m 00s");
+}
+
+#[test]
+fn labels() {
+    assert_eq!(duration_label(RuleDuration::Session), "Session");
+    assert_eq!(scope_label(PromptScope::AppAnywhere), "App anywhere");
+    assert_eq!(verdict_label(Verdict::Reject), "reject");
+}
+
+/// An unenforced deny is amber, not red: nothing was stopped, and colouring
+/// it like a block would say the opposite of what happened.
+#[test]
+fn an_unenforced_block_is_not_coloured_as_one() {
+    let mut ev = event("/usr/bin/curl", "1.1.1.1:443", 1_000);
+    ev.verdict = Verdict::Deny;
+    ev.enforced = false;
+    assert_eq!(event_color(&ev), REJECT_COLOR);
+    ev.enforced = true;
+    assert_eq!(event_color(&ev), DENY_COLOR);
+    // Allow is allow either way: observe mode changes nothing about it.
+    ev.verdict = Verdict::Allow;
+    assert_eq!(event_color(&ev), ALLOW_COLOR);
+    ev.enforced = false;
+    assert_eq!(event_color(&ev), ALLOW_COLOR);
+}

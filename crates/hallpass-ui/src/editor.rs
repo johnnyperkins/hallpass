@@ -294,6 +294,16 @@ impl RuleEditor {
         (open, saved)
     }
 
+    /// Put the form into the state a returned rule leaves it in.
+    ///
+    /// Test-only: `awaiting` is private, and the state between clicking Save
+    /// and the daemon answering is where the reconciliation logic lives, so
+    /// a headless test has to be able to reach it without a widget tree.
+    #[cfg(test)]
+    pub(crate) fn mark_sent(&mut self) {
+        self.awaiting = true;
+    }
+
     /// Whether a save is in flight, i.e. the next daemon Ok/Err answers it.
     pub fn awaiting_ack(&self) -> bool {
         self.awaiting

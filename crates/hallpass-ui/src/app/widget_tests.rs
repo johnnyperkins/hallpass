@@ -1,0 +1,216 @@
+//! Tests of properties that need a real widget tree.
+//!
+//! Two kinds live here, and nothing else should. First, layout as a security
+//! property: which button keyboard traversal reaches first in the prompt
+//! window. Second, the paths that only exist because a widget was operated -
+//! a window closed, a checkbox clicked, Quit pressed - where the thing worth
+//! proving is that the operation reaches the state logic at all.
+//!
+//! `egui_kittest` reads the AccessKit tree, so none of this needs a GPU or a
+//! display. Everything downstream of these entry points is cheaper to test as
+//! state; see the sibling `tests` module.
+
+use egui_kittest::kittest::{NodeT as _, Queryable as _};
+use egui_kittest::Harness;
+
+use super::tests::{conn, drain};
+use super::*;
+
+/// A prompt plus what its buttons answered, so a test can read the reply
+/// back out from behind the harness.
+struct PromptFixture {
+    prompt: PromptState,
+    answered: Vec<(u64, ClientMsg)>,
+}
+
+/// Fixed rather than wall clock: the countdown is display-only here, and a
+/// real clock would make the progress bar (and so the frame) differ per run.
+const NOW_MS: u64 = 1_700_000_000_000;
+
+const EXE: &str = "/usr/bin/curl";
+
+/// One prompt window's body, laid out on its own the way its viewport shows
+/// it.
+fn prompt_harness() -> Harness<'static, PromptFixture> {
+    let state = PromptFixture {
+        prompt: PromptState::new(1, conn(EXE, "93.184.216.34:443"), NOW_MS + 30_000, NOW_MS),
+        answered: Vec::new(),
+    };
+    Harness::builder()
+        .with_size(egui::vec2(440.0, 330.0))
+        .build_ui_state(
+            |ui, state: &mut PromptFixture| {
+                prompt_ui(ui, &mut state.prompt, NOW_MS, &[], &mut state.answered);
+            },
+            state,
+        )
+}
+
+/// An app holding `count` prompts from one application, plus the receiver
+/// the network thread would read.
+fn app_with_prompts(count: u64) -> (HallpassApp, tokio::sync::mpsc::UnboundedReceiver<ClientMsg>) {
+    let (to_daemon, from_ui) = tokio::sync::mpsc::unbounded_channel();
+    let (_to_ui, from_net) = std::sync::mpsc::channel();
+    let mut app = HallpassApp::with_channels(to_daemon, from_net);
+    // Real deadlines: the window drops prompts the daemon has already timed
+    // out, and it reads the clock to do it.
+    let now = hallpass_types::unix_ms_now();
+    app.prompts = (1..=count)
+        .map(|id| PromptState::new(id, conn(EXE, &format!("1.1.1.{id}:443")), now + 30_000, now))
+        .collect();
+    (app, from_ui)
+}
+
+/// Deny has to be what keyboard traversal reaches first.
+///
+/// This window steals focus from whatever the operator was doing, and the
+/// answer given without reading it has to be the recoverable one: a wrong
+/// deny costs a retry, a wrong allow costs the connection the prompt existed
+/// to stop. Widget order is traversal order in egui, so this is a property
+/// of the laid-out tree and nothing else.
+#[test]
+fn deny_leads_keyboard_traversal() {
+    let mut harness = prompt_harness();
+    let mut reached = Vec::new();
+    for _ in 0..8 {
+        harness.key_press(egui::Key::Tab);
+        harness.run();
+        for label in ["Deny", "Allow"] {
+            if harness.get_by_label(label).accesskit_node().is_focused() {
+                reached.push(label);
+            }
+        }
+        // Traversal wraps, so stop once both have been seen or the order
+        // gets recorded twice.
+        if reached.len() == 2 {
+            break;
+        }
+    }
+    assert_eq!(
+        reached.first().copied(),
+        Some("Deny"),
+        "tab order reached {reached:?}"
+    );
+    assert!(
+        reached.contains(&"Allow"),
+        "traversal must still reach Allow: {reached:?}"
+    );
+}
+
+/// The reorder above moves the buttons past each other, so the wiring is
+/// worth pinning: each button answers with its own verdict, carrying the
+/// duration and scope the operator picked.
+#[test]
+fn each_button_answers_with_its_own_verdict() {
+    for (label, verdict) in [("Deny", Verdict::Deny), ("Allow", Verdict::Allow)] {
+        let mut harness = prompt_harness();
+        harness.get_by_label(label).click();
+        harness.run();
+        let expected = harness.state().prompt.reply(verdict);
+        assert_eq!(
+            harness.state().answered,
+            vec![(1, expected)],
+            "{label} answered with the wrong verdict"
+        );
+    }
+}
+
+/// Closing the window reaches the dismissal, and reaches it for every prompt
+/// the window covers rather than only the one on show. What dismissal means
+/// is `dismiss_prompts`, tested as state.
+#[test]
+fn closing_the_window_dismisses_every_prompt_it_covers() {
+    let (app, mut from_ui) = app_with_prompts(3);
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(600.0, 500.0))
+        .build_ui_state(|ui, app: &mut HallpassApp| app.prompt_windows(ui.ctx()), app);
+    // One window, really on screen, for all three: the front prompt names
+    // the application and the other two are listed as pending.
+    harness.get_by_label(EXE);
+    harness.get_by_label_contains("2 more request(s) pending");
+
+    // Under a test backend egui embeds child viewports in the root one, so
+    // the close arrives on the root's info; a single group keeps that
+    // faithful to one window being closed.
+    harness
+        .input_mut()
+        .viewports
+        .entry(egui::ViewportId::ROOT)
+        .or_default()
+        .events
+        .push(egui::ViewportEvent::Close);
+    harness.step();
+
+    assert_eq!(
+        drain(&mut from_ui),
+        (1..=3).map(prompt::close_reply).collect::<Vec<_>>(),
+        "a closed window left prompts for the daemon's default verdict"
+    );
+    assert!(harness.state().prompts.is_empty());
+}
+
+/// Quitting abandons every prompt on screen, so it answers them for the same
+/// reason closing one window does. Best effort by nature - the process may
+/// exit before the network thread writes the replies - but the queue must
+/// hold them, or the one certain outcome is the daemon's default verdict.
+#[test]
+fn quitting_denies_the_prompts_left_on_screen() {
+    let (app, mut from_ui) = app_with_prompts(2);
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(820.0, 520.0))
+        .build_ui_state(|ui, app: &mut HallpassApp| app.main_window(ui), app);
+
+    harness.get_by_label("Quit").click();
+    harness.run();
+
+    assert_eq!(
+        drain(&mut from_ui),
+        (1..=2).map(prompt::close_reply).collect::<Vec<_>>(),
+        "quitting left prompts to the daemon's default verdict"
+    );
+    assert!(harness.state().quit_requested);
+    assert!(harness.state().prompts.is_empty());
+}
+
+/// The checkbox in the rules list asks the daemon; it does not edit the row.
+/// A refused toggle would otherwise leave the operator believing a rule is
+/// off while it is still enforced, which claims less enforcement than there
+/// is. The row only changes when the daemon's answer to the refetch lands.
+#[test]
+fn toggling_a_rule_asks_the_daemon_instead_of_editing_the_row() {
+    let (to_daemon, mut from_ui) = tokio::sync::mpsc::unbounded_channel();
+    let (_to_ui, from_net) = std::sync::mpsc::channel();
+    let mut app = HallpassApp::with_channels(to_daemon, from_net);
+    app.tab = Tab::Rules;
+    app.rules = vec![hallpass_types::Rule {
+        name: "block-telemetry".to_string(),
+        action: hallpass_types::Action::Deny,
+        duration: RuleDuration::Forever,
+        priority: 10,
+        enabled: true,
+        matcher: hallpass_types::RuleMatch {
+            port: Some(443),
+            ..Default::default()
+        },
+    }];
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(820.0, 520.0))
+        .build_ui_state(|ui, app: &mut HallpassApp| app.main_window(ui), app);
+
+    harness
+        .get_by_role(egui::accesskit::Role::CheckBox)
+        .click();
+    harness.run();
+
+    assert_eq!(
+        drain(&mut from_ui),
+        vec![ClientMsg::RuleToggle {
+            name: "block-telemetry".to_string(),
+            enabled: false,
+        }]
+    );
+    assert!(
+        harness.state().rules[0].enabled,
+        "the row was edited before the daemon agreed to it"
+    );
+}

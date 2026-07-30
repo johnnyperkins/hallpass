@@ -81,6 +81,21 @@ links to keep the prose pointing at the right code; a link that stops
 resolving degrades silently to plain text, so without `-D warnings` the
 convention rots with nothing failing.
 
+The GUI is covered by that plain workspace run, with no display and no daemon.
+`HallpassApp` owns both ends of its channel pair, so a test builds one with
+`HallpassApp::with_channels`, feeds it `UiEvent`s and asserts on the
+`ClientMsg`s that come back. That seam is where the volume goes, because the
+GUI defects this project has had to fix were state logic that happened to live
+behind a window rather than anything to do with drawing: an edit applied
+before the daemon agreed to it, a backfill appended twice, a claim about
+enforcement made before anything had said so. Properties that genuinely need a
+laid-out widget tree use `egui_kittest`, which reads the AccessKit tree and
+needs no GPU: which button the prompt window's keyboard traversal reaches
+first, and the paths that exist only because a widget was operated, where what
+is worth proving is that the operation reaches the state logic at all. Its
+`snapshot` and `wgpu` features are deliberately left off: pixel diffing is the
+flaky part and proves nothing these tests do not.
+
 There is no `cargo fmt` gate. The tree is hand-formatted.
 
 `cargo deny check` is separate because cargo-deny is a separate install. The
