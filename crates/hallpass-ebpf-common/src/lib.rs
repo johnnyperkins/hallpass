@@ -10,6 +10,13 @@
 //!   skc_num is already host order. eBPF target is bpfel, so host order
 //!   matches the little-endian userspace on every supported platform.
 
+// Deny unsafe here rather than inheriting workspace lints, which this crate
+// cannot do because it needs the two `unsafe impl aya::Pod` blocks below.
+// Without a deny in force those per-item `allow`s suppress nothing, so any
+// future `unsafe` in this crate would have compiled silently while the
+// attributes suggested it was contained.
+#![deny(unsafe_code)]
+
 #![cfg_attr(not(test), no_std)]
 
 /// IPPROTO_TCP.

@@ -27,7 +27,7 @@ use aya_ebpf::{
         bpf_probe_read_user, bpf_probe_read_user_str_bytes,
     },
     macros::{kprobe, kretprobe, map, tracepoint, uprobe, uretprobe},
-    maps::{HashMap, LruHashMap, PerCpuArray, RingBuf},
+    maps::{LruHashMap, PerCpuArray, RingBuf},
     programs::{ProbeContext, RetProbeContext, TracePointContext},
 };
 use hallpass_ebpf_common::{
@@ -322,7 +322,7 @@ fn capture_name(scratch_map: &LruHashMap<u64, DnsScratch>, node: *const u8, out:
         Ok(s) if !s.is_empty() => scratch.name_len = s.len() as u32,
         _ => return 0,
     }
-    let _ = scratch_map.insert(bpf_get_current_pid_tgid(), &*scratch, 0);
+    let _ = scratch_map.insert(bpf_get_current_pid_tgid(), *scratch, 0);
     0
 }
 

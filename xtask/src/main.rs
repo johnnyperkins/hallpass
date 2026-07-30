@@ -7,6 +7,7 @@ fn main() -> ExitCode {
     let task = std::env::args().nth(1);
     let result = match task.as_deref() {
         Some("build-ebpf") => build_ebpf(),
+        Some("clippy-ebpf") => clippy_ebpf(),
         Some("build") => build_ebpf().and_then(|()| build_workspace()),
         Some("test") => test_workspace(),
         Some("e2e") => test_e2e(),
@@ -33,6 +34,7 @@ fn print_usage() {
     eprintln!("usage: cargo xtask <task>");
     eprintln!("tasks:");
     eprintln!("  build-ebpf    build the hallpass-ebpf kernel programs");
+    eprintln!("  clippy-ebpf   lint the hallpass-ebpf kernel programs (-D warnings)");
     eprintln!("  build         build-ebpf, then a release build of the whole workspace");
     eprintln!("                (with the ebpf feature); what install.sh runs");
     eprintln!("  test          run the workspace unit/integration tests (no privileges)");
@@ -69,6 +71,21 @@ fn build_ebpf() -> Result<(), String> {
         .current_dir(dir)
         // cargo xtask runs under the workspace toolchain; drop that so
         // hallpass-ebpf's rust-toolchain.toml (nightly) takes effect.
+        .env_remove("RUSTUP_TOOLCHAIN")
+        .env_remove("CARGO"))
+}
+
+/// Lint crates/hallpass-ebpf, which no workspace command reaches.
+///
+/// It is deliberately not a workspace member, so `cargo clippy --workspace`
+/// cannot see it, and `build-ebpf` only compiles it. That left the one crate
+/// in the project containing `unsafe` (and running in the kernel) as the only
+/// crate never linted. Same toolchain juggling as [`build_ebpf`].
+fn clippy_ebpf() -> Result<(), String> {
+    let dir = workspace_root().join("crates/hallpass-ebpf");
+    run(Command::new("cargo")
+        .args(["clippy", "--release", "--", "-D", "warnings"])
+        .current_dir(dir)
         .env_remove("RUSTUP_TOOLCHAIN")
         .env_remove("CARGO"))
 }

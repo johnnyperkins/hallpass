@@ -40,6 +40,11 @@ jobs:
         run: cargo install bpf-linker --locked
       - name: Build eBPF object
         run: cargo xtask build-ebpf
+      # crates/hallpass-ebpf is not a workspace member, so the clippy job
+      # cannot reach it. It holds every `unsafe` in the project and runs in
+      # the kernel, so it is the last crate that should go unlinted.
+      - name: Clippy (ebpf kernel programs)
+        run: cargo xtask clippy-ebpf
       - name: Clippy (ebpf feature)
         run: cargo clippy -p hallpassd --all-targets --features ebpf -- -D warnings
       # The plain test job never enables the feature, so the tests gated

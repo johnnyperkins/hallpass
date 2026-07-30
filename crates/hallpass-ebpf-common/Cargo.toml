@@ -14,4 +14,6 @@ aya = { version = "0.14", optional = true }
 
 # NOTE: no [lints] workspace inheritance here. The workspace denies
 # unsafe_code, but this crate needs exactly two `unsafe impl aya::Pod`
-# blocks behind the "user" feature. Everything else stays safe.
+# blocks behind the "user" feature. src/lib.rs carries its own
+# #![deny(unsafe_code)] so those two blocks are real, enforced exemptions
+# rather than the only unsafe that happens to be written down.

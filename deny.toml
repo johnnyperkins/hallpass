@@ -2,7 +2,12 @@
 # https://embarkstudios.github.io/cargo-deny/
 
 [graph]
-all-features = false
+# True so the optional dependencies the shipped product actually uses are in
+# the graph. install.sh defaults to building with hallpassd/ebpf, which pulls
+# aya; with all-features = false, cargo deny never saw aya or its tree, so an
+# advisory in the code that loads eBPF programs into the kernel as root would
+# have produced a green run.
+all-features = true
 
 [advisories]
 version = 2

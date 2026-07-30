@@ -48,7 +48,12 @@ esac
 target_user=${SUDO_USER:-$(id -un)}
 
 echo ">> Installing (sudo)..."
-sudo sh -eu <<INSTALL
+# Quoted delimiter plus argv: an unquoted heredoc is expanded by this
+# unprivileged shell before being piped into a root one, so a value like
+# SUDO_USER (which sudo does not set when the script is run directly, and which
+# nothing validates) would be interpolated straight into root's input.
+sudo sh -eus -- "$target_user" <<'INSTALL'
+target_user=$1
 install -Dm755 target/release/hallpassd   /usr/bin/hallpassd
 install -Dm755 target/release/hallpass-cli /usr/bin/hallpass-cli
 install -Dm755 target/release/hallpass-ui  /usr/bin/hallpass-ui
@@ -56,7 +61,10 @@ install -Dm755 target/release/hallpass-ui  /usr/bin/hallpass-ui
 # Config and example rule: never clobber admin-edited policy. The example
 # rule is guarded like the config, so editing it (or deleting it outright)
 # survives a reinstall instead of being silently restored.
-install -d /etc/hallpass /etc/hallpass/rules.d
+#
+# Explicit mode on the directories: the rule-trust design depends on rules.d
+# not being group-writable, so do not lean on coreutils' implicit default.
+install -d -m755 /etc/hallpass /etc/hallpass/rules.d
 [ -f /etc/hallpass/config.toml ] || install -m644 etc/config.toml /etc/hallpass/config.toml
 [ -e /etc/hallpass/rules.d/example-allow-dns.toml ] \
   || install -m644 etc/rules.d/example-allow-dns.toml /etc/hallpass/rules.d/example-allow-dns.toml
