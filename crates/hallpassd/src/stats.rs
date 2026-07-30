@@ -96,8 +96,12 @@ impl Counters {
 
     /// Count a deny or reject that observe mode recorded without applying.
     ///
-    /// This is the number an operator sizes a rollout by: it is exactly what
-    /// would have broken had the same policy been enforced.
+    /// This is the number an operator sizes a rollout by, so it counts every
+    /// packet enforcement would have stopped, including the ones that carry
+    /// no connection (ICMP, SCTP, unparsable) and are decided by
+    /// `unhandled_proto_verdict` alone. Those appear in no event, so if they
+    /// were left out of this counter too, a hardened profile's dead ping
+    /// would be invisible until the day enforcement was switched on.
     pub fn record_observed_only(&self) {
         self.observed_only.fetch_add(1, Ordering::Relaxed);
     }

@@ -73,7 +73,9 @@ EXPLAIN OPTIONS:
     --cmdline STR                Its full command line
     --parent-exe PATH            Executable path of its parent
     --exe-sha256 HEX             SHA-256 to use for hash operands (64 hex
-                                 digits); otherwise the daemon hashes --exe
+                                 digits). Without it, hash-pinning rules
+                                 report exe_sha256 as unmatched: the daemon
+                                 will not hash a path a client named
     --domain NAME                Destination domain, as DNS snooping would
                                  have annotated it
     --user UID                   UID of the hypothetical process
@@ -156,16 +158,6 @@ impl GroupBy {
         }
     }
 
-    /// Header for the key column of the `top` table.
-    pub fn column(self) -> &'static str {
-        match self {
-            GroupBy::Exe => "EXE",
-            GroupBy::Domain => "DOMAIN",
-            GroupBy::Host => "HOST",
-            GroupBy::Port => "PORT",
-            GroupBy::Rule => "RULE",
-        }
-    }
 }
 
 /// Client-side event filters for `events`.

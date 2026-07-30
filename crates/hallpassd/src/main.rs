@@ -256,7 +256,6 @@ async fn main() {
     // Blocking nfqueue loop on its own thread, over the queue bound
     // before the nftables install. None means interception is off for
     // this run (no privileges); rule management still works over IPC.
-    //
     let shutdown = Arc::new(AtomicBool::new(false));
     let queue_thread = queue.map(|queue| {
         nfqueue::spawn(

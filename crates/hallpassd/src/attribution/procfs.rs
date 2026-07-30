@@ -231,6 +231,23 @@ pub(super) fn proc_snapshot(
     (exe, cmdline, parent_exe_of(proc_root, pid))
 }
 
+/// Longest command line kept for a connection.
+///
+/// A process chooses its own argv and `ARG_MAX` is megabytes, so this string
+/// is attacker-sized as well as attacker-written. Uncapped it travelled into
+/// every event, the daemon's event history, each client's queue, and the
+/// syslog exporter, which put a multi-megabyte allocation per connection
+/// inside a root daemon and could push a history reply past the 1 MiB wire
+/// frame limit, breaking the client's connection instead of answering it.
+///
+/// Generous next to any real command line, so the truncation marker is a
+/// sign of something deliberate rather than of normal use. It bounds
+/// `cmdline_contains` in the same stroke, which is sound: the operand is
+/// already documented as a scoping convenience rather than a boundary,
+/// since a process that wants to dodge it simply does not put the string in
+/// its argv at all.
+pub(super) const MAX_CMDLINE_BYTES: usize = 4096;
+
 /// Best-effort read of exe symlink and cmdline for a PID. Also used by
 /// the eBPF attributor to snapshot details on exec events.
 pub(super) fn read_proc_details(proc_root: &Path, pid: u32) -> (Option<PathBuf>, Option<String>) {
@@ -243,9 +260,31 @@ pub(super) fn read_proc_details(proc_root: &Path, pid: u32) -> (Option<PathBuf>,
             .map(|part| String::from_utf8_lossy(part).into_owned())
             .collect::<Vec<_>>()
             .join(" ");
-        (!joined.is_empty()).then_some(joined)
+        (!joined.is_empty()).then(|| truncate_cmdline(joined))
     });
     (exe, cmdline)
+}
+
+/// Cap a command line at [`MAX_CMDLINE_BYTES`], marking that it was cut.
+///
+/// Cuts on a character boundary: the source is `from_utf8_lossy` output, so
+/// it is valid UTF-8 with multi-byte characters a byte slice would split.
+fn truncate_cmdline(mut s: String) -> String {
+    if s.len() <= MAX_CMDLINE_BYTES {
+        return s;
+    }
+    let cut = s
+        .char_indices()
+        .map(|(i, _)| i)
+        .take_while(|i| *i <= MAX_CMDLINE_BYTES)
+        .last()
+        .unwrap_or(0);
+    s.truncate(cut);
+    // Visible in every rendering of this string, so an operator reading a
+    // prompt is told the argv continues rather than shown a prefix that
+    // looks complete.
+    s.push_str("...[truncated]");
+    s
 }
 
 #[cfg(test)]
@@ -344,5 +383,42 @@ mod tests {
         // the freshly read details must be discarded.
         std::fs::remove_file(fd_dir.join("3")).unwrap();
         assert_eq!(verified_proc_details(&dir, 4242, 123456), None);
+    }
+
+    /// A process picks its own argv and ARG_MAX is megabytes. Uncapped, that
+    /// string reached the event history, every client queue and the syslog
+    /// exporter, and one connection could push a history reply past the wire
+    /// frame limit.
+    #[test]
+    fn cmdline_is_capped_at_capture() {
+        let dir = crate::testutil::TestDir::new("procfs-cmdline-cap");
+        let dir = dir.path();
+        std::fs::create_dir_all(dir.join("4242")).unwrap();
+        // NUL-separated argv, like the kernel presents it.
+        let mut raw = b"prog\0".to_vec();
+        raw.extend(std::iter::repeat_n(b'A', MAX_CMDLINE_BYTES * 3));
+        std::fs::write(dir.join("4242/cmdline"), &raw).unwrap();
+
+        let (_exe, cmdline) = read_proc_details(dir, 4242);
+        let cmdline = cmdline.expect("cmdline");
+        assert!(
+            cmdline.len() < MAX_CMDLINE_BYTES + 64,
+            "kept {} bytes",
+            cmdline.len()
+        );
+        assert!(cmdline.starts_with("prog "), "the real prefix survives");
+        assert!(cmdline.ends_with("...[truncated]"), "the cut must be visible");
+    }
+
+    /// Cutting by bytes would split a multi-byte character and panic, and
+    /// this string is `from_utf8_lossy` output of bytes a process chose.
+    #[test]
+    fn cmdline_truncation_lands_on_a_char_boundary() {
+        let wide = "\u{5206}".repeat(MAX_CMDLINE_BYTES);
+        let out = truncate_cmdline(wide);
+        assert!(out.ends_with("...[truncated]"));
+        assert!(out.len() <= MAX_CMDLINE_BYTES + 16, "kept {} bytes", out.len());
+        // Short input is returned untouched, no marker.
+        assert_eq!(truncate_cmdline("curl x".to_string()), "curl x");
     }
 }

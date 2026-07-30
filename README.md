@@ -241,7 +241,7 @@ why each one did or did not decide, naming the operand that failed rather
 than only reporting that something did:
 
 ```
-verdict: DENY  (rule block-telemetry)
+verdict: DENY  rule=block-telemetry
 
 RULE               PRIO  OUTCOME
 allow-curl-https    100  no match (domain)

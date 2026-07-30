@@ -691,8 +691,12 @@ pub struct Stats {
     /// ICMP, ...) or that failed to parse, resolved by the
     /// `unhandled_proto_verdict` config instead of rules.
     pub other_proto_total: u64,
-    /// Connections whose deny/reject verdict was recorded but not applied
+    /// Packets whose deny/reject verdict was recorded but not applied
     /// because the daemon runs in observe mode. Zero while enforcing.
+    ///
+    /// Includes packets no rule could see (ICMP, SCTP, unparsable), which
+    /// are decided by `unhandled_proto_verdict` and appear in no event, so
+    /// this is the whole of what enforcing the same config would stop.
     pub observed_only: u64,
     /// Observed-DNS packets dropped because the snoop queue was full. Costs
     /// a domain annotation on later connections, never a verdict.

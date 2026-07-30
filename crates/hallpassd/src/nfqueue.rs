@@ -219,7 +219,11 @@ pub fn run(mut queue: Queue, queue_num: u16, mut deps: QueueDeps) -> std::io::Re
         while let Ok((seq, verdict)) = deps.verdict_rx.try_recv() {
             busy = true;
             if let Some(msg) = held.remove(&seq) {
-                apply_verdict(&mut queue, msg, verdict);
+                // Through the helper like every other policy verdict. A
+                // packet only reaches here while enforcing (observe mode
+                // never holds one), so this is a no-op today and exists so
+                // that stays true if observe mode ever does hold a packet.
+                apply_verdict(&mut queue, msg, applied_verdict(verdict, deps.enforcing));
             }
         }
 
@@ -265,6 +269,14 @@ pub fn run(mut queue: Queue, queue_num: u16, mut deps: QueueDeps) -> std::io::Re
                             "unhandled packet blocked by policy"
                         );
                     } else {
+                        // Counted like any other unenforced block. These
+                        // carry no Connection, so this counter is the only
+                        // place they appear: an operator sizing a rollout
+                        // from `observed_only` would otherwise read zero and
+                        // then lose ping and path-MTU discovery on the day
+                        // they switch to enforcing, which is exactly the
+                        // breakage observe mode exists to predict.
+                        deps.stats.record_observed_only();
                         tracing::info!(
                             ?parsed,
                             verdict = deps.unhandled_verdict.as_str(),

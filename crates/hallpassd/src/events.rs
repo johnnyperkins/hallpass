@@ -106,10 +106,20 @@ impl EventBus {
         let mut out: Vec<ConnEvent> = Vec::new();
         let mut bytes = 0usize;
         for ev in &newest {
-            bytes += event_cost(ev);
-            if bytes > HISTORY_REPLY_BUDGET && !out.is_empty() {
+            let cost = event_cost(ev);
+            // An event larger than the whole budget cannot go in any reply.
+            // Skipping it answers with the rest of the history; returning it
+            // would build a frame the codec refuses, and a refused frame
+            // breaks the client's connection instead of answering it. Every
+            // field is capped at capture, so this is a backstop rather than
+            // an expected case.
+            if cost > HISTORY_REPLY_BUDGET {
+                continue;
+            }
+            if bytes + cost > HISTORY_REPLY_BUDGET {
                 break;
             }
+            bytes += cost;
             out.push(ConnEvent::clone(ev));
         }
         out.reverse();
@@ -240,14 +250,24 @@ mod tests {
         );
     }
 
-    /// One oversized event is still worth returning: an empty reply would
-    /// read as "nothing happened".
+    /// An event too large for any reply is skipped rather than sent. Sending
+    /// it would build a frame the codec refuses, and the client would get its
+    /// connection dropped instead of an answer, over and over as long as that
+    /// event stayed newest.
     #[test]
-    fn single_oversized_event_is_still_returned() {
+    fn oversized_event_is_skipped_and_the_rest_still_answer() {
         let bus = EventBus::default();
-        let mut c = conn();
-        c.cmdline = Some("A".repeat(HISTORY_REPLY_BUDGET * 2));
-        bus.emit(c, Verdict::Deny, None);
-        assert_eq!(bus.history(10).len(), 1);
+        bus.emit(conn(), Verdict::Allow, Some("before".into()));
+        let mut huge = conn();
+        huge.cmdline = Some("A".repeat(HISTORY_REPLY_BUDGET * 2));
+        bus.emit(huge, Verdict::Deny, None);
+        bus.emit(conn(), Verdict::Allow, Some("after".into()));
+
+        let out = bus.history(10);
+        assert_eq!(out.len(), 2, "the oversized event must be the only one lost");
+        assert_eq!(out[0].rule_name.as_deref(), Some("before"));
+        assert_eq!(out[1].rule_name.as_deref(), Some("after"));
+        hallpass_types::wire::encode(&hallpass_types::DaemonMsg::Events(out))
+            .expect("reply must encode");
     }
 }

@@ -53,6 +53,19 @@ struct Hit {
     last_ms: AtomicU64,
 }
 
+/// Longest accepted rule name.
+///
+/// Names are echoed back in every rule listing, every hit report, every
+/// explain trace and every event that a rule decided, so their length is
+/// multiplied by the number of rules in a single reply. The wire codec
+/// refuses frames over 1 MiB and a refused frame breaks the client's
+/// connection instead of answering it, so an unbounded name let a
+/// `hallpass`-group client make the daemon unanswerable to every client,
+/// itself included. `Forever` rules were bounded incidentally by the
+/// filesystem's name limit; `Session` rules are never written to disk and
+/// had no bound at all.
+pub const MAX_RULE_NAME_BYTES: usize = 256;
+
 /// Most rule names tracked at once.
 ///
 /// The map is keyed by name and outlives the rules themselves, so a client
@@ -356,6 +369,12 @@ impl RuleStore {
         if rule.name.is_empty() {
             return Err("rule name must not be empty".into());
         }
+        if rule.name.len() > MAX_RULE_NAME_BYTES {
+            return Err(format!(
+                "rule name is {} bytes, must be at most {MAX_RULE_NAME_BYTES}",
+                rule.name.len()
+            ));
+        }
         // Before compile: compiling opens the list files as root.
         list_paths_within(&rule, &self.rules_dir)?;
         CompiledRule::compile(&rule)?;
@@ -477,7 +496,28 @@ impl RuleStore {
 
     fn rebuild(&self) {
         let rules: Vec<Rule> = self.list();
+        self.prune_hits(&rules);
         self.active.store(Arc::new(RuleSet::compile(&rules)));
+    }
+
+    /// Drop hit counters for rules that are no longer loaded.
+    ///
+    /// The counter map deliberately outlives a reload so editing one rule
+    /// file does not reset its history, but a name whose rule is gone is
+    /// never reported again, so keeping it only spends the cap. Without
+    /// this, an interactive daemon reaches the cap on prompt-generated
+    /// names alone (each gets a fresh one), and past the cap every newly
+    /// added rule reports zero hits forever, which reads as dead policy an
+    /// operator would then delete.
+    ///
+    /// Called from `rebuild`, which already holds no lock: taking `hits`
+    /// here and `entries` then `hits` in [`RuleStore::hits`] keeps one
+    /// order everywhere.
+    fn prune_hits(&self, rules: &[Rule]) {
+        let live: std::collections::HashSet<&str> =
+            rules.iter().map(|r| r.name.as_str()).collect();
+        let mut map = self.hits.write().unwrap_or_else(|e| e.into_inner());
+        map.retain(|name, _| live.contains(name.as_str()));
     }
 
     fn persist(&self, rule: &Rule, entries: &[Entry]) -> Result<PathBuf, String> {
@@ -918,6 +958,43 @@ mod tests {
         }
         let tracked = store.hits.read().unwrap().len();
         assert_eq!(tracked, MAX_TRACKED_RULE_NAMES);
+    }
+
+    /// A name is echoed back in every listing, hit report and explain trace,
+    /// so its length is multiplied by the rule count in one reply. Session
+    /// rules never reach the filesystem, so nothing else bounded this.
+    #[test]
+    fn overlong_rule_name_rejected() {
+        let (_td, dir) = tmpdir("longname");
+        let store = RuleStore::new(dir.clone());
+        let mut r = rule("x", RuleDuration::Session);
+        r.name = "n".repeat(MAX_RULE_NAME_BYTES + 1);
+        let err = store.add(r).expect_err("overlong name must be refused");
+        assert!(err.contains("must be at most"), "{err}");
+
+        let mut ok = rule("x", RuleDuration::Session);
+        ok.name = "n".repeat(MAX_RULE_NAME_BYTES);
+        assert!(store.add(ok).is_ok(), "the limit itself is accepted");
+    }
+
+    /// Counters for rules that are gone are never reported, so keeping them
+    /// only spends the cap. An interactive daemon generates a fresh rule name
+    /// per prompt, and past the cap every new rule would report zero hits
+    /// forever, which reads as dead policy an operator would then delete.
+    #[test]
+    fn hit_counters_for_deleted_rules_are_pruned() {
+        let (_td, dir) = tmpdir("prunehits");
+        let store = RuleStore::new(dir.clone());
+        store.add(rule("keep", RuleDuration::Forever)).unwrap();
+        store.add(rule("drop", RuleDuration::Forever)).unwrap();
+        store.record_hit("keep");
+        store.record_hit("drop");
+        assert_eq!(store.hits.read().unwrap().len(), 2);
+
+        store.delete("drop").unwrap();
+        assert_eq!(store.hits.read().unwrap().len(), 1, "the gone rule's counter goes too");
+        // The surviving rule keeps its history.
+        assert_eq!(store.hits().iter().find(|h| h.name == "keep").unwrap().hits, 1);
     }
 
     #[test]
