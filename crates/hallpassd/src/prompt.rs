@@ -348,6 +348,13 @@ impl PromptTable {
             let _ = self.verdict_tx.send((seq, verdict));
         }
         self.stats.record_verdict(verdict);
+        // Count the hit here too, not only on the packet path. A rule that
+        // mostly resolves prompts already on screen (the sweep in
+        // `resolve_covered_by`) would otherwise read as dead policy in
+        // `rules --stats`, which is the exact question those counts answer.
+        if let Some(name) = &rule {
+            self.store.record_hit(name);
+        }
         self.events.emit(conn, verdict, rule);
     }
 
