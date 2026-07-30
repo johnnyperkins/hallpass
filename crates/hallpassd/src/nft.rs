@@ -53,10 +53,14 @@ fn ruleset(queue_num: u16, verdict_bypass: bool) -> String {
     let snoop = snoop_queue(queue_num);
     let mark = REJECT_MARK;
     let bypass = if verdict_bypass { " bypass" } else { "" };
-    // `reject` is its own base chain at a later priority than `output`, so a
-    // packet the daemon accepted with REJECT_MARK reaches it: reinjection
+    // `reject_marked` is its own base chain at a later priority than `output`,
+    // so a packet the daemon accepted with REJECT_MARK reaches it: reinjection
     // resumes at the next base chain in the hook, not inside `output`.
     // Unmarked (allowed) packets traverse it and fall through untouched.
+    //
+    // Not named `reject`: that is an nftables keyword, and using it makes the
+    // whole ruleset fail to parse. `install` then leaves no table at all, so
+    // nothing is filtered.
     format!(
         "table inet hallpass {{\n\
          \tchain output {{\n\
@@ -64,7 +68,7 @@ fn ruleset(queue_num: u16, verdict_bypass: bool) -> String {
          \t\tct state new queue num {queue_num}{bypass}\n\
          \t\tudp dport 53 ct state != new queue num {snoop} bypass\n\
          \t}}\n\
-         \tchain reject {{\n\
+         \tchain reject_marked {{\n\
          \t\ttype filter hook output priority filter; policy accept;\n\
          \t\tmeta mark {mark} meta l4proto tcp reject with tcp reset\n\
          \t\tmeta mark {mark} reject\n\
@@ -164,22 +168,69 @@ mod tests {
     fn reject_rules_live_in_their_own_later_chain() {
         let r = ruleset(3, true);
         let output = r
-            .split("\tchain reject {")
+            .split("\tchain reject_marked {")
             .next()
             .expect("output chain precedes the reject chain");
         assert!(
             !output.contains(&format!("meta mark {REJECT_MARK}")),
             "reject rules must not sit in the chain that queues packets:\n{r}"
         );
-        assert!(r.contains("\tchain reject {\n\t\ttype filter hook output priority filter;"));
+        assert!(r.contains("\tchain reject_marked {\n\t\ttype filter hook output priority filter;"));
         // The mark rules must both be inside the reject chain.
         let reject = r
-            .split("\tchain reject {")
+            .split("\tchain reject_marked {")
             .nth(1)
             .and_then(|s| s.split("\t}").next())
             .expect("reject chain body");
         assert!(reject.contains(&format!("meta mark {REJECT_MARK} meta l4proto tcp reject with tcp reset")));
         assert!(reject.contains(&format!("meta mark {REJECT_MARK} reject")));
+    }
+
+    /// Hand the rendered ruleset to the real `nft` parser.
+    ///
+    /// Asserting on substrings cannot catch a ruleset that nft refuses to
+    /// parse, and `install` renders the whole table in one `nft -f -`, so a
+    /// single bad token means no table is installed and nothing is filtered.
+    /// That is how `chain reject` shipped: `reject` is a keyword, every line
+    /// after it failed, and in the fail-open posture the daemon logged the
+    /// error and carried on with no interception at all.
+    ///
+    /// Works without root. Unprivileged `nft -c` cannot reach netlink and says
+    /// so, but it still parses first, so a syntax error is reported either way
+    /// and is the only thing this asserts on.
+    #[test]
+    fn rendered_ruleset_parses_under_real_nft() {
+        let Some(nft) = ["/usr/sbin/nft", "/sbin/nft", "/usr/bin/nft", "/bin/nft"]
+            .into_iter()
+            .find(|p| Path::new(p).is_file())
+        else {
+            eprintln!("SKIP rendered_ruleset_parses_under_real_nft: no nft binary");
+            return;
+        };
+
+        for bypass in [true, false] {
+            let text = ruleset(3, bypass);
+            let mut child = Command::new(nft)
+                .args(["-c", "-f", "-"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("spawn nft");
+            child
+                .stdin
+                .take()
+                .expect("nft stdin")
+                .write_all(text.as_bytes())
+                .expect("write ruleset");
+            let out = child.wait_with_output().expect("wait for nft");
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                !stderr.contains("syntax error"),
+                "nft rejected the ruleset (queue_bypass={bypass}):\n{stderr}\n\
+                 --- ruleset ---\n{text}"
+            );
+        }
     }
 
     #[test]
