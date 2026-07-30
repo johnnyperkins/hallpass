@@ -314,7 +314,7 @@ pub enum Parsed {
     Help,
 }
 
-/// Parse arguments (excluding argv[0]).
+/// Parse arguments (excluding `argv[0]`).
 pub fn parse(argv: &[String]) -> Result<Parsed, String> {
     let mut socket = PathBuf::from(DEFAULT_SOCKET);
     let mut json = false;

@@ -271,7 +271,8 @@ impl RuleEditor {
 
     /// Render the editor window. Returns `(keep_open, rule_to_send)`.
     /// A returned rule does not close the window; the app closes it when
-    /// the daemon acks via [`RuleEditor::ack_ok`].
+    /// the daemon acks; see [`RuleEditor::ack_err`] and
+    /// [`RuleEditor::ack_lost`] for the paths that keep it open.
     pub fn window(&mut self, ctx: &egui::Context) -> (bool, Option<Rule>) {
         let mut open = true;
         let mut saved = None;

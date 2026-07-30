@@ -3,7 +3,7 @@
 //! NFQUEUE reports interfaces as kernel ifindex values; rules match on
 //! names ("eth0", "wg0"). Names are cached and the /sys scan repeated only
 //! when an unknown index appears (interface hotplug); an index that stays
-//! unknown after a rescan is cached as "if<N>" so it cannot trigger a scan
+//! unknown after a rescan is cached as `if<N>` so it cannot trigger a scan
 //! per packet.
 //!
 //! Known limitation: renaming an interface without changing its ifindex

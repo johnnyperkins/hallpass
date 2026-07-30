@@ -44,7 +44,8 @@ pub struct Row {
     pub blocked: u64,
     /// Deny or reject that observe mode recorded without applying.
     pub would_block: u64,
-    /// Distinct destinations seen, capped at [`MAX_PEERS_PER_ROW`].
+    /// Distinct destinations seen, capped internally so a process cycling
+    /// destinations cannot grow one row without bound.
     pub peers: usize,
     /// Most recent event for this row, as Unix milliseconds.
     pub last_ms: u64,

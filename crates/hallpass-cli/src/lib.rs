@@ -30,7 +30,7 @@ pub const EXIT_ERR: i32 = 1;
 /// Exit code for a connection failure.
 pub const EXIT_CONN: i32 = 2;
 
-/// Run the CLI with the given arguments (excluding argv[0]).
+/// Run the CLI with the given arguments (excluding `argv[0]`).
 ///
 /// Returns the process exit code.
 pub async fn run(argv: &[String]) -> i32 {

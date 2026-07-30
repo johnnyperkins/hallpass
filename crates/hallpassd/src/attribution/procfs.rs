@@ -146,7 +146,7 @@ impl Attributor for ProcfsAttributor {
     }
 }
 
-/// Scan `proc_root`/PID/fd/* for a symlink to "socket:[inode]".
+/// Scan `proc_root`/PID/fd/* for a symlink to `socket:[inode]`.
 fn find_pid_for_inode(proc_root: &Path, inode: u64) -> Option<u32> {
     for entry in std::fs::read_dir(proc_root).ok()?.flatten() {
         let name = entry.file_name();
@@ -160,7 +160,7 @@ fn find_pid_for_inode(proc_root: &Path, inode: u64) -> Option<u32> {
     None
 }
 
-/// Does `proc_root`/PID/fd/* contain a symlink to "socket:[inode]"?
+/// Does `proc_root`/PID/fd/* contain a symlink to `socket:[inode]`?
 fn pid_holds_inode(proc_root: &Path, pid: u32, inode: u64) -> bool {
     let target = format!("socket:[{inode}]");
     let Ok(fds) = std::fs::read_dir(proc_root.join(pid.to_string()).join("fd")) else {
