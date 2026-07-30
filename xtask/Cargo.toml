@@ -7,5 +7,14 @@ description = "Build tasks for the hallpass workspace"
 
 [dependencies]
 
+# Test-only, and deliberately not build dependencies: the task itself stays
+# dependency-free so it cannot fail to compile on a fresh checkout. The
+# starter rules `dev` writes are parsed here through the daemon's own Rule
+# type, because a rule file the daemon silently skips would leave the dev
+# loop looking broken for no visible reason.
+[dev-dependencies]
+hallpass-types = { path = "../crates/hallpass-types" }
+toml = "0.8"
+
 [lints]
 workspace = true

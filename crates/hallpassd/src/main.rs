@@ -285,7 +285,12 @@ async fn main() {
     // failing to come up.
     #[cfg(feature = "dev-fixtures")]
     if config_arg.synthetic_events {
-        devfixtures::spawn(Arc::clone(&events), Arc::clone(&counters));
+        devfixtures::spawn(
+            Arc::clone(&events),
+            Arc::clone(&counters),
+            Arc::clone(&store),
+            cfg.default_verdict,
+        );
     }
 
     // IPC server.

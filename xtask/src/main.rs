@@ -293,6 +293,90 @@ fn dev_config(dir: &Path) -> String {
     )
 }
 
+/// The starter policy `dev` writes into an empty scratch `rules.d`.
+///
+/// The synthetic connections are decided by whatever is loaded, so against an
+/// empty directory every one of them falls to `default_verdict` and the feed
+/// is a wall of identical allows with no rule names. These give the cast
+/// something to be decided by: an allow, a deny at higher priority that wins
+/// over it, a reject, and two connections nothing matches. There is nothing
+/// special about them - edit, disable, delete, or add from a client, and the
+/// next connection follows.
+const DEV_RULES: &[(&str, &str)] = &[
+    (
+        "allow-web",
+        "name = \"allow-web\"\n\
+         action = \"allow\"\n\
+         duration = \"forever\"\n\
+         priority = 10\n\
+         enabled = true\n\
+         \n\
+         [match]\n\
+         port = 443\n\
+         proto = \"tcp\"\n",
+    ),
+    (
+        "block-telemetry",
+        "name = \"block-telemetry\"\n\
+         action = \"deny\"\n\
+         duration = \"forever\"\n\
+         priority = 100\n\
+         enabled = true\n\
+         \n\
+         [match]\n\
+         domain = \"telemetry.example.com\"\n",
+    ),
+    (
+        "allow-updates",
+        "name = \"allow-updates\"\n\
+         action = \"allow\"\n\
+         duration = \"forever\"\n\
+         priority = 10\n\
+         enabled = true\n\
+         \n\
+         [match]\n\
+         port = 80\n\
+         proto = \"tcp\"\n",
+    ),
+    (
+        "block-unknown-binaries",
+        "name = \"block-unknown-binaries\"\n\
+         action = \"reject\"\n\
+         duration = \"forever\"\n\
+         priority = 100\n\
+         enabled = true\n\
+         \n\
+         [match]\n\
+         exe_glob = \"/tmp/*\"\n",
+    ),
+];
+
+/// Write the starter policy, unless the scratch directory already has rules.
+///
+/// Guarded on the directory being empty of rules rather than on each file
+/// being absent, so a rule deleted while working on something stays deleted
+/// across runs. Emptying the directory is how to ask for the starter set
+/// back.
+fn seed_dev_rules(dir: &Path) -> Result<(), String> {
+    let has_rules = std::fs::read_dir(dir)
+        .map_err(|e| format!("failed to read {}: {e}", dir.display()))?
+        .filter_map(Result::ok)
+        .any(|e| e.path().extension().is_some_and(|x| x == "toml"));
+    if has_rules {
+        return Ok(());
+    }
+    for (stem, body) in DEV_RULES {
+        let path = dir.join(format!("{stem}.toml"));
+        std::fs::write(&path, body)
+            .map_err(|e| format!("failed to write {}: {e}", path.display()))?;
+        // The daemon skips a rule file that is group- or world-writable, and
+        // a permissive umask would produce one. A skipped starter rule would
+        // show up only as a count in `status`.
+        set_mode(&path, 0o600)?;
+    }
+    Ok(())
+}
+
 /// Where the dev scratch dir goes.
 ///
 /// `$XDG_RUNTIME_DIR` is preferred: it is already 0700 and user-owned, it is
@@ -323,6 +407,7 @@ fn dev() -> Result<(), String> {
     let rules_dir = dir.join("rules.d");
     std::fs::create_dir_all(&rules_dir)
         .map_err(|e| format!("failed to create {}: {e}", rules_dir.display()))?;
+    seed_dev_rules(&rules_dir)?;
 
     let cfg_path = dir.join("config.toml");
     std::fs::write(&cfg_path, dev_config(&dir))
@@ -356,6 +441,12 @@ fn dev() -> Result<(), String> {
     eprintln!("the events and traffic views are fed by SYNTHETIC connections, since");
     eprintln!("with no interception there is nothing real to show. They are built in");
     eprintln!("under the dev-fixtures feature and cannot exist in a release binary.");
+    eprintln!();
+    eprintln!("the connections are invented; the verdicts are not. Each one runs through");
+    eprintln!("the loaded ruleset the way a real packet does, so editing a rule changes");
+    eprintln!("what the next one is decided by, and hit counts move. A starter policy is");
+    eprintln!("written to the rules dir when it is empty:");
+    eprintln!("  {}", rules_dir.display());
     eprintln!();
     eprintln!("in another terminal:");
     eprintln!("  cargo run -q -p hallpass-cli -- --socket {socket} status");
@@ -436,6 +527,69 @@ mod tests {
             }
             _ => assert_eq!(dev_dir(), workspace_root().join("target/dev")),
         }
+    }
+
+    /// Parsed through the daemon's own type, which is `deny_unknown_fields`:
+    /// a starter rule with a key the daemon does not know is skipped at load
+    /// with nothing but a counter to say so, and the dev loop then looks
+    /// broken for a reason nobody can see.
+    #[test]
+    fn the_starter_rules_are_rules_the_daemon_accepts() {
+        for (stem, body) in DEV_RULES {
+            let rule: hallpass_types::Rule = toml::from_str(body)
+                .unwrap_or_else(|e| panic!("{stem}.toml does not parse as a rule: {e}"));
+            assert_eq!(&rule.name, stem, "file name and rule name must agree");
+            assert!(rule.enabled, "{stem} would load disabled");
+            assert_ne!(
+                rule.matcher,
+                hallpass_types::RuleMatch::default(),
+                "{stem} matches every connection"
+            );
+        }
+    }
+
+    /// The deny has to outrank the allow it overlaps, or the telemetry
+    /// connection is allowed by the port rule and the starter policy
+    /// demonstrates nothing.
+    #[test]
+    fn the_starter_policy_lets_the_block_win() {
+        let by_name = |want: &str| -> hallpass_types::Rule {
+            let (_, body) = DEV_RULES
+                .iter()
+                .find(|(stem, _)| *stem == want)
+                .expect("rule present");
+            toml::from_str(body).expect("parses")
+        };
+        let block = by_name("block-telemetry");
+        let allow = by_name("allow-web");
+        assert!(
+            block.priority > allow.priority,
+            "higher priority is evaluated first"
+        );
+        assert_eq!(block.action, hallpass_types::Action::Deny);
+        assert_eq!(allow.matcher.port, Some(443));
+    }
+
+    /// Re-running `dev` must not undo an edit. The seed is written only into
+    /// a directory with no rules in it.
+    #[test]
+    fn seeding_leaves_an_existing_rules_dir_alone() {
+        let dir = std::env::temp_dir().join(format!("hallpass-xtask-seed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        seed_dev_rules(&dir).unwrap();
+        let seeded = std::fs::read_dir(&dir).unwrap().count();
+        assert_eq!(seeded, DEV_RULES.len());
+
+        std::fs::write(dir.join("allow-web.toml"), "edited").unwrap();
+        seed_dev_rules(&dir).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("allow-web.toml")).unwrap(),
+            "edited",
+            "a second run overwrote an edited rule"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

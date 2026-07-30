@@ -1,4 +1,4 @@
-//! Synthetic connection events for client development. Never in a release
+//! Synthetic connections for client development. Never in a release
 //! build: gated behind the non-default `dev-fixtures` feature.
 //!
 //! Without root the daemon cannot bind an nfqueue, so no traffic is ever
@@ -8,11 +8,19 @@
 //! iterate on without privileges. This feeds the same event bus the verdict
 //! path feeds, so those views exercise their real code.
 //!
-//! The events are fabricated, so anything downstream of the bus sees
-//! fabricated data too, including the syslog exporter. That is the reason
-//! this cannot exist in a shipped binary: a feature flag the operator has to
-//! opt into at compile time is the only version of this that cannot be turned
-//! on by accident on a real host.
+//! What is fabricated is the connection, and only the connection. Each one is
+//! run through the loaded ruleset the way [`crate::nfqueue`] runs a real one,
+//! so the verdict, the rule name and the hit counters are the engine's
+//! answers rather than a script's. That is the difference between a dev loop
+//! that exercises the rule path and one that impersonates it: editing a rule
+//! changes what the next connection is decided by, which is exactly what
+//! someone working on a client needs to be able to see.
+//!
+//! The connections are still invented, so anything downstream of the bus sees
+//! invented data, including the syslog exporter. That is the reason this
+//! cannot exist in a shipped binary: a feature flag the operator has to opt
+//! into at compile time is the only version of this that cannot be turned on
+//! by accident on a real host.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -20,13 +28,15 @@ use std::time::Duration;
 use hallpass_types::{Connection, FlowTuple, Proto, Verdict};
 
 use crate::events::EventBus;
+use crate::rules::store::RuleStore;
 use crate::stats::Counters;
 
 /// Delay between generated connections. Fast enough that a view fills while
 /// you watch it, slow enough to read.
 const INTERVAL: Duration = Duration::from_millis(700);
 
-/// One fabricated connection shape.
+/// One fabricated connection shape. No verdict: that is the ruleset's to
+/// decide, the same as for a real packet.
 struct Scenario {
     exe: &'static str,
     cmdline: &'static str,
@@ -34,36 +44,42 @@ struct Scenario {
     /// views must render rather than hide.
     domain: &'static str,
     port: u16,
-    verdict: Verdict,
-    /// None stands for a connection no rule matched, which is what the
-    /// prompt path or the default verdict decides.
-    rule: Option<&'static str>,
 }
 
-/// The cast: plausible applications, destinations, and verdicts, chosen to
-/// exercise every rendering branch (allowed, blocked, rule-decided,
-/// prompt-defaulted, resolved and unresolved destinations).
+/// The cast: plausible applications and destinations, chosen so the starter
+/// policy `cargo xtask dev` writes decides them several different ways
+/// (allowed, denied, rejected, and matched by no rule at all). Editing that
+/// policy, or adding to it from a client, changes what these are decided by.
 const SCENARIOS: &[Scenario] = &[
     Scenario { exe: "/usr/bin/curl", cmdline: "curl https://example.org",
-        domain: "example.org", port: 443, verdict: Verdict::Allow, rule: Some("allow-web") },
+        domain: "example.org", port: 443 },
     Scenario { exe: "/usr/lib/firefox/firefox", cmdline: "firefox",
-        domain: "cdn.example.net", port: 443, verdict: Verdict::Allow, rule: Some("allow-web") },
+        domain: "cdn.example.net", port: 443 },
     Scenario { exe: "/usr/lib/firefox/firefox", cmdline: "firefox",
-        domain: "telemetry.example.com", port: 443, verdict: Verdict::Deny,
-        rule: Some("block-telemetry") },
+        domain: "telemetry.example.com", port: 443 },
     Scenario { exe: "/usr/bin/ssh", cmdline: "ssh build@10.0.0.9",
-        domain: "", port: 22, verdict: Verdict::Allow, rule: None },
+        domain: "", port: 22 },
     Scenario { exe: "/usr/bin/apt", cmdline: "apt update",
-        domain: "deb.example.org", port: 80, verdict: Verdict::Allow, rule: Some("allow-updates") },
+        domain: "deb.example.org", port: 80 },
     Scenario { exe: "/tmp/.cache/miner", cmdline: "./miner --pool",
-        domain: "pool.example.biz", port: 3333, verdict: Verdict::Reject,
-        rule: Some("block-unknown-binaries") },
+        domain: "pool.example.biz", port: 3333 },
     Scenario { exe: "/usr/bin/python3", cmdline: "python3 backup.py",
-        domain: "backup.example.org", port: 8443, verdict: Verdict::Deny, rule: None },
+        domain: "backup.example.org", port: 8443 },
 ];
 
 /// Start the generator. One task, stopped only by the process exiting.
-pub fn spawn(events: Arc<EventBus>, stats: Arc<Counters>) {
+///
+/// `default_verdict` stands in for the prompt a real unmatched connection
+/// would raise: there is no held packet here to release, and no client is
+/// guaranteed to be attached, so an unmatched connection records what an
+/// unanswered prompt would have produced. Observe mode does the same thing
+/// on the real path.
+pub fn spawn(
+    events: Arc<EventBus>,
+    stats: Arc<Counters>,
+    rules: Arc<RuleStore>,
+    default_verdict: Verdict,
+) {
     tracing::warn!(
         "dev-fixtures: emitting synthetic connection events, this build is not fit for a real host"
     );
@@ -92,11 +108,23 @@ pub fn spawn(events: Arc<EventBus>, stats: Arc<Counters>) {
                 domain: (!s.domain.is_empty()).then(|| s.domain.to_string()),
                 iface: Some("eth0".to_string()),
             };
-            stats.record_verdict(s.verdict);
-            if !events.enforcing() && s.verdict != Verdict::Allow {
+            // The same sequence the verdict path runs, minus the packet:
+            // one ruleset snapshot, match, count the hit, emit. The hash
+            // operand is deliberately never computed - these executables do
+            // not exist on disk, so a hash-pinning rule can only fail to
+            // match, and asking for one would read a file that is not there.
+            let (verdict, rule_name) = match rules.ruleset().match_conn(&conn, None) {
+                Some((rule, verdict)) => (verdict, Some(rule.name.clone())),
+                None => (default_verdict, None),
+            };
+            if let Some(name) = &rule_name {
+                rules.record_hit(name);
+            }
+            stats.record_verdict(verdict);
+            if !events.enforcing() && verdict != Verdict::Allow {
                 stats.record_observed_only();
             }
-            events.emit(conn, s.verdict, s.rule.map(str::to_string));
+            events.emit(conn, verdict, rule_name);
             n += 1;
         }
     });
