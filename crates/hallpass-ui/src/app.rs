@@ -57,17 +57,33 @@ enum ConnStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AckKind {
     RuleSave,
+    /// Enable/disable. Kept distinct from `Other` because a rejected
+    /// toggle has to be reconciled against the daemon; see [`needs_refresh`].
+    RuleToggle,
+    /// Delete, for the same reason.
+    RuleDelete,
     Other,
+}
+
+/// Whether the ack for `kind` must be followed by re-reading the rule list.
+///
+/// Toggles and deletes change what is enforced, and the daemon can refuse
+/// either. Nothing on this side can tell an accepted change from a refused
+/// one without asking, and guessing wrong is not a cosmetic error: a rejected
+/// toggle would leave the operator believing a rule is off while it is still
+/// enforced, and a rejected delete would remove the row for a rule that still
+/// exists. Refetching after both outcomes keeps the screen equal to policy.
+fn needs_refresh(kind: Option<AckKind>) -> bool {
+    matches!(kind, Some(AckKind::RuleToggle) | Some(AckKind::RuleDelete))
 }
 
 /// The ack, if any, the daemon will send for `msg`.
 fn ack_kind(msg: &ClientMsg) -> Option<AckKind> {
     match msg {
         ClientMsg::RuleAdd(_) => Some(AckKind::RuleSave),
-        ClientMsg::Subscribe { .. }
-        | ClientMsg::PromptReply { .. }
-        | ClientMsg::RuleDelete { .. }
-        | ClientMsg::RuleToggle { .. } => Some(AckKind::Other),
+        ClientMsg::RuleToggle { .. } => Some(AckKind::RuleToggle),
+        ClientMsg::RuleDelete { .. } => Some(AckKind::RuleDelete),
+        ClientMsg::Subscribe { .. } | ClientMsg::PromptReply { .. } => Some(AckKind::Other),
         _ => None,
     }
 }
@@ -230,19 +246,24 @@ impl HallpassApp {
             // the form (and everything typed into it) alive on a reject,
             // close it on success, and route unrelated acks elsewhere.
             DaemonMsg::Err { message } => {
-                match (
-                    self.pending_acks.pop_front(),
-                    self.editor.as_mut().filter(|e| e.awaiting_ack()),
-                ) {
+                let kind = self.pending_acks.pop_front();
+                match (kind, self.editor.as_mut().filter(|e| e.awaiting_ack())) {
                     (Some(AckKind::RuleSave), Some(editor)) => editor.ack_err(&message),
                     _ => self.last_error = Some(message),
                 }
+                if needs_refresh(kind) {
+                    self.send(ClientMsg::RuleList);
+                }
             }
             DaemonMsg::Ok => {
-                if self.pending_acks.pop_front() == Some(AckKind::RuleSave)
+                let kind = self.pending_acks.pop_front();
+                if kind == Some(AckKind::RuleSave)
                     && self.editor.as_ref().is_some_and(RuleEditor::awaiting_ack)
                 {
                     self.editor = None;
+                }
+                if needs_refresh(kind) {
+                    self.send(ClientMsg::RuleList);
                 }
             }
             // Neither is requested by this client yet. Ignoring them keeps
@@ -557,14 +578,14 @@ impl HallpassApp {
         if let Some(editor) = edit {
             self.editor = Some(editor);
         }
+        // Neither of these touches self.rules. The displayed policy is
+        // whatever the daemon last reported, and the ack handler refetches
+        // it: a local edit applied before the answer would show a rule as
+        // disabled or gone while the daemon still enforces it.
         if let Some((name, enabled)) = toggle {
-            if let Some(rule) = self.rules.iter_mut().find(|r| r.name == name) {
-                rule.enabled = enabled;
-            }
             self.send(ClientMsg::RuleToggle { name, enabled });
         }
         if let Some(name) = delete {
-            self.rules.retain(|r| r.name != name);
             self.send(ClientMsg::RuleDelete { name });
         }
     }
@@ -914,5 +935,40 @@ mod tests {
         assert_eq!(duration_label(RuleDuration::Session), "Session");
         assert_eq!(scope_label(PromptScope::AppAnywhere), "App anywhere");
         assert_eq!(verdict_label(Verdict::Reject), "reject");
+    }
+
+    /// A rejected toggle or delete must send the operator back to the
+    /// daemon's view. Both outcomes refetch, because nothing here can tell
+    /// an accepted change from a refused one, and the wrong guess leaves an
+    /// enforced rule looking disabled or invisible.
+    #[test]
+    fn toggle_and_delete_acks_force_a_refresh() {
+        assert!(needs_refresh(Some(AckKind::RuleToggle)));
+        assert!(needs_refresh(Some(AckKind::RuleDelete)));
+        // A rule save reconciles through the editor, and the editor sends
+        // its own RuleList; refetching here too would be noise.
+        assert!(!needs_refresh(Some(AckKind::RuleSave)));
+        assert!(!needs_refresh(Some(AckKind::Other)));
+        assert!(!needs_refresh(None));
+    }
+
+    /// Toggles and deletes must not share an ack kind with anything else:
+    /// the FIFO is how a reply is matched to its request, so a miscategorized
+    /// request reconciles the wrong thing.
+    #[test]
+    fn ack_kinds_are_distinct_per_request() {
+        let toggle = ClientMsg::RuleToggle { name: "r".into(), enabled: false };
+        let delete = ClientMsg::RuleDelete { name: "r".into() };
+        assert_eq!(ack_kind(&toggle), Some(AckKind::RuleToggle));
+        assert_eq!(ack_kind(&delete), Some(AckKind::RuleDelete));
+        assert_eq!(
+            ack_kind(&ClientMsg::Subscribe { events: true, prompts: true }),
+            Some(AckKind::Other)
+        );
+        // Requests answered with data, not an ack, must not enter the FIFO
+        // at all or every later reply is matched to the wrong request.
+        assert_eq!(ack_kind(&ClientMsg::RuleList), None);
+        assert_eq!(ack_kind(&ClientMsg::Stats), None);
+        assert_eq!(ack_kind(&ClientMsg::EventHistory { limit: 10 }), None);
     }
 }
