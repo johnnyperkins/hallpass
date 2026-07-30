@@ -229,7 +229,44 @@ hallpass-cli rules toggle allow-dns off
 hallpass-cli events                        # stream connection events
 hallpass-cli top                           # live aggregate of current activity
 hallpass-cli watch                         # answer prompts in the terminal
+hallpass-cli rules --stats                 # list rules with hit counts
+hallpass-cli rules export > policy.toml    # the whole ruleset as one document
+hallpass-cli rules import policy.toml      # add every rule in a document
+hallpass-cli explain --exe /usr/bin/curl --dest 1.1.1.1 --port 443
 ```
+
+`explain` asks what policy would do with a connection without sending a
+packet. It answers with the verdict, then every rule in evaluation order and
+why each one did or did not decide, naming the operand that failed rather
+than only reporting that something did:
+
+```
+verdict: DENY  (rule block-telemetry)
+
+RULE               PRIO  OUTCOME
+allow-curl-https    100  no match (domain)
+block-telemetry      50  matched
+deny-all              0  not reached
+```
+
+It evaluates through the same predicate the packet path uses, so an
+explanation cannot disagree with enforcement. The connection is described
+entirely by the flags, so it answers for the facts you state: nothing is
+verified against `/proc`, and `--exe-sha256` has to be supplied if a
+hash-pinning rule is in play, since the daemon will not hash a path a client
+named for it.
+
+`rules --stats` adds hit counts and a last-hit time to the listing, which is
+how a rule that never matches anything becomes visible. Counts are per rule
+name and survive a rules-directory reload, so editing one file keeps its
+history; they reset when the daemon restarts, because this answers "is this
+rule doing anything", not "what happened last month".
+
+`rules export` writes the ruleset as one TOML document using the same field
+names as the files in `rules.d`, so it can be read, diffed, and checked into
+version control, and a single entry can be lifted into `rules.d` unchanged.
+`rules import` offers every rule even after one is refused, reports each by
+name, and exits non-zero if any failed.
 
 `top` answers "what is this machine talking to" rather than "what happened
 next": it folds the event stream into a live table, seeded from the daemon's
