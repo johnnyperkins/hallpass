@@ -5,39 +5,64 @@ on:
     branches: [main, master]
   pull_request:
 
+# Read-only by default. Nothing here publishes, comments, or writes to the
+# repo, and the e2e job runs a freshly built binary as root on the runner, so
+# the token it can reach should be able to do as little as possible.
+permissions:
+  contents: read
+
+# A new push supersedes the one before it on the same ref. The e2e job takes
+# root and network namespaces, so leaving stale runs queued costs real time.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
+
+# Third-party actions are pinned to a full commit SHA, not a tag or branch:
+# a tag can be moved and `@stable` is a branch, so either would let an
+# upstream change run new code here without a commit in this repo. The
+# trailing comment records which release each SHA is. Dependabot
+# (.github/dependabot.yml) proposes the bumps so the pins do not rot.
+# `dtolnay/rust-toolchain` publishes no release tags; its branch names are the
+# toolchain selector, so the pin is the head of the `stable` branch.
 
 jobs:
   test:
     name: test + clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable branch
         with:
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       # The e2e tests are #[ignore]-gated (need root + netns) and run in
       # the e2e job; the nightly-only hallpass-ebpf build has its own job.
       - name: Test
         run: cargo test --workspace
+      # `cargo xtask lint` runs this plus the two clippy invocations in the
+      # ebpf job below, so one local command covers every lint gate here.
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
   ebpf:
     name: ebpf feature build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable branch
         with:
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       # rustup auto-installs the nightly + rust-src pinned by
       # crates/hallpass-ebpf/rust-toolchain.toml on first use.
       - name: Install bpf-linker
-        run: cargo install bpf-linker --locked
+        # Pinned: this compiles and runs third-party code in the job, so the
+        # version that linked the kernel object should change only when this
+        # file does. --locked also holds bpf-linker's own dependency tree.
+        run: cargo install bpf-linker --locked --version 0.10.4
       - name: Build eBPF object
         run: cargo xtask build-ebpf
       # crates/hallpass-ebpf is not a workspace member, so the clippy job
@@ -53,13 +78,28 @@ jobs:
       - name: Test (ebpf feature)
         run: cargo test -p hallpassd --features ebpf
 
+  docs:
+    name: docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable branch
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      # RUSTDOCFLAGS=-D warnings (set inside the task) is the point: the doc
+      # comments carry the security reasoning and lean on intra-doc links, and
+      # a link that stops resolving degrades to plain text with no other
+      # signal. This job does not build the ebpf feature, so it needs no
+      # nightly toolchain and no bpf-linker.
+      - name: Docs
+        run: cargo xtask doc
+
   e2e:
     name: e2e (root + netns)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable branch
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - name: Install tools
         # iproute2 and python3 ship with the runner image; the suite also
         # needs nft and nc.
@@ -68,7 +108,7 @@ jobs:
       # below treats any skip as a broken environment, so the binary must
       # be built with the feature (which needs the eBPF object first).
       - name: Install bpf-linker
-        run: cargo install bpf-linker --locked
+        run: cargo install bpf-linker --locked --version 0.10.4
       - name: Build eBPF object
         run: cargo xtask build-ebpf
       # Build unprivileged so the cache and target/ stay runner-user-owned;
@@ -81,6 +121,14 @@ jobs:
         # unusable; grep for the skip marker so a broken root or tool setup
         # fails the job instead of going silently green. --nocapture because
         # the harness hides stderr of passing tests.
+        #
+        # This is the one step that runs project code as root. It stays a
+        # `cargo test` rather than the prebuilt binary because cargo picks
+        # the test binary by hash and the hash changes with every source
+        # edit; the build above is what keeps the compile unprivileged, so
+        # cargo has nothing left to do here but launch. `sudo cargo` is
+        # avoided locally for a different reason (root-owned files in
+        # target/); on a throwaway runner that does not matter.
         shell: bash
         run: |
           sudo -E "$(command -v cargo)" test -p hallpassd --test e2e --features ebpf -- --ignored --test-threads=1 --nocapture 2>&1 | tee e2e.log
@@ -90,5 +138,5 @@ jobs:
     name: cargo-deny
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
