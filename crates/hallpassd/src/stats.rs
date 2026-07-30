@@ -72,7 +72,7 @@ impl Counters {
     /// the log itself becoming the flood.
     pub fn record_dns_snoop_dropped(&self) {
         let n = self.dns_snoop_dropped.fetch_add(1, Ordering::Relaxed) + 1;
-        if n.is_power_of_two() || n % 10_000 == 0 {
+        if n.is_power_of_two() || n.is_multiple_of(10_000) {
             tracing::warn!(dropped = n, "DNS snoop queue full, dropping observed DNS");
         }
     }

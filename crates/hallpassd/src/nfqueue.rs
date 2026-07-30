@@ -222,10 +222,10 @@ pub fn run(mut queue: Queue, queue_num: u16, mut deps: QueueDeps) -> std::io::Re
 
                 // The first query on a DNS flow is `ct state new` and thus
                 // arrives on the verdict queue; snoop it before deciding.
-                if packet::is_dns_query(&tuple) {
-                    if deps.dns_tx.try_send((tuple, msg.get_payload().to_vec())).is_err() {
-                        deps.stats.record_dns_snoop_dropped();
-                    }
+                if packet::is_dns_query(&tuple)
+                    && deps.dns_tx.try_send((tuple, msg.get_payload().to_vec())).is_err()
+                {
+                    deps.stats.record_dns_snoop_dropped();
                 }
 
                 let iface = iface_map.name(msg.get_outdev());
