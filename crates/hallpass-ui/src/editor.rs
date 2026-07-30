@@ -7,7 +7,7 @@
 //! here is a trust boundary.
 
 use eframe::egui::{self, ComboBox, TextEdit};
-use hallpass_types::{Action, Proto, Rule, RuleDuration, RuleMatch};
+use hallpass_types::{Action, Connection, Proto, Rule, RuleDuration, RuleMatch};
 
 /// Duration choice in the form; `Timed` carries its timespan text.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -97,6 +97,47 @@ impl RuleEditor {
             error: None,
             awaiting: false,
         }
+    }
+
+    /// A form pre-filled from a connection that already happened.
+    ///
+    /// Writing a rule by hand from a row in the traffic view means retyping
+    /// an executable path and an address the operator is looking at, which is
+    /// where the typos come from. The action deliberately stays at the `add`
+    /// default (deny) rather than mirroring whatever the connection got: this
+    /// opens from a row the operator picked out, and the safe reading of that
+    /// is "I want to stop this", not "make what just happened permanent".
+    ///
+    /// The name is a suggestion, not a decision; it is sanitized because the
+    /// process chose its own executable path, and it lands in a field the
+    /// operator edits and then reads back.
+    pub fn from_connection(conn: &Connection) -> Self {
+        let mut e = Self::add();
+        let exe = conn
+            .exe_path
+            .as_ref()
+            .map(|p| hallpass_types::sanitize_for_display(&p.display().to_string()).into_owned())
+            .unwrap_or_default();
+        let stem = conn
+            .exe_path
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .map(|n| hallpass_types::sanitize_for_display(&n.to_string_lossy()).into_owned())
+            .unwrap_or_else(|| "connection".to_string());
+        e.name = format!("{stem}-{}", conn.tuple.dst.port());
+        e.exe = exe;
+        e.port = conn.tuple.dst.port().to_string();
+        e.proto = Some(conn.tuple.proto);
+        // Prefer the domain over the address: an address is one of however
+        // many a name resolves to today, so a rule pinned to it silently
+        // stops covering the thing the operator meant.
+        match &conn.domain {
+            Some(domain) => {
+                e.domain = hallpass_types::sanitize_for_display(domain).into_owned()
+            }
+            None => e.dest = conn.tuple.dst.ip().to_string(),
+        }
+        e
     }
 
     /// A form pre-filled from an existing rule.
@@ -416,6 +457,59 @@ mod tests {
         e.name = "test".into();
         e.port = "443".into();
         e
+    }
+
+    fn conn(exe: Option<&str>, domain: Option<&str>) -> Connection {
+        Connection {
+            tuple: hallpass_types::FlowTuple {
+                proto: Proto::Tcp,
+                src: "10.0.0.1:40000".parse().unwrap(),
+                dst: "93.184.216.34:443".parse().unwrap(),
+            },
+            uid: Some(1000),
+            pid: Some(1),
+            exe_path: exe.map(std::path::PathBuf::from),
+            cmdline: None,
+            parent_exe: None,
+            domain: domain.map(String::from),
+            iface: None,
+        }
+    }
+
+    #[test]
+    fn prefill_from_connection_prefers_the_domain() {
+        let e = RuleEditor::from_connection(&conn(Some("/usr/bin/curl"), Some("example.org")));
+        assert_eq!(e.name, "curl-443");
+        assert_eq!(e.exe, "/usr/bin/curl");
+        assert_eq!(e.port, "443");
+        assert_eq!(e.proto, Some(Proto::Tcp));
+        // An address is one of however many a name resolves to, so a rule
+        // pinned to it would quietly stop covering what was meant.
+        assert_eq!(e.domain, "example.org");
+        assert_eq!(e.dest, "");
+        // Deny, not whatever the connection got: the operator picked this
+        // row out, and the safe reading of that is "stop this".
+        assert_eq!(e.action, Action::Deny);
+
+        // Without a resolved name the address is all there is.
+        let e = RuleEditor::from_connection(&conn(Some("/usr/bin/curl"), None));
+        assert_eq!(e.dest, "93.184.216.34");
+        assert_eq!(e.domain, "");
+    }
+
+    /// The process chose its own executable path, and the prefilled name is
+    /// a field the operator reads back before saving.
+    #[test]
+    fn prefill_sanitizes_hostile_paths() {
+        let e = RuleEditor::from_connection(&conn(
+            Some("/tmp/evil\r\x1b[2K/usr/bin/firefox"),
+            Some("bank.example\u{202e}moc.reknatta"),
+        ));
+        for field in [&e.name, &e.exe, &e.domain] {
+            assert!(!field.contains('\x1b'), "{field:?}");
+            assert!(!field.contains('\r'), "{field:?}");
+            assert!(!field.contains('\u{202e}'), "{field:?}");
+        }
     }
 
     #[test]

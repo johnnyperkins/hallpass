@@ -6,15 +6,26 @@ use std::sync::mpsc::Receiver;
 use std::time::Duration;
 
 use eframe::egui::{self, Color32, RichText};
-use hallpass_types::{ClientMsg, ConnEvent, PromptScope, Rule, RuleDuration, Stats, Verdict};
+use hallpass_types::{
+    ClientMsg, ConnEvent, Connection, PromptScope, Rule, RuleDuration, Stats, Verdict,
+};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::editor::RuleEditor;
 use crate::net::{self, UiEvent};
 use crate::prompt::{self, PromptState};
+use crate::traffic;
 
 /// Maximum number of events kept in the scrollback.
 const MAX_EVENTS: usize = 1000;
+
+/// Events requested from the daemon's history when a connection comes up.
+/// Clamped by the daemon to its own ring capacity.
+const EVENT_HISTORY_LIMIT: u32 = 1000;
+
+/// Rows shown in the traffic view. The aggregate is capped separately; this
+/// is only how much of it fits on a screen worth reading.
+const TRAFFIC_ROWS: usize = 200;
 
 /// Green accent for Allow.
 pub(crate) const ALLOW_COLOR: Color32 = Color32::from_rgb(0x2e, 0xa0, 0x43);
@@ -27,6 +38,7 @@ pub(crate) const REJECT_COLOR: Color32 = Color32::from_rgb(0xd0, 0x87, 0x20);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Tab {
     Events,
+    Traffic,
     Rules,
     Stats,
 }
@@ -77,6 +89,10 @@ pub struct HallpassApp {
     quit_requested: bool,
     /// Open rule add/edit form, if any.
     editor: Option<RuleEditor>,
+    /// Free-text filter applied to the event feed and the traffic view.
+    filter: String,
+    /// What the traffic view groups by.
+    group_by: traffic::GroupBy,
     /// FIFO of what each expected Ok/Err answers, in send order.
     pending_acks: VecDeque<AckKind>,
 }
@@ -98,6 +114,8 @@ impl HallpassApp {
             last_error: None,
             quit_requested: false,
             editor: None,
+            filter: String::new(),
+            group_by: traffic::GroupBy::default(),
             pending_acks: VecDeque::new(),
         }
     }
@@ -126,6 +144,15 @@ impl HallpassApp {
                     });
                     self.send(ClientMsg::RuleList);
                     self.send(ClientMsg::Stats);
+                    // Backfill: the subscription above only carries what
+                    // happens next, so a window opened after the traffic
+                    // would show an apparently idle machine. Requested after
+                    // Subscribe so nothing that arrives in between is lost;
+                    // the feed tolerates the duplicate ordering because it is
+                    // a display, not an audit trail.
+                    self.send(ClientMsg::EventHistory {
+                        limit: EVENT_HISTORY_LIMIT,
+                    });
                 }
                 UiEvent::Disconnected { retry_in } => {
                     self.status = ConnStatus::Reconnecting { retry_in };
@@ -243,7 +270,10 @@ impl HallpassApp {
             // Refresh data whenever a data tab is opened.
             match tab {
                 Tab::Rules => self.send(ClientMsg::RuleList),
-                Tab::Stats => self.send(ClientMsg::Stats),
+                // The banner and the observe-mode wording read from the
+                // stats, so opening Traffic refreshes them rather than
+                // showing whatever was current when the window last did.
+                Tab::Stats | Tab::Traffic => self.send(ClientMsg::Stats),
                 Tab::Events => {}
             }
         }
@@ -266,6 +296,7 @@ impl HallpassApp {
                 ui.separator();
                 for (tab, label) in [
                     (Tab::Events, "Events"),
+                    (Tab::Traffic, "Traffic"),
                     (Tab::Rules, "Rules"),
                     (Tab::Stats, "Stats"),
                 ] {
@@ -305,38 +336,75 @@ impl HallpassApp {
             });
         });
 
-        egui::CentralPanel::default().show(ui, |ui| match self.tab {
-            Tab::Events => self.events_tab(ui),
-            Tab::Rules => self.rules_tab(ui),
-            Tab::Stats => self.stats_tab(ui),
+        egui::CentralPanel::default().show(ui, |ui| {
+            // Nothing is being blocked while this is showing, and every
+            // other signal (a WOULD- prefix on a verdict, a line in Stats)
+            // is only visible to someone already looking at the right pane.
+            if !self.stats.enforcing {
+                ui.colored_label(
+                    REJECT_COLOR,
+                    "OBSERVE MODE: policy is evaluated and recorded, nothing is blocked",
+                );
+                ui.separator();
+            }
+            match self.tab {
+                Tab::Events => self.events_tab(ui),
+                Tab::Traffic => self.traffic_tab(ui),
+                Tab::Rules => self.rules_tab(ui),
+                Tab::Stats => self.stats_tab(ui),
+            }
         });
     }
 
     fn events_tab(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label("Filter:");
+            ui.text_edit_singleline(&mut self.filter);
+            if ui.button("Clear").clicked() {
+                self.filter.clear();
+            }
+        });
+        ui.separator();
         if self.events.is_empty() {
             ui.label("No events yet.");
             return;
         }
+        // Filtering copies references, not events: the feed is capped at
+        // MAX_EVENTS, so this is bounded work per frame.
+        let shown: Vec<&ConnEvent> = self
+            .events
+            .iter()
+            .filter(|ev| traffic::matches_filter(ev, &self.filter))
+            .collect();
+        if shown.is_empty() {
+            ui.label("No events match the filter.");
+            return;
+        }
+        let mut new_rule_from: Option<Connection> = None;
         let row_height = ui.text_style_height(&egui::TextStyle::Body);
         // show_rows virtualizes the list: only visible rows are formatted.
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .stick_to_bottom(true)
-            .show_rows(ui, row_height, self.events.len(), |ui, range| {
+            .show_rows(ui, row_height, shown.len(), |ui, range| {
                 egui::Grid::new("events_grid")
                     .striped(true)
-                    .num_columns(5)
+                    .num_columns(6)
                     .show(ui, |ui| {
                         ui.strong("Time");
                         ui.strong("Verdict");
                         ui.strong("Application");
                         ui.strong("Destination");
                         ui.strong("Rule");
+                        ui.strong("");
                         ui.end_row();
                         for i in range {
-                            let ev = &self.events[i];
+                            let ev = shown[i];
                             ui.monospace(format_time(ev.unix_ms));
-                            ui.colored_label(verdict_color(ev.verdict), verdict_label(ev.verdict));
+                            // verdict_label comes from the event, not the
+                            // verdict, so an unenforced deny reads
+                            // "would-deny": the connection went out.
+                            ui.colored_label(event_color(ev), ev.verdict_label());
                             ui.label(prompt::exe_name(&ev.conn));
                             ui.monospace(format!(
                                 "{} {}",
@@ -344,6 +412,87 @@ impl HallpassApp {
                                 prompt::format_dest(&ev.conn)
                             ));
                             ui.label(prompt::ui_text(ev.rule_name.as_deref().unwrap_or("-")));
+                            if ui
+                                .small_button("Rule")
+                                .on_hover_text("Create a rule from this connection")
+                                .clicked()
+                            {
+                                new_rule_from = Some(ev.conn.clone());
+                            }
+                            ui.end_row();
+                        }
+                    });
+            });
+        if let Some(conn) = new_rule_from {
+            self.editor = Some(RuleEditor::from_connection(&conn));
+        }
+    }
+
+    fn traffic_tab(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label("Group by:");
+            for g in [
+                traffic::GroupBy::Exe,
+                traffic::GroupBy::Domain,
+                traffic::GroupBy::Rule,
+            ] {
+                ui.selectable_value(&mut self.group_by, g, g.label());
+            }
+            ui.separator();
+            ui.label("Filter:");
+            ui.text_edit_singleline(&mut self.filter);
+        });
+        ui.separator();
+
+        // Rebuilt per frame from the capped feed rather than folded
+        // incrementally, so changing the grouping or the filter cannot leave
+        // stale counts behind. MAX_EVENTS bounds the cost.
+        let agg = traffic::Aggregate::rebuild(
+            self.events
+                .iter()
+                .filter(|ev| traffic::matches_filter(ev, &self.filter)),
+            self.group_by,
+        );
+        if agg.total == 0 {
+            ui.label("No traffic recorded yet.");
+            return;
+        }
+        ui.label(format!(
+            "{} connections across {} {}",
+            agg.total,
+            agg.len(),
+            self.group_by.label().to_lowercase()
+        ));
+        if agg.overflow > 0 {
+            ui.colored_label(
+                REJECT_COLOR,
+                format!("{} connections not counted: too many distinct keys", agg.overflow),
+            );
+        }
+        let rows = agg.top(TRAFFIC_ROWS);
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                egui::Grid::new("traffic_grid")
+                    .striped(true)
+                    .num_columns(7)
+                    .show(ui, |ui| {
+                        ui.strong(self.group_by.label());
+                        ui.strong("Total");
+                        ui.strong("Allowed");
+                        ui.strong("Blocked");
+                        ui.strong("Would block");
+                        ui.strong("Peers");
+                        ui.strong("Last seen");
+                        ui.end_row();
+                        for row in &rows {
+                            ui.label(prompt::ui_text(&row.key));
+                            ui.monospace(row.total.to_string());
+                            ui.colored_label(ALLOW_COLOR, row.allowed.to_string());
+                            ui.colored_label(DENY_COLOR, row.blocked.to_string());
+                            ui.colored_label(REJECT_COLOR, row.would_block.to_string());
+                            ui.monospace(row.peers.to_string());
+                            ui.monospace(format_time(row.last_ms));
                             ui.end_row();
                         }
                     });
@@ -695,6 +844,15 @@ fn verdict_label(v: Verdict) -> &'static str {
         Verdict::Deny => "deny",
         Verdict::Reject => "reject",
     }
+}
+
+/// Colour for one event, which is not the same as the colour for its
+/// verdict: an unenforced deny is amber, because nothing was stopped.
+fn event_color(ev: &ConnEvent) -> Color32 {
+    if !ev.enforced && ev.verdict != Verdict::Allow {
+        return REJECT_COLOR;
+    }
+    verdict_color(ev.verdict)
 }
 
 fn verdict_color(v: Verdict) -> Color32 {

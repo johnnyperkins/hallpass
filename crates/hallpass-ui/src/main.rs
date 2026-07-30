@@ -8,6 +8,7 @@ mod app;
 mod editor;
 mod net;
 mod prompt;
+mod traffic;
 
 use std::path::PathBuf;
 
