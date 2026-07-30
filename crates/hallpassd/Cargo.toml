@@ -10,6 +10,10 @@ description = "Hallpass application firewall daemon"
 # object exists at target/bpfel-unknown-none/release/hallpass-ebpf; the
 # default build works without it (procfs attribution only).
 ebpf = ["dep:aya", "dep:hallpass-ebpf-common"]
+# Synthetic connection events for client development (`cargo xtask dev`).
+# Never enable for a real host: it fabricates events, and everything
+# downstream of the event bus, syslog export included, treats them as real.
+dev-fixtures = []
 
 [dependencies]
 hallpass-types = { path = "../hallpass-types" }

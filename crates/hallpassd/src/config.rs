@@ -47,6 +47,12 @@ pub struct ConfigArg {
     pub path: PathBuf,
     /// True when `--config` named the path, making a missing file fatal.
     pub explicit: bool,
+    /// True when `--synthetic-events` asked for fabricated traffic. Only
+    /// ever settable in a `dev-fixtures` build; a release binary rejects
+    /// the flag as unknown, which is the point of putting it behind a
+    /// compile-time feature rather than a config key.
+    #[cfg(feature = "dev-fixtures")]
+    pub synthetic_events: bool,
 }
 
 /// Longest usable unix socket path: `sun_path` is 108 bytes including the
@@ -194,6 +200,8 @@ pub fn parse_args<I: Iterator<Item = String>>(mut args: I) -> Result<ConfigArg, 
     let mut arg_out = ConfigArg {
         path: PathBuf::from(DEFAULT_CONFIG_PATH),
         explicit: false,
+        #[cfg(feature = "dev-fixtures")]
+        synthetic_events: false,
     };
     while let Some(arg) = args.next() {
         if arg == "--config" {
@@ -205,6 +213,11 @@ pub fn parse_args<I: Iterator<Item = String>>(mut args: I) -> Result<ConfigArg, 
         } else if let Some(v) = arg.strip_prefix("--config=") {
             arg_out.path = PathBuf::from(v);
             arg_out.explicit = true;
+        } else if cfg!(feature = "dev-fixtures") && arg == "--synthetic-events" {
+            #[cfg(feature = "dev-fixtures")]
+            {
+                arg_out.synthetic_events = true;
+            }
         } else {
             return Err(format!("unknown argument: {arg} (usage: hallpassd [--config <path>])"));
         }
@@ -301,6 +314,8 @@ mod tests {
         let missing = PathBuf::from("/nonexistent/hallpass/config.toml");
 
         let err = Config::load(&ConfigArg {
+            #[cfg(feature = "dev-fixtures")]
+            synthetic_events: false,
             path: missing.clone(),
             explicit: true,
         })
@@ -308,6 +323,8 @@ mod tests {
         assert!(err.contains("config.toml"), "{err}");
 
         let cfg = Config::load(&ConfigArg {
+            #[cfg(feature = "dev-fixtures")]
+            synthetic_events: false,
             path: missing,
             explicit: false,
         })

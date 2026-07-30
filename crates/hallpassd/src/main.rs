@@ -10,6 +10,8 @@
 
 mod attribution;
 mod config;
+#[cfg(feature = "dev-fixtures")]
+mod devfixtures;
 mod dns;
 mod events;
 mod iface;
@@ -281,6 +283,14 @@ async fn main() {
             },
         )
     });
+
+    // Synthetic traffic, only in a build that opted into it at compile
+    // time. Started after the real workers so it can never mask one
+    // failing to come up.
+    #[cfg(feature = "dev-fixtures")]
+    if config_arg.synthetic_events {
+        devfixtures::spawn(Arc::clone(&events), Arc::clone(&counters));
+    }
 
     // IPC server.
     let ipc_deps = Arc::new(ipc::server::IpcDeps {

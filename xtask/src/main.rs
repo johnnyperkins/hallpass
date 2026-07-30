@@ -332,8 +332,13 @@ fn dev() -> Result<(), String> {
     set_mode(&cfg_path, 0o600)?;
 
     let socket = dir.join("hallpass.sock");
+    // The dev-fixtures feature feeds synthetic connections into the event
+    // bus. Without root there is no interception, so every event-driven
+    // view renders an empty machine and the whole observability surface is
+    // undevelopable. It is a non-default feature precisely so a shipped
+    // binary cannot be talked into fabricating events.
     run(Command::new(cargo())
-        .args(["build", "-p", "hallpassd"])
+        .args(["build", "-p", "hallpassd", "--features", "dev-fixtures"])
         .current_dir(workspace_root()))?;
 
     let socket = socket.display();
@@ -345,6 +350,10 @@ fn dev() -> Result<(), String> {
     eprintln!("no nftables table is installed and no traffic is filtered. IPC, rule");
     eprintln!("management, prompts, events, and stats all work, which is what the");
     eprintln!("CLI and the UI are written against.");
+    eprintln!();
+    eprintln!("the events and traffic views are fed by SYNTHETIC connections, since");
+    eprintln!("with no interception there is nothing real to show. They are built in");
+    eprintln!("under the dev-fixtures feature and cannot exist in a release binary.");
     eprintln!();
     eprintln!("in another terminal:");
     eprintln!("  cargo run -q -p hallpass-cli -- --socket {socket} status");
@@ -360,6 +369,7 @@ fn dev() -> Result<(), String> {
     let err = Command::new(workspace_root().join("target/debug/hallpassd"))
         .arg("--config")
         .arg(&cfg_path)
+        .arg("--synthetic-events")
         .current_dir(workspace_root())
         .exec();
     Err(format!("failed to exec hallpassd: {err}"))
