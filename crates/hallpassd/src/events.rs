@@ -2,7 +2,7 @@
 //! short in-memory history a monitoring client replays on connect.
 
 use std::collections::VecDeque;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use hallpass_types::{unix_ms_now, ConnEvent, Connection, Verdict};
 use tokio::sync::broadcast;
@@ -36,11 +36,15 @@ const HISTORY_FIXED_COST: usize = 128;
 pub struct EventBus {
     tx: broadcast::Sender<ConnEvent>,
     /// Oldest first. Guarded by a plain mutex: the writer is the single
-    /// verdict thread, and the only readers are operator requests, so the
-    /// lock is uncontended in practice. A client polling history does make
-    /// the verdict thread wait for one bounded copy, which is why the reply
-    /// is capped by both count and bytes.
-    history: Mutex<VecDeque<ConnEvent>>,
+    /// verdict thread, and the readers are operator requests.
+    ///
+    /// Held behind `Arc` so answering a request copies pointers rather than
+    /// strings while the lock is held. Cloning a thousand events with their
+    /// command lines under this lock would stall the verdict thread for as
+    /// long as that takes, once per request, and any `hallpass`-group client
+    /// can ask as fast as it likes. The deep copy happens after the guard is
+    /// dropped, where it costs the caller and nobody else.
+    history: Mutex<VecDeque<Arc<ConnEvent>>>,
     /// Stamped onto every event as `enforced`. False in observe mode, where
     /// verdicts are recorded and nothing is applied.
     enforcing: bool,
@@ -84,7 +88,7 @@ impl EventBus {
             unix_ms: unix_ms_now(),
             enforced: self.enforcing,
         };
-        self.push_history(ev.clone());
+        self.push_history(Arc::new(ev.clone()));
         let _ = self.tx.send(ev);
     }
 
@@ -93,23 +97,26 @@ impl EventBus {
     ///
     /// Trimmed to [`HISTORY_REPLY_BUDGET`]; the newest events are kept.
     pub fn history(&self, limit: usize) -> Vec<ConnEvent> {
-        let guard = self.lock_history();
         let limit = limit.min(HISTORY_CAPACITY);
+        // Under the lock: pointer copies only, newest first.
+        let guard = self.lock_history();
+        let newest: Vec<Arc<ConnEvent>> = guard.iter().rev().take(limit).cloned().collect();
+        drop(guard);
+
         let mut out: Vec<ConnEvent> = Vec::new();
         let mut bytes = 0usize;
-        for ev in guard.iter().rev().take(limit) {
+        for ev in &newest {
             bytes += event_cost(ev);
             if bytes > HISTORY_REPLY_BUDGET && !out.is_empty() {
                 break;
             }
-            out.push(ev.clone());
+            out.push(ConnEvent::clone(ev));
         }
-        drop(guard);
         out.reverse();
         out
     }
 
-    fn push_history(&self, ev: ConnEvent) {
+    fn push_history(&self, ev: Arc<ConnEvent>) {
         let mut guard = self.lock_history();
         if guard.len() == HISTORY_CAPACITY {
             guard.pop_front();
@@ -121,7 +128,7 @@ impl EventBus {
     /// convenience and enforcement never reads it, so recovering the
     /// contents is strictly better than propagating the panic into the
     /// verdict path or the control channel.
-    fn lock_history(&self) -> std::sync::MutexGuard<'_, VecDeque<ConnEvent>> {
+    fn lock_history(&self) -> std::sync::MutexGuard<'_, VecDeque<Arc<ConnEvent>>> {
         self.history.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
