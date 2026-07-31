@@ -24,7 +24,13 @@ use serde::{Deserialize, Serialize};
 /// the [`ClientMsg::EventHistory`], [`ClientMsg::RuleStats`] and
 /// [`ClientMsg::Explain`] request/reply pairs. Appended enum variants alone
 /// would not need a bump; the struct fields do.
-pub const PROTOCOL_VERSION: u32 = 3;
+///
+/// v4: prompt-handler liveness. Three more [`Stats`] fields
+/// (`prompt_handler_connected`, `prompts_unanswered`,
+/// `prompt_handlers_evicted`) and the [`DaemonMsg::PromptHandlerRevoked`]
+/// variant. Same split as v3: the appended variant would have been free, the
+/// struct fields are what forces the bump.
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// Transport-layer protocol of a connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -705,6 +711,27 @@ pub struct Stats {
     /// nothing is blocked. A status display that omits this shows a healthy
     /// firewall that is not filtering.
     pub enforcing: bool,
+    /// Whether a client currently holds the prompt-handler slot.
+    ///
+    /// False means every connection no rule matches is resolved with the
+    /// configured default verdict without anyone being asked. That is the
+    /// intended behaviour on a headless host and a silent policy change on a
+    /// desktop, and nothing else distinguishes the two, so a status display
+    /// that omits this cannot tell an operator their prompts stopped working.
+    pub prompt_handler_connected: bool,
+    /// Connections resolved with the default verdict because nobody answered:
+    /// no client held the prompt slot, or the client holding it let the
+    /// prompt time out.
+    ///
+    /// Counts decisions made by nobody. A rising number with
+    /// [`Stats::prompt_handler_connected`] true is a handler that is
+    /// connected and not deciding.
+    pub prompts_unanswered: u64,
+    /// Prompt handlers evicted from the slot for leaving prompts unanswered.
+    ///
+    /// Non-zero means the slot was taken back at least once so another client
+    /// could have it. See [`DaemonMsg::PromptHandlerRevoked`].
+    pub prompt_handlers_evicted: u64,
 }
 
 /// How often one rule has decided a connection, for [`ClientMsg::RuleStats`].
@@ -919,4 +946,14 @@ pub enum DaemonMsg {
     RuleHits(Vec<RuleHit>),
     /// Response to [`ClientMsg::Explain`].
     Explanation(Explanation),
+    /// The prompt-handler slot this client held has been taken back, because
+    /// prompts sent to it went unanswered until they timed out.
+    ///
+    /// Carries no reason text on purpose: everything the daemon could say
+    /// here it already says in its log, and a client that wants the slot back
+    /// only needs to know it lost it. Send [`ClientMsg::Subscribe`] with
+    /// `prompts: true` to claim it again; a client that is alive gets it back
+    /// on the next round trip, which is what keeps this from punishing an
+    /// operator who simply stepped away from the keyboard.
+    PromptHandlerRevoked,
 }

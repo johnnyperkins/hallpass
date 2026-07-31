@@ -221,6 +221,9 @@ mod tests {
                 observed_only: 9,
                 dns_snoop_dropped: 11,
                 enforcing: false,
+                prompt_handler_connected: true,
+                prompts_unanswered: 13,
+                prompt_handlers_evicted: 2,
             }),
             DaemonMsg::Ok,
             DaemonMsg::Err {
@@ -265,6 +268,7 @@ mod tests {
                     },
                 ],
             }),
+            DaemonMsg::PromptHandlerRevoked,
         ];
         for msg in &msgs {
             let back = roundtrip(msg).await;

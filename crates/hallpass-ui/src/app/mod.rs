@@ -312,6 +312,28 @@ impl HallpassApp {
                     self.send(ClientMsg::RuleList);
                 }
             }
+            // The daemon took the prompt slot back because prompts sent here
+            // timed out unanswered. Claim it again immediately: this window
+            // is alive and reading, so the eviction was about an operator who
+            // was not at the keyboard, and leaving the slot empty would mean
+            // every later connection is decided by the daemon's default with
+            // nothing on screen. A client that is genuinely wedged never gets
+            // this far, which is what makes the eviction worth doing.
+            //
+            // `events: false`, unlike the subscribe on connect: the daemon
+            // starts one event forwarder per connection and this one is
+            // already running, so only the slot is being asked for.
+            DaemonMsg::PromptHandlerRevoked => {
+                self.send(ClientMsg::Subscribe {
+                    events: false,
+                    prompts: true,
+                });
+                self.last_error = Some(
+                    "the daemon released this window's prompt slot after \
+                     prompts went unanswered; reclaiming it"
+                        .to_string(),
+                );
+            }
             // Neither is requested by this client yet. Ignoring them keeps
             // the connection alive: the alternative on an unexpected reply
             // would be tearing down the stream that carries prompts.
@@ -713,6 +735,25 @@ impl HallpassApp {
             ui.end_row();
             ui.label("Prompted");
             ui.monospace(s.prompted.to_string());
+            ui.end_row();
+            // Whether anyone is being asked at all, and how often nobody
+            // answered. Without these rows a window that has quietly lost the
+            // prompt slot looks exactly like a quiet machine.
+            ui.label("Prompt handler");
+            if s.prompt_handler_connected {
+                ui.monospace("connected");
+            } else {
+                ui.colored_label(DENY_COLOR, "none - connections take the default");
+            }
+            ui.end_row();
+            ui.label("Unanswered prompts");
+            ui.monospace(s.prompts_unanswered.to_string());
+            ui.end_row();
+            ui.label("Prompt overflows");
+            ui.monospace(s.prompts_overflowed.to_string());
+            ui.end_row();
+            ui.label("Handlers evicted");
+            ui.monospace(s.prompt_handlers_evicted.to_string());
             ui.end_row();
             ui.label("Rules loaded");
             ui.monospace(s.rules_loaded.to_string());

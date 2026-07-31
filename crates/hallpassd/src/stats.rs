@@ -19,6 +19,10 @@ pub struct Counters {
     dns_snoop_dropped: AtomicU64,
     /// Deny/reject verdicts recorded but not applied, in observe mode.
     observed_only: AtomicU64,
+    /// Connections resolved by the default verdict because nobody answered.
+    prompts_unanswered: AtomicU64,
+    /// Prompt handlers evicted from the slot for not answering.
+    prompt_handlers_evicted: AtomicU64,
     /// False in observe mode. Reported so a client cannot read `denied` as
     /// "blocked" when nothing was blocked.
     enforcing: bool,
@@ -45,6 +49,8 @@ impl Counters {
             other_proto_total: AtomicU64::new(0),
             dns_snoop_dropped: AtomicU64::new(0),
             observed_only: AtomicU64::new(0),
+            prompts_unanswered: AtomicU64::new(0),
+            prompt_handlers_evicted: AtomicU64::new(0),
             enforcing,
         }
     }
@@ -106,9 +112,35 @@ impl Counters {
         self.observed_only.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Count a connection the default verdict decided because nobody
+    /// answered: no client held the prompt slot, or the one that did let the
+    /// prompt time out.
+    ///
+    /// Separate from [`Counters::record_prompt_overflow`], which is the
+    /// daemon's own limit rather than a missing operator, because the two
+    /// call for different actions: raise `max_pending_prompts`, or find out
+    /// what happened to the prompt handler.
+    pub fn record_prompt_unanswered(&self) {
+        self.prompts_unanswered.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Count a prompt handler evicted from the slot for not answering.
+    pub fn record_prompt_handler_evicted(&self) {
+        self.prompt_handlers_evicted.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Snapshot for the IPC reply. `rules_loaded` and `rules_skipped` come
-    /// from the rule store.
-    pub fn snapshot(&self, rules_loaded: u32, rules_skipped: u64) -> Stats {
+    /// from the rule store, `prompt_handler_connected` from the prompt table.
+    ///
+    /// Those three are passed in rather than mirrored into a counter here on
+    /// purpose: they are facts owned elsewhere, and a copy kept in step by
+    /// hand is a copy that eventually is not.
+    pub fn snapshot(
+        &self,
+        rules_loaded: u32,
+        rules_skipped: u64,
+        prompt_handler_connected: bool,
+    ) -> Stats {
         Stats {
             connections_total: self.connections_total.load(Ordering::Relaxed),
             allowed: self.allowed.load(Ordering::Relaxed),
@@ -123,6 +155,9 @@ impl Counters {
             observed_only: self.observed_only.load(Ordering::Relaxed),
             dns_snoop_dropped: self.dns_snoop_dropped.load(Ordering::Relaxed),
             enforcing: self.enforcing,
+            prompt_handler_connected,
+            prompts_unanswered: self.prompts_unanswered.load(Ordering::Relaxed),
+            prompt_handlers_evicted: self.prompt_handlers_evicted.load(Ordering::Relaxed),
         }
     }
 }
@@ -141,7 +176,9 @@ mod tests {
         c.record_dns_spoof_rejected();
         c.record_prompt_overflow();
         c.record_prompt_overflow();
-        let s = c.snapshot(5, 4);
+        c.record_prompt_unanswered();
+        c.record_prompt_handler_evicted();
+        let s = c.snapshot(5, 4, true);
         assert_eq!(s.connections_total, 3);
         assert_eq!(s.allowed, 1);
         assert_eq!(s.denied, 2);
@@ -151,7 +188,19 @@ mod tests {
         assert_eq!(s.rules_skipped, 4);
         assert_eq!(s.prompts_overflowed, 2);
         assert_eq!(s.observed_only, 0);
+        assert_eq!(s.prompts_unanswered, 1);
+        assert_eq!(s.prompt_handlers_evicted, 1);
         assert!(s.enforcing);
+        assert!(s.prompt_handler_connected);
+    }
+
+    /// The prompt-handler flag is not a counter: it is passed in from the
+    /// prompt table at snapshot time, so it cannot drift from the table.
+    #[test]
+    fn prompt_handler_flag_is_passed_through() {
+        let c = Counters::default();
+        assert!(!c.snapshot(0, 0, false).prompt_handler_connected);
+        assert!(c.snapshot(0, 0, true).prompt_handler_connected);
     }
 
     /// Observe mode has to be visible in the snapshot: `denied` counts what
@@ -163,7 +212,7 @@ mod tests {
         c.record_verdict(Verdict::Deny);
         c.record_observed_only();
         c.record_dns_snoop_dropped();
-        let s = c.snapshot(0, 0);
+        let s = c.snapshot(0, 0, true);
         assert!(!s.enforcing);
         assert_eq!(s.denied, 1);
         assert_eq!(s.observed_only, 1);

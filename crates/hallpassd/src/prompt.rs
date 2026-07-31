@@ -40,14 +40,31 @@ struct Pending {
     deadline_ms: u64,
 }
 
+/// Consecutive timed-out prompts before the handler slot is taken back.
+///
+/// Not one: a prompt can time out with a perfectly healthy handler on the
+/// other end, because the operator was not at the keyboard. Three in a row is
+/// the point where "nobody is reading this" is the better explanation, and
+/// the cost of being wrong about that is one round trip (see
+/// [`DaemonMsg::PromptHandlerRevoked`]), not a lost prompt.
+const MAX_UNANSWERED_EXPIRIES: u32 = 3;
+
+/// The client holding the prompt-handler slot.
+struct Handler {
+    /// Outbound channel of the client. Bounded: a stalled client drops
+    /// messages instead of growing memory; the prompt timeout then applies
+    /// the default verdict.
+    tx: Sender<DaemonMsg>,
+    /// Prompts that have timed out since this handler last answered one.
+    unanswered: u32,
+}
+
 #[derive(Default)]
 struct Inner {
     by_id: HashMap<u64, Pending>,
     by_key: HashMap<Key, u64>,
-    /// Outbound channel of the sole prompt-handler client, if connected.
-    /// Bounded: a stalled client drops messages instead of growing memory;
-    /// the prompt timeout then applies the default verdict.
-    handler: Option<Sender<DaemonMsg>>,
+    /// The sole prompt-handler client, if one is connected.
+    handler: Option<Handler>,
 }
 
 /// Table of prompts awaiting a client decision.
@@ -96,11 +113,21 @@ impl PromptTable {
         self.default_verdict
     }
 
+    /// Whether a client currently holds the prompt-handler slot.
+    ///
+    /// Reported in the stats snapshot because nothing else says so: with no
+    /// handler, every connection no rule matches is resolved with the default
+    /// verdict and no operator is ever asked.
+    pub fn has_handler(&self) -> bool {
+        let inner = self.inner.lock().unwrap();
+        inner.handler.as_ref().is_some_and(|h| !h.tx.is_closed())
+    }
+
     /// Claim the prompt-handler slot. Returns false if already claimed.
     pub fn set_handler(&self, tx: Sender<DaemonMsg>) -> bool {
         let mut inner = self.inner.lock().unwrap();
         match &inner.handler {
-            Some(h) if !h.is_closed() => false,
+            Some(h) if !h.tx.is_closed() => false,
             _ => {
                 // Re-deliver everything still pending: requests are
                 // otherwise sent only at creation, so prompts opened
@@ -114,7 +141,7 @@ impl PromptTable {
                         deadline_ms: p.deadline_ms,
                     });
                 }
-                inner.handler = Some(tx);
+                inner.handler = Some(Handler { tx, unanswered: 0 });
                 true
             }
         }
@@ -123,7 +150,7 @@ impl PromptTable {
     /// Release the handler slot if `tx` currently holds it.
     pub fn clear_handler(&self, tx: &Sender<DaemonMsg>) {
         let mut inner = self.inner.lock().unwrap();
-        if inner.handler.as_ref().is_some_and(|h| h.same_channel(tx)) {
+        if inner.handler.as_ref().is_some_and(|h| h.tx.same_channel(tx)) {
             inner.handler = None;
         }
     }
@@ -149,10 +176,15 @@ impl PromptTable {
         }
 
         let handler = match &inner.handler {
-            Some(h) if !h.is_closed() => h.clone(),
+            Some(h) if !h.tx.is_closed() => h.tx.clone(),
             _ => {
                 drop(inner);
                 tracing::debug!("no prompt handler connected, applying default verdict");
+                // Nobody was asked, so this is one more decision made by
+                // nobody. The counter is the only trace: with no handler
+                // there is no prompt, and an event that records the default
+                // verdict looks exactly like a rule having chosen it.
+                self.stats.record_prompt_unanswered();
                 self.finish_default(conn, vec![seq]);
                 return;
             }
@@ -286,7 +318,7 @@ impl PromptTable {
                 resolved.push((id, pending));
             }
         }
-        let handler = inner.handler.clone();
+        let handler = inner.handler.as_ref().map(|h| h.tx.clone());
         drop(inner);
 
         for (id, pending) in resolved {
@@ -309,11 +341,56 @@ impl PromptTable {
             return; // already answered
         };
         tracing::info!(id, "prompt timed out, applying default verdict");
+        self.stats.record_prompt_unanswered();
         self.finish_default(pending.conn, pending.packets);
-        let inner = self.inner.lock().unwrap();
-        if let Some(h) = &inner.handler {
-            let _ = h.try_send(DaemonMsg::PromptExpired { id });
+        self.strike_handler(id);
+    }
+
+    /// Tell the handler the prompt is gone, and count it against the
+    /// handler's liveness.
+    ///
+    /// A client holding the slot and never answering is not a hypothetical:
+    /// the slot goes to whoever asks first, so any process that may talk to
+    /// the daemon can take it and stay silent, and then every unmatched
+    /// connection is decided by the timeout default while the real interface
+    /// is told the slot is occupied. Enough consecutive timeouts and the slot
+    /// is released, so a client that is actually there can have it.
+    ///
+    /// Which way it fails: towards releasing a slot that was fine. The daemon
+    /// cannot tell a client that is ignoring prompts from one whose operator
+    /// walked away, so this deliberately punishes neither. A live client is
+    /// told it lost the slot and claims it again on the next round trip; a
+    /// client that is not reading its socket never sees the message and stays
+    /// out. The one thing this is not is a boundary against a hostile client,
+    /// which can hold the slot by re-claiming it, or simply write an allow
+    /// rule instead: anything permitted to speak to this socket is already
+    /// trusted with policy. What it does buy is that the state is now visible
+    /// (`prompt_handlers_evicted`, `prompts_unanswered`) rather than silent.
+    fn strike_handler(&self, expired_id: u64) {
+        let mut inner = self.inner.lock().unwrap();
+        // Taken out to be looked at and put back unless it is out of
+        // strikes, so "still the handler" and "evicted" stay one decision
+        // made under one lock.
+        let Some(mut handler) = inner.handler.take() else {
+            return;
+        };
+        let _ = handler.tx.try_send(DaemonMsg::PromptExpired { id: expired_id });
+        handler.unanswered += 1;
+        if handler.unanswered < MAX_UNANSWERED_EXPIRIES {
+            inner.handler = Some(handler);
+            return;
         }
+        drop(inner);
+
+        self.stats.record_prompt_handler_evicted();
+        tracing::warn!(
+            unanswered = handler.unanswered,
+            "prompt handler let every prompt time out, releasing the slot; \
+             unmatched connections take the default verdict until a client claims it"
+        );
+        // Best effort by nature: the client this exists to remove is the one
+        // not draining its channel, and it will not receive this either.
+        let _ = handler.tx.try_send(DaemonMsg::PromptHandlerRevoked);
     }
 
     fn take(&self, id: u64) -> Option<Pending> {
@@ -329,7 +406,7 @@ impl PromptTable {
     /// client cannot pass the check and then have the slot change under it.
     fn take_as_handler(&self, tx: &Sender<DaemonMsg>, id: u64) -> Result<Pending, String> {
         let mut inner = self.inner.lock().unwrap();
-        if !inner.handler.as_ref().is_some_and(|h| h.same_channel(tx)) {
+        if !inner.handler.as_ref().is_some_and(|h| h.tx.same_channel(tx)) {
             return Err("not the registered prompt handler".to_string());
         }
         let pending = inner
@@ -337,6 +414,12 @@ impl PromptTable {
             .remove(&id)
             .ok_or_else(|| format!("unknown or expired prompt id {id}"))?;
         inner.by_key.remove(&pending.key);
+        // Deciding one prompt clears the liveness strikes: they count
+        // consecutive timeouts, so a handler that is answering is never
+        // evicted for prompts its operator missed earlier in the day.
+        if let Some(h) = inner.handler.as_mut() {
+            h.unanswered = 0;
+        }
         Ok(pending)
     }
 
@@ -444,17 +527,27 @@ mod tests {
         table: Arc<PromptTable>,
         verdict_rx: mpsc::UnboundedReceiver<(u64, Verdict)>,
         store: Arc<RuleStore>,
+        stats: Arc<Counters>,
         _dir: crate::testutil::TestDir,
+    }
+
+    impl Harness {
+        /// The stats snapshot a client would read, with the table's own
+        /// handler state in it.
+        fn snapshot(&self) -> hallpass_types::Stats {
+            self.stats.snapshot(0, 0, self.table.has_handler())
+        }
     }
 
     fn harness(tag: &str, max_pending: usize, default: Verdict) -> Harness {
         let dir = crate::testutil::TestDir::new(&format!("prompt-{tag}"));
         let store = Arc::new(RuleStore::new(dir.path().to_path_buf()));
         let (verdict_tx, verdict_rx) = mpsc::unbounded_channel();
+        let stats = Arc::new(Counters::default());
         let table = Arc::new(PromptTable::new(
             verdict_tx,
             Arc::new(EventBus::default()),
-            Arc::new(Counters::default()),
+            Arc::clone(&stats),
             Arc::clone(&store),
             Duration::from_secs(5),
             max_pending,
@@ -464,6 +557,7 @@ mod tests {
             table,
             verdict_rx,
             store,
+            stats,
             _dir: dir,
         }
     }
@@ -490,6 +584,87 @@ mod tests {
         let mut h = harness("nohandler", 4, Verdict::Deny);
         h.table.handle_new(conn("/bin/a", "1.1.1.1:443"), 7);
         assert_eq!(h.verdict_rx.recv().await, Some((7, Verdict::Deny)));
+        // Nobody was asked, and the event this emits is indistinguishable
+        // from a rule having chosen the same verdict. The counters are the
+        // only place that difference exists.
+        let s = h.snapshot();
+        assert!(!s.prompt_handler_connected);
+        assert_eq!(s.prompts_unanswered, 1);
+    }
+
+    /// A client can claim the prompt slot and never answer, which sends every
+    /// unmatched connection to the timeout default while the real interface
+    /// is told the slot is taken. Enough consecutive timeouts and the slot is
+    /// released for somebody who will use it.
+    #[tokio::test(start_paused = true)]
+    async fn a_handler_that_never_answers_loses_the_slot() {
+        let mut h = harness("evict", 8, Verdict::Allow);
+        let (tx, mut prompt_rx) = mpsc::channel(64);
+        assert!(h.table.set_handler(tx.clone()));
+
+        for seq in 1..=u64::from(MAX_UNANSWERED_EXPIRIES) {
+            h.table
+                .handle_new(conn("/bin/a", &format!("1.1.1.{seq}:443")), seq);
+            tokio::time::advance(Duration::from_secs(6)).await;
+            assert_eq!(h.verdict_rx.recv().await, Some((seq, Verdict::Allow)));
+        }
+
+        let s = h.snapshot();
+        assert!(!s.prompt_handler_connected, "slot released");
+        assert_eq!(s.prompt_handlers_evicted, 1);
+        assert_eq!(s.prompts_unanswered, u64::from(MAX_UNANSWERED_EXPIRIES));
+
+        // The evicted client is told, so one that is merely idle reclaims
+        // the slot instead of going quiet for the rest of the session.
+        let mut revoked = 0;
+        while let Ok(msg) = prompt_rx.try_recv() {
+            if matches!(msg, DaemonMsg::PromptHandlerRevoked) {
+                revoked += 1;
+            }
+        }
+        assert_eq!(revoked, 1, "told exactly once");
+
+        // And the slot is really free, for the evicted client or any other.
+        let (other, _other_rx) = mpsc::channel(16);
+        assert!(h.table.set_handler(other));
+    }
+
+    /// The strikes count consecutive timeouts, so a handler that is deciding
+    /// prompts is never evicted for the ones its operator was away for.
+    #[tokio::test(start_paused = true)]
+    async fn answering_one_prompt_clears_the_strikes() {
+        let mut h = harness("evict-reset", 8, Verdict::Allow);
+        let (tx, mut prompt_rx) = mpsc::channel(64);
+        assert!(h.table.set_handler(tx.clone()));
+
+        let mut seq = 0;
+        // One short of eviction, twice over, with an answer in between.
+        for _ in 0..2 {
+            for _ in 0..MAX_UNANSWERED_EXPIRIES - 1 {
+                seq += 1;
+                h.table
+                    .handle_new(conn("/bin/a", &format!("1.1.1.{seq}:443")), seq);
+                tokio::time::advance(Duration::from_secs(6)).await;
+                assert_eq!(h.verdict_rx.recv().await, Some((seq, Verdict::Allow)));
+            }
+            // Drain the requests and expiries of the timed-out prompts, so
+            // the next message is the one for the prompt answered below.
+            while prompt_rx.try_recv().is_ok() {}
+            seq += 1;
+            h.table
+                .handle_new(conn("/bin/a", &format!("1.1.1.{seq}:443")), seq);
+            let DaemonMsg::PromptRequest { id, .. } = prompt_rx.recv().await.unwrap() else {
+                panic!("expected PromptRequest");
+            };
+            h.table
+                .reply(&tx, id, Verdict::Deny, RuleDuration::Once, PromptScope::ThisPort)
+                .expect("the handler answers");
+            assert_eq!(h.verdict_rx.recv().await, Some((seq, Verdict::Deny)));
+        }
+
+        let s = h.snapshot();
+        assert!(s.prompt_handler_connected, "still the handler");
+        assert_eq!(s.prompt_handlers_evicted, 0);
     }
 
     /// A filename may hold any byte but '/' and NUL, and the stem lands in a

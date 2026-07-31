@@ -130,9 +130,16 @@ pub async fn watch(mut client: Client) -> Result<(), CliError> {
                 }
                 Some(Err(e)) => return Err(e.into()),
                 Some(Ok(DaemonMsg::PromptRequest { id, conn, deadline_ms })) => {
-                    queue.push_back(Pending { id, conn, deadline_ms });
-                    if current.is_none() {
-                        current = promote(&mut queue);
+                    // Claiming the prompt slot re-delivers everything still
+                    // pending, so the reclaim below re-sends the prompts this
+                    // session already holds. Without this guard the operator
+                    // is walked through the same prompt twice and the second
+                    // answer draws an error for an id already spent.
+                    if !already_held(&current, &queue, id) {
+                        queue.push_back(Pending { id, conn, deadline_ms });
+                        if current.is_none() {
+                            current = promote(&mut queue);
+                        }
                     }
                 }
                 Some(Ok(DaemonMsg::PromptExpired { id })) => {
@@ -166,16 +173,40 @@ pub async fn watch(mut client: Client) -> Result<(), CliError> {
                         hallpass_types::sanitize_for_display(&message)
                     );
                 }
+                Some(Ok(DaemonMsg::PromptHandlerRevoked)) => {
+                    // The daemon took the slot back because prompts sent here
+                    // timed out. This session is alive and simply waiting on a
+                    // human, so claim it again: leaving the slot empty would
+                    // mean every later connection is decided by the daemon's
+                    // default with nothing printed here to say so.
+                    eprintln!(
+                        "the daemon released this session's prompt slot after \
+                         prompts went unanswered; claiming it again"
+                    );
+                    wire::write_msg(
+                        &mut write_half,
+                        &ClientMsg::Subscribe { events: false, prompts: true },
+                    )
+                    .await?;
+                }
                 Some(Ok(_)) => {}
             },
             line = lines.next_line() => match line {
-                Ok(Some(line)) => {
-                    if let Some((pending, stage)) = current.take() {
+                Ok(Some(line)) => match current.take() {
+                    Some((pending, stage)) if unix_ms_now() < pending.deadline_ms => {
                         current = step(&mut write_half, &mut queue, pending, stage, &line)
                             .await?;
                     }
+                    // Timed out while it was on screen. The daemon has
+                    // already applied its default verdict, so the answer
+                    // being typed would only draw an error for a spent id.
+                    Some((pending, _)) => {
+                        println!("prompt #{} expired", pending.id);
+                        current = promote(&mut queue);
+                    }
                     // Input with no pending prompt is silently ignored.
-                }
+                    None => {}
+                },
                 Ok(None) => return Ok(()),
                 Err(e) => return Err(CliError::Protocol(format!("stdin error: {e}"))),
             },
@@ -184,10 +215,30 @@ pub async fn watch(mut client: Client) -> Result<(), CliError> {
     }
 }
 
-/// Pop the next queued prompt and print its details plus the first hint.
+/// Whether prompt `id` is already on screen or waiting in the queue.
+fn already_held(current: &Option<(Pending, Stage)>, queue: &VecDeque<Pending>, id: u64) -> bool {
+    current.as_ref().is_some_and(|(p, _)| p.id == id) || queue.iter().any(|p| p.id == id)
+}
+
+/// Pop the next queued prompt that is still live and print its details plus
+/// the first hint.
+///
+/// Past-deadline entries are announced and dropped rather than put to the
+/// operator. `PromptExpired` normally does that, but it only reaches the
+/// client holding the prompt slot, and a session whose slot was just taken
+/// back holds nothing: prompts that expire before it is claimed again are
+/// announced to nobody. Asking about one would be asking a question the
+/// daemon has already answered with its default verdict.
 fn promote(queue: &mut VecDeque<Pending>) -> Option<(Pending, Stage)> {
-    let p = queue.pop_front()?;
-    print!("{}", format_prompt(&p, unix_ms_now()));
+    let now = unix_ms_now();
+    let p = loop {
+        let p = queue.pop_front()?;
+        if now < p.deadline_ms {
+            break p;
+        }
+        println!("prompt #{} expired", p.id);
+    };
+    print!("{}", format_prompt(&p, now));
     println!("{VERDICT_HINT}");
     Some((p, Stage::Verdict))
 }
@@ -257,6 +308,65 @@ mod tests {
     use hallpass_types::{FlowTuple, Proto};
     use std::net::SocketAddr;
     use std::path::PathBuf;
+
+    fn pending(id: u64, deadline_ms: u64) -> Pending {
+        Pending {
+            id,
+            conn: Connection {
+                tuple: FlowTuple {
+                    proto: Proto::Tcp,
+                    src: "127.0.0.1:50000".parse::<SocketAddr>().unwrap(),
+                    dst: "93.184.216.34:443".parse::<SocketAddr>().unwrap(),
+                },
+                uid: Some(1000),
+                pid: Some(1),
+                exe_path: Some(PathBuf::from("/usr/bin/curl")),
+                cmdline: None,
+                parent_exe: None,
+                domain: None,
+                iface: None,
+            },
+            deadline_ms,
+        }
+    }
+
+    /// A prompt past its deadline must never be put to the operator. The
+    /// daemon announces an expiry with `PromptExpired`, but only to the client
+    /// holding the prompt slot, and a session whose slot was just taken back
+    /// holds nothing: prompts that expire before it claims the slot again are
+    /// announced to nobody. Asking about one presents a connection the daemon
+    /// has already decided as though it were still waiting for an answer.
+    #[test]
+    fn promote_skips_prompts_the_daemon_has_already_decided() {
+        let live = unix_ms_now() + 60_000;
+        let mut queue: VecDeque<Pending> =
+            [pending(1, 0), pending(2, 0), pending(3, live)].into();
+        let (p, _) = promote(&mut queue).expect("the live prompt is promoted");
+        assert_eq!(p.id, 3, "the two expired ones were skipped");
+        assert!(queue.is_empty());
+
+        let mut queue: VecDeque<Pending> = [pending(4, 0)].into();
+        assert!(
+            promote(&mut queue).is_none(),
+            "nothing live means nothing to ask"
+        );
+    }
+
+    /// Claiming the prompt slot makes the daemon re-deliver everything still
+    /// pending, and this session claims it again whenever it is revoked. A
+    /// re-delivered prompt is one already on screen or already queued, so
+    /// queuing it again would ask the same question twice and spend the id on
+    /// the first answer.
+    #[test]
+    fn a_redelivered_prompt_is_not_taken_twice() {
+        let live = unix_ms_now() + 60_000;
+        let queue: VecDeque<Pending> = [pending(2, live)].into();
+        let current = Some((pending(1, live), Stage::Verdict));
+        assert!(already_held(&current, &queue, 1), "the one on screen");
+        assert!(already_held(&current, &queue, 2), "the one queued");
+        assert!(!already_held(&current, &queue, 3), "a genuinely new prompt");
+        assert!(!already_held(&None, &VecDeque::new(), 1));
+    }
 
     #[test]
     fn input_parsing() {

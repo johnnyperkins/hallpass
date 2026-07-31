@@ -365,7 +365,11 @@ async fn message_loop(
             ClientMsg::Stats => {
                 let rules = deps.store.ruleset().rule_count() as u32;
                 let skipped = deps.store.rules_skipped();
-                DaemonMsg::Stats(deps.stats.snapshot(rules, skipped))
+                DaemonMsg::Stats(deps.stats.snapshot(
+                    rules,
+                    skipped,
+                    deps.prompts.has_handler(),
+                ))
             }
             ClientMsg::EventHistory { limit } => {
                 DaemonMsg::Events(deps.events.history(limit as usize))

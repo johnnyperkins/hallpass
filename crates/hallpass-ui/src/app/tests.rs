@@ -421,6 +421,44 @@ fn connecting_subscribes_before_asking_for_history() {
     assert_eq!(Vec::from(t.app.pending_acks.clone()), vec![AckKind::Other]);
 }
 
+/// The daemon releases the prompt slot when prompts sent to it time out
+/// unanswered, which is what a hostile client holding the slot looks like -
+/// and also what this window looks like when its operator walked away.
+/// Reclaiming it is what makes the second case cost nothing: absorbing the
+/// message would leave every later connection decided by the daemon's
+/// default with nothing on screen to say so.
+#[test]
+fn a_revoked_prompt_slot_is_claimed_again() {
+    let mut t = TestApp::new();
+    t.feed(UiEvent::Connected);
+    t.sent();
+    t.daemon(DaemonMsg::Ok); // the initial Subscribe's ack
+    assert!(t.app.pending_acks.is_empty());
+
+    t.daemon(DaemonMsg::PromptHandlerRevoked);
+    assert_eq!(
+        t.sent(),
+        vec![ClientMsg::Subscribe {
+            events: false,
+            prompts: true,
+        }],
+        "the slot is claimed again, and only the slot: this connection's \
+         event subscription is untouched"
+    );
+    assert!(
+        t.app
+            .last_error
+            .as_deref()
+            .is_some_and(|e| e.contains("prompt slot")),
+        "the operator is told: {:?}",
+        t.app.last_error
+    );
+    // Acked like any other Subscribe, so the FIFO stays aligned.
+    assert_eq!(Vec::from(t.app.pending_acks.clone()), vec![AckKind::Other]);
+    t.daemon(DaemonMsg::Ok);
+    assert!(t.app.pending_acks.is_empty());
+}
+
 // ---- the event feed (5c2c1a8) --------------------------------------------
 
 /// Every reconnect asks for history again, and a daemon that did not

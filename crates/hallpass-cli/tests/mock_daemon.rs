@@ -71,6 +71,9 @@ async fn handshake_and_stats_roundtrip() {
         observed_only: 0,
         dns_snoop_dropped: 0,
         enforcing: true,
+        prompt_handler_connected: true,
+        prompts_unanswered: 0,
+        prompt_handlers_evicted: 0,
     };
     let daemon = tokio::spawn(mock_daemon(listener, move |mut stream| async move {
         let req: ClientMsg = wire::read_msg(&mut stream).await.expect("read req");

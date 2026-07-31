@@ -156,6 +156,20 @@ pub fn format_stats(s: &Stats, pal: Palette) -> String {
         ("denied", s.denied.to_string()),
         ("observed only", s.observed_only.to_string()),
         ("prompted", s.prompted.to_string()),
+        (
+            "prompt handler",
+            if s.prompt_handler_connected {
+                "connected".to_string()
+            } else {
+                // Painted like observe mode, and for the same reason: with
+                // nobody holding the slot every unmatched connection takes
+                // the default verdict unasked, and the counters above look
+                // no different when that is what is happening.
+                pal.paint(Style::Warn, "none (unmatched connections take the default)")
+            },
+        ),
+        ("prompts unanswered", s.prompts_unanswered.to_string()),
+        ("handlers evicted", s.prompt_handlers_evicted.to_string()),
         ("rules loaded", s.rules_loaded.to_string()),
         ("rules skipped", s.rules_skipped.to_string()),
         ("dns spoofed", s.dns_spoof_rejected.to_string()),
@@ -637,23 +651,43 @@ mod tests {
             observed_only: 4,
             dns_snoop_dropped: 6,
             enforcing,
+            prompt_handler_connected: true,
+            prompts_unanswered: 9,
+            prompt_handlers_evicted: 2,
         }
     }
 
     #[test]
     fn stats_table() {
         let out = format_stats(&stats(true), plain());
-        assert!(out.contains("mode               enforcing\n"), "{out}");
-        assert!(out.contains("connections        100\n"), "{out}");
-        assert!(out.contains("observed only      4\n"), "{out}");
-        assert!(out.contains("rules loaded       3\n"), "{out}");
-        assert!(out.contains("rules skipped      2\n"), "{out}");
-        assert!(out.contains("dns spoofed        7\n"), "{out}");
-        assert!(out.contains("dns snoop dropped  6\n"), "{out}");
-        assert!(out.contains("prompt overflows   1\n"), "{out}");
-        assert!(out.contains("uptime             1h 0m 0s\n"), "{out}");
+        assert!(out.contains("mode                enforcing\n"), "{out}");
+        assert!(out.contains("connections         100\n"), "{out}");
+        assert!(out.contains("observed only       4\n"), "{out}");
+        assert!(out.contains("rules loaded        3\n"), "{out}");
+        assert!(out.contains("rules skipped       2\n"), "{out}");
+        assert!(out.contains("dns spoofed         7\n"), "{out}");
+        assert!(out.contains("dns snoop dropped   6\n"), "{out}");
+        assert!(out.contains("prompt overflows    1\n"), "{out}");
+        assert!(out.contains("uptime              1h 0m 0s\n"), "{out}");
         // No warning while enforcing.
         assert!(!out.contains("OBSERVE"), "{out}");
+    }
+
+    /// With no prompt handler the daemon asks nobody and applies the default
+    /// verdict, and every other counter in this table looks the same as it
+    /// does on a host whose operator is answering. The row has to say so.
+    #[test]
+    fn stats_table_reports_the_prompt_handler() {
+        let out = format_stats(&stats(true), plain());
+        assert!(out.contains("prompt handler      connected\n"), "{out}");
+        assert!(out.contains("prompts unanswered  9\n"), "{out}");
+        assert!(out.contains("handlers evicted    2\n"), "{out}");
+
+        let mut s = stats(true);
+        s.prompt_handler_connected = false;
+        let out = format_stats(&s, plain());
+        assert!(out.contains("prompt handler      none"), "{out}");
+        assert!(out.contains("take the default"), "{out}");
     }
 
     /// A status table that looks healthy while nothing is filtered is the
@@ -662,7 +696,7 @@ mod tests {
     #[test]
     fn stats_table_flags_observe_mode() {
         let out = format_stats(&stats(false), plain());
-        assert!(out.contains("mode               observe (not enforcing)\n"), "{out}");
+        assert!(out.contains("mode                observe (not enforcing)\n"), "{out}");
         assert!(out.contains(OBSERVE_WARNING), "{out}");
         assert!(out.contains("every packet is let through"), "{out}");
     }
