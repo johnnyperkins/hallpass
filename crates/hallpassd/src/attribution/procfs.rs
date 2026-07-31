@@ -2,9 +2,11 @@
 //! and owning UID for a local address; /proc/*/fd/* symlinks map the inode
 //! to a PID; /proc/pid/{exe,cmdline} give process details.
 
+use std::collections::VecDeque;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::Mutex;
 
 use hallpass_types::{FlowTuple, Proto};
 
@@ -106,8 +108,28 @@ pub fn find_local_match(
     wildcard
 }
 
+/// Processes remembered as having owned a flow, newest first.
+///
+/// Small on purpose. Connections cluster hard on a handful of programs (a
+/// browser opens them in bursts), so the win is in the first few entries,
+/// and every entry is a directory this may scan before the general walk.
+const RECENT_PIDS: usize = 8;
+
+/// Share of one scan's descriptor budget the recent processes may spend.
+///
+/// They are a guess, so they must not be able to spend what the walk behind
+/// them needs: at a quarter, being wrong about all eight costs a quarter of
+/// the budget and the walk still runs with three quarters of it.
+const RECENT_BUDGET_SHARE: usize = 4;
+
 /// Procfs-backed attributor.
-pub struct ProcfsAttributor;
+///
+/// Holds the recently-seen processes, which is the only state here; the
+/// rest of the module is free functions over a proc root.
+#[derive(Default)]
+pub struct ProcfsAttributor {
+    recent: Mutex<VecDeque<u32>>,
+}
 
 impl ProcfsAttributor {
     fn tables(proto: Proto) -> [&'static str; 2] {
@@ -116,6 +138,61 @@ impl ProcfsAttributor {
             Proto::Udp => ["/proc/net/udp", "/proc/net/udp6"],
         }
     }
+
+    /// Find the process holding `inode`, trying the ones that owned the
+    /// last few flows before walking every process on the host.
+    ///
+    /// The walk visits processes in `/proc` readdir order, which has nothing
+    /// to do with which of them is likely to own a brand new socket. On this
+    /// developer's idle desktop a full walk is ~4.5ms over 4164 visible
+    /// descriptors while the heaviest single process holds 413, so checking
+    /// the last few owners first is worth an order of magnitude on the
+    /// common case. It is only an ordering: every candidate is confirmed to
+    /// hold the inode by the same check the walk uses, so a wrong guess
+    /// costs descriptors and never an answer.
+    ///
+    /// One behaviour does change. When several processes share a socket (a
+    /// fork, or a descriptor passed over a unix socket) the walk returns the
+    /// lowest pid, because readdir yields them in order; this returns the
+    /// most recently seen holder instead. Neither is more correct, both
+    /// genuinely hold it, but `exe` rules can tell them apart.
+    ///
+    /// Returns the pid and how many descriptors were looked at, which is
+    /// what the tests assert on: the point of the whole function is that the
+    /// second number is small.
+    fn find_pid(&self, proc_root: &Path, inode: u64) -> (Option<u32>, usize) {
+        let mut spent = 0;
+        let recent: Vec<u32> = self.recent.lock().unwrap().iter().copied().collect();
+        let guess_budget = MAX_FDS_PER_SCAN / RECENT_BUDGET_SHARE;
+        for pid in recent {
+            let limit = MAX_FDS_PER_PID.min(guess_budget.saturating_sub(spent));
+            if limit == 0 {
+                break;
+            }
+            let (found, scanned) = scan_pid_fds(proc_root, pid, inode, limit);
+            spent += scanned;
+            if found {
+                return (Some(pid), spent);
+            }
+        }
+        let (pid, walked) = find_pid_for_inode_within(
+            proc_root,
+            inode,
+            MAX_FDS_PER_PID,
+            MAX_FDS_PER_SCAN - spent,
+        );
+        (pid, spent + walked)
+    }
+
+    /// Remember `pid` as the newest owner.
+    fn remember(&self, pid: u32) {
+        let mut recent = self.recent.lock().unwrap();
+        if let Some(at) = recent.iter().position(|&p| p == pid) {
+            recent.remove(at);
+        }
+        recent.push_front(pid);
+        recent.truncate(RECENT_PIDS);
+    }
 }
 
 impl Attributor for ProcfsAttributor {
@@ -123,11 +200,13 @@ impl Attributor for ProcfsAttributor {
         // Both tables are read whole. Only the parsing is lazy, since
         // find_local_match stops at the first exact hit; the reads below
         // are not, and seq_file regenerates every socket on the host per
-        // read. This is the larger half of what an attribution miss costs
-        // and it cannot be trimmed, because the uid used for `user` rules
-        // comes from the same row. Asking the kernel for one row instead of
-        // all of them needs NETLINK_SOCK_DIAG; see
-        // docs/attribution-threading.md.
+        // read. It cannot be trimmed either, because the uid used for
+        // `user` rules comes from the same row. Asking the kernel for one
+        // row instead of all of them needs NETLINK_SOCK_DIAG, which is
+        // worth doing on a host with tens of thousands of sockets and
+        // roughly nothing on a desktop: measured, this is the smaller half
+        // of a miss by about 18x. See docs/attribution-threading.md and the
+        // attribution_cost measurement below.
         let texts: Vec<String> = Self::tables(tuple.proto)
             .into_iter()
             .filter_map(|t| std::fs::read_to_string(t).ok())
@@ -137,12 +216,19 @@ impl Attributor for ProcfsAttributor {
             .flat_map(|t| t.lines().filter_map(parse_proc_net_line));
         let entry = find_local_match(entries, &tuple.src)?;
         let proc_root = Path::new("/proc");
-        let verified = find_pid_for_inode(proc_root, entry.inode)
+        let verified = self
+            .find_pid(proc_root, entry.inode)
+            .0
             .and_then(|pid| verified_proc_details(proc_root, pid, entry.inode));
         let (pid, exe_path, cmdline) = match verified {
             Some((pid, exe, cmd)) => (Some(pid), exe, cmd),
             None => (None, None, None),
         };
+        // Only verified owners are remembered, so a guess that did not hold
+        // up cannot steer the next lookup.
+        if let Some(pid) = pid {
+            self.remember(pid);
+        }
         Some(ProcInfo {
             pid,
             uid: entry.uid,
@@ -179,7 +265,13 @@ const MAX_FDS_PER_SCAN: usize = 65_536;
 /// Times a scan has run out of budget, for the log below.
 static ABANDONED_SCANS: AtomicU64 = AtomicU64::new(0);
 
-/// Scan `proc_root`/PID/fd/* for a symlink to `socket:[inode]`.
+/// Scan every process under `proc_root` for a descriptor pointing at
+/// `socket:[inode]`, spending at most `max_per_pid` descriptors on any one
+/// process and `max_total` overall. Reports the pid and what was spent.
+///
+/// The budgets are arguments rather than constants so they can be exercised
+/// without opening tens of thousands of descriptors; production callers pass
+/// [`MAX_FDS_PER_PID`] and [`MAX_FDS_PER_SCAN`].
 ///
 /// Which way it fails when the budget runs out: the socket resolves to no
 /// process, so the connection keeps the uid from its `/proc/net` row and
@@ -191,29 +283,26 @@ static ABANDONED_SCANS: AtomicU64 = AtomicU64::new(0);
 /// everybody by opening descriptors. A process that hides from attribution
 /// this way gains nothing it did not already have, since it can also just
 /// exec after connecting (see the README's security model).
-fn find_pid_for_inode(proc_root: &Path, inode: u64) -> Option<u32> {
-    find_pid_for_inode_within(proc_root, inode, MAX_FDS_PER_PID, MAX_FDS_PER_SCAN)
-}
-
-/// [`find_pid_for_inode`] with the budgets given, so they can be exercised
-/// without opening tens of thousands of descriptors.
 fn find_pid_for_inode_within(
     proc_root: &Path,
     inode: u64,
     max_per_pid: usize,
     max_total: usize,
-) -> Option<u32> {
+) -> (Option<u32>, usize) {
     let mut budget = max_total;
-    for entry in std::fs::read_dir(proc_root).ok()?.flatten() {
+    let Ok(dir) = std::fs::read_dir(proc_root) else {
+        return (None, 0);
+    };
+    for entry in dir.flatten() {
         let name = entry.file_name();
         let Some(pid) = name.to_str().and_then(|s| s.parse::<u32>().ok()) else {
             continue;
         };
         let (found, scanned) = scan_pid_fds(proc_root, pid, inode, max_per_pid.min(budget));
-        if found {
-            return Some(pid);
-        }
         budget -= scanned;
+        if found {
+            return (Some(pid), max_total - budget);
+        }
         if budget == 0 {
             // Logged on the first and then at each power of ten, so a host
             // that is hitting this says so without the log becoming the load.
@@ -225,10 +314,10 @@ fn find_pid_for_inode_within(
                      decided without an executable"
                 );
             }
-            return None;
+            return (None, max_total);
         }
     }
-    None
+    (None, max_total - budget)
 }
 
 /// Does `proc_root`/PID/fd/* contain a symlink to `socket:[inode]`?
@@ -443,8 +532,9 @@ mod tests {
         assert_eq!(ppid_of(&dir, 4242), Some(4200));
         assert_eq!(ppid_of(&dir, 9999), None);
 
-        assert_eq!(find_pid_for_inode(&dir, 123456), Some(4242));
-        assert_eq!(find_pid_for_inode(&dir, 1), None);
+        let full = |inode| find_pid_for_inode_within(&dir, inode, usize::MAX, usize::MAX).0;
+        assert_eq!(full(123456), Some(4242));
+        assert_eq!(full(1), None);
         let (exe, cmdline) = read_proc_details(&dir, 4242);
         assert_eq!(exe, Some(PathBuf::from("/usr/bin/curl")));
         assert_eq!(cmdline.as_deref(), Some("curl https://example.org"));
@@ -477,7 +567,7 @@ mod tests {
         // Across the walk: 30 descriptors exist, the budget is 6, so it
         // gives up rather than reading them all, and says so.
         let before = ABANDONED_SCANS.load(AtomicOrdering::Relaxed);
-        assert_eq!(find_pid_for_inode_within(&dir, 999, 4, 6), None);
+        assert_eq!(find_pid_for_inode_within(&dir, 999, 4, 6).0, None);
         assert!(
             ABANDONED_SCANS.load(AtomicOrdering::Relaxed) > before,
             "the scan ran out of budget rather than finishing"
@@ -487,7 +577,91 @@ mod tests {
         let owner = dir.join("300/fd/0");
         std::fs::remove_file(&owner).unwrap();
         std::os::unix::fs::symlink("socket:[999]", &owner).unwrap();
-        assert_eq!(find_pid_for_inode_within(&dir, 999, 100, 100), Some(300));
+        assert_eq!(find_pid_for_inode_within(&dir, 999, 100, 100).0, Some(300));
+    }
+
+    /// A socket owned by a process that owned the last one is found by
+    /// looking at that process, not at every process on the host.
+    ///
+    /// Asserted on the descriptor count rather than on the pid, because the
+    /// pid is the same either way: the walk finds it too, just after reading
+    /// everything else first. The count is the entire point of the change.
+    #[test]
+    fn a_recent_owner_is_found_without_walking_the_host() {
+        let td = crate::testutil::TestDir::new("procfs-recent");
+        let dir = td.path().to_path_buf();
+        // Decoys, holding sockets that are not the one being looked for.
+        for pid in 0..20u32 {
+            let fd_dir = dir.join((100 + pid).to_string()).join("fd");
+            std::fs::create_dir_all(&fd_dir).unwrap();
+            for fd in 0..50u32 {
+                let target = format!("socket:[{}]", 7000 + pid * 50 + fd);
+                std::os::unix::fs::symlink(target, fd_dir.join(fd.to_string())).unwrap();
+            }
+        }
+        // The owner: five descriptors, the wanted socket third.
+        let owner_fds = dir.join("900/fd");
+        std::fs::create_dir_all(&owner_fds).unwrap();
+        for fd in 0..5u32 {
+            let target = if fd == 2 {
+                "socket:[4242]".to_string()
+            } else {
+                format!("socket:[{}]", 8000 + fd)
+            };
+            std::os::unix::fs::symlink(target, owner_fds.join(fd.to_string())).unwrap();
+        }
+
+        let attributor = ProcfsAttributor::default();
+        // Cold: found, but only after reading a good deal of the fixture.
+        let (cold_pid, cold_scanned) = attributor.find_pid(&dir, 4242);
+        assert_eq!(cold_pid, Some(900));
+        attributor.remember(900);
+
+        // Warm: the same answer, having read only the owner's own
+        // descriptors. Not an exact count, because readdir does not promise
+        // to yield "0".."4" in that order, so the matching one can be
+        // anywhere among the five.
+        let (warm_pid, warm_scanned) = attributor.find_pid(&dir, 4242);
+        assert_eq!(warm_pid, Some(900));
+        assert!(
+            warm_scanned <= 5,
+            "only the remembered process was read: {warm_scanned}"
+        );
+        assert!(
+            warm_scanned < cold_scanned,
+            "warm {warm_scanned} vs cold {cold_scanned}"
+        );
+
+        // A guess that no longer holds the socket costs its descriptors and
+        // nothing else: the walk behind it still finds the right process.
+        let attributor = ProcfsAttributor::default();
+        attributor.remember(105);
+        let (pid, scanned) = attributor.find_pid(&dir, 4242);
+        assert_eq!(pid, Some(900), "a wrong guess never costs the answer");
+        assert!(scanned > 50, "the wrong guess was read first: {scanned}");
+    }
+
+    /// Newest first, no duplicates, and bounded.
+    #[test]
+    fn remembered_owners_are_recent_and_bounded() {
+        let a = ProcfsAttributor::default();
+        for pid in 1..=(RECENT_PIDS as u32 + 4) {
+            a.remember(pid);
+        }
+        let recent: Vec<u32> = a.recent.lock().unwrap().iter().copied().collect();
+        assert_eq!(recent.len(), RECENT_PIDS);
+        assert_eq!(recent[0], RECENT_PIDS as u32 + 4, "newest first");
+
+        // Seeing one again moves it to the front rather than duplicating it.
+        a.remember(recent[3]);
+        let again: Vec<u32> = a.recent.lock().unwrap().iter().copied().collect();
+        assert_eq!(again[0], recent[3]);
+        assert_eq!(again.len(), RECENT_PIDS);
+        assert_eq!(
+            again.iter().filter(|&&p| p == recent[3]).count(),
+            1,
+            "no duplicates"
+        );
     }
 
     /// The two halves of an attribution miss, timed against each other.
@@ -594,7 +768,13 @@ mod tests {
             }
         }
         let (min, median) = timed(9, || {
-            assert_eq!(find_pid_for_inode(Path::new("/proc"), 42), None);
+            let found = find_pid_for_inode_within(
+                Path::new("/proc"),
+                42,
+                MAX_FDS_PER_PID,
+                MAX_FDS_PER_SCAN,
+            );
+            assert_eq!(found.0, None);
         });
         println!("  {pids} processes, {readable} readable here, {fds} descriptors visible");
         println!(
@@ -605,9 +785,37 @@ mod tests {
         );
 
         println!(
-            "\n  the walk is {:.0}x the idle table read on this machine\n",
+            "\n  the walk is {:.0}x the idle table read on this machine",
             min.as_secs_f64() / idle_read.as_secs_f64()
         );
+
+        // Half 2 again, for a socket this process really owns, with and
+        // without the owner remembered. This is the change the recent-owner
+        // list makes, measured rather than argued.
+        println!("\n-- half 2: same walk, socket owned by this process --");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let local = listener.local_addr().unwrap();
+        let text = std::fs::read_to_string("/proc/net/tcp").unwrap();
+        let entry = find_local_match(text.lines().filter_map(parse_proc_net_line), &local)
+            .expect("our own listener is in /proc/net/tcp");
+        let me = std::process::id();
+
+        let cold = ProcfsAttributor::default();
+        let (cold_min, _) = timed(9, || {
+            assert_eq!(cold.find_pid(Path::new("/proc"), entry.inode).0, Some(me));
+        });
+        let warm = ProcfsAttributor::default();
+        warm.remember(me);
+        let (warm_min, _) = timed(9, || {
+            assert_eq!(warm.find_pid(Path::new("/proc"), entry.inode).0, Some(me));
+        });
+        println!(
+            "  cold {:.0}us, owner remembered {:.0}us, {:.0}x",
+            cold_min.as_secs_f64() * 1e6,
+            warm_min.as_secs_f64() * 1e6,
+            cold_min.as_secs_f64() / warm_min.as_secs_f64()
+        );
+        println!();
     }
 
     #[test]
