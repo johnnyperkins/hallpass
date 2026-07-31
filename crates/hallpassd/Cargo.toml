@@ -40,6 +40,10 @@ notify = "8"
 arc-swap = "1"
 lru = "0.16"
 sha2 = { workspace = true }
+# AF_NETLINK socket for the sock_diag attribution path; the daemon denies
+# unsafe_code and std has no netlink socket. Chosen over neli (proc-macro
+# subtree) for pulling only bytes, libc and log, all already in the tree.
+netlink-sys = { version = "0.8", default-features = false }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

@@ -681,7 +681,10 @@ mod tests {
     /// The socket-count sweep is the one controlled part: it creates the
     /// sockets itself, so that column is comparable across machines. The
     /// walk is not controlled and its inputs are printed next to it so the
-    /// number can be interpreted.
+    /// number can be interpreted. A `sock_diag` lookup of one established
+    /// socket is timed beside the table read at each step of the sweep,
+    /// because its whole claim is the shape of that column: a hash lookup
+    /// should stay flat while the file read grows with occupancy.
     ///
     /// Unprivileged it can only read its own processes' descriptors and
     /// skips the rest cheaply. The daemon runs as root and scans every one,
@@ -723,10 +726,35 @@ mod tests {
             )
         }
 
-        println!("\n-- half 1: /proc/net/tcp{{,6}}, read whole per miss --");
-        println!("     sockets       rows      bytes        min     median");
+        use super::super::sockdiag::{DiagReply, DiagSocket};
+
+        println!("\n-- half 1: /proc/net/tcp{{,6}} read whole vs one sock_diag lookup --");
+        println!("     sockets       rows      bytes  table min  table med   diag min   diag med");
+        // The lookup target: an established pair, which is the shape every
+        // `ct state new` TCP flow has by the time the verdict path asks.
+        // Both ends stay alive so the socket sits in the kernel's
+        // established hash for the whole sweep.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let _server = listener.accept().unwrap();
+        let tuple = FlowTuple {
+            proto: Proto::Tcp,
+            src: client.local_addr().unwrap(),
+            dst: client.peer_addr().unwrap(),
+        };
+        let mut diag = DiagSocket::open().expect("NETLINK_SOCK_DIAG socket");
+        // Same answer as the file, checked once up front, so the loop below
+        // times two ways of asking one question rather than two questions.
+        let text = std::fs::read_to_string("/proc/net/tcp").unwrap();
+        let from_file = find_local_match(text.lines().filter_map(parse_proc_net_line), &tuple.src)
+            .expect("the pair is in /proc/net/tcp");
+        match diag.lookup(&tuple).expect("sock_diag lookup") {
+            DiagReply::Found(e) => assert_eq!(e, from_file, "kernel and file disagree"),
+            other => panic!("sock_diag did not find the pair: {other:?}"),
+        }
+
         let mut held: Vec<std::net::TcpListener> = Vec::new();
-        let mut idle_read = Duration::MAX;
+        let (mut idle_read, mut idle_diag) = (Duration::MAX, Duration::MAX);
         for extra in [0usize, 1_000, 5_000, 20_000] {
             while held.len() < extra {
                 match std::net::TcpListener::bind("127.0.0.1:0") {
@@ -741,19 +769,32 @@ mod tests {
             let (min, median) = timed(20, || {
                 read_proc_net();
             });
+            let (diag_min, diag_median) = timed(100, || {
+                match diag.lookup(&tuple) {
+                    Ok(DiagReply::Found(_)) => {}
+                    other => panic!("sock_diag lookup failed mid-sweep: {other:?}"),
+                }
+            });
             if extra == 0 {
                 idle_read = min;
+                idle_diag = diag_min;
             }
             println!(
-                "  +{:>9} {:>10} {:>10} {:>8.0}us {:>8.0}us",
+                "  +{:>9} {:>10} {:>10} {:>8.0}us {:>8.0}us {:>8.1}us {:>8.1}us",
                 held.len(),
                 rows,
                 bytes,
                 min.as_secs_f64() * 1e6,
-                median.as_secs_f64() * 1e6
+                median.as_secs_f64() * 1e6,
+                diag_min.as_secs_f64() * 1e6,
+                diag_median.as_secs_f64() * 1e6
             );
         }
         drop(held);
+        println!(
+            "\n  one sock_diag lookup is 1/{:.0} of the idle table read",
+            idle_read.as_secs_f64() / idle_diag.as_secs_f64()
+        );
 
         println!("\n-- half 2: /proc/*/fd walk, socket nobody holds --");
         let (mut pids, mut readable, mut fds) = (0usize, 0usize, 0usize);

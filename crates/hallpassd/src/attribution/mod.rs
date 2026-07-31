@@ -7,6 +7,11 @@ pub mod cache;
 pub mod ebpf;
 pub mod hash;
 pub mod procfs;
+// Spike, measured but not yet consulted by the verdict path, so outside of
+// tests nothing calls it; drop the allow when the chain adopts or the spike
+// is thrown away. See docs/attribution-threading.md, recommendation 3.
+#[allow(dead_code)]
+pub mod sockdiag;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
