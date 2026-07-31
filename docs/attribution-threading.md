@@ -175,11 +175,13 @@ bounded sources returned rather than inventing a fallback verdict. That
 degrades to "eBPF's answer" under the feature and to "no answer" without it,
 which is honest, and it never converts latency into a verdict.
 
-## The finding that outranks all of this
+## The finding that outranked all of this (fixed)
 
-`cached_still_valid` (`mod.rs:117-126`) asks two questions: does
-`/proc/<pid>` exist, and does its `exe` symlink still read the same. Neither
-establishes that the recorded process still owns *this flow*.
+Left here because the reasoning is why the fix looks the way it does.
+
+`cached_still_valid` asked two questions: does `/proc/<pid>` exist, and does
+its `exe` symlink still read the same. Neither establishes that the recorded
+process still owns *this flow*.
 
 The cache is keyed on the 5-tuple with a 60 second positive TTL
 (`cache.rs:14-16`). A process reads a victim's live tuple from world-readable
@@ -191,14 +193,24 @@ hash is taken from the live victim binary. On a default-deny host that is a
 bypass of every identity-scoped allow rule for that destination, and the
 event stream records the victim's name for the connection.
 
-`uid`, `cmdline` and `parent_exe` are not checked at all, and each is a rule
-operand. The primitive needed to fix it already exists in this tree: the eBPF
-detail cache validates a pid by `(pid, starttime)` (`ebpf.rs:149-153`,
-`procfs.rs:216-220`), which was added for exactly this class of bug and was
-not applied here. Carry `starttime` in `ProcInfo`, require it to be equal,
-re-check the socket inode and uid from the `/proc/net` row before serving a
-positive, and shorten the positive TTL. That is a security fix, not a
-performance one, and it should not wait behind the threading question.
+`uid`, `cmdline` and `parent_exe` were not checked at all, and each is a rule
+operand.
+
+The fix does not re-resolve the tuple, which would cost the whole of half 1
+on every cache hit. A source port only becomes free to reuse once the socket
+behind it is closed, and the kernel hands out a fresh inode per socket, so
+"does the recorded process still hold the recorded socket inode" answers
+exactly the right question for the price of one `/proc/<pid>/fd` readdir.
+`ProcInfo` carries the inode and the start time to make that possible; the
+start time was already the primitive the eBPF detail cache used for pid
+recycling, and had simply not been applied here. Entries with no inode, which
+is what the eBPF source produces, are never served: that map is keyed by the
+same tuple and the connect that reused the port has already overwritten it,
+so asking it again is cheaper than the check and more current than the cache.
+
+The positive TTL is deliberately left at 60s. With the ownership check in
+front of it the TTL is no longer what bounds staleness, and shortening it
+would only cost hit rate.
 
 ## Re-checked audit leads
 
@@ -208,7 +220,7 @@ them. Checked against the code:
 | Lead | Verdict |
 | --- | --- |
 | `hash.rs:94` unbounded synchronous hashing on the packet path | Confirmed. Recommendation 1. |
-| `attribution/mod.rs:82` cached positive-hit revalidation scope | Confirmed, and larger than reported. See above. |
+| `attribution/mod.rs:82` cached positive-hit revalidation scope | Confirmed, larger than reported, and fixed. See above. |
 | `attribution/ebpf.rs:149` exec snapshot keyed on (pid, starttime) | Confirmed, with a caveat. starttime survives execve, so the key cannot detect an exec; in the normal case the exec tracepoint overwrites the entry, so there is no everyday misattribution. It goes stale when that event is lost (a 256 KiB ring, silently dropped when full) or arrives after the connection is judged, and there is a lost update between the snapshot and the `put` on the miss path. |
 | `procfs.rs:135` an in-flight (SCM_RIGHTS) socket has no `/proc` owner | Partly. Real for an fd in flight over a unix socket, where the socket is listed with a live inode and no pid holds it. Refuted for a zombie, whose orphaned socket reports inode 0 and is skipped. The consequence was misstated: attribution does not fail, it returns the uid with `pid: None`, so `exe` rules cannot match and the connection falls to a prompt rather than to a verdict. |
 | `procfs.rs:238` exe path taken verbatim, including `" (deleted)"` | Partly. Exact `exe` and `parent_exe` comparisons do fail against the suffix. `exe_glob` mostly still matches, because the matcher leaves `literal_separator` off. The hashing half is refuted: hashing prefers `/proc/<pid>/exe`, which opens the still-live inode of the unlinked binary. |

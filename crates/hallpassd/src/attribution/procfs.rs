@@ -142,6 +142,11 @@ impl Attributor for ProcfsAttributor {
             exe_path,
             cmdline,
             parent_exe: pid.and_then(|p| parent_exe_of(proc_root, p)),
+            starttime: pid.and_then(|p| starttime_of(proc_root, p)),
+            // The row this was resolved from. Whether the pid still holds
+            // it is what tells a live cache entry from one whose port has
+            // been handed to somebody else.
+            socket_inode: Some(entry.inode),
         })
     }
 }
@@ -161,7 +166,7 @@ fn find_pid_for_inode(proc_root: &Path, inode: u64) -> Option<u32> {
 }
 
 /// Does `proc_root`/PID/fd/* contain a symlink to `socket:[inode]`?
-fn pid_holds_inode(proc_root: &Path, pid: u32, inode: u64) -> bool {
+pub(super) fn pid_holds_inode(proc_root: &Path, pid: u32, inode: u64) -> bool {
     let target = format!("socket:[{inode}]");
     let Ok(fds) = std::fs::read_dir(proc_root.join(pid.to_string()).join("fd")) else {
         return false; // permission denied or process gone
@@ -212,7 +217,6 @@ pub(super) fn parent_exe_of(proc_root: &Path, pid: u32) -> Option<PathBuf> {
 /// 22, parsed after the comm field's closing paren like [`ppid_of`]. The
 /// (pid, starttime) pair identifies one process incarnation: a recycled
 /// pid gets a new starttime.
-#[cfg_attr(not(feature = "ebpf"), allow(dead_code))]
 pub(super) fn starttime_of(proc_root: &Path, pid: u32) -> Option<u64> {
     let stat = std::fs::read_to_string(proc_root.join(pid.to_string()).join("stat")).ok()?;
     let after_comm = stat.rsplit_once(')')?.1;

@@ -141,7 +141,10 @@ impl EbpfAttributor {
         })
     }
 
-    fn details_for(&self, pid: u32) -> ProcDetails {
+    /// Details for `pid`, with the start time they were read at. The
+    /// caller needs that start time too, so it is returned rather than
+    /// read a second time.
+    fn details_for(&self, pid: u32) -> (ProcDetails, Option<u64>) {
         // Exit events are lossy and fork-without-exec emits no exec
         // event, so a cache hit may describe a previous occupant of
         // this pid; only serve it while the starttime still matches
@@ -149,14 +152,14 @@ impl EbpfAttributor {
         let now_start = procfs::starttime_of(Path::new("/proc"), pid);
         if let Some((d, cached_start)) = self.cache.lock().unwrap().get(&pid) {
             if now_start.is_some() && *cached_start == now_start {
-                return d.clone();
+                return (d.clone(), now_start);
             }
         }
         // Not seen via the exec tracepoint (started before the daemon)
         // or stale; snapshot now and remember it.
         let d = procfs::proc_snapshot(Path::new("/proc"), pid);
         self.cache.lock().unwrap().put(pid, (d.clone(), now_start));
-        d
+        (d, now_start)
     }
 }
 
@@ -169,13 +172,22 @@ impl Drop for EbpfAttributor {
 impl Attributor for EbpfAttributor {
     fn attribute(&self, tuple: &FlowTuple) -> Option<ProcInfo> {
         let val = self.sock_map.get(&flow_key(tuple), 0).ok()?;
-        let (exe_path, cmdline, parent_exe) = self.details_for(val.pid);
+        let ((exe_path, cmdline, parent_exe), starttime) = self.details_for(val.pid);
         Some(ProcInfo {
             pid: Some(val.pid),
             uid: val.uid,
             exe_path,
             cmdline,
             parent_exe,
+            starttime,
+            // The kernel side records (pid, uid) against the flow tuple and
+            // never sees the socket inode. Leaving it unset means the
+            // attribution cache will not serve this entry without asking
+            // again, which is the right trade here: the map is keyed by the
+            // same tuple and the connect that reused the port has already
+            // overwritten it, so one lookup is both cheaper than
+            // revalidating and more current than the cached answer.
+            socket_inode: None,
         })
     }
 }

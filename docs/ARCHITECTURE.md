@@ -79,7 +79,13 @@ A new outbound connection then travels like this:
    while the process is fresh, and evicts on exit.
    A cached positive hit is revalidated before use, because source ports are
    reused and serving a stale entry would hand the old process's identity,
-   and its allow rules, to whatever owns the port now.
+   and its allow rules, to whatever owns the port now. Revalidation is three
+   questions, and each rules out a different way the entry can have gone
+   wrong: does the recorded process still hold the recorded socket inode
+   (the flow is the same one), is its start time unchanged (the pid was not
+   recycled), and does its exe symlink still read the same (it did not exec
+   in place). An entry the source could not attach an inode to is never
+   served from the cache at all.
 
 5. **Annotated with a domain.** The destination IP is looked up in the
    IP-to-domain cache. Two independent snoopers fill that cache. The wire
