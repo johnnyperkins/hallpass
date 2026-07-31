@@ -47,8 +47,9 @@ new` is judged, so established flows are never re-checked.
 A new outbound connection then travels like this:
 
 1. **Queued.** The kernel hands the packet to NFQUEUE. The whole table is
-   installed in one `nft -f -`, and the queues were bound before it (see the
-   ordering invariants below), so there is always a listener.
+   installed in one `nft -f -`, and the queues were bound and already being
+   drained before it went up (see the ordering invariants below), so there is
+   always a listener.
 
 2. **Received on the verdict thread.** `nfq` is a blocking API and verdicts
    must be issued on the queue handle, so a dedicated std thread owns it. The
@@ -243,7 +244,7 @@ needed a bump on their own, being appended variants.
 ## Startup ordering invariants
 
 `crates/hallpassd/src/main.rs` is short and reads like a list of
-initializations. It is not: three of the steps are ordered for reasons that
+initializations. It is not: several of the steps are ordered for reasons that
 are invisible from the code alone, and reordering them has shipped real bugs.
 Each one is stated in a comment at the site. They are repeated here because
 the comments are what a reordering diff deletes.
@@ -269,6 +270,20 @@ accidentally gave the queue thread time to win the race. Fixing invariant 1
 exposed it, and eight e2e tests whose first connection expects a deny started
 failing on a loaded machine. Packets arriving before the verdict loop starts
 now buffer in the queue and are judged when it drains.
+
+**2b. The install happens last, after the verdict loop is draining.** Binding
+is only half of it. A bound queue with nobody calling `recv` fills to its
+depth and then overflows, and an overflowed queue is resolved by the same
+`bypass` flag: the buffering above only covers as many packets as the queue
+holds. The install used to sit before `RuleStore::new`, which reads every rule
+file and every domain, IP and hash list in `rules.d`, so the undrained window
+was as long as that takes and bounded by nothing the daemon controls. It is
+now the last thing startup does. The cost is that the host is unfiltered for
+the whole of startup rather than part of it, which is deliberate: that is the
+state the machine is in before the daemon runs at all and it ends at the
+install. The other order produced a state nothing else produces, an installed
+table with no verdicts behind it, which reads as healthy from outside while
+policy is not being applied to a single packet.
 
 **3. The resolver uprobes capture the queried name at call entry, and every
 entry-probe bail-out clears that thread's scratch entry.** Capturing at entry

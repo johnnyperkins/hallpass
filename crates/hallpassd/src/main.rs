@@ -1,10 +1,13 @@
 //! Hallpass daemon: interactive application firewall.
 //!
-//! Startup order: config, nftables install, then three long-lived workers:
-//! the blocking nfqueue loop on its own thread, the prompt dispatcher, and
-//! the IPC server. SIGTERM/SIGINT tear the nftables table down; the panic
-//! hook does too only in fail-open mode (`queue_bypass = true`), because in
-//! fail-closed mode the leftover table is what keeps enforcement up.
+//! Startup order: config, the IPC socket, the nfqueues, then the long-lived
+//! workers (the blocking nfqueue loop on its own thread, the prompt
+//! dispatcher, the DNS snoop consumer, the IPC server), and the nftables
+//! install last of all. Each of those positions is load-bearing; see the
+//! comment at each site and `docs/ARCHITECTURE.md`. SIGTERM/SIGINT tear the
+//! nftables table down; the panic hook does too only in fail-open mode
+//! (`queue_bypass = true`), because in fail-closed mode the leftover table is
+//! what keeps enforcement up.
 
 #![deny(unsafe_code)]
 
@@ -125,33 +128,17 @@ async fn main() {
         }
     };
 
-    let nft_installed = match &queue {
-        None => false,
-        Some(_) => match nft::install(cfg.queue_num, cfg.queue_bypass) {
-            Ok(()) => {
-                tracing::info!("nftables ruleset installed");
-                true
-            }
-            Err(e) if cfg.queue_bypass => {
-                tracing::error!("nftables install failed, continuing without interception: {e}");
-                false
-            }
-            Err(e) => {
-                // Fail-closed posture: running unenforced would silently
-                // contradict the operator's declared choice. Refuse to
-                // start.
-                tracing::error!("nftables install failed and queue_bypass is off: {e}");
-                std::process::exit(1);
-            }
-        },
-    };
-
     // Fail-open mode: a panic must not leave the nft table (and thus queued
     // packets) behind. Fail-closed mode is the opposite: the table IS the
     // enforcement, so a panicking daemon leaves it up (bypass-less queue
     // drops new connections) until a restart or an explicit teardown.
     // Teardown is idempotent; exiting is safer than running with
     // interception half torn down.
+    //
+    // Armed here rather than next to the install below, because the hook has
+    // to be in place before the table can exist: a panic in the setup between
+    // the two would otherwise leave a queue nobody drains behind under
+    // fail-open, which is the state this hook exists to prevent.
     let default_hook = std::panic::take_hook();
     let teardown_on_panic = cfg.queue_bypass;
     std::panic::set_hook(Box::new(move |info| {
@@ -258,6 +245,10 @@ async fn main() {
     // this run (no privileges); rule management still works over IPC.
     let shutdown = Arc::new(AtomicBool::new(false));
     let queue_thread = queue.map(|queue| {
+        // Started before the install below: everything the loop needs
+        // (the rule store, the domain cache, the prompt table) is built
+        // by this point, so the first packet the table produces meets a
+        // daemon that can decide it.
         nfqueue::spawn(
             queue,
             cfg.queue_num,
@@ -279,6 +270,44 @@ async fn main() {
             },
         )
     });
+
+    // Install last, once the loop above is draining the queues. The table
+    // is what makes the kernel queue packets, so installing it earlier
+    // opens a window in which packets are queued and nobody is taking
+    // them: those are resolved by the `bypass` flag alone, which under
+    // fail-open silently allows what a rule would deny and under
+    // fail-closed drops what a rule would allow. That window used to
+    // cover `RuleStore::new`, which reads every rule file and every
+    // domain, IP and hash list in `rules.d`, so its length was bounded by
+    // nothing the daemon controls.
+    //
+    // The cost of moving it here is that the host stays unfiltered until
+    // this line, which is deliberate: that is the state the machine is
+    // already in before the daemon starts at all, and it ends here. The
+    // other order produced a state nothing else produces, an installed
+    // table with no verdicts behind it, which reads as healthy from
+    // outside (the journal says the ruleset is installed) while policy is
+    // not being applied to a single packet.
+    let nft_installed = match &queue_thread {
+        None => false,
+        Some(_) => match nft::install(cfg.queue_num, cfg.queue_bypass) {
+            Ok(()) => {
+                tracing::info!("nftables ruleset installed");
+                true
+            }
+            Err(e) if cfg.queue_bypass => {
+                tracing::error!("nftables install failed, continuing without interception: {e}");
+                false
+            }
+            Err(e) => {
+                // Fail-closed posture: running unenforced would silently
+                // contradict the operator's declared choice. Refuse to
+                // start.
+                tracing::error!("nftables install failed and queue_bypass is off: {e}");
+                std::process::exit(1);
+            }
+        },
+    };
 
     // Synthetic traffic, only in a build that opted into it at compile
     // time. Started after the real workers so it can never mask one
