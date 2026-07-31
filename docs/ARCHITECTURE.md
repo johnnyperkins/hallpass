@@ -72,8 +72,13 @@ A new outbound connection then travels like this:
    `tcp_v4_connect`/`tcp_v6_connect` (and the UDP `sendmsg` path), so a
    process that exits before its first packet is inspected still attributes.
    Procfs is the fallback and the retry for anything eBPF cannot resolve: it
-   reads `/proc/net/{tcp,tcp6,udp,udp6}` for the socket inode and owning uid,
-   then walks `/proc/*/fd/*` to find the pid. The executable, command line,
+   resolves the flow's local address to the socket inode and owning uid, then
+   walks `/proc/*/fd/*` to find the pid. The address half is one
+   `NETLINK_SOCK_DIAG` lookup on the protocols a startup probe proved this
+   kernel answers, and a whole-table read of
+   `/proc/net/{tcp,tcp6,udp,udp6}` otherwise (`udp_diag` is a separate,
+   often absent, kernel module); which path is in use is logged once at
+   startup and never decided per packet. The executable, command line,
    and parent executable are read from `/proc` either way; the eBPF path
    additionally snapshots them from an exec tracepoint so they are captured
    while the process is fresh, and evicts on exit.

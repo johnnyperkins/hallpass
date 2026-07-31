@@ -45,6 +45,7 @@ the direction that would have sent the work at the wrong target. Measured
 | | 8.6 ms at 20024 rows |
 | full `/proc/*/fd` walk | 2.4 ms over 2163 visible descriptors |
 | | 1.1 us per descriptor |
+| one `NETLINK_SOCK_DIAG` lookup | 0.7 us, at 24 rows and at 20024 |
 
 The walk is 10 to 20x the table read depending on how busy the machine is,
 and that figure is a floor: unprivileged the walk can only read its own
@@ -153,8 +154,9 @@ which is to say nftables with DNS names bolted on.
 
 Bound the unbounded work where it is, rather than moving it or deleting it.
 Everything below is smaller than any of the three options, and none of it
-changes which thread anything runs on. Items 1, 2, 4 and 5 have landed; item
-3 is the one still open, and the measurements above demoted it.
+changes which thread anything runs on. Every item has landed, item 3 last
+and only after its spike measured the round trip; its priority reversed
+twice on this page, both times because a number arrived.
 
 **0. Look at the processes that owned the last few flows first.** **Done**,
 and it is the largest single win available, because it attacks the half that
@@ -201,24 +203,49 @@ enough that no ordinary process reaches it, count and log the ones that do.
 A process that hides from attribution this way gains nothing it did not
 already have (see the exec-after-connect limitation in the README).
 
-**3. Ask the kernel for one socket instead of dumping them all.** Still open,
-and worth less than it looks. A `NETLINK_SOCK_DIAG` `inet_diag_req_v2`
-carrying the 4-tuple is a hash lookup in the kernel that returns the inode
-and the uid, in place of a seq_file dump of two whole tables. Same
-information, same semantics. But the table read is the *smaller* half by 10
-to 20x on a desktop, so this buys 250 us on the machine this is built for and
-becomes worth real money only where sockets number in the tens of thousands,
-which is where the read reaches 8 ms.
+**3. Ask the kernel for one socket instead of dumping them all.** **Done**,
+spiked first, because for most of its life this item's ranking rested on
+guesses. A `NETLINK_SOCK_DIAG` `inet_diag_req_v2` carrying the 4-tuple is a
+hash lookup in the kernel that returns the inode and the uid, in place of a
+seq_file dump of two whole tables. Same information, same semantics. An
+earlier draft demoted it as "the smaller half by 10 to 20x", which was true
+while the walk was unordered; item 0 then took the walk to 17 us warm, which
+left this read at roughly 94% of a warm miss and promoted it back. The spike
+measured the round trip at 0.7 us regardless of occupancy, against 300 us
+for the idle-desktop table read and 8 ms at 20k sockets, so the guess it was
+spiked against (5 to 20 us) was itself pessimistic by an order of magnitude.
 
-It also costs a dependency decision. The daemon denies `unsafe_code` and the
-standard library has no `AF_NETLINK` socket, so this means adopting a netlink
-crate and defending it at `cargo deny`. `netlink-sys` needs only `bytes`,
-`libc` and `log`, all three already in the daemon's tree, so it is one crate
-rather than a subtree; `neli` pulls a proc-macro subtree;
-`netlink-packet-sock-diag` was last released in 2023, and the request is a
-fixed 56-byte struct that `to_le_bytes` can build without it. Keep the file
-read as the fallback for a kernel without the diag module, which is also what
-keeps the existing tests meaningful.
+The dependency decision went as anticipated: `netlink-sys` is the one new
+crate, needing only `bytes`, `libc` and `log`, all already in the daemon's
+tree (`neli` pulls a proc-macro subtree; `netlink-packet-sock-diag` was last
+released in 2023, and the request is a fixed 56-byte struct built by hand in
+`sockdiag.rs`, whose reply parses the way `parse_proc_net_line` does). The
+attributor probes once at startup, per protocol, and logs which path is in
+use; the file read stays as the fallback and carries every protocol the
+probe failed. Four facts the code now depends on, each confirmed against
+the live kernel before being written down:
+
+- ENOENT from a lookup means both "no such socket" and "no diag handler for
+  this protocol", by kernel design. That is why the probe asks about a
+  socket it created and still holds open, where only one reading is
+  possible, and one reason the choice is never remade per packet: on a
+  kernel without the module, every miss would pay a query that cannot
+  succeed in front of the read that answers.
+- `udp_diag` reads the sockid swapped relative to `tcp_diag` ("src and dst
+  are swapped for historical reasons", net/ipv4/udp_diag.c). Getting that
+  wrong is not an error; it is a permanent ENOENT that reads as a missing
+  module and silently keeps the slow path.
+- Replies need no source check: netlink refuses userspace-to-userspace
+  unicast without CAP_NET_ADMIN, sock_diag does not opt out of that check,
+  and a CAP_NET_ADMIN holder could already rewrite the ruleset itself.
+- An exact lookup is narrower than the file in two ways the fallback
+  absorbs. A Found reply for a TIME_WAIT or orphaned socket names nobody
+  (uid 0 and inode 0 are placeholders; served, they would attribute the
+  flow to root), and a lookup with no interface scope cannot see sockets
+  bound with SO_BINDTODEVICE, which needs no privilege since Linux 5.7 and
+  which the file lists. Both fall back to the read, whose own
+  skip-and-wildcard logic then decides; neither is served and neither is
+  treated as a final miss.
 
 **4. Fix the comment at `procfs.rs:122-123`**, which describes a laziness the
 `.collect()` on the next line removes. **Done.**

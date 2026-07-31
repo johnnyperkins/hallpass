@@ -8,11 +8,14 @@
 //! with what was asked; `attribution_cost` in [`super::procfs`] times the
 //! two against each other.
 //!
-//! Spike status: measured by that test and not yet consulted by the verdict
-//! path. See docs/attribution-threading.md, recommendation 3, for why the
-//! file read must stay as the fallback (`udp_diag` is a separate kernel
-//! module and not always loaded); [`DiagSocket::open`] says why the choice
-//! between the two must be made once at startup rather than per packet.
+//! Measured before it was adopted (0.7us a lookup against 300us for the
+//! idle-machine table read, and flat where the read grows with occupancy):
+//! the procfs attributor consults this for the address half of a miss on
+//! the protocols a startup probe proved the kernel answers. The file read
+//! stays as the fallback because `udp_diag` is a separate kernel module and
+//! not always loaded; [`DiagSocket::open`] says why the choice between the
+//! two is made once at startup rather than per packet. See
+//! docs/attribution-threading.md, recommendation 3.
 //!
 //! The wire format is built and parsed by hand rather than through a
 //! sock-diag packet crate. The request is one fixed 72-byte message (a
@@ -247,6 +250,45 @@ impl DiagSocket {
         Err(std::io::Error::other("no reply matched the request"))
     }
 
+    /// Whether this kernel answers one-socket lookups for `proto`, asked by
+    /// looking up a loopback socket created for the question. For a socket
+    /// the prober itself holds open, ENOENT cannot mean "no such socket",
+    /// so the ambiguity documented on [`DiagReply::Errno`] resolves to "no
+    /// diag handler". Every failure is "no": the caller then reads
+    /// /proc/net as it always has, which costs speed and never correctness.
+    pub fn probe(&mut self, proto: Proto) -> bool {
+        match proto {
+            // A listener is found by its local side alone.
+            Proto::Tcp => {
+                let Ok(l) = std::net::TcpListener::bind("127.0.0.1:0") else {
+                    return false;
+                };
+                let Ok(local) = l.local_addr() else { return false };
+                self.probe_finds(proto, local, "0.0.0.0:0".parse().unwrap())
+            }
+            // connect() on UDP sends nothing; it pins the remote side so
+            // the probe asks with a full 4-tuple, the shape a judged flow
+            // has when the verdict path asks.
+            Proto::Udp => {
+                let dst: SocketAddr = "127.0.0.1:9".parse().unwrap();
+                let Ok(s) = std::net::UdpSocket::bind("127.0.0.1:0") else {
+                    return false;
+                };
+                if s.connect(dst).is_err() {
+                    return false;
+                }
+                let Ok(local) = s.local_addr() else { return false };
+                self.probe_finds(proto, local, dst)
+            }
+        }
+    }
+
+    /// One probe lookup, called with the probe's socket still open so a
+    /// miss can only mean the handler is absent.
+    fn probe_finds(&mut self, proto: Proto, src: SocketAddr, dst: SocketAddr) -> bool {
+        let tuple = FlowTuple { proto, src, dst };
+        matches!(self.lookup(&tuple), Ok(DiagReply::Found(_)))
+    }
 }
 
 #[cfg(test)]

@@ -1,6 +1,9 @@
-//! Attribution via /proc: /proc/net/{tcp,tcp6,udp,udp6} gives socket inode
-//! and owning UID for a local address; /proc/*/fd/* symlinks map the inode
-//! to a PID; /proc/pid/{exe,cmdline} give process details.
+//! Attribution via the kernel's socket tables and /proc: the flow's local
+//! address resolves to a socket inode and owning UID, through one
+//! [`sock_diag`](super::sockdiag) lookup on the protocols a startup probe
+//! proved this kernel answers and by reading /proc/net/{tcp,tcp6,udp,udp6}
+//! whole otherwise; /proc/*/fd/* symlinks map the inode to a PID;
+//! /proc/pid/{exe,cmdline} give process details.
 
 use std::collections::VecDeque;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -10,6 +13,7 @@ use std::sync::Mutex;
 
 use hallpass_types::{FlowTuple, Proto};
 
+use super::sockdiag::{DiagReply, DiagSocket};
 use super::{Attributor, ProcInfo};
 
 /// One row of a /proc/net table.
@@ -122,13 +126,33 @@ const RECENT_PIDS: usize = 8;
 /// the budget and the walk still runs with three quarters of it.
 const RECENT_BUDGET_SHARE: usize = 4;
 
+/// I/O failures the sock_diag socket may show before it is dropped.
+///
+/// Post-probe, a netlink lookup fails only when something is broken
+/// (fd trouble, ENOBUFS under memory exhaustion), and a failed query in
+/// front of every file read costs more than the file read alone. A few
+/// retries absorb a transient failure; after that the socket is closed
+/// and every later miss goes straight to the file. The budget is total
+/// rather than consecutive so the query-then-read pattern is bounded for
+/// the daemon's life, not merely rate-limited.
+const MAX_DIAG_ERRORS: u8 = 3;
+
 /// Procfs-backed attributor.
 ///
-/// Holds the recently-seen processes, which is the only state here; the
+/// Holds the recently-seen processes and, when [`Self::with_sock_diag`]
+/// probed one up, the netlink socket that answers the address half; the
 /// rest of the module is free functions over a proc root.
 #[derive(Default)]
 pub struct ProcfsAttributor {
     recent: Mutex<VecDeque<u32>>,
+    /// The sock_diag socket and its remaining error budget. `None` under
+    /// [`Default`] (tests, and any caller that did not ask for a probe)
+    /// and after the budget runs out.
+    diag: Mutex<Option<(DiagSocket, u8)>>,
+    /// Which protocols the startup probe proved the kernel answers.
+    /// `udp_diag` is a separate module, so these really do differ.
+    diag_tcp: bool,
+    diag_udp: bool,
 }
 
 impl ProcfsAttributor {
@@ -137,6 +161,111 @@ impl ProcfsAttributor {
             Proto::Tcp => ["/proc/net/tcp", "/proc/net/tcp6"],
             Proto::Udp => ["/proc/net/udp", "/proc/net/udp6"],
         }
+    }
+
+    /// An attributor that resolves the address half of a miss with one
+    /// sock_diag lookup where the kernel answers, probed per protocol
+    /// right here, and by reading /proc/net where it does not.
+    ///
+    /// Probing once at startup rather than per packet is the point: a
+    /// failed query in front of a file read is strictly worse than the
+    /// file read alone, so "try and fall back" must not be the steady
+    /// state. The probe asks about sockets it creates itself, because
+    /// ENOENT from a lookup means both "no such socket" and "no diag
+    /// handler"; for a socket the probe holds open, only the second
+    /// reading is possible.
+    pub fn with_sock_diag() -> Self {
+        let mut a = Self::default();
+        match DiagSocket::open() {
+            Ok(mut diag) => {
+                a.diag_tcp = diag.probe(Proto::Tcp);
+                a.diag_udp = diag.probe(Proto::Udp);
+                if a.diag_tcp || a.diag_udp {
+                    tracing::info!(
+                        tcp = a.diag_tcp,
+                        udp = a.diag_udp,
+                        "sock_diag attribution lookups active"
+                    );
+                    *a.diag.lock().unwrap() = Some((diag, MAX_DIAG_ERRORS));
+                } else {
+                    tracing::warn!(
+                        "sock_diag answered for no protocol; reading /proc/net tables"
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!("sock_diag unavailable, reading /proc/net tables: {e}");
+            }
+        }
+        a
+    }
+
+    /// The address half of a miss: the socket's local-address row, by one
+    /// sock_diag lookup where the startup probe proved this protocol
+    /// answers, with the file read behind it.
+    ///
+    /// The read stays behind the lookup for the answers the lookup cannot
+    /// give (see [`Self::diag_entry`]), and it is the whole path both for
+    /// protocols the probe failed and after the error budget retires the
+    /// socket. The steady state is therefore never query-then-read: the
+    /// fallback read runs behind a query only for the rare rows the lookup
+    /// cannot serve, at 0.7us in front of a 300us read, and a process that
+    /// manufactures such rows for its own sockets buys its own flows the
+    /// pre-diag cost and nobody else's.
+    fn socket_entry(&self, tuple: &FlowTuple) -> Option<SocketEntry> {
+        let probed = match tuple.proto {
+            Proto::Tcp => self.diag_tcp,
+            Proto::Udp => self.diag_udp,
+        };
+        if probed {
+            if let Some(entry) = self.diag_entry(tuple) {
+                return Some(entry);
+            }
+        }
+        Self::file_entry(tuple)
+    }
+
+    /// One sock_diag lookup. `None` always means "let the file read
+    /// answer", and it covers three different situations, stated at the
+    /// arms below: a row the lookup can see but the file path would
+    /// refuse, a socket the lookup cannot see at all, and a query that
+    /// failed outright. Only the last spends the error budget; the first
+    /// two are legitimate per-flow answers that must be able to recur.
+    fn diag_entry(&self, tuple: &FlowTuple) -> Option<SocketEntry> {
+        let mut guard = self.diag.lock().unwrap();
+        let (diag, budget) = guard.as_mut()?;
+        match diag.lookup(tuple) {
+            Ok(DiagReply::Found(entry)) if entry.inode != 0 => return Some(entry),
+            // A Found reply for a TIME_WAIT or orphaned socket names
+            // nobody: uid 0 and inode 0 are placeholders, not an owner.
+            // The file path skips exactly these rows in find_local_match,
+            // and serving one here would attribute the flow to root and
+            // send the fd walk hunting "socket:[0]". Fall back so the
+            // read's own skip-and-wildcard logic decides.
+            Ok(DiagReply::Found(_)) => return None,
+            // ENOENT is narrower than "no such socket": this lookup is
+            // not scoped to an interface, and the kernel then cannot see
+            // sockets bound with SO_BINDTODEVICE, which the file lists
+            // (confirmed live; unprivileged since Linux 5.7). The file
+            // read answers for them, so a miss here is never final.
+            Ok(DiagReply::Errno(2)) => return None,
+            // Anything else post-probe is broken plumbing, not a per-flow
+            // answer; fall through and spend budget so a persistent
+            // failure cannot put a dead query in front of every read for
+            // the daemon's life.
+            Ok(DiagReply::Errno(e)) => {
+                tracing::warn!(errno = e, "sock_diag lookup refused; reading /proc/net");
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "sock_diag lookup failed; reading /proc/net");
+            }
+        }
+        *budget = budget.saturating_sub(1);
+        if *budget == 0 {
+            tracing::warn!("sock_diag disabled; /proc/net table reads from here on");
+            *guard = None;
+        }
+        None
     }
 
     /// Find the process holding `inode`, trying the ones that owned the
@@ -193,20 +322,17 @@ impl ProcfsAttributor {
         recent.push_front(pid);
         recent.truncate(RECENT_PIDS);
     }
-}
 
-impl Attributor for ProcfsAttributor {
-    fn attribute(&self, tuple: &FlowTuple) -> Option<ProcInfo> {
-        // Both tables are read whole. Only the parsing is lazy, since
-        // find_local_match stops at the first exact hit; the reads below
-        // are not, and seq_file regenerates every socket on the host per
-        // read. It cannot be trimmed either, because the uid used for
-        // `user` rules comes from the same row. Asking the kernel for one
-        // row instead of all of them needs NETLINK_SOCK_DIAG, which is
-        // worth doing on a host with tens of thousands of sockets and
-        // roughly nothing on a desktop: measured, this is the smaller half
-        // of a miss by about 18x. See docs/attribution-threading.md and the
-        // attribution_cost measurement below.
+    /// The fallback address half: both of the protocol's tables, read
+    /// whole. Only the parsing is lazy, since find_local_match stops at
+    /// the first exact hit; the reads are not, and seq_file regenerates
+    /// every socket on the host per read. It cannot be trimmed either,
+    /// because the uid used for `user` rules comes from the same row.
+    /// That is why a probed sock_diag lookup replaces this wherever the
+    /// kernel answers: measured (attribution_cost below), the lookup is
+    /// 0.7us flat while this read starts around 300us on an idle desktop
+    /// and grows with socket-table occupancy to 8ms at 20k sockets.
+    fn file_entry(tuple: &FlowTuple) -> Option<SocketEntry> {
         let texts: Vec<String> = Self::tables(tuple.proto)
             .into_iter()
             .filter_map(|t| std::fs::read_to_string(t).ok())
@@ -214,7 +340,13 @@ impl Attributor for ProcfsAttributor {
         let entries = texts
             .iter()
             .flat_map(|t| t.lines().filter_map(parse_proc_net_line));
-        let entry = find_local_match(entries, &tuple.src)?;
+        find_local_match(entries, &tuple.src)
+    }
+}
+
+impl Attributor for ProcfsAttributor {
+    fn attribute(&self, tuple: &FlowTuple) -> Option<ProcInfo> {
+        let entry = self.socket_entry(tuple)?;
         let proc_root = Path::new("/proc");
         let verified = self
             .find_pid(proc_root, entry.inode)
@@ -639,6 +771,81 @@ mod tests {
         let (pid, scanned) = attributor.find_pid(&dir, 4242);
         assert_eq!(pid, Some(900), "a wrong guess never costs the answer");
         assert!(scanned > 50, "the wrong guess was read first: {scanned}");
+    }
+
+    /// The wired path, end to end against the live kernel: an attributor
+    /// that probed sock_diag up and one that did not must resolve the same
+    /// connected socket to the same process. This is what makes the two
+    /// address halves interchangeable, which is the whole claim of the
+    /// probe-and-replace design. Skips (and says so) where the probe finds
+    /// no handler, e.g. a locked-down sandbox.
+    #[test]
+    fn diag_and_file_paths_attribute_the_same_socket() {
+        let probed = ProcfsAttributor::with_sock_diag();
+        if !probed.diag_tcp {
+            eprintln!("SKIP sockdiag: probe found no TCP handler");
+            return;
+        }
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let _server = listener.accept().unwrap();
+        let tuple = FlowTuple {
+            proto: Proto::Tcp,
+            src: client.local_addr().unwrap(),
+            dst: client.peer_addr().unwrap(),
+        };
+        let via_file = ProcfsAttributor::default()
+            .attribute(&tuple)
+            .expect("file path finds our socket");
+        // The walk over the real /proc is budgeted, and on a host holding
+        // more descriptors than the budget the file path legitimately
+        // resolves no pid. Equality with the diag path would then compare
+        // two budget exhaustions, so skip loudly rather than fail over
+        // the environment.
+        if via_file.pid != Some(std::process::id()) {
+            eprintln!("SKIP sockdiag: /proc walk budget exhausted on this host");
+            return;
+        }
+        let via_diag = probed.attribute(&tuple).expect("diag path finds our socket");
+        assert_eq!(via_diag.pid, Some(std::process::id()));
+        assert_eq!(via_diag, via_file, "the two address halves agree");
+    }
+
+    /// A flow whose socket has entered TIME_WAIT must not be attributed
+    /// off the kernel's placeholder row. The exact lookup returns Found
+    /// for such a socket with uid 0 and inode 0, which names root and a
+    /// socket no process holds; the file path skips those rows, and the
+    /// diag path must fall back rather than serve them.
+    #[test]
+    fn a_time_wait_socket_is_not_attributed_to_root() {
+        let probed = ProcfsAttributor::with_sock_diag();
+        if !probed.diag_tcp {
+            eprintln!("SKIP sockdiag: probe found no TCP handler");
+            return;
+        }
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        let tuple = FlowTuple {
+            proto: Proto::Tcp,
+            src: client.local_addr().unwrap(),
+            dst: client.peer_addr().unwrap(),
+        };
+        // The side that closes first is the one that lingers in
+        // TIME_WAIT; a moment for the FIN exchange to finish on loopback.
+        drop(client);
+        drop(server);
+        drop(listener);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        // Either no attribution (the file path skipped the row too) or a
+        // real one; the placeholder signature is the one wrong answer.
+        if let Some(info) = probed.attribute(&tuple) {
+            assert!(
+                !(info.uid == 0 && info.socket_inode == Some(0)),
+                "TIME_WAIT placeholder served as an owner: {info:?}"
+            );
+        }
     }
 
     /// Newest first, no duplicates, and bounded.

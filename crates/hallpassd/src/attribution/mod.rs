@@ -7,10 +7,6 @@ pub mod cache;
 pub mod ebpf;
 pub mod hash;
 pub mod procfs;
-// Spike, measured but not yet consulted by the verdict path, so outside of
-// tests nothing calls it; drop the allow when the chain adopts or the spike
-// is thrown away. See docs/attribution-threading.md, recommendation 3.
-#[allow(dead_code)]
 pub mod sockdiag;
 
 use std::path::{Path, PathBuf};
@@ -88,7 +84,7 @@ impl AttributionChain {
     /// runtime; see `ebpf::EbpfAttributor::new`.
     #[cfg_attr(not(feature = "ebpf"), allow(unused_variables))]
     pub fn default_chain(dns_cache: Option<Arc<crate::dns::IpDomainCache>>) -> Arc<Self> {
-        let procfs: Box<dyn Attributor> = Box::new(procfs::ProcfsAttributor::default());
+        let procfs: Box<dyn Attributor> = Box::new(procfs::ProcfsAttributor::with_sock_diag());
         #[cfg(feature = "ebpf")]
         if let Some(e) = ebpf::EbpfAttributor::new(dns_cache) {
             return Arc::new(Self::new(vec![Box::new(e), procfs]));
