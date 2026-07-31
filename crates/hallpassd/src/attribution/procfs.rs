@@ -490,6 +490,126 @@ mod tests {
         assert_eq!(find_pid_for_inode_within(&dir, 999, 100, 100), Some(300));
     }
 
+    /// The two halves of an attribution miss, timed against each other.
+    ///
+    /// Read the output as a ratio, not as absolutes. What it answers is
+    /// "which half should be worked on", and that answer survives the things
+    /// that make the absolutes untrustworthy: the numbers come from whatever
+    /// processes and sockets happen to exist on the machine that runs it, a
+    /// slower CPU moves both halves together, and a VM inflates the walk
+    /// more than the table read, since the walk is bound by syscall count
+    /// (one readlink per descriptor) while the read is bound by bytes.
+    ///
+    /// It is deliberately not a regression gate. There is no baseline to
+    /// compare against, because the inputs are the state of the machine, so
+    /// it is `#[ignore]`d and CI never runs it. It prints and always passes.
+    ///
+    /// The socket-count sweep is the one controlled part: it creates the
+    /// sockets itself, so that column is comparable across machines. The
+    /// walk is not controlled and its inputs are printed next to it so the
+    /// number can be interpreted.
+    ///
+    /// Unprivileged it can only read its own processes' descriptors and
+    /// skips the rest cheaply. The daemon runs as root and scans every one,
+    /// so the walk figure here is a floor rather than an estimate of what
+    /// the daemon pays. Deriving that estimate is arithmetic and belongs in
+    /// prose, where it can be labelled as one; it is not printed here next
+    /// to measurements.
+    ///
+    /// ```text
+    /// cargo test -p hallpassd --release -- --ignored --nocapture attribution_cost
+    /// ```
+    #[test]
+    #[ignore = "measurement, not a test"]
+    fn attribution_cost() {
+        use std::time::{Duration, Instant};
+
+        /// Min and median of `runs` samples. Min because noise only ever
+        /// adds, median so a reader can see whether it was noisy.
+        fn timed(runs: usize, mut f: impl FnMut()) -> (Duration, Duration) {
+            let mut samples: Vec<Duration> = (0..runs)
+                .map(|_| {
+                    let start = Instant::now();
+                    f();
+                    start.elapsed()
+                })
+                .collect();
+            samples.sort();
+            (samples[0], samples[runs / 2])
+        }
+
+        fn read_proc_net() -> (usize, usize) {
+            let texts: Vec<String> = ["/proc/net/tcp", "/proc/net/tcp6"]
+                .into_iter()
+                .filter_map(|t| std::fs::read_to_string(t).ok())
+                .collect();
+            (
+                texts.iter().map(|t| t.len()).sum(),
+                texts.iter().map(|t| t.lines().count()).sum(),
+            )
+        }
+
+        println!("\n-- half 1: /proc/net/tcp{{,6}}, read whole per miss --");
+        println!("     sockets       rows      bytes        min     median");
+        let mut held: Vec<std::net::TcpListener> = Vec::new();
+        let mut idle_read = Duration::MAX;
+        for extra in [0usize, 1_000, 5_000, 20_000] {
+            while held.len() < extra {
+                match std::net::TcpListener::bind("127.0.0.1:0") {
+                    Ok(l) => held.push(l),
+                    Err(e) => {
+                        println!("  stopped short of {extra} sockets: {e}");
+                        break;
+                    }
+                }
+            }
+            let (bytes, rows) = read_proc_net();
+            let (min, median) = timed(20, || {
+                read_proc_net();
+            });
+            if extra == 0 {
+                idle_read = min;
+            }
+            println!(
+                "  +{:>9} {:>10} {:>10} {:>8.0}us {:>8.0}us",
+                held.len(),
+                rows,
+                bytes,
+                min.as_secs_f64() * 1e6,
+                median.as_secs_f64() * 1e6
+            );
+        }
+        drop(held);
+
+        println!("\n-- half 2: /proc/*/fd walk, socket nobody holds --");
+        let (mut pids, mut readable, mut fds) = (0usize, 0usize, 0usize);
+        for entry in std::fs::read_dir("/proc").unwrap().flatten() {
+            let Some(pid) = entry.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) else {
+                continue;
+            };
+            pids += 1;
+            if let Ok(d) = std::fs::read_dir(format!("/proc/{pid}/fd")) {
+                readable += 1;
+                fds += d.count();
+            }
+        }
+        let (min, median) = timed(9, || {
+            assert_eq!(find_pid_for_inode(Path::new("/proc"), 42), None);
+        });
+        println!("  {pids} processes, {readable} readable here, {fds} descriptors visible");
+        println!(
+            "  full walk: {:.2}ms min, {:.2}ms median, {:.3}us per descriptor",
+            min.as_secs_f64() * 1e3,
+            median.as_secs_f64() * 1e3,
+            min.as_secs_f64() * 1e6 / fds.max(1) as f64
+        );
+
+        println!(
+            "\n  the walk is {:.0}x the idle table read on this machine\n",
+            min.as_secs_f64() / idle_read.as_secs_f64()
+        );
+    }
+
     #[test]
     fn verified_details_require_pid_to_still_hold_inode() {
         let td = crate::testutil::TestDir::new("procfs-verify");
