@@ -4,6 +4,7 @@
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 use hallpass_types::{FlowTuple, Proto};
 
@@ -119,8 +120,14 @@ impl ProcfsAttributor {
 
 impl Attributor for ProcfsAttributor {
     fn attribute(&self, tuple: &FlowTuple) -> Option<ProcInfo> {
-        // Stream both tables lazily; find_local_match returns on the
-        // first exact hit without parsing the rest.
+        // Both tables are read whole. Only the parsing is lazy, since
+        // find_local_match stops at the first exact hit; the reads below
+        // are not, and seq_file regenerates every socket on the host per
+        // read. This is the larger half of what an attribution miss costs
+        // and it cannot be trimmed, because the uid used for `user` rules
+        // comes from the same row. Asking the kernel for one row instead of
+        // all of them needs NETLINK_SOCK_DIAG; see
+        // docs/attribution-threading.md.
         let texts: Vec<String> = Self::tables(tuple.proto)
             .into_iter()
             .filter_map(|t| std::fs::read_to_string(t).ok())
@@ -151,15 +158,74 @@ impl Attributor for ProcfsAttributor {
     }
 }
 
+/// Most of one process's file descriptors the scan will look at.
+///
+/// A process may hold up to its `RLIMIT_NOFILE`, which is not the daemon's
+/// to choose, and every entry costs a readlink on the thread that decides
+/// every packet. The cap is per process rather than spread across the scan
+/// on purpose: a budget shared across the whole walk lets one process with a
+/// huge descriptor table exhaust it and cost *other* processes their
+/// attribution, while a per-process cap costs only the process that is over
+/// it. Far above anything a desktop program holds.
+const MAX_FDS_PER_PID: usize = 16_384;
+
+/// Most descriptors the scan will look at in total to resolve one socket.
+///
+/// The per-process cap alone does not bound the walk, since the walk visits
+/// every process. This does, and the two together mean no single process can
+/// take more than a quarter of it.
+const MAX_FDS_PER_SCAN: usize = 65_536;
+
+/// Times a scan has run out of budget, for the log below.
+static ABANDONED_SCANS: AtomicU64 = AtomicU64::new(0);
+
 /// Scan `proc_root`/PID/fd/* for a symlink to `socket:[inode]`.
+///
+/// Which way it fails when the budget runs out: the socket resolves to no
+/// process, so the connection keeps the uid from its `/proc/net` row and
+/// loses pid, executable, command line and parent. Rules naming any of those
+/// then do not match it and it falls through to the prompt or the default
+/// verdict. That is a real cost, and the alternative is worse: the scan is
+/// unbounded work on the one thread where blocking stalls every other
+/// connection on the host, and any local process can inflate it for
+/// everybody by opening descriptors. A process that hides from attribution
+/// this way gains nothing it did not already have, since it can also just
+/// exec after connecting (see the README's security model).
 fn find_pid_for_inode(proc_root: &Path, inode: u64) -> Option<u32> {
+    find_pid_for_inode_within(proc_root, inode, MAX_FDS_PER_PID, MAX_FDS_PER_SCAN)
+}
+
+/// [`find_pid_for_inode`] with the budgets given, so they can be exercised
+/// without opening tens of thousands of descriptors.
+fn find_pid_for_inode_within(
+    proc_root: &Path,
+    inode: u64,
+    max_per_pid: usize,
+    max_total: usize,
+) -> Option<u32> {
+    let mut budget = max_total;
     for entry in std::fs::read_dir(proc_root).ok()?.flatten() {
         let name = entry.file_name();
         let Some(pid) = name.to_str().and_then(|s| s.parse::<u32>().ok()) else {
             continue;
         };
-        if pid_holds_inode(proc_root, pid, inode) {
+        let (found, scanned) = scan_pid_fds(proc_root, pid, inode, max_per_pid.min(budget));
+        if found {
             return Some(pid);
+        }
+        budget -= scanned;
+        if budget == 0 {
+            // Logged on the first and then at each power of ten, so a host
+            // that is hitting this says so without the log becoming the load.
+            let n = ABANDONED_SCANS.fetch_add(1, AtomicOrdering::Relaxed) + 1;
+            if n.is_power_of_two() || n.is_multiple_of(10_000) {
+                tracing::warn!(
+                    abandoned = n,
+                    "too many open descriptors to scan; connections are being \
+                     decided without an executable"
+                );
+            }
+            return None;
         }
     }
     None
@@ -167,13 +233,27 @@ fn find_pid_for_inode(proc_root: &Path, inode: u64) -> Option<u32> {
 
 /// Does `proc_root`/PID/fd/* contain a symlink to `socket:[inode]`?
 pub(super) fn pid_holds_inode(proc_root: &Path, pid: u32, inode: u64) -> bool {
+    scan_pid_fds(proc_root, pid, inode, MAX_FDS_PER_PID).0
+}
+
+/// Look at up to `limit` of PID's descriptors for `socket:[inode]`.
+/// Returns whether it was there and how many entries were looked at.
+fn scan_pid_fds(proc_root: &Path, pid: u32, inode: u64, limit: usize) -> (bool, usize) {
     let target = format!("socket:[{inode}]");
     let Ok(fds) = std::fs::read_dir(proc_root.join(pid.to_string()).join("fd")) else {
-        return false; // permission denied or process gone
+        return (false, 0); // permission denied or process gone
     };
-    fds.flatten()
-        .filter_map(|fd| std::fs::read_link(fd.path()).ok())
-        .any(|link| link.as_os_str() == target.as_str())
+    let mut scanned = 0;
+    for fd in fds.take(limit) {
+        scanned += 1;
+        let Ok(fd) = fd else { continue };
+        let holds = std::fs::read_link(fd.path())
+            .is_ok_and(|link| link.as_os_str() == target.as_str());
+        if holds {
+            return (true, scanned);
+        }
+    }
+    (false, scanned)
 }
 
 /// Read exe/cmdline for `pid`, then confirm the PID still holds the socket
@@ -368,6 +448,46 @@ mod tests {
         let (exe, cmdline) = read_proc_details(&dir, 4242);
         assert_eq!(exe, Some(PathBuf::from("/usr/bin/curl")));
         assert_eq!(cmdline.as_deref(), Some("curl https://example.org"));
+    }
+
+    /// The scan runs on the thread that decides every packet and the number
+    /// of descriptors it has to look at is chosen by the processes on the
+    /// host, so it is capped. Without the cap one process with a large
+    /// descriptor table makes every attribution on the host expensive.
+    #[test]
+    fn the_descriptor_scan_stops_at_its_budget() {
+        let td = crate::testutil::TestDir::new("procfs-budget");
+        let dir = td.path().to_path_buf();
+        for pid in [100u32, 200, 300] {
+            let fd_dir = dir.join(pid.to_string()).join("fd");
+            std::fs::create_dir_all(&fd_dir).unwrap();
+            for fd in 0..10 {
+                let target = format!("socket:[{}]", 5000 + pid + fd);
+                std::os::unix::fs::symlink(target, fd_dir.join(fd.to_string())).unwrap();
+            }
+        }
+
+        // Per process: it looks at exactly what it is allowed to and stops,
+        // rather than at everything the process holds.
+        assert_eq!(scan_pid_fds(&dir, 100, 999, 3), (false, 3));
+        assert_eq!(scan_pid_fds(&dir, 100, 999, 100), (false, 10));
+        // A process that is not there costs nothing.
+        assert_eq!(scan_pid_fds(&dir, 999, 999, 100), (false, 0));
+
+        // Across the walk: 30 descriptors exist, the budget is 6, so it
+        // gives up rather than reading them all, and says so.
+        let before = ABANDONED_SCANS.load(AtomicOrdering::Relaxed);
+        assert_eq!(find_pid_for_inode_within(&dir, 999, 4, 6), None);
+        assert!(
+            ABANDONED_SCANS.load(AtomicOrdering::Relaxed) > before,
+            "the scan ran out of budget rather than finishing"
+        );
+
+        // A budget it fits inside finds the socket wherever it is.
+        let owner = dir.join("300/fd/0");
+        std::fs::remove_file(&owner).unwrap();
+        std::os::unix::fs::symlink("socket:[999]", &owner).unwrap();
+        assert_eq!(find_pid_for_inode_within(&dir, 999, 100, 100), Some(300));
     }
 
     #[test]

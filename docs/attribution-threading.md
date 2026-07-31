@@ -133,9 +133,13 @@ which is to say nftables with DNS names bolted on.
 
 Bound the unbounded work where it is, rather than moving it or deleting it.
 Everything below is smaller than any of the three options, and none of it
-changes which thread anything runs on.
+changes which thread anything runs on. Items 1, 2 and 4 have landed; item 3
+is the one still open, and it needs a dependency decision before any code:
+the daemon denies `unsafe_code`, so a raw netlink socket means taking on a
+netlink crate and defending it at `cargo deny`, or finding another way to
+ask.
 
-**1. Cap the executable hash** (`hash.rs:87-98`). `std::io::copy` into the
+**1. Cap the executable hash** (`hash.rs:87-98`). **Done.** `std::io::copy` into the
 hasher has no size cap and no regular-file check, and it runs inline on the
 verdict thread. The gate in front of it is not the mitigation it looks like:
 an unscoped `hashes_file` blocklist rule, which is the canonical way to write
@@ -148,6 +152,10 @@ skip. The failure direction is already documented for `exe_sha256`: a rule
 that cannot verify a binary does not match it.
 
 **2. Bound the fd scan per pid, not per attribution** (`procfs.rs:164-172`).
+**Done**, with one addition: a per-process cap alone does not bound the walk,
+because the walk visits every process, so there is a total cap as well. The
+two together mean no single process can take more than a quarter of the
+budget, which is the property a shared budget alone would not have had.
 This distinction is the whole point. A budget spent across the whole walk lets
 one process with a million fds exhaust it and cost every *other* process its
 attribution, which is option A's failure with extra steps. A budget per pid
@@ -166,7 +174,7 @@ for a kernel without the diag module, which is also what keeps the existing
 tests meaningful.
 
 **4. Fix the comment at `procfs.rs:122-123`**, which describes a laziness the
-`.collect()` on the next line removes.
+`.collect()` on the next line removes. **Done.**
 
 Only if those are done and measured and still not enough: a deadline whose
 granularity is **per source, not per packet**. Run the bounded sources inline,

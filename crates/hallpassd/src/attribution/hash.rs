@@ -41,9 +41,31 @@ impl FileId {
     }
 }
 
+/// Largest executable this will read.
+///
+/// The read runs on the verdict thread, where blocking is a stalled packet
+/// for every other connection on the host, and the size of the file is
+/// chosen by whoever exec'd it. 256 MiB is past any binary this is likely to
+/// meet (the largest commonly shipped ones are well under 200 MiB) and is a
+/// bounded fraction of a second to hash, once per distinct file.
+///
+/// Skipping costs the hash, which costs a match: a rule pinning
+/// `exe_sha256` or listing a `hashes_file` does not match a binary this
+/// large, and evaluation falls through to lower-priority rules or the prompt.
+/// That is the behaviour [`hallpass_types::RuleMatch::exe_sha256`] already
+/// documents for a binary that cannot be read, and it opens no new evasion:
+/// padding a binary past the cap changes its bytes, and a padded binary has
+/// a different hash, so it was never going to match a pinned rule anyway.
+const MAX_HASHED_BYTES: u64 = 256 * 1024 * 1024;
+
 /// Bounded LRU cache of executable hashes.
+///
+/// `None` records a file that was looked at and deliberately not hashed, so
+/// an oversized binary is measured and refused once rather than on every
+/// packet it sends.
 pub struct ExeHashCache {
-    entries: Mutex<LruCache<FileId, String>>,
+    entries: Mutex<LruCache<FileId, Option<String>>>,
+    max_bytes: u64,
 }
 
 impl Default for ExeHashCache {
@@ -54,9 +76,16 @@ impl Default for ExeHashCache {
 
 impl ExeHashCache {
     pub fn new(max_entries: usize) -> ExeHashCache {
+        ExeHashCache::with_max_bytes(max_entries, MAX_HASHED_BYTES)
+    }
+
+    /// Cache with an explicit size cap, so the refusal can be exercised
+    /// without writing a quarter of a gigabyte to disk.
+    pub fn with_max_bytes(max_entries: usize, max_bytes: u64) -> ExeHashCache {
         let cap = NonZeroUsize::new(max_entries.max(1)).unwrap();
         ExeHashCache {
             entries: Mutex::new(LruCache::new(cap)),
+            max_bytes,
         }
     }
 
@@ -86,14 +115,31 @@ impl ExeHashCache {
     /// a replacement's hash if the path was swapped between the calls.
     pub fn sha256(&self, path: &Path) -> Option<String> {
         let mut file = std::fs::File::open(path).ok()?;
-        let id = FileId::of(&file.metadata().ok()?);
-        if let Some(hex) = self.entries.lock().unwrap().get(&id) {
-            return Some(hex.clone());
+        let meta = file.metadata().ok()?;
+        let id = FileId::of(&meta);
+        if let Some(cached) = self.entries.lock().unwrap().get(&id) {
+            return cached.clone();
+        }
+        // Refused before a byte is read, and remembered as refused. Anything
+        // without a length to check is refused with it: a regular file is
+        // the only thing an executable can be, and it is the only thing
+        // whose size means the read will end.
+        if !meta.is_file() || meta.len() > self.max_bytes {
+            tracing::warn!(
+                bytes = meta.len(),
+                regular = meta.is_file(),
+                "not hashing an executable this large on the verdict thread; \
+                 hash-pinned rules will not match it"
+            );
+            self.entries.lock().unwrap().put(id, None);
+            return None;
         }
         let mut hasher = Sha256::new();
+        // A read that fails part way is not cached: it is a transient
+        // failure, not a decision about this file.
         std::io::copy(&mut file, &mut hasher).ok()?;
         let hex = format!("{:x}", hasher.finalize());
-        self.entries.lock().unwrap().put(id, hex.clone());
+        self.entries.lock().unwrap().put(id, Some(hex.clone()));
         Some(hex)
     }
 }
@@ -126,6 +172,39 @@ mod tests {
     fn unreadable_path_is_none() {
         let cache = ExeHashCache::default();
         assert_eq!(cache.sha256(Path::new("/nonexistent/no-such-file")), None);
+    }
+
+    /// The read runs on the thread that decides every packet, and the size
+    /// of the file is chosen by whoever exec'd it, so there is a point past
+    /// which the daemon declines. Declining costs the match, not a verdict:
+    /// a hash-pinned rule stops matching, exactly as it does for a binary it
+    /// cannot read.
+    #[test]
+    fn an_oversized_executable_is_measured_and_refused() {
+        let dir = TestDir::new("hash-cap");
+        let path = dir.path().join("big");
+        std::fs::write(&path, b"0123456789").unwrap();
+        let cache = ExeHashCache::with_max_bytes(8, 4);
+        assert_eq!(cache.sha256(&path), None);
+
+        // Refused once and remembered, so a process sending at line rate
+        // does not re-measure its own binary per packet.
+        assert_eq!(cache.sha256(&path), None);
+        assert_eq!(cache.entries.lock().unwrap().len(), 1);
+
+        // Under the cap the same cache hashes normally.
+        std::fs::write(&path, b"ab").unwrap();
+        assert_eq!(cache.sha256(&path).unwrap().len(), 64);
+    }
+
+    /// Only a regular file has a length that makes the read finite. A
+    /// directory, a fifo or a character device is refused on the same path.
+    #[test]
+    fn a_non_regular_file_is_never_read() {
+        let dir = TestDir::new("hash-dir");
+        let cache = ExeHashCache::default();
+        assert_eq!(cache.sha256(dir.path()), None);
+        assert_eq!(cache.sha256(Path::new("/dev/zero")), None);
     }
 
     #[test]
