@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use notify::Watcher;
-use hallpass_types::Rule;
+use hallpass_types::{wire, Rule};
 
 use super::engine::RuleSet;
 use super::model::CompiledRule;
@@ -36,8 +36,10 @@ pub struct RuleStore {
     active: ArcSwap<RuleSet>,
     entries: Mutex<Vec<Entry>>,
     rules_dir: PathBuf,
-    /// Cumulative count of disk rule files skipped across every load
-    /// (bad permissions, unparsable, or duplicate name).
+    /// Cumulative count of disk rule files skipped across every applied
+    /// load, whether refused deliberately (bad permissions, unparsable,
+    /// duplicate name, symlink) or unreadable. Scans that were aborted as
+    /// incomplete contribute nothing: their files are all still enforced.
     rules_skipped: AtomicU64,
     /// Per-rule-name hit accounting. Deliberately keyed by name and kept
     /// outside the entry list so a rules-directory reload does not reset
@@ -74,6 +76,47 @@ pub const MAX_RULE_NAME_BYTES: usize = 256;
 /// a rule is a cosmetic failure, while refusing the rule or evicting a
 /// live one would change enforcement, and this runs on the verdict path.
 const MAX_TRACKED_RULE_NAMES: usize = 4096;
+
+/// Most rules the store will hold at once, counting disk and session rules.
+///
+/// Any `hallpass`-group member can loop `RuleAdd` with distinct `Forever`
+/// names, and without a count bound each add grows `rules.d` on disk,
+/// recompiles a set one rule larger, and lengthens the O(n) match the
+/// verdict thread runs per packet, forever. The bound fails toward an error
+/// reply to the client whose add would exceed it, which costs that client a
+/// rule and never costs a verdict: every rule already loaded keeps matching
+/// exactly as before. On the prompt path the same refusal is logged and the
+/// operator's verdict still applies to the held packets; only the remembered
+/// rule is lost. Replacing an existing rule by name stays allowed at the cap
+/// because it does not grow the set.
+///
+/// Disk rules are exempt at load time: they are authored by root, and
+/// refusing to load the excess would silently change what root's own files
+/// enforce, which is a verdict cost. A root operator who wants more than
+/// the cap has written them by hand and owns the consequences; see the
+/// frame-budget note on [`MAX_RULE_WIRE_BYTES`] for what those are.
+pub const MAX_RULES: usize = 1024;
+
+/// Largest postcard-encoded size of one rule accepted over IPC, in bytes.
+///
+/// `RuleList` answers with every rule in a single frame, and the codec
+/// refuses frames over [`hallpass_types::wire::MAX_FRAME_SIZE`] on encode,
+/// which breaks the connection instead of answering. The name cap alone
+/// does not protect that reply: a matcher string (`cmdline_contains`, a
+/// glob) can be pushed to nearly the 1 MiB inbound frame limit in a single
+/// accepted rule, so a handful of such rules would make `RuleList`
+/// unanswerable for every client from then on, and `Forever` rules reload
+/// from disk across restarts. Bounding each rule's encoded size keeps the
+/// worst full listing, [`MAX_RULES`] x this, at 768 KiB, comfortably
+/// inside the frame (`rule_list_frame_budget` pins the arithmetic). The
+/// bound fails toward an error reply to the client that sent the oversized
+/// rule; hand-written disk rules bypass it on the same root-is-trusted
+/// grounds as the count cap. On the prompt path, where the rule embeds the
+/// connection's full executable path, an exe deep enough to push the
+/// encoding past the bound means that prompt's decision is applied but not
+/// remembered as a rule, with a warning each time; the verdict itself is
+/// never affected.
+pub const MAX_RULE_WIRE_BYTES: usize = 768;
 
 /// A rule (or list) file is trusted when owned by root (or by the daemon's
 /// own euid, for non-root development runs) and not group/world-writable.
@@ -148,25 +191,50 @@ fn sanitize_filename(name: &str) -> String {
     }
 }
 
-/// Result of scanning the rules directory: the accepted entries and how
-/// many files were skipped (bad permissions, unparsable, or duplicate name).
+/// Result of scanning the rules directory: the accepted entries, how many
+/// files were skipped (every skip is logged at its site, whether refused
+/// deliberately or unreadable), and whether the scan saw everything it
+/// should have.
 struct LoadResult {
     entries: Vec<Entry>,
     skipped: u64,
+    /// False when the scan may have missed rules through no fault of their
+    /// files: the directory failed to open or enumerate, or a file failed
+    /// to open, stat, or read for a reason other than having been deleted.
+    /// A deliberate skip (symlink, bad permissions, unparsable, duplicate)
+    /// leaves this true: those files were seen and judged. A file the scan
+    /// could not look at counts in `skipped` too, so the two categories
+    /// overlap in the counter but not in this flag. The distinction matters
+    /// because [`RuleStore::reload_disk`] replaces the loaded set with this
+    /// one, and treating "could not look" as "looked and found nothing"
+    /// turned a transient error into silently dropped policy.
+    complete: bool,
 }
 
 fn load_dir(dir: &Path) -> LoadResult {
     let self_uid = effective_uid().unwrap_or(u32::MAX);
     let mut entries = Vec::new();
     let mut skipped = 0u64;
+    let mut complete = true;
     let read = match std::fs::read_dir(dir) {
         Ok(r) => r,
         Err(e) => {
             tracing::warn!(dir = %dir.display(), "cannot read rules dir: {e}");
-            return LoadResult { entries, skipped };
+            return LoadResult { entries, skipped, complete: false };
         }
     };
-    for item in read.flatten() {
+    for item in read {
+        let item = match item {
+            Ok(i) => i,
+            Err(e) => {
+                // An enumeration error mid-scan: whatever entries the
+                // iterator never yielded are simply absent, so the scan
+                // cannot claim to be the whole directory.
+                tracing::warn!(dir = %dir.display(), "error listing rules dir: {e}");
+                complete = false;
+                continue;
+            }
+        };
         let path = item.path();
         if path.extension().is_none_or(|e| e != "toml") {
             continue;
@@ -183,6 +251,11 @@ fn load_dir(dir: &Path) -> LoadResult {
             }
             Ok(_) => {}
             Err(e) => {
+                // NotFound is a file deleted between the directory read and
+                // this stat, which is an ordinary delete, not a blind spot.
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    complete = false;
+                }
                 tracing::warn!(file = %path.display(), "cannot stat rule file: {e}");
                 skipped += 1;
                 continue;
@@ -200,6 +273,15 @@ fn load_dir(dir: &Path) -> LoadResult {
         {
             Ok(f) => f,
             Err(e) => {
+                // Same NotFound carve-out as the stat above. Anything else
+                // (EACCES, EMFILE, EIO) is a file that exists but could not
+                // be looked at, so the scan is not the whole story. ELOOP
+                // from O_NOFOLLOW means a symlink raced in; that is the
+                // refusal working, but the entry was seen as a non-link
+                // moments ago, so conservatively treat it as incomplete too.
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    complete = false;
+                }
                 tracing::warn!(file = %path.display(), "cannot open rule file: {e}");
                 skipped += 1;
                 continue;
@@ -208,6 +290,8 @@ fn load_dir(dir: &Path) -> LoadResult {
         let meta = match file.metadata() {
             Ok(m) => m,
             Err(e) => {
+                // fstat on an open fd; failure here is not a deletion.
+                complete = false;
                 tracing::warn!(file = %path.display(), "cannot stat rule file: {e}");
                 skipped += 1;
                 continue;
@@ -229,11 +313,17 @@ fn load_dir(dir: &Path) -> LoadResult {
             continue;
         }
         let mut text = String::new();
-        let rule: Rule = match file
-            .read_to_string(&mut text)
-            .map_err(|e| e.to_string())
-            .and_then(|_| toml::from_str(&text).map_err(|e| e.to_string()))
-        {
+        if let Err(e) = file.read_to_string(&mut text) {
+            // A read error on an open fd (EIO) is "could not look", not
+            // "looked and judged": lumping it in with parse failures left
+            // the scan claiming completeness through the exact transient
+            // errors the completeness flag exists to catch.
+            complete = false;
+            tracing::warn!(file = %path.display(), "cannot read rule file: {e}");
+            skipped += 1;
+            continue;
+        }
+        let rule: Rule = match toml::from_str(&text) {
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!(file = %path.display(), "skipping unparsable rule file: {e}");
@@ -259,13 +349,27 @@ fn load_dir(dir: &Path) -> LoadResult {
             origin: Origin::Disk(path),
         });
     }
-    LoadResult { entries, skipped }
+    LoadResult { entries, skipped, complete }
 }
 
 impl RuleStore {
     /// Create a store, loading persisted rules from `rules_dir`.
     pub fn new(rules_dir: PathBuf) -> RuleStore {
         let loaded = load_dir(&rules_dir);
+        // At startup there is no earlier good set to keep, so an incomplete
+        // scan proceeds with what loaded, loudly. Refusing to start would
+        // also take down the control channel and the prompt path over what
+        // may be a transient error; the missing rules load when a later
+        // scan completes (the watcher retries incomplete ones, when it is
+        // running), and (unlike a silent reload shrink) the operator was
+        // told.
+        if !loaded.complete {
+            tracing::error!(
+                dir = %rules_dir.display(),
+                count = loaded.entries.len(),
+                "rules directory scan was incomplete; starting with a partial rule set"
+            );
+        }
         tracing::info!(
             count = loaded.entries.len(),
             skipped = loaded.skipped,
@@ -375,6 +479,18 @@ impl RuleStore {
                 rule.name.len()
             ));
         }
+        // Measured with the codec that will echo the rule back, so the size
+        // being bounded is exactly the size RuleList pays; see
+        // MAX_RULE_WIRE_BYTES for why the bound exists.
+        let wire_bytes = wire::encode(&rule)
+            .map_err(|e| format!("rule does not encode: {e}"))?
+            .len()
+            - wire::FRAME_PREFIX_BYTES;
+        if wire_bytes > MAX_RULE_WIRE_BYTES {
+            return Err(format!(
+                "rule encodes to {wire_bytes} bytes, must be at most {MAX_RULE_WIRE_BYTES}"
+            ));
+        }
         // Before compile: compiling opens the list files as root.
         list_paths_within(&rule, &self.rules_dir)?;
         CompiledRule::compile(&rule)?;
@@ -382,12 +498,25 @@ impl RuleStore {
         // reload_disk() takes the same lock, so it cannot observe the new
         // file before this add lands in `entries`.
         let mut entries = self.entries.lock().unwrap();
+        // One lookup serves both the cap exemption and the replacement
+        // below; persist() takes the entries as a shared slice, so nothing
+        // between here and the remove() can shift the position.
+        let existing = entries.iter().position(|e| e.rule.name == rule.name);
+        // Checked under the lock so two racing adds cannot both squeeze in,
+        // and before the persist so a refused add leaves no file behind.
+        // Replacement by name is exempt: it does not grow the set. See
+        // MAX_RULES for the failure direction.
+        if existing.is_none() && entries.len() >= MAX_RULES {
+            return Err(format!(
+                "rule store is full ({MAX_RULES} rules); delete a rule first"
+            ));
+        }
         let origin = if rule.duration == hallpass_types::RuleDuration::Forever {
             Origin::Disk(self.persist(&rule, &entries)?)
         } else {
             Origin::Session
         };
-        if let Some(pos) = entries.iter().position(|e| e.rule.name == rule.name) {
+        if let Some(pos) = existing {
             let old = entries.remove(pos);
             // Replacing a disk rule with a session rule must not leave a
             // stale file that would resurrect the old rule on reload.
@@ -478,9 +607,28 @@ impl RuleStore {
         changed
     }
 
-    /// Re-read disk rules (hot reload), keeping session rules.
-    pub fn reload_disk(&self) {
+    /// Re-read disk rules (hot reload), keeping session rules. Returns
+    /// whether a complete scan was applied; after `false` nothing changed
+    /// and the caller should retry.
+    pub fn reload_disk(&self) -> bool {
         let fresh = load_dir(&self.rules_dir);
+        // An incomplete scan fails toward staleness: the loaded set stays as
+        // it is and this reload changes nothing, the skip counter included
+        // (an aborted scan's skips would otherwise inflate it once per
+        // retry, for files that are all still enforced). The alternative,
+        // swapping in whatever partially loaded, silently disables rules
+        // root wrote (a vanished deny keeps matching nothing while
+        // everything reads as healthy) on nothing more than a transient
+        // EMFILE or EIO. Stale policy is the last state root successfully
+        // expressed; the watcher retries on a delay until a scan completes,
+        // so the staleness lasts as long as the error does.
+        if !fresh.complete {
+            tracing::warn!(
+                dir = %self.rules_dir.display(),
+                "rules reload aborted: directory scan was incomplete; keeping current rules"
+            );
+            return false;
+        }
         self.rules_skipped.fetch_add(fresh.skipped, Ordering::Relaxed);
         let mut entries = self.entries.lock().unwrap();
         entries.retain(|e| e.origin == Origin::Session);
@@ -492,6 +640,7 @@ impl RuleStore {
         drop(entries);
         self.rebuild();
         tracing::info!("rules reloaded from disk");
+        true
     }
 
     fn rebuild(&self) {
@@ -580,6 +729,13 @@ pub fn spawn_expiry_sweeper(store: Arc<RuleStore>) {
     });
 }
 
+/// How long to wait before retrying a reload whose directory scan came
+/// back incomplete. Long enough that a transient EMFILE has usually
+/// cleared, short enough that root's edit is not left unapplied for long;
+/// a permanently unscannable directory warns at this cadence, which is the
+/// operator's signal to go look.
+const RELOAD_RETRY_DELAY: Duration = Duration::from_secs(5);
+
 /// Watch the rules directory and hot-reload on changes, debounced 200ms.
 /// Returns an error if the watcher cannot be created; a missing directory
 /// is tolerated (watch is skipped with a warning).
@@ -601,7 +757,15 @@ pub fn spawn_watcher(store: Arc<RuleStore>) -> notify::Result<()> {
         while rx.recv().await.is_some() {
             tokio::time::sleep(Duration::from_millis(200)).await;
             while rx.try_recv().is_ok() {}
-            store.reload_disk();
+            // The directory event that got us here is consumed whether or
+            // not the scan succeeds, so an incomplete scan is retried on a
+            // timer rather than waiting for another write to the directory
+            // that may never come: root's edit must not stay unapplied
+            // because its own event raced a transient error.
+            while !store.reload_disk() {
+                tokio::time::sleep(RELOAD_RETRY_DELAY).await;
+                while rx.try_recv().is_ok() {}
+            }
         }
     });
     Ok(())
@@ -995,6 +1159,199 @@ mod tests {
         assert_eq!(store.hits.read().unwrap().len(), 1, "the gone rule's counter goes too");
         // The surviving rule keeps its history.
         assert_eq!(store.hits().iter().find(|h| h.name == "keep").unwrap().hits, 1);
+    }
+
+    /// The store refuses to grow past [`MAX_RULES`], while replacing an
+    /// existing rule by name stays allowed at the cap.
+    #[test]
+    fn rule_count_capped_but_replacement_allowed() {
+        let (_td, dir) = tmpdir("countcap");
+        let store = RuleStore::new(dir.clone());
+        // Filled directly rather than through MAX_RULES add() calls, each
+        // of which rebuilds the whole set: under test is the cap check.
+        {
+            let mut entries = store.entries.lock().unwrap();
+            for i in 0..MAX_RULES {
+                entries.push(Entry {
+                    rule: rule(&format!("r{i}"), RuleDuration::Session),
+                    origin: Origin::Session,
+                });
+            }
+        }
+        let err = store
+            .add(rule("one-too-many", RuleDuration::Session))
+            .expect_err("the add past the cap must be refused");
+        assert!(err.contains("full"), "{err}");
+        store
+            .add(rule("r7", RuleDuration::Session))
+            .expect("replacement by name at the cap");
+        assert_eq!(store.list().len(), MAX_RULES);
+        // A delete makes room again.
+        store.delete("r7").unwrap();
+        store
+            .add(rule("fits-now", RuleDuration::Session))
+            .expect("add after a delete");
+    }
+
+    /// A rule whose matcher strings blow up its encoded size is refused:
+    /// the name cap alone does not protect the single-frame RuleList reply.
+    #[test]
+    fn oversized_rule_rejected_on_add() {
+        let (_td, dir) = tmpdir("wiresize");
+        let store = RuleStore::new(dir.clone());
+        let mut big = rule("big", RuleDuration::Session);
+        big.matcher.cmdline_contains = Some("x".repeat(MAX_RULE_WIRE_BYTES));
+        let err = store.add(big).expect_err("oversized rule must be refused");
+        assert!(err.contains("encodes to"), "{err}");
+        assert!(store.list().is_empty());
+    }
+
+    /// The worst listing the caps allow, [`MAX_RULES`] rules each at
+    /// [`MAX_RULE_WIRE_BYTES`], must encode as one RuleList reply inside
+    /// the wire frame limit, with margin. This is the arithmetic the two
+    /// caps were chosen for; a future bump to either constant fails here
+    /// before it ships an unanswerable daemon.
+    #[test]
+    fn rule_list_frame_budget() {
+        let worst = MAX_RULES * MAX_RULE_WIRE_BYTES;
+        assert!(
+            worst <= wire::MAX_FRAME_SIZE * 3 / 4,
+            "{MAX_RULES} rules x {MAX_RULE_WIRE_BYTES} bytes = {worst} needs to stay \
+             well inside the {} frame limit",
+            wire::MAX_FRAME_SIZE
+        );
+
+        // And with real encoding, not just arithmetic: rules padded to the
+        // per-rule cap, listed all at once, encode inside one frame.
+        // encode() itself refuses payloads over the frame limit, so
+        // surviving the expect is the entire check; asserting on the
+        // returned length would re-test what encode already enforces.
+        let mut rules = Vec::with_capacity(MAX_RULES);
+        for i in 0..MAX_RULES {
+            let mut r = rule(&format!("r{i}"), RuleDuration::Session);
+            let base = wire::encode(&r).unwrap().len() - wire::FRAME_PREFIX_BYTES;
+            // Padding leaves headroom for its own varint length bytes.
+            r.matcher.cmdline_contains =
+                Some("x".repeat(MAX_RULE_WIRE_BYTES - base - 8));
+            let padded = wire::encode(&r).unwrap().len() - wire::FRAME_PREFIX_BYTES;
+            assert!(padded <= MAX_RULE_WIRE_BYTES, "test rule overshot the cap");
+            rules.push(r);
+        }
+        wire::encode(&hallpass_types::DaemonMsg::Rules(rules))
+            .expect("a maximal RuleList reply must encode inside the frame limit");
+    }
+
+    /// Measurement harness, not a test: prints what the capped store costs
+    /// and always passes. Numbers are machine-relative; read them against
+    /// each other, not as absolutes. Run with:
+    /// `cargo test -p hallpassd --release rule_store_cost -- --ignored --nocapture`
+    #[test]
+    #[ignore = "measurement harness; run by hand with --nocapture"]
+    fn rule_store_cost() {
+        use std::time::Instant;
+
+        let mut typical = rule("allow curl to example.org:443", RuleDuration::Forever);
+        typical.matcher.exe = Some("/usr/bin/curl".into());
+        typical.matcher.domain = Some("example.org".into());
+        let bytes = wire::encode(&typical).unwrap().len() - wire::FRAME_PREFIX_BYTES;
+        println!("typical prompt rule: {bytes} wire bytes (cap {MAX_RULE_WIRE_BYTES})");
+
+        let rules: Vec<Rule> = (0..MAX_RULES)
+            .map(|i| {
+                let mut r = rule(&format!("rule-{i}"), RuleDuration::Session);
+                r.matcher.exe = Some(format!("/usr/bin/tool-{i}").into());
+                r
+            })
+            .collect();
+
+        let t = Instant::now();
+        let set = RuleSet::compile(&rules);
+        println!(
+            "RuleSet::compile of {} rules: {:?} (paid per add and per reload, on a runtime worker)",
+            set.rule_count(),
+            t.elapsed()
+        );
+
+        let conn = hallpass_types::Connection {
+            tuple: hallpass_types::FlowTuple {
+                proto: hallpass_types::Proto::Tcp,
+                src: "10.0.0.1:40000".parse().unwrap(),
+                dst: "192.0.2.1:999".parse().unwrap(),
+            },
+            uid: Some(1000),
+            pid: Some(1),
+            exe_path: Some("/usr/bin/nothing-matches".into()),
+            cmdline: None,
+            parent_exe: None,
+            domain: None,
+            iface: None,
+        };
+        let iterations = 1000u32;
+        let t = Instant::now();
+        for _ in 0..iterations {
+            std::hint::black_box(set.match_conn(std::hint::black_box(&conn), None));
+        }
+        println!(
+            "match_conn full miss over {MAX_RULES} rules: {:?} per packet (the verdict thread's share)",
+            t.elapsed() / iterations
+        );
+
+        let (_td, dir) = tmpdir("cost");
+        let store = RuleStore::new(dir);
+        {
+            let mut entries = store.entries.lock().unwrap();
+            for r in rules.iter().take(MAX_RULES - 2) {
+                entries.push(Entry {
+                    rule: r.clone(),
+                    origin: Origin::Session,
+                });
+            }
+        }
+        let t = Instant::now();
+        store.add(rule("one-session", RuleDuration::Session)).unwrap();
+        println!("session add at occupancy {}: {:?}", MAX_RULES - 2, t.elapsed());
+        let t = Instant::now();
+        store.add(rule("one-forever", RuleDuration::Forever)).unwrap();
+        println!(
+            "forever add at occupancy {}: {:?} (adds the rules.d write)",
+            MAX_RULES - 1,
+            t.elapsed()
+        );
+    }
+
+    /// A reload whose directory scan fails must keep the last good rule
+    /// set. Dropping to whatever partially loaded would silently disable
+    /// rules root wrote, on nothing more than a transient error.
+    #[test]
+    fn failed_scan_does_not_shrink_ruleset() {
+        if effective_uid() == Some(0) {
+            return; // directory modes do not restrict root
+        }
+        let (_td, dir) = tmpdir("partial-scan");
+        let store = RuleStore::new(dir.clone());
+        store.add(rule("keep-on-disk", RuleDuration::Forever)).unwrap();
+        assert_eq!(store.list().len(), 1);
+
+        let mode =
+            |m: u32| std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(m)).unwrap();
+        mode(0o000);
+        let applied = store.reload_disk();
+        mode(0o755);
+        assert!(!applied, "an incomplete scan must report itself for retry");
+        assert_eq!(
+            store.list().len(),
+            1,
+            "an unreadable rules dir must not drop loaded rules"
+        );
+        assert_eq!(store.ruleset().rule_count(), 1);
+        assert_eq!(
+            store.rules_skipped(),
+            0,
+            "an aborted reload must not count skips for files still enforced"
+        );
+        // Once the directory is scannable again the retry succeeds.
+        assert!(store.reload_disk(), "a complete scan must report applied");
+        assert_eq!(store.list().len(), 1);
     }
 
     #[test]
