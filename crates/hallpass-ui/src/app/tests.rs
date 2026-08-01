@@ -279,7 +279,7 @@ fn every_ack_kind_crossed_with_ok_and_err() {
             let refetched = t.sent() == vec![ClientMsg::RuleList];
             assert_eq!(refetched, expected, "{request:?} refetch after err={is_err}");
             assert!(
-                t.app.pending_acks.is_empty(),
+                t.app.pending_ack_kinds().is_empty(),
                 "{request:?} left an ack in the FIFO"
             );
             // Without an editor waiting, an Err is the status bar's.
@@ -297,7 +297,7 @@ fn acks_are_matched_to_requests_in_send_order() {
     t.app.send(ClientMsg::RuleToggle { name: "first".to_string(), enabled: false });
     t.editor_awaiting_ack();
     assert_eq!(
-        Vec::from(t.app.pending_acks.clone()),
+        t.app.pending_ack_kinds(),
         vec![AckKind::RuleToggle, AckKind::RuleSave]
     );
 
@@ -331,7 +331,7 @@ fn a_dropped_message_keeps_the_queue_aligned() {
     let mut t = TestApp::new();
     t.app.send(ClientMsg::RuleToggle { name: "gone".to_string(), enabled: false });
     t.sent();
-    assert_eq!(t.app.pending_acks.len(), 1);
+    assert_eq!(t.app.pending_ack_kinds().len(), 1);
 
     t.feed(UiEvent::SendFailed {
         msg: ClientMsg::RuleToggle {
@@ -339,7 +339,7 @@ fn a_dropped_message_keeps_the_queue_aligned() {
             enabled: false,
         },
     });
-    assert!(t.app.pending_acks.is_empty(), "the dead ack was left queued");
+    assert!(t.app.pending_ack_kinds().is_empty(), "the dead ack was left queued");
     assert!(
         t.app
             .last_error
@@ -385,13 +385,13 @@ fn a_lost_connection_clears_what_cannot_survive_it() {
     let mut t = TestApp::new();
     t.daemon(prompt_request(1, "/usr/bin/curl"));
     t.editor_awaiting_ack();
-    assert_eq!(t.app.prompts.len(), 1);
+    assert_eq!(t.app.prompt_ids().len(), 1);
 
     t.feed(UiEvent::Disconnected {
         retry_in: Duration::from_secs(1),
     });
-    assert!(t.app.prompts.is_empty());
-    assert!(t.app.pending_acks.is_empty());
+    assert!(t.app.prompt_ids().is_empty());
+    assert!(t.app.pending_ack_kinds().is_empty());
     let editor = t.app.editor.as_ref().expect("the form survives");
     assert!(!editor.awaiting_ack(), "nothing is coming to answer it");
 }
@@ -418,7 +418,7 @@ fn connecting_subscribes_before_asking_for_history() {
         ]
     );
     // Only Subscribe is acked; the other three are answered with data.
-    assert_eq!(Vec::from(t.app.pending_acks.clone()), vec![AckKind::Other]);
+    assert_eq!(t.app.pending_ack_kinds(), vec![AckKind::Other]);
 }
 
 /// The daemon releases the prompt slot when prompts sent to it time out
@@ -433,7 +433,7 @@ fn a_revoked_prompt_slot_is_claimed_again() {
     t.feed(UiEvent::Connected);
     t.sent();
     t.daemon(DaemonMsg::Ok); // the initial Subscribe's ack
-    assert!(t.app.pending_acks.is_empty());
+    assert!(t.app.pending_ack_kinds().is_empty());
 
     t.daemon(DaemonMsg::PromptHandlerRevoked);
     assert_eq!(
@@ -454,9 +454,9 @@ fn a_revoked_prompt_slot_is_claimed_again() {
         t.app.last_error
     );
     // Acked like any other Subscribe, so the FIFO stays aligned.
-    assert_eq!(Vec::from(t.app.pending_acks.clone()), vec![AckKind::Other]);
+    assert_eq!(t.app.pending_ack_kinds(), vec![AckKind::Other]);
     t.daemon(DaemonMsg::Ok);
-    assert!(t.app.pending_acks.is_empty());
+    assert!(t.app.pending_ack_kinds().is_empty());
 }
 
 // ---- the event feed (5c2c1a8) --------------------------------------------
@@ -628,10 +628,10 @@ fn a_repeated_prompt_request_does_not_stack() {
     let mut t = TestApp::new();
     t.daemon(prompt_request(1, "/usr/bin/curl"));
     t.daemon(prompt_request(1, "/usr/bin/curl"));
-    assert_eq!(t.app.prompts.len(), 1);
+    assert_eq!(t.app.prompt_ids().len(), 1);
 
     t.daemon(prompt_request(2, "/usr/bin/curl"));
-    assert_eq!(t.app.prompts.len(), 2);
+    assert_eq!(t.app.prompt_ids().len(), 2);
 }
 
 /// A prompt answered elsewhere, timed out, or resolved by a rule that
@@ -643,7 +643,7 @@ fn an_expired_prompt_is_dropped() {
     t.daemon(prompt_request(2, "/usr/bin/curl"));
     t.daemon(DaemonMsg::PromptExpired { id: 1 });
     assert_eq!(
-        t.app.prompts.iter().map(|p| p.id).collect::<Vec<_>>(),
+        t.app.prompt_ids(),
         vec![2]
     );
 }
@@ -678,7 +678,7 @@ fn dismissing_prompts_answers_every_one_of_them() {
 
     assert_eq!(t.sent(), vec![prompt::close_reply(1), prompt::close_reply(3)]);
     assert_eq!(
-        t.app.prompts.iter().map(|p| p.id).collect::<Vec<_>>(),
+        t.app.prompt_ids(),
         vec![2],
         "a dismissed prompt leaves the queue, an untouched one stays"
     );
@@ -708,7 +708,7 @@ fn unrequested_replies_are_ignored_rather_than_fatal() {
     t.daemon(DaemonMsg::HelloAck { version: 3 });
     assert!(t.sent().is_empty());
     assert!(t.app.last_error.is_none());
-    assert!(t.app.pending_acks.is_empty());
+    assert!(t.app.pending_ack_kinds().is_empty());
 }
 
 // ---- display helpers -----------------------------------------------------

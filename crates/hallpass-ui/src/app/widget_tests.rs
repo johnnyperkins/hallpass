@@ -51,11 +51,11 @@ fn prompt_harness() -> Harness<'static, PromptFixture> {
 fn app_with_prompts(count: u64) -> (HallpassApp, tokio::sync::mpsc::UnboundedReceiver<ClientMsg>) {
     let (to_daemon, from_ui) = tokio::sync::mpsc::unbounded_channel();
     let (_to_ui, from_net) = std::sync::mpsc::channel();
-    let mut app = HallpassApp::with_channels(to_daemon, from_net);
+    let app = HallpassApp::with_channels(to_daemon, from_net);
     // Real deadlines: the window drops prompts the daemon has already timed
     // out, and it reads the clock to do it.
     let now = hallpass_types::unix_ms_now();
-    app.prompts = (1..=count)
+    app.prompts.lock().unwrap().pending = (1..=count)
         .map(|id| PromptState::new(id, conn(EXE, &format!("1.1.1.{id}:443")), now + 30_000, now))
         .collect();
     (app, from_ui)
@@ -186,7 +186,7 @@ fn closing_the_window_dismisses_every_prompt_it_covers() {
         (1..=3).map(prompt::close_reply).collect::<Vec<_>>(),
         "a closed window left prompts for the daemon's default verdict"
     );
-    assert!(harness.state().prompts.is_empty());
+    assert!(harness.state().prompt_ids().is_empty());
 }
 
 /// Quitting abandons every prompt on screen, so it answers them for the same
@@ -209,7 +209,7 @@ fn quitting_denies_the_prompts_left_on_screen() {
         "quitting left prompts to the daemon's default verdict"
     );
     assert!(harness.state().quit_requested);
-    assert!(harness.state().prompts.is_empty());
+    assert!(harness.state().prompt_ids().is_empty());
 }
 
 /// The checkbox in the rules list asks the daemon; it does not edit the row.
