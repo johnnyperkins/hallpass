@@ -43,7 +43,23 @@ SystemCallArchitectures=native
 
 # Everything root would otherwise carry, dropped to what the daemon uses:
 #   NET_ADMIN        install the nftables table, bind the NFQUEUE netlink socket
-#   DAC_READ_SEARCH  read /proc/<pid>/{exe,cmdline,fd} for other users' processes
+#   DAC_READ_SEARCH  read files regardless of mode bits: hashing another
+#                    user's 0700 binary for an exe_sha256 rule
+#   SYS_PTRACE       pass the kernel's ptrace access check, which gates the
+#                    /proc/<pid>/exe and /proc/<pid>/fd readlinks for other
+#                    users' processes. DAC_READ_SEARCH does not satisfy that
+#                    check (probed live: readlink /proc/<pid>/exe under a
+#                    bounding set with only DAC_READ_SEARCH fails, and
+#                    succeeds the moment SYS_PTRACE is added). Without it,
+#                    attribution silently loses the executable path for any
+#                    process the eBPF exec snapshot has not covered: anything
+#                    started before the daemon, and every process on a
+#                    procfs-only build. The visible symptom is prompt answers
+#                    that apply their verdict but cannot create a rule
+#                    ("prompt reply for connection without executable path").
+#                    The ptrace syscall itself is in @debug and stays outside
+#                    SystemCallFilter below, so this grants /proc visibility,
+#                    not live process attach.
 #   CHOWN            chgrp the IPC socket and its directory to the hallpass group
 #   BPF, PERFMON     load the eBPF programs, attach kprobes and uprobes
 #   SYS_RESOURCE     raise RLIMIT_MEMLOCK for BPF maps (kernels before 5.11)
@@ -53,7 +69,7 @@ SystemCallArchitectures=native
 # SYS_ADMIN is close to granting root, so it is opt-in for old kernels rather
 # than the default. NET_RAW is absent too: NFQUEUE is netlink, not a raw
 # socket, and a wrong guess there fails loudly at "nfqueue bind failed".
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_DAC_READ_SEARCH CAP_CHOWN CAP_BPF CAP_PERFMON CAP_SYS_RESOURCE
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_DAC_READ_SEARCH CAP_SYS_PTRACE CAP_CHOWN CAP_BPF CAP_PERFMON CAP_SYS_RESOURCE
 
 # Allow-list only, deliberately with no matching "~" deny line. Mixing the two
 # forms subtracts the deny set from the allow set, and perf_event_open belongs
