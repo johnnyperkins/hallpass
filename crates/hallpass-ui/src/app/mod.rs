@@ -825,9 +825,9 @@ impl HallpassApp {
                 .with_resizable(false)
                 .with_always_on_top();
             ctx.show_viewport_immediate(viewport_id, builder, |ui, _class| {
-                egui::CentralPanel::default().show(ui, |ui| {
-                    prompt_ui(ui, p, now_ms, &rest, &mut answered);
-                });
+                // prompt_ui lays out its own panels: actions pinned to the
+                // bottom, info scrolling above them.
+                prompt_ui(ui, p, now_ms, &rest, &mut answered);
                 if ui.ctx().input(|i| i.viewport().close_requested()) {
                     // Closing the window is a decision, not the absence of
                     // one; `dismiss_prompts` is what that decision means.
@@ -853,6 +853,14 @@ impl HallpassApp {
 /// Body of a single prompt popup: the app's oldest pending prompt, plus
 /// its other pending destinations (`rest`), which a host- or app-wide
 /// answer will cover in the same stroke.
+///
+/// Split into a bottom action panel and a scrolling info body, in that
+/// order, because the viewport is a fixed 440x330 and every info line
+/// (path, command line, resolved names) is text the judged process
+/// chose: stacked in one column, enough of it pushed Allow and Deny out
+/// of the window, an unanswerable prompt an adversary can construct.
+/// The panel is laid out first so the actions own their space no matter
+/// how much the body wants, and the body scrolls inside what is left.
 fn prompt_ui(
     ui: &mut egui::Ui,
     p: &mut PromptState,
@@ -860,6 +868,23 @@ fn prompt_ui(
     rest: &[String],
     answered: &mut Vec<(u64, ClientMsg)>,
 ) {
+    // Salted by prompt id like the details grid: two apps prompting at
+    // once means two of these windows live in one pass, and their panels
+    // must not collide on one id.
+    egui::Panel::bottom(egui::Id::new(("prompt-actions", p.id))).show(ui, |ui| {
+        prompt_actions_ui(ui, p, now_ms, answered);
+    });
+    egui::CentralPanel::default().show(ui, |ui| {
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                prompt_info_ui(ui, p, rest);
+            });
+    });
+}
+
+/// The scrolling half: everything the operator reads to decide.
+fn prompt_info_ui(ui: &mut egui::Ui, p: &PromptState, rest: &[String]) {
     let conn = &p.conn;
 
     ui.horizontal(|ui| {
@@ -909,8 +934,18 @@ fn prompt_ui(
                 .small(),
         );
     }
-    ui.separator();
+}
 
+/// The pinned half: the pickers, the warning the scope picker earns, the
+/// verdict buttons, and the countdown. The warning lives here rather than
+/// in the scrolling body because it must be on screen at the moment the
+/// scope it warns about is selected.
+fn prompt_actions_ui(
+    ui: &mut egui::Ui,
+    p: &mut PromptState,
+    now_ms: u64,
+    answered: &mut Vec<(u64, ClientMsg)>,
+) {
     ui.horizontal(|ui| {
         egui::ComboBox::from_id_salt(("duration", p.id))
             .selected_text(duration_label(p.duration))
