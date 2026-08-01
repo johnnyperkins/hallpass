@@ -129,7 +129,22 @@ impl EbpfAttributor {
                     tracing::info!("libc DNS snoop active (getaddrinfo, gethostbyname family)");
                 }
                 Err(e) => {
-                    tracing::warn!("libc DNS snoop unavailable: {e}");
+                    // Annotation loss only: the wire snooper still covers
+                    // plaintext port 53; what goes missing is names resolved
+                    // through a stub resolver or an encrypted upstream. The
+                    // hint is earned: kprobes attaching while uprobes fail
+                    // looks like a bug, but on several kernel lines the
+                    // uprobe perf PMU demands CAP_SYS_ADMIN where the kprobe
+                    // PMU accepts CAP_PERFMON (probe-confirmed on a live
+                    // host), and the shipped unit deliberately refuses
+                    // SYS_ADMIN; see etc/hallpassd.service.
+                    tracing::warn!(
+                        "libc DNS snoop unavailable: {e}; under a \
+                         capability-restricted service this usually means \
+                         attaching uprobes needs CAP_SYS_ADMIN on this \
+                         kernel; wire DNS snooping still covers plaintext \
+                         port 53"
+                    );
                 }
             }
         }

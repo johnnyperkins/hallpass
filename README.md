@@ -368,9 +368,15 @@ attacker with root, who can delete the nftables table outright.
   passes the kernel's ptrace access check on `/proc/<pid>/exe` for other
   users' processes; the `ptrace` syscall itself stays outside the filter, so
   the grant is `/proc` visibility, not live attach. `CAP_SYS_ADMIN` is
-  deliberately excluded, so on kernels older than 5.8, where `bpf()` requires
-  it, eBPF attribution falls back to procfs and logs why; add it back there
-  if you want the eBPF path.
+  deliberately excluded, which costs annotation, never enforcement: on
+  kernels older than 5.8, where `bpf()` requires it, eBPF attribution falls
+  back to procfs and logs why; and on kernel lines whose uprobe perf PMU
+  demands it (kprobes accept `CAP_PERFMON`), the libc-resolver DNS snoop is
+  unavailable under the unit and logs why - the wire snooper still covers
+  plaintext port 53, so the loss is names resolved through a stub resolver
+  or an encrypted upstream. Both are restored per host by a
+  `systemctl edit hallpassd` drop-in re-adding `CAP_SYS_ADMIN`; the unit
+  file shows the exact lines.
 - **Config file trust**: the config is read under the same ownership and
   permission policy as rule files. It sets `default_verdict`, `queue_bypass`,
   and the rules directory, so it is the most security-relevant file on disk.

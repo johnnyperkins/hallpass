@@ -63,12 +63,24 @@ SystemCallArchitectures=native
 #   CHOWN            chgrp the IPC socket and its directory to the hallpass group
 #   BPF, PERFMON     load the eBPF programs, attach kprobes and uprobes
 #   SYS_RESOURCE     raise RLIMIT_MEMLOCK for BPF maps (kernels before 5.11)
-# Deliberately absent: SYS_ADMIN. On kernels before 5.8, bpf() needs it rather
-# than CAP_BPF, so eBPF attribution there falls back to procfs and says so in
-# the journal ("eBPF attribution unavailable, using procfs fallback"). Granting
-# SYS_ADMIN is close to granting root, so it is opt-in for old kernels rather
-# than the default. NET_RAW is absent too: NFQUEUE is netlink, not a raw
-# socket, and a wrong guess there fails loudly at "nfqueue bind failed".
+# Deliberately absent: SYS_ADMIN, which costs two things, both annotation
+# rather than enforcement. On kernels before 5.8, bpf() needs it rather than
+# CAP_BPF, so eBPF attribution there falls back to procfs and says so in the
+# journal ("eBPF attribution unavailable, using procfs fallback"). And on
+# several kernel lines the uprobe perf PMU demands SYS_ADMIN where the kprobe
+# PMU accepts PERFMON (probe-confirmed live: same binary, kprobes attach,
+# "libc DNS snoop unavailable: ... perf_event_open failed"; adding SYS_ADMIN
+# via drop-in, "libc DNS snoop active"), so under this unit the libc-resolver
+# DNS snoop is degraded: the wire snooper still covers plaintext port 53, and
+# what goes missing is names resolved through a stub resolver or an encrypted
+# upstream. Granting SYS_ADMIN is close to granting root, so both losses are
+# accepted here rather than defaulted away; opt in per host with a drop-in
+# (systemctl edit hallpassd) appending SYS_ADMIN:
+#   [Service]
+#   CapabilityBoundingSet=
+#   CapabilityBoundingSet=CAP_NET_ADMIN CAP_DAC_READ_SEARCH CAP_SYS_PTRACE CAP_CHOWN CAP_BPF CAP_PERFMON CAP_SYS_RESOURCE CAP_SYS_ADMIN
+# NET_RAW is absent too: NFQUEUE is netlink, not a raw socket, and a wrong
+# guess there fails loudly at "nfqueue bind failed".
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_DAC_READ_SEARCH CAP_SYS_PTRACE CAP_CHOWN CAP_BPF CAP_PERFMON CAP_SYS_RESOURCE
 
 # Allow-list only, deliberately with no matching "~" deny line. Mixing the two
