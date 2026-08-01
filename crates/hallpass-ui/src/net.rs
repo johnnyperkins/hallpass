@@ -15,6 +15,8 @@ use hallpass_types::{ClientMsg, DaemonMsg, PROTOCOL_VERSION};
 use tokio::net::UnixStream;
 use tokio::sync::mpsc::UnboundedReceiver;
 
+use crate::notify::NotifyEvent;
+
 /// Messages delivered from the network task to the egui thread.
 #[derive(Debug)]
 pub enum UiEvent {
@@ -35,11 +37,17 @@ const BACKOFF_MIN: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
 
 /// Spawn the background thread running the tokio runtime and connection loop.
+///
+/// `to_notify` is the notifier's channel: prompt lifecycle events are
+/// teed straight from this thread, because the UI-side channel is only
+/// drained while the main window paints, and the entire point of a
+/// desktop notification is to fire while it does not.
 pub fn spawn(
     socket: PathBuf,
     to_ui: Sender<UiEvent>,
     from_ui: UnboundedReceiver<ClientMsg>,
     ctx: egui::Context,
+    to_notify: Sender<NotifyEvent>,
 ) {
     std::thread::Builder::new()
         .name("hallpass-net".into())
@@ -48,7 +56,7 @@ pub fn spawn(
                 .enable_all()
                 .build()
                 .expect("failed to build tokio runtime");
-            rt.block_on(run(socket, to_ui, from_ui, ctx));
+            rt.block_on(run(socket, to_ui, from_ui, ctx, to_notify));
         })
         .expect("failed to spawn network thread");
 }
@@ -70,10 +78,11 @@ async fn run(
     to_ui: Sender<UiEvent>,
     mut from_ui: UnboundedReceiver<ClientMsg>,
     ctx: egui::Context,
+    to_notify: Sender<NotifyEvent>,
 ) {
     let mut backoff = BACKOFF_MIN;
     loop {
-        match connect_and_serve(&socket, &to_ui, &mut from_ui, &ctx).await {
+        match connect_and_serve(&socket, &to_ui, &mut from_ui, &ctx, &to_notify).await {
             Ok(()) => {
                 // UI channel closed: app is exiting.
                 return;
@@ -84,6 +93,10 @@ async fn run(
                 if e.handshaken {
                     backoff = BACKOFF_MIN;
                 }
+                // Every pending prompt died with the connection; their
+                // banners must not outlive them. The daemon re-delivers
+                // survivors on reconnect, which re-raises the banners.
+                let _ = to_notify.send(NotifyEvent::Disconnected);
                 tracing::warn!("daemon connection failed: {}", e.message);
                 if !send_ui(&to_ui, &ctx, UiEvent::Disconnected { retry_in: backoff }) {
                     return;
@@ -120,6 +133,7 @@ async fn connect_and_serve(
     to_ui: &Sender<UiEvent>,
     from_ui: &mut UnboundedReceiver<ClientMsg>,
     ctx: &egui::Context,
+    to_notify: &Sender<NotifyEvent>,
 ) -> Result<(), SessionError> {
     let stream = UnixStream::connect(socket)
         .await
@@ -183,6 +197,22 @@ async fn connect_and_serve(
         tokio::select! {
             incoming = read_msg::<DaemonMsg, _>(&mut reader) => {
                 let msg = incoming.map_err(|e| fail(format!("read: {e}")))?;
+                // Tee the prompt lifecycle to the notifier before the UI:
+                // the UI channel is only drained while the main window
+                // paints, and the banner exists for when it does not.
+                match &msg {
+                    DaemonMsg::PromptRequest { id, conn, deadline_ms } => {
+                        let _ = to_notify.send(NotifyEvent::Request {
+                            id: *id,
+                            conn: Box::new(conn.clone()),
+                            deadline_ms: *deadline_ms,
+                        });
+                    }
+                    DaemonMsg::PromptExpired { id } => {
+                        let _ = to_notify.send(NotifyEvent::Gone { id: *id });
+                    }
+                    _ => {}
+                }
                 if !send_ui(to_ui, ctx, UiEvent::Daemon(msg)) {
                     return Ok(());
                 }
@@ -190,6 +220,14 @@ async fn connect_and_serve(
             outgoing = from_ui.recv() => {
                 match outgoing {
                     Some(msg) => {
+                        // A reply leaving the queue ends the prompt locally
+                        // whether or not the write succeeds (a failed write
+                        // is reported as SendFailed and the daemon's
+                        // timeout decides), so its banner retires either
+                        // way.
+                        if let ClientMsg::PromptReply { id, .. } = &msg {
+                            let _ = to_notify.send(NotifyEvent::Gone { id: *id });
+                        }
                         if let Err(e) = write_msg(&mut writer, &msg).await {
                             send_ui(to_ui, ctx, UiEvent::SendFailed { msg });
                             return Err(fail(format!("write: {e}")));

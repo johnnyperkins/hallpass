@@ -200,7 +200,9 @@ impl HallpassApp {
     pub fn new(cc: &eframe::CreationContext<'_>, socket: PathBuf) -> Self {
         let (to_daemon, from_ui) = tokio::sync::mpsc::unbounded_channel();
         let (to_ui, from_net) = std::sync::mpsc::channel();
-        net::spawn(socket, to_ui, from_ui, cc.egui_ctx.clone());
+        let (to_notify, from_net_notify) = std::sync::mpsc::channel();
+        crate::notify::spawn(from_net_notify);
+        net::spawn(socket, to_ui, from_ui, cc.egui_ctx.clone(), to_notify);
         Self::with_channels(to_daemon, from_net)
     }
 

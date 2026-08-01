@@ -7,6 +7,7 @@
 mod app;
 mod editor;
 mod net;
+mod notify;
 mod prompt;
 mod traffic;
 
