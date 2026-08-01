@@ -11,6 +11,9 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 /// Maximum allowed frame payload size in bytes (1 MiB).
 pub const MAX_FRAME_SIZE: usize = 1024 * 1024;
 
+/// Bytes of length prefix preceding every frame payload.
+pub const FRAME_PREFIX_BYTES: usize = 4;
+
 /// Errors produced by the wire codec.
 #[derive(Debug, thiserror::Error)]
 pub enum WireError {
@@ -30,14 +33,14 @@ pub type Result<T> = std::result::Result<T, WireError>;
 
 /// Encode a message as a length-prefixed postcard frame.
 pub fn encode<T: Serialize>(msg: &T) -> Result<Vec<u8>> {
-    // Serialize directly after a 4-byte placeholder, then backfill the
-    // length prefix - one allocation, no payload copy.
-    let mut frame = postcard::to_extend(msg, vec![0u8; 4])?;
-    let payload_len = frame.len() - 4;
+    // Serialize directly after the length-prefix placeholder, then backfill
+    // it - one allocation, no payload copy.
+    let mut frame = postcard::to_extend(msg, vec![0u8; FRAME_PREFIX_BYTES])?;
+    let payload_len = frame.len() - FRAME_PREFIX_BYTES;
     if payload_len > MAX_FRAME_SIZE {
         return Err(WireError::FrameTooLarge(payload_len));
     }
-    frame[..4].copy_from_slice(&(payload_len as u32).to_le_bytes());
+    frame[..FRAME_PREFIX_BYTES].copy_from_slice(&(payload_len as u32).to_le_bytes());
     Ok(frame)
 }
 
@@ -54,7 +57,7 @@ pub fn decode<T: DeserializeOwned>(payload: &[u8]) -> Result<T> {
 /// Rejects frames whose declared length exceeds [`MAX_FRAME_SIZE`] before
 /// allocating or reading the payload.
 pub async fn read_msg<T: DeserializeOwned, R: AsyncRead + Unpin>(r: &mut R) -> Result<T> {
-    let mut len_buf = [0u8; 4];
+    let mut len_buf = [0u8; FRAME_PREFIX_BYTES];
     r.read_exact(&mut len_buf).await?;
     let len = u32::from_le_bytes(len_buf) as usize;
     if len > MAX_FRAME_SIZE {
@@ -142,9 +145,10 @@ mod tests {
     {
         // Sync frame round-trip.
         let frame = encode(msg).unwrap();
-        let len = u32::from_le_bytes(frame[..4].try_into().unwrap()) as usize;
-        assert_eq!(len, frame.len() - 4);
-        let decoded: T = decode(&frame[4..]).unwrap();
+        let len =
+            u32::from_le_bytes(frame[..FRAME_PREFIX_BYTES].try_into().unwrap()) as usize;
+        assert_eq!(len, frame.len() - FRAME_PREFIX_BYTES);
+        let decoded: T = decode(&frame[FRAME_PREFIX_BYTES..]).unwrap();
         assert_eq!(&decoded, msg);
 
         // Async round-trip through an in-memory buffer.
