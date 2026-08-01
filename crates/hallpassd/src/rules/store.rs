@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
+use notify::event::{AccessKind, AccessMode, EventKind};
 use notify::Watcher;
 use hallpass_types::{wire, Rule};
 
@@ -736,6 +737,28 @@ pub fn spawn_expiry_sweeper(store: Arc<RuleStore>) {
 /// operator's signal to go look.
 const RELOAD_RETRY_DELAY: Duration = Duration::from_secs(5);
 
+/// Whether a watcher event can reflect a change to the rules on disk.
+///
+/// The inotify backend reports read-side events too: opening a file for
+/// reading arrives as `Access(Open)`. [`RuleStore::reload_disk`] opens
+/// every rule and list file in the watched directory, so reloading on any
+/// event let the watcher feed itself: one real write, then each reload's
+/// own reads fired the next reload at debounce cadence, forever (observed
+/// live as "rules reloaded from disk" every 200ms until restart). Only
+/// `Access` events are dropped, and `Close(Write)` is kept out of the
+/// drop: it is the one access-family event that implies a write (a file
+/// modified through a mapping can close without any `Modify` event), and
+/// the reload path opens read-only, so keeping it cannot re-arm the loop.
+/// Everything unrecognized reloads: this filter fails toward a spurious
+/// directory scan, never toward leaving root's edit unapplied.
+fn reload_worthy(kind: &EventKind) -> bool {
+    match kind {
+        EventKind::Access(AccessKind::Close(AccessMode::Write)) => true,
+        EventKind::Access(_) => false,
+        _ => true,
+    }
+}
+
 /// Watch the rules directory and hot-reload on changes, debounced 200ms.
 /// Returns an error if the watcher cannot be created; a missing directory
 /// is tolerated (watch is skipped with a warning).
@@ -743,7 +766,7 @@ pub fn spawn_watcher(store: Arc<RuleStore>) -> notify::Result<()> {
     let dir = store.rules_dir.clone();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-        if res.is_ok() {
+        if res.is_ok_and(|ev| reload_worthy(&ev.kind)) {
             let _ = tx.send(());
         }
     })?;
@@ -1364,5 +1387,74 @@ mod tests {
         let mut unnamed = rule("", RuleDuration::Session);
         unnamed.name = String::new();
         assert!(store.add(unnamed).is_err());
+    }
+
+    /// The reload path only ever opens for read, so the access-family
+    /// events it can generate about itself must not schedule a reload,
+    /// while every shape a writer produces must.
+    #[test]
+    fn read_side_events_are_not_reload_worthy() {
+        use notify::event::{CreateKind, DataChange, ModifyKind, RemoveKind};
+        // What a read-only directory scan emits.
+        assert!(!reload_worthy(&EventKind::Access(AccessKind::Open(AccessMode::Any))));
+        assert!(!reload_worthy(&EventKind::Access(AccessKind::Close(AccessMode::Read))));
+        assert!(!reload_worthy(&EventKind::Access(AccessKind::Any)));
+        // What writers emit, including a mapped write's only trace.
+        assert!(reload_worthy(&EventKind::Access(AccessKind::Close(AccessMode::Write))));
+        assert!(reload_worthy(&EventKind::Create(CreateKind::File)));
+        assert!(reload_worthy(&EventKind::Modify(ModifyKind::Data(DataChange::Any))));
+        assert!(reload_worthy(&EventKind::Remove(RemoveKind::File)));
+        // Unknown fails toward a spurious scan, never toward staleness.
+        assert!(reload_worthy(&EventKind::Any));
+    }
+
+    /// One write to the rules directory must produce one reload, not a
+    /// self-sustaining loop. The reload reads every file in the watched
+    /// directory and the inotify backend reports read events, so an
+    /// unfiltered watcher re-triggered itself at debounce cadence forever
+    /// (observed live as "rules reloaded from disk" every 200ms). Pinned
+    /// against the real watcher and the real reload: a second watcher on
+    /// the same directory sees the reload's own opens, so silence on it
+    /// after the reload has applied means the daemon watcher went quiet.
+    #[tokio::test]
+    async fn watcher_does_not_feed_itself() {
+        let (_td, dir) = tmpdir("watch-quiesce");
+        let store = Arc::new(RuleStore::new(dir.clone()));
+        spawn_watcher(Arc::clone(&store)).unwrap();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut observer =
+            notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+                if let Ok(ev) = res {
+                    let _ = tx.send(ev.kind);
+                }
+            })
+            .unwrap();
+        observer.watch(&dir, notify::RecursiveMode::NonRecursive).unwrap();
+
+        // The legitimate write that starts the cycle.
+        let text = toml::to_string(&rule("quiesce", RuleDuration::Forever)).unwrap();
+        std::fs::write(dir.join("quiesce.toml"), text).unwrap();
+
+        // Wait for the debounced reload to apply rather than a fixed
+        // interval, so a loaded machine cannot push the first reload's
+        // reads into the silence window below.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !store.list().iter().any(|r| r.name == "quiesce") {
+            assert!(std::time::Instant::now() < deadline, "reload never applied");
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        // Settle past one more debounce interval, drain what the reload
+        // itself produced, then require silence: a self-feeding watcher
+        // reloads again every 200ms, and each reload opens files here.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        while rx.try_recv().is_ok() {}
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let mut late = Vec::new();
+        while let Ok(kind) = rx.try_recv() {
+            late.push(kind);
+        }
+        assert!(late.is_empty(), "watcher fed itself: {late:?}");
     }
 }
