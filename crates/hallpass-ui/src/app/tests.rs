@@ -132,6 +132,13 @@ fn prompt_request(id: u64, exe: &str) -> DaemonMsg {
     }
 }
 
+pub(super) fn runtime_config(secs: u64, verdict: Verdict) -> hallpass_types::RuntimeConfig {
+    hallpass_types::RuntimeConfig {
+        prompt_timeout_secs: secs,
+        default_verdict: verdict,
+    }
+}
+
 // ---- rule changes are the daemon's to make (662ea63) ---------------------
 
 /// A refused toggle leaves the rule enforced, so the screen has to go back
@@ -205,6 +212,10 @@ fn ack_kinds_are_distinct_per_request() {
     assert_eq!(ack_kind(&toggle), Some(AckKind::RuleToggle));
     assert_eq!(ack_kind(&delete), Some(AckKind::RuleDelete));
     assert_eq!(
+        ack_kind(&ClientMsg::ConfigSet(runtime_config(30, Verdict::Deny))),
+        Some(AckKind::ConfigSet)
+    );
+    assert_eq!(
         ack_kind(&ClientMsg::Subscribe { events: true, prompts: true }),
         Some(AckKind::Other)
     );
@@ -220,6 +231,7 @@ fn ack_kinds_are_distinct_per_request() {
     assert_eq!(ack_kind(&ClientMsg::Stats), None);
     assert_eq!(ack_kind(&ClientMsg::EventHistory { limit: 10 }), None);
     assert_eq!(ack_kind(&ClientMsg::RuleStats), None);
+    assert_eq!(ack_kind(&ClientMsg::ConfigGet), None);
 }
 
 // ---- the ack FIFO --------------------------------------------------------
@@ -251,10 +263,11 @@ fn a_rejected_save_keeps_the_form_open() {
     assert!(t.sent().is_empty(), "a save reconciles through the editor");
 }
 
-/// The whole ack matrix: every kind, crossed with Ok and with Err. Only
-/// toggles and deletes refetch; with no form waiting, every Err is the
-/// status bar's. The two tests above cover where a save's ack goes when
-/// there is a form waiting for it.
+/// The ack matrix, crossed with Ok and with Err. Only toggles and deletes
+/// refetch the rule list; with no form waiting, every Err here is the
+/// status bar's. The two tests above cover where a save's ack goes when a
+/// form is waiting for it, and the settings tests below cover ConfigSet,
+/// whose ack reconciles against the settings instead.
 #[test]
 fn every_ack_kind_crossed_with_ok_and_err() {
     let refetch = [
@@ -359,6 +372,28 @@ fn a_dropped_message_keeps_the_queue_aligned() {
     assert!(t.sent().is_empty(), "an Other ack refetched the rule list");
 }
 
+/// A settings change that never reached the daemon is not in force, and
+/// the form will snap back on the next Config reply; the loss has to be
+/// named, and its dead ack has to leave the FIFO.
+#[test]
+fn a_dropped_settings_change_is_reported_and_keeps_the_queue_aligned() {
+    let mut t = TestApp::new();
+    t.app.send(ClientMsg::ConfigSet(runtime_config(30, Verdict::Deny)));
+    t.sent();
+    t.feed(UiEvent::SendFailed {
+        msg: ClientMsg::ConfigSet(runtime_config(30, Verdict::Deny)),
+    });
+    assert!(t.app.pending_ack_kinds().is_empty(), "the dead ack was left queued");
+    assert!(
+        t.app
+            .last_error
+            .as_deref()
+            .is_some_and(|e| e.contains("settings change")),
+        "{:?}",
+        t.app.last_error
+    );
+}
+
 /// A lost prompt reply is the one the daemon backstops with its default
 /// verdict, so it says so rather than failing silently.
 #[test]
@@ -412,6 +447,7 @@ fn connecting_subscribes_before_asking_for_history() {
             },
             ClientMsg::RuleList,
             ClientMsg::Stats,
+            ClientMsg::ConfigGet,
             ClientMsg::EventHistory {
                 limit: EVENT_HISTORY_LIMIT,
             },
@@ -610,12 +646,48 @@ fn opening_a_data_tab_refetches_it() {
         (Tab::Rules, vec![ClientMsg::RuleList]),
         (Tab::Traffic, vec![ClientMsg::Stats]),
         (Tab::Stats, vec![ClientMsg::Stats]),
+        (Tab::Settings, vec![ClientMsg::ConfigGet]),
         (Tab::Events, vec![]),
     ] {
         t.app.select_tab(tab);
         assert_eq!(t.sent(), expected, "opening {tab:?}");
         t.app.select_tab(tab);
         assert!(t.sent().is_empty(), "reselecting {tab:?} refetched again");
+    }
+}
+
+// ---- runtime settings ----------------------------------------------------
+
+/// A Config reply is what fills the settings form, drafts included: the
+/// form shows what the daemon holds, never a guess.
+#[test]
+fn a_config_reply_fills_the_settings_form() {
+    let mut t = TestApp::new();
+    assert!(t.app.daemon_config.is_none(), "no values before the daemon speaks");
+    t.daemon(DaemonMsg::Config(runtime_config(30, Verdict::Deny)));
+    assert_eq!(t.app.daemon_config, Some(runtime_config(30, Verdict::Deny)));
+    assert_eq!(t.app.settings_timeout, "30");
+    assert_eq!(t.app.settings_verdict, Verdict::Deny);
+}
+
+/// An accepted settings change re-reads the settings, so the form settles
+/// on what the daemon actually holds; a refused one does the same and puts
+/// the daemon's complaint next to the Apply that retries it, not in the
+/// status bar.
+#[test]
+fn a_settings_ack_reconciles_by_refetching() {
+    for (outcome, expect_err) in [(DaemonMsg::Ok, false), (err("out of range"), true)] {
+        let mut t = TestApp::new();
+        t.app.send(ClientMsg::ConfigSet(runtime_config(30, Verdict::Deny)));
+        t.sent();
+        t.daemon(outcome);
+        assert_eq!(t.sent(), vec![ClientMsg::ConfigGet], "err={expect_err}");
+        assert_eq!(t.app.settings_error.is_some(), expect_err);
+        assert!(
+            t.app.last_error.is_none(),
+            "a settings rejection belongs in the settings tab"
+        );
+        assert!(t.app.pending_ack_kinds().is_empty());
     }
 }
 

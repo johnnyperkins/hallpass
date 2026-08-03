@@ -77,21 +77,22 @@ pub struct PromptTable {
     events: Arc<EventBus>,
     stats: Arc<Counters>,
     store: Arc<RuleStore>,
-    timeout: Duration,
+    /// Prompt timeout and default verdict, changeable over IPC. The
+    /// timeout is read when a prompt is created (deadline and timer arm
+    /// together, so they cannot disagree); the verdict is read when a
+    /// decision is actually applied.
+    settings: Arc<crate::config::RuntimeSettings>,
     max_pending: usize,
-    default_verdict: Verdict,
 }
 
 impl PromptTable {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         verdict_tx: UnboundedSender<(u64, Verdict)>,
         events: Arc<EventBus>,
         stats: Arc<Counters>,
         store: Arc<RuleStore>,
-        timeout: Duration,
+        settings: Arc<crate::config::RuntimeSettings>,
         max_pending: usize,
-        default_verdict: Verdict,
     ) -> PromptTable {
         PromptTable {
             inner: Mutex::new(Inner::default()),
@@ -100,9 +101,8 @@ impl PromptTable {
             events,
             stats,
             store,
-            timeout,
+            settings,
             max_pending,
-            default_verdict,
         }
     }
 
@@ -110,7 +110,7 @@ impl PromptTable {
     /// answered in time. Also what an explain request reports for a
     /// connection that would raise a prompt.
     pub fn default_verdict(&self) -> Verdict {
-        self.default_verdict
+        self.settings.default_verdict()
     }
 
     /// Whether a client currently holds the prompt-handler slot.
@@ -198,7 +198,11 @@ impl PromptTable {
         }
 
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let deadline_ms = unix_ms_now() + self.timeout.as_millis() as u64;
+        // One read serves both the deadline and the timer below, so a
+        // concurrent settings change cannot arm a timer that disagrees
+        // with the deadline the client was told.
+        let timeout = Duration::from_secs(self.settings.prompt_timeout_secs());
+        let deadline_ms = unix_ms_now() + timeout.as_millis() as u64;
         inner.by_key.insert(key.clone(), id);
         inner.by_id.insert(
             id,
@@ -227,7 +231,7 @@ impl PromptTable {
 
         let table = Arc::clone(self);
         tokio::spawn(async move {
-            tokio::time::sleep(table.timeout).await;
+            tokio::time::sleep(timeout).await;
             table.expire(id);
         });
     }
@@ -442,9 +446,11 @@ impl PromptTable {
     }
 
     /// Resolve packets with the configured default verdict (no handler,
-    /// table overflow, or prompt timeout).
+    /// table overflow, or prompt timeout). Read here, at decision time,
+    /// so a prompt outliving a settings change resolves with the
+    /// operator's latest choice rather than the one it was created under.
     fn finish_default(&self, conn: Connection, packets: Vec<u64>) {
-        self.finish(conn, packets, self.default_verdict, None);
+        self.finish(conn, packets, self.settings.default_verdict(), None);
     }
 }
 
@@ -528,6 +534,7 @@ mod tests {
         verdict_rx: mpsc::UnboundedReceiver<(u64, Verdict)>,
         store: Arc<RuleStore>,
         stats: Arc<Counters>,
+        settings: Arc<crate::config::RuntimeSettings>,
         _dir: crate::testutil::TestDir,
     }
 
@@ -544,20 +551,26 @@ mod tests {
         let store = Arc::new(RuleStore::new(dir.path().to_path_buf()));
         let (verdict_tx, verdict_rx) = mpsc::unbounded_channel();
         let stats = Arc::new(Counters::default());
+        let settings = Arc::new(crate::config::RuntimeSettings::new(
+            hallpass_types::RuntimeConfig {
+                prompt_timeout_secs: 5,
+                default_verdict: default,
+            },
+        ));
         let table = Arc::new(PromptTable::new(
             verdict_tx,
             Arc::new(EventBus::default()),
             Arc::clone(&stats),
             Arc::clone(&store),
-            Duration::from_secs(5),
+            Arc::clone(&settings),
             max_pending,
-            default,
         ));
         Harness {
             table,
             verdict_rx,
             store,
             stats,
+            settings,
             _dir: dir,
         }
     }
@@ -948,6 +961,61 @@ mod tests {
         tokio::time::advance(Duration::from_secs(6)).await;
         assert_eq!(h.verdict_rx.recv().await, Some((9, Verdict::Deny)));
         assert_eq!(prompt_rx.recv().await, Some(DaemonMsg::PromptExpired { id }));
+    }
+
+    /// A runtime settings change: the new timeout arms prompts created
+    /// after it (armed prompts keep their deadline), and the default
+    /// verdict is read when a decision is applied, so a prompt that
+    /// outlives the change resolves with the operator's latest choice.
+    #[tokio::test(start_paused = true)]
+    async fn settings_changes_apply_to_new_prompts_and_pending_defaults() {
+        let mut h = harness("settings", 8, Verdict::Allow);
+        let (tx, mut prompt_rx) = mpsc::channel(16);
+        assert!(h.table.set_handler(tx.clone()));
+
+        // Armed under timeout=5s.
+        h.table.handle_new(conn("/bin/a", "1.1.1.1:443"), 1);
+        let DaemonMsg::PromptRequest { deadline_ms: first_deadline, .. } =
+            prompt_rx.recv().await.unwrap()
+        else {
+            panic!("expected PromptRequest");
+        };
+
+        h.settings
+            .apply(&hallpass_types::RuntimeConfig {
+                prompt_timeout_secs: 60,
+                default_verdict: Verdict::Deny,
+            })
+            .expect("valid settings");
+
+        // A prompt created after the change carries the longer deadline.
+        h.table.handle_new(conn("/bin/b", "2.2.2.2:443"), 2);
+        let DaemonMsg::PromptRequest { deadline_ms: second_deadline, .. } =
+            prompt_rx.recv().await.unwrap()
+        else {
+            panic!("expected PromptRequest");
+        };
+        assert!(
+            second_deadline >= first_deadline + 50_000,
+            "new timeout did not reach new prompts: {first_deadline} vs {second_deadline}"
+        );
+
+        // The first prompt still expires on its original 5s timer, and the
+        // default it resolves with is the one in force now: deny.
+        tokio::time::advance(Duration::from_secs(6)).await;
+        assert_eq!(h.verdict_rx.recv().await, Some((1, Verdict::Deny)));
+
+        // Out-of-range sets are refused and change nothing.
+        let err = h
+            .settings
+            .apply(&hallpass_types::RuntimeConfig {
+                prompt_timeout_secs: 0,
+                default_verdict: Verdict::Allow,
+            })
+            .expect_err("zero timeout must be refused");
+        assert!(err.contains("at least 1"), "{err}");
+        assert_eq!(h.settings.snapshot().prompt_timeout_secs, 60);
+        assert_eq!(h.settings.snapshot().default_verdict, Verdict::Deny);
     }
 
     #[tokio::test]

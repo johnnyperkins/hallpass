@@ -9,7 +9,8 @@ use std::time::Duration;
 use eframe::egui::{self, Color32, RichText};
 use egui_extras::{Column, TableBuilder};
 use hallpass_types::{
-    ClientMsg, ConnEvent, Connection, PromptScope, Rule, RuleDuration, Stats, Verdict,
+    ClientMsg, ConnEvent, Connection, PromptScope, Rule, RuleDuration, RuntimeConfig, Stats,
+    Verdict,
 };
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -43,6 +44,7 @@ enum Tab {
     Traffic,
     Rules,
     Stats,
+    Settings,
 }
 
 /// Connection status shown in the status bar.
@@ -60,23 +62,34 @@ enum ConnStatus {
 enum AckKind {
     RuleSave,
     /// Enable/disable. Kept distinct from `Other` because a rejected
-    /// toggle has to be reconciled against the daemon; see [`needs_refresh`].
+    /// toggle has to be reconciled against the daemon; see [`reconcile_msg`].
     RuleToggle,
     /// Delete, for the same reason.
     RuleDelete,
+    /// Runtime settings change: reconciled by re-reading the settings
+    /// (see [`reconcile_msg`]), and a rejection lands in the settings
+    /// tab, next to its retry.
+    ConfigSet,
     Other,
 }
 
-/// Whether the ack for `kind` must be followed by re-reading the rule list.
+/// The request, if any, whose reply reconciles the screen after the ack
+/// for `kind`.
 ///
-/// Toggles and deletes change what is enforced, and the daemon can refuse
-/// either. Nothing on this side can tell an accepted change from a refused
-/// one without asking, and guessing wrong is not a cosmetic error: a rejected
-/// toggle would leave the operator believing a rule is off while it is still
-/// enforced, and a rejected delete would remove the row for a rule that still
-/// exists. Refetching after both outcomes keeps the screen equal to policy.
-fn needs_refresh(kind: Option<AckKind>) -> bool {
-    matches!(kind, Some(AckKind::RuleToggle) | Some(AckKind::RuleDelete))
+/// Toggles and deletes change what is enforced, a settings change what
+/// will be, and the daemon can refuse any of them. Nothing on this side
+/// can tell an accepted change from a refused one without asking, and
+/// guessing wrong is not a cosmetic error: a rejected toggle would leave
+/// the operator believing a rule is off while it is still enforced, and a
+/// rejected settings change would display a timeout that is not in force.
+/// Refetching after both outcomes keeps the screen equal to policy, so
+/// this runs for Ok and for Err alike.
+fn reconcile_msg(kind: Option<AckKind>) -> Option<ClientMsg> {
+    match kind {
+        Some(AckKind::RuleToggle | AckKind::RuleDelete) => Some(ClientMsg::RuleList),
+        Some(AckKind::ConfigSet) => Some(ClientMsg::ConfigGet),
+        _ => None,
+    }
 }
 
 /// Identity of one decided connection, for telling a replayed event from one
@@ -99,6 +112,7 @@ fn ack_kind(msg: &ClientMsg) -> Option<AckKind> {
         ClientMsg::RuleAdd(_) => Some(AckKind::RuleSave),
         ClientMsg::RuleToggle { .. } => Some(AckKind::RuleToggle),
         ClientMsg::RuleDelete { .. } => Some(AckKind::RuleDelete),
+        ClientMsg::ConfigSet(_) => Some(AckKind::ConfigSet),
         ClientMsg::Subscribe { .. } | ClientMsg::PromptReply { .. } => Some(AckKind::Other),
         _ => None,
     }
@@ -183,6 +197,19 @@ pub struct HallpassApp {
     filter: String,
     /// What the traffic view groups by.
     group_by: traffic::GroupBy,
+    /// Runtime settings as the daemon last reported them. None until it
+    /// has answered once, for the same reason `stats` starts None: the
+    /// settings tab must not display values the daemon never confirmed.
+    daemon_config: Option<RuntimeConfig>,
+    /// The settings form's edited copies, reset to the daemon's values
+    /// whenever a [`hallpass_types::DaemonMsg::Config`] reply lands (Apply
+    /// refetches, so the form always settles on what the daemon actually
+    /// accepted).
+    settings_timeout: String,
+    settings_verdict: Verdict,
+    /// Parse error or daemon rejection for the settings form, shown next
+    /// to its Apply button rather than in the status bar.
+    settings_error: Option<String>,
     /// Popup viewports declared on the previous frame. A viewport id
     /// appearing that was not in here is a window being born, which is
     /// the one moment it gets its focus and attention requests; replaced
@@ -228,6 +255,10 @@ impl HallpassApp {
             editor: None,
             filter: String::new(),
             group_by: traffic::GroupBy::default(),
+            daemon_config: None,
+            settings_timeout: String::new(),
+            settings_verdict: Verdict::Allow,
+            settings_error: None,
             surfaced_popups: std::collections::HashSet::new(),
         }
     }
@@ -263,6 +294,10 @@ impl HallpassApp {
                     });
                     self.send(ClientMsg::RuleList);
                     self.send(ClientMsg::Stats);
+                    // The settings too: a daemon restarted between
+                    // connections may hold different values, and the
+                    // settings tab must not keep showing the old ones.
+                    self.send(ClientMsg::ConfigGet);
                     // Backfill: the subscription above only carries what
                     // happens next, so a window opened after the traffic
                     // would show an apparently idle machine. Requested after
@@ -306,6 +341,7 @@ impl HallpassApp {
                         ClientMsg::RuleAdd(_) => "a rule change",
                         ClientMsg::RuleDelete { .. } => "a rule deletion",
                         ClientMsg::RuleToggle { .. } => "a rule toggle",
+                        ClientMsg::ConfigSet(_) => "a settings change",
                         _ => "a request",
                     };
                     self.last_error =
@@ -355,6 +391,14 @@ impl HallpassApp {
             }
             DaemonMsg::Rules(rules) => self.rules = rules,
             DaemonMsg::Stats(stats) => self.stats = Some(stats),
+            // The settings form always settles on what the daemon actually
+            // holds: every reply resets the drafts, and Apply refetches, so
+            // the form cannot keep displaying an edit the daemon refused.
+            DaemonMsg::Config(cfg) => {
+                self.daemon_config = Some(cfg);
+                self.settings_timeout = cfg.prompt_timeout_secs.to_string();
+                self.settings_verdict = cfg.default_verdict;
+            }
             // Replies arrive in request order on the one IPC stream;
             // `pending_acks` records what each was for, so a save's ack
             // is told apart from a toggle's or a prompt reply's: keep
@@ -364,10 +408,17 @@ impl HallpassApp {
                 let kind = self.link.pending_acks.lock().unwrap().pop_front();
                 match (kind, self.editor.as_mut().filter(|e| e.awaiting_ack())) {
                     (Some(AckKind::RuleSave), Some(editor)) => editor.ack_err(&message),
+                    // A refused settings change belongs next to the Apply
+                    // that retries it, like a refused rule save belongs in
+                    // the editor.
+                    (Some(AckKind::ConfigSet), _) => {
+                        self.settings_error =
+                            Some(format!("daemon rejected the change: {}", prompt::ui_text(&message)));
+                    }
                     _ => self.last_error = Some(message),
                 }
-                if needs_refresh(kind) {
-                    self.send(ClientMsg::RuleList);
+                if let Some(refetch) = reconcile_msg(kind) {
+                    self.send(refetch);
                 }
             }
             DaemonMsg::Ok => {
@@ -377,8 +428,11 @@ impl HallpassApp {
                 {
                     self.editor = None;
                 }
-                if needs_refresh(kind) {
-                    self.send(ClientMsg::RuleList);
+                if kind == Some(AckKind::ConfigSet) {
+                    self.settings_error = None;
+                }
+                if let Some(refetch) = reconcile_msg(kind) {
+                    self.send(refetch);
                 }
             }
             // The daemon took the prompt slot back because prompts sent here
@@ -489,6 +543,9 @@ impl HallpassApp {
                 // stats, so opening Traffic refreshes them rather than
                 // showing whatever was current when the window last did.
                 Tab::Stats | Tab::Traffic => self.send(ClientMsg::Stats),
+                // Re-read on open: another client may have changed the
+                // settings since this window last looked.
+                Tab::Settings => self.send(ClientMsg::ConfigGet),
                 Tab::Events => {}
             }
         }
@@ -521,6 +578,7 @@ impl HallpassApp {
                     (Tab::Traffic, "Traffic"),
                     (Tab::Rules, "Rules"),
                     (Tab::Stats, "Stats"),
+                    (Tab::Settings, "Settings"),
                 ] {
                     if ui.selectable_label(self.tab == tab, label).clicked() {
                         self.select_tab(tab);
@@ -574,6 +632,7 @@ impl HallpassApp {
                 Tab::Traffic => self.traffic_tab(ui),
                 Tab::Rules => self.rules_tab(ui),
                 Tab::Stats => self.stats_tab(ui),
+                Tab::Settings => self.settings_tab(ui),
             }
         });
     }
@@ -904,6 +963,80 @@ impl HallpassApp {
             ui.monospace(format_uptime(s.uptime_secs));
             ui.end_row();
         });
+    }
+
+    /// The runtime-settings form: prompt timeout and default action.
+    ///
+    /// Edits go to the daemon and nowhere else; the displayed values are
+    /// whatever it last reported, and Apply's ack refetches them, so the
+    /// form cannot show a change the daemon refused (the same rule the
+    /// rules tab follows). A change lasts until the daemon restarts:
+    /// config.toml stays the operator's file, and the form says so
+    /// instead of pretending to persist.
+    fn settings_tab(&mut self, ui: &mut egui::Ui) {
+        let Some(current) = self.daemon_config else {
+            ui.label("Waiting for the daemon...");
+            return;
+        };
+        egui::Grid::new("settings_grid")
+            .num_columns(2)
+            .spacing([8.0, 6.0])
+            .show(ui, |ui| {
+                ui.label("Prompt timeout (seconds)")
+                    .on_hover_text("How long a prompt waits before the default action applies");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.settings_timeout).desired_width(80.0),
+                );
+                ui.end_row();
+
+                ui.label("Default action").on_hover_text(
+                    "Applied when no rule matches and nobody answers the prompt in time",
+                );
+                egui::ComboBox::from_id_salt("settings-default-verdict")
+                    .selected_text(verdict_label(self.settings_verdict))
+                    .show_ui(ui, |ui| {
+                        for v in [Verdict::Allow, Verdict::Deny, Verdict::Reject] {
+                            ui.selectable_value(&mut self.settings_verdict, v, verdict_label(v));
+                        }
+                    });
+                ui.end_row();
+            });
+        ui.add_space(6.0);
+        if let Some(err) = &self.settings_error {
+            ui.colored_label(DENY_COLOR, err);
+            ui.add_space(6.0);
+        }
+        ui.horizontal(|ui| {
+            if ui.button("Apply").clicked() {
+                match self.settings_timeout.trim().parse::<u64>() {
+                    Ok(prompt_timeout_secs) => {
+                        self.settings_error = None;
+                        self.send(ClientMsg::ConfigSet(RuntimeConfig {
+                            prompt_timeout_secs,
+                            default_verdict: self.settings_verdict,
+                        }));
+                    }
+                    Err(_) => {
+                        self.settings_error =
+                            Some("prompt timeout must be a number of seconds".to_string());
+                    }
+                }
+            }
+            if ui.button("Revert").clicked() {
+                self.settings_timeout = current.prompt_timeout_secs.to_string();
+                self.settings_verdict = current.default_verdict;
+                self.settings_error = None;
+            }
+        });
+        ui.add_space(10.0);
+        ui.label(
+            RichText::new(
+                "Changes apply immediately and last until the daemon restarts; \
+                 make them permanent in /etc/hallpass/config.toml. Prompts already \
+                 on screen keep the deadline they were created with.",
+            )
+            .small(),
+        );
     }
 
     // ---- prompt popups ---------------------------------------------------

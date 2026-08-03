@@ -69,16 +69,18 @@ const SCENARIOS: &[Scenario] = &[
 
 /// Start the generator. One task, stopped only by the process exiting.
 ///
-/// `default_verdict` stands in for the prompt a real unmatched connection
+/// The default verdict stands in for the prompt a real unmatched connection
 /// would raise: there is no held packet here to release, and no client is
 /// guaranteed to be attached, so an unmatched connection records what an
 /// unanswered prompt would have produced. Observe mode does the same thing
-/// on the real path.
+/// on the real path. It is read per decision from the runtime settings, so
+/// changing the default in the GUI's settings tab moves the next fixture
+/// decisions - which is exactly the loop `xtask dev` exists to exercise.
 pub fn spawn(
     events: Arc<EventBus>,
     stats: Arc<Counters>,
     rules: Arc<RuleStore>,
-    default_verdict: Verdict,
+    settings: Arc<crate::config::RuntimeSettings>,
 ) {
     tracing::warn!(
         "dev-fixtures: emitting synthetic connection events, this build is not fit for a real host"
@@ -115,7 +117,7 @@ pub fn spawn(
             // match, and asking for one would read a file that is not there.
             let (verdict, rule_name) = match rules.ruleset().match_conn(&conn, None) {
                 Some((rule, verdict)) => (verdict, Some(rule.name.clone())),
-                None => (default_verdict, None),
+                None => (settings.default_verdict(), None),
             };
             if let Some(name) = &rule_name {
                 rules.record_hit(name);

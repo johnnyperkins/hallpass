@@ -63,10 +63,11 @@ pub struct QueueDeps {
     /// False in observe mode: policy is evaluated and every decision is
     /// recorded, but the packet is accepted whatever the verdict says.
     pub enforcing: bool,
-    /// Verdict recorded for an unmatched connection in observe mode, where
-    /// nothing is held for a prompt. Matches what the prompt path would
-    /// apply if nobody answered.
-    pub default_verdict: Verdict,
+    /// Source of the default verdict recorded for an unmatched connection
+    /// in observe mode, where nothing is held for a prompt. Read per
+    /// decision so it matches what the prompt path would apply if nobody
+    /// answered, including after a runtime settings change.
+    pub settings: Arc<crate::config::RuntimeSettings>,
     pub shutdown: Arc<AtomicBool>,
     /// Signalled when the loop dies on a persistent error, so the daemon
     /// shuts down (and tears nftables down) instead of running on looking
@@ -314,7 +315,7 @@ pub fn run(mut queue: Queue, queue_num: u16, mut deps: QueueDeps) -> std::io::Re
                     // configured default instead, which is what an
                     // unanswered prompt resolves to anyway.
                     Decision::Prompt(conn) if !deps.enforcing => {
-                        commit(&mut queue, msg, deps.default_verdict, None, conn, &deps);
+                        commit(&mut queue, msg, deps.settings.default_verdict(), None, conn, &deps);
                     }
                     Decision::Prompt(conn) => {
                         let seq = next_seq;

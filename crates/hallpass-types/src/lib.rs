@@ -30,7 +30,15 @@ use serde::{Deserialize, Serialize};
 /// `prompt_handlers_evicted`) and the [`DaemonMsg::PromptHandlerRevoked`]
 /// variant. Same split as v3: the appended variant would have been free, the
 /// struct fields are what forces the bump.
-pub const PROTOCOL_VERSION: u32 = 4;
+///
+/// v5: runtime settings. [`ClientMsg::ConfigGet`], [`ClientMsg::ConfigSet`]
+/// and [`DaemonMsg::Config`], all appended variants. Bumped anyway, unlike
+/// the appended pairs in v3: a v4 daemon cannot decode a `ConfigGet` frame
+/// at all (an out-of-range variant index fails the read), which would tear
+/// down the connection carrying this client's prompts the first time the
+/// settings tab is opened. The exact-match handshake turns that mid-session
+/// break into a clean refusal at connect.
+pub const PROTOCOL_VERSION: u32 = 5;
 
 /// Transport-layer protocol of a connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -815,6 +823,29 @@ pub struct Explanation {
     pub trace: Vec<RuleTrace>,
 }
 
+/// The daemon settings a client may read and change at runtime.
+///
+/// Deliberately the two knobs the prompt path runs on and nothing more:
+/// everything else in the daemon's config (socket path, queue number, rules
+/// directory, bypass posture) shapes startup and cannot be re-applied to a
+/// running process without re-doing startup.
+///
+/// A change applies from the moment the daemon accepts it and lasts until
+/// the daemon restarts; it is not written back to config.toml, which stays
+/// the operator's file. Prompts already on screen keep the deadline that
+/// was armed when they were created - the daemon holds their packets, and
+/// stretching that window retroactively is not a client's call - so a new
+/// timeout is first visible on the next prompt. The default verdict is
+/// read when a decision is actually made, so a prompt that times out after
+/// a change resolves with the operator's latest choice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeConfig {
+    /// Seconds an interactive prompt waits before the default applies.
+    pub prompt_timeout_secs: u64,
+    /// Verdict applied when no rule matches and no prompt reply arrives.
+    pub default_verdict: Verdict,
+}
+
 /// Scope of the rule generated from an interactive prompt reply.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -896,6 +927,14 @@ pub enum ClientMsg {
     /// Ask what policy would do with a hypothetical connection. Answered
     /// with [`DaemonMsg::Explanation`].
     Explain(ExplainRequest),
+    /// Request the current runtime settings. Answered with
+    /// [`DaemonMsg::Config`].
+    ConfigGet,
+    /// Change the runtime settings, until the daemon restarts. Answered
+    /// with Ok, or Err when a value is out of range (the same bounds the
+    /// config file enforces). See [`RuntimeConfig`] for what a change
+    /// means for prompts already on screen.
+    ConfigSet(RuntimeConfig),
 }
 
 /// Messages sent from the daemon to a client.
@@ -956,4 +995,8 @@ pub enum DaemonMsg {
     /// on the next round trip, which is what keeps this from punishing an
     /// operator who simply stepped away from the keyboard.
     PromptHandlerRevoked,
+    /// Response to [`ClientMsg::ConfigGet`]: the settings currently in
+    /// effect, whichever of the config file and later `ConfigSet`s put
+    /// them there.
+    Config(RuntimeConfig),
 }

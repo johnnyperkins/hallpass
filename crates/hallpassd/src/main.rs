@@ -31,7 +31,6 @@ mod testutil;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
 
 use tokio::signal::unix::{signal, SignalKind};
 
@@ -183,14 +182,18 @@ async fn main() {
     // way) rather than keep queueing traffic nobody drains.
     let (fatal_tx, mut fatal_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
 
+    // The prompt timeout and default verdict, changeable over IPC for as
+    // long as the process lives; the config file remains the state a
+    // restart returns to.
+    let settings = Arc::new(config::RuntimeSettings::new(cfg.runtime()));
+
     let prompts = Arc::new(PromptTable::new(
         verdict_tx,
         Arc::clone(&events),
         Arc::clone(&counters),
         Arc::clone(&store),
-        Duration::from_secs(cfg.prompt_timeout_secs),
+        Arc::clone(&settings),
         cfg.max_pending_prompts,
-        cfg.default_verdict,
     ));
 
     // DNS snoop consumer: record outbound queries, then only absorb
@@ -264,7 +267,7 @@ async fn main() {
                 exe_hash: Arc::new(attribution::hash::ExeHashCache::default()),
                 unhandled_verdict: cfg.unhandled_proto_verdict,
                 enforcing,
-                default_verdict: cfg.default_verdict,
+                settings: Arc::clone(&settings),
                 shutdown: Arc::clone(&shutdown),
                 fatal_tx,
             },
@@ -318,7 +321,7 @@ async fn main() {
             Arc::clone(&events),
             Arc::clone(&counters),
             Arc::clone(&store),
-            cfg.default_verdict,
+            Arc::clone(&settings),
         );
     }
 
@@ -328,6 +331,7 @@ async fn main() {
         prompts,
         events,
         stats: counters,
+        settings,
     });
     let ipc_task = tokio::spawn(async move {
         if let Err(e) = ipc::server::serve(ipc_listener, ipc_deps).await {

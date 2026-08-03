@@ -24,6 +24,7 @@ pub struct IpcDeps {
     pub prompts: Arc<PromptTable>,
     pub events: Arc<EventBus>,
     pub stats: Arc<Counters>,
+    pub settings: Arc<crate::config::RuntimeSettings>,
 }
 
 /// Look up a group's GID in /etc/group.
@@ -376,6 +377,18 @@ async fn message_loop(
             }
             ClientMsg::RuleStats => DaemonMsg::RuleHits(deps.store.hits()),
             ClientMsg::Explain(req) => DaemonMsg::Explanation(explain(&req, deps)),
+            ClientMsg::ConfigGet => DaemonMsg::Config(deps.settings.snapshot()),
+            ClientMsg::ConfigSet(new) => {
+                // Logged like a rule change: it is one. Anything on this
+                // socket is already trusted with policy (it can write an
+                // allow rule outright), so the settings are not a wider
+                // grant; the log line is what makes the change auditable.
+                tracing::info!(?peer_uid, ?new, "runtime settings change");
+                match deps.settings.apply(&new) {
+                    Ok(()) => DaemonMsg::Ok,
+                    Err(message) => DaemonMsg::Err { message },
+                }
+            }
         };
         send(out_tx, reply).await;
     }
@@ -434,15 +447,20 @@ mod tests {
         let store = Arc::new(RuleStore::new(dir.path().join("rules")));
         let events = Arc::new(EventBus::default());
         let stats = Arc::new(Counters::default());
+        let settings = Arc::new(crate::config::RuntimeSettings::new(
+            hallpass_types::RuntimeConfig {
+                prompt_timeout_secs: 5,
+                default_verdict: Verdict::Allow,
+            },
+        ));
         let (verdict_tx, _verdict_rx) = mpsc::unbounded_channel();
         let prompts = Arc::new(PromptTable::new(
             verdict_tx,
             Arc::clone(&events),
             Arc::clone(&stats),
             Arc::clone(&store),
-            Duration::from_secs(5),
+            Arc::clone(&settings),
             8,
-            Verdict::Allow,
         ));
         (
             Arc::new(IpcDeps {
@@ -450,6 +468,7 @@ mod tests {
                 prompts,
                 events,
                 stats,
+                settings,
             }),
             dir,
         )
@@ -509,6 +528,69 @@ mod tests {
             DaemonMsg::Stats(s) => assert_eq!(s.rules_loaded, 1),
             other => panic!("expected stats, got {other:?}"),
         }
+    }
+
+    /// The runtime-settings round trip: get reports the config values, a
+    /// valid set changes what the next get reports, an invalid one is
+    /// refused and changes nothing.
+    #[tokio::test]
+    async fn config_get_and_set_roundtrip() {
+        let (deps, dir) = test_deps("config");
+        let sock = dir.path().join("test.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        let server_deps = Arc::clone(&deps);
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let _ = handle_conn(stream, server_deps).await;
+        });
+
+        let mut c = client(&sock).await;
+        wire::write_msg(&mut c, &ClientMsg::Hello { version: PROTOCOL_VERSION })
+            .await
+            .unwrap();
+        let _: DaemonMsg = wire::read_msg(&mut c).await.unwrap();
+
+        wire::write_msg(&mut c, &ClientMsg::ConfigGet).await.unwrap();
+        assert_eq!(
+            wire::read_msg::<DaemonMsg, _>(&mut c).await.unwrap(),
+            DaemonMsg::Config(hallpass_types::RuntimeConfig {
+                prompt_timeout_secs: 5,
+                default_verdict: Verdict::Allow,
+            })
+        );
+
+        let new = hallpass_types::RuntimeConfig {
+            prompt_timeout_secs: 30,
+            default_verdict: Verdict::Deny,
+        };
+        wire::write_msg(&mut c, &ClientMsg::ConfigSet(new)).await.unwrap();
+        assert_eq!(wire::read_msg::<DaemonMsg, _>(&mut c).await.unwrap(), DaemonMsg::Ok);
+        wire::write_msg(&mut c, &ClientMsg::ConfigGet).await.unwrap();
+        assert_eq!(
+            wire::read_msg::<DaemonMsg, _>(&mut c).await.unwrap(),
+            DaemonMsg::Config(new)
+        );
+
+        // Out of range: refused with the same bounds the config file has,
+        // and the settings stay where the last valid set put them.
+        wire::write_msg(
+            &mut c,
+            &ClientMsg::ConfigSet(hallpass_types::RuntimeConfig {
+                prompt_timeout_secs: 3601,
+                default_verdict: Verdict::Allow,
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            wire::read_msg::<DaemonMsg, _>(&mut c).await.unwrap(),
+            DaemonMsg::Err { .. }
+        ));
+        wire::write_msg(&mut c, &ClientMsg::ConfigGet).await.unwrap();
+        assert_eq!(
+            wire::read_msg::<DaemonMsg, _>(&mut c).await.unwrap(),
+            DaemonMsg::Config(new)
+        );
     }
 
     #[tokio::test]

@@ -1,8 +1,10 @@
-//! Daemon configuration: /etc/hallpass/config.toml plus a --config override.
+//! Daemon configuration: /etc/hallpass/config.toml plus a --config override,
+//! and the two knobs of it that clients may change over IPC at runtime.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 
-use hallpass_types::Verdict;
+use hallpass_types::{RuntimeConfig, Verdict};
 use serde::Deserialize;
 
 /// Default location of the daemon config file.
@@ -138,7 +140,112 @@ impl Default for Config {
     }
 }
 
+/// The settings clients may change over IPC, shared by everything that
+/// reads them: the prompt table (deadline and timer for each new prompt,
+/// verdict for each unanswered one), the queue thread (observe-mode
+/// unmatched connections), and the IPC server (get/set).
+///
+/// Runtime-only on purpose. config.toml is the operator's file - hand
+/// formatted, commented, root-owned - and a daemon rewriting it to persist
+/// a GUI toggle would destroy that; a restart returns to the file.
+///
+/// Atomics rather than one mutex, and not for speed: the verdict thread
+/// reads these, and the architecture promises it shares exactly one lock
+/// with the tokio side (the event-history mutex, see ARCHITECTURE.md
+/// "Threads and tasks"); a settings lock would quietly make that two.
+/// Each value is read independently at its use site, and the two do not
+/// need to change as one: a torn Get between the two stores of a Set
+/// reports a state the daemon really passed through. A future knob that
+/// must change atomically with another breaks this scheme; that is the
+/// point to revisit, not to extend.
+pub struct RuntimeSettings {
+    prompt_timeout_secs: AtomicU64,
+    /// A [`Verdict`] via [`verdict_to_u8`]; atomics do not hold enums.
+    default_verdict: AtomicU8,
+}
+
+fn verdict_to_u8(v: Verdict) -> u8 {
+    match v {
+        Verdict::Allow => 0,
+        Verdict::Deny => 1,
+        Verdict::Reject => 2,
+    }
+}
+
+fn verdict_from_u8(v: u8) -> Verdict {
+    match v {
+        0 => Verdict::Allow,
+        1 => Verdict::Deny,
+        // Unreachable while every store goes through verdict_to_u8; mapped
+        // rather than panicked because this runs on the verdict thread.
+        _ => Verdict::Reject,
+    }
+}
+
+impl RuntimeSettings {
+    pub fn new(initial: RuntimeConfig) -> RuntimeSettings {
+        RuntimeSettings {
+            prompt_timeout_secs: AtomicU64::new(initial.prompt_timeout_secs),
+            default_verdict: AtomicU8::new(verdict_to_u8(initial.default_verdict)),
+        }
+    }
+
+    /// Seconds a new prompt waits before the default verdict applies.
+    /// Prompts already armed keep the value they were created under.
+    pub fn prompt_timeout_secs(&self) -> u64 {
+        self.prompt_timeout_secs.load(Ordering::Relaxed)
+    }
+
+    /// Verdict for a connection nobody decided, read at decision time.
+    pub fn default_verdict(&self) -> Verdict {
+        verdict_from_u8(self.default_verdict.load(Ordering::Relaxed))
+    }
+
+    /// Both settings, for [`hallpass_types::ClientMsg::ConfigGet`].
+    pub fn snapshot(&self) -> RuntimeConfig {
+        RuntimeConfig {
+            prompt_timeout_secs: self.prompt_timeout_secs(),
+            default_verdict: self.default_verdict(),
+        }
+    }
+
+    /// Apply a client's change, holding it to the same bounds the config
+    /// file is held to. `Err` is a message for that client; nothing is
+    /// changed by a rejected set.
+    pub fn apply(&self, new: &RuntimeConfig) -> Result<(), String> {
+        validate_prompt_timeout(new.prompt_timeout_secs)?;
+        self.prompt_timeout_secs
+            .store(new.prompt_timeout_secs, Ordering::Relaxed);
+        self.default_verdict
+            .store(verdict_to_u8(new.default_verdict), Ordering::Relaxed);
+        Ok(())
+    }
+}
+
+/// The prompt-timeout bounds, shared by the config file and runtime sets so
+/// the two paths cannot drift apart.
+fn validate_prompt_timeout(secs: u64) -> Result<(), String> {
+    if secs == 0 {
+        return Err("prompt_timeout_secs must be at least 1".into());
+    }
+    // The prompt table turns this into a millisecond deadline; keep it
+    // far away from any range where that arithmetic could truncate.
+    if secs > 3600 {
+        return Err("prompt_timeout_secs must be at most 3600".into());
+    }
+    Ok(())
+}
+
 impl Config {
+    /// The subset of this config that stays changeable while the daemon
+    /// runs; the seed for [`RuntimeSettings`].
+    pub fn runtime(&self) -> RuntimeConfig {
+        RuntimeConfig {
+            prompt_timeout_secs: self.prompt_timeout_secs,
+            default_verdict: self.default_verdict,
+        }
+    }
+
     /// Load config from `arg`. A malformed file is always a hard error, and
     /// so is a missing one that `--config` named explicitly.
     ///
@@ -165,14 +272,7 @@ impl Config {
 
     /// Reject values that would render the daemon useless.
     fn validate(&self) -> Result<(), String> {
-        if self.prompt_timeout_secs == 0 {
-            return Err("prompt_timeout_secs must be at least 1".into());
-        }
-        // The prompt table turns this into a millisecond deadline; keep it
-        // far away from any range where that arithmetic could truncate.
-        if self.prompt_timeout_secs > 3600 {
-            return Err("prompt_timeout_secs must be at most 3600".into());
-        }
+        validate_prompt_timeout(self.prompt_timeout_secs)?;
         if self.max_pending_prompts == 0 {
             return Err("max_pending_prompts must be at least 1".into());
         }
