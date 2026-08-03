@@ -176,9 +176,6 @@ pub struct HallpassApp {
     /// trustworthy, so it is only made once the daemon has made it.
     stats: Option<Stats>,
     last_error: Option<String>,
-    /// Set by the Quit button; lets the main viewport actually close instead
-    /// of hiding.
-    quit_requested: bool,
     /// Open rule add/edit form, if any.
     editor: Option<RuleEditor>,
     /// Free-text filter applied to the event feed and the traffic view.
@@ -227,7 +224,6 @@ impl HallpassApp {
             rules: Vec::new(),
             stats: None,
             last_error: None,
-            quit_requested: false,
             editor: None,
             filter: String::new(),
             group_by: traffic::GroupBy::default(),
@@ -468,6 +464,20 @@ impl HallpassApp {
         }
     }
 
+    /// Answer every prompt still on screen before the process exits.
+    ///
+    /// Leaving with prompts open abandons them the same way closing their
+    /// window does, so it answers them the same way (deny, once). Best
+    /// effort by nature: the replies are queued to the network thread and
+    /// the process may exit before it writes them, in which case the
+    /// daemon's timeout still decides. Queuing them costs nothing and is
+    /// right whenever it wins.
+    fn abandon_open_prompts(&mut self) {
+        let pending: Vec<u64> =
+            self.prompts.lock().unwrap().pending.iter().map(|p| p.id).collect();
+        self.dismiss_prompts(pending);
+    }
+
     fn select_tab(&mut self, tab: Tab) {
         if self.tab != tab {
             self.tab = tab;
@@ -487,11 +497,18 @@ impl HallpassApp {
 
     fn main_window(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
-        // Closing the main window hides it; prompt popups keep working.
-        // Quit (from the status bar) really exits.
-        if ctx.input(|i| i.viewport().close_requested()) && !self.quit_requested {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        // Closing the main window quits, exactly like Quit. It used to hide
+        // the window so popups kept serving, but an app that survives its
+        // own close button is a surprise, not a feature. The cost is stated
+        // where it is paid: quitting releases the prompt-handler slot, and
+        // every later unmatched connection takes the daemon's default
+        // verdict with nothing on screen; the prompts still open are
+        // denied-once first rather than left to time out. The dismissal is
+        // idempotent (ids no longer pending are skipped), so re-running on
+        // the teardown frames costs nothing; any future exit path (a tray
+        // item, a quit accelerator) must abandon open prompts the same way.
+        if ctx.input(|i| i.viewport().close_requested()) {
+            self.abandon_open_prompts();
         }
 
         egui::Panel::top("tabs").show(ui, |ui| {
@@ -533,17 +550,7 @@ impl HallpassApp {
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("Quit").clicked() {
-                        self.quit_requested = true;
-                        // Leaving with prompts on screen abandons them the
-                        // same way closing their window does, so it answers
-                        // them the same way. Best effort by nature: the
-                        // replies are queued to the network thread and the
-                        // process may exit before it writes them, in which
-                        // case the daemon's timeout still decides. Queuing
-                        // them costs nothing and is right whenever it wins.
-                        let pending: Vec<u64> =
-                            self.prompts.lock().unwrap().pending.iter().map(|p| p.id).collect();
-                        self.dismiss_prompts(pending);
+                        self.abandon_open_prompts();
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     }
                 });

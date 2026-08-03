@@ -208,7 +208,6 @@ fn quitting_denies_the_prompts_left_on_screen() {
         (1..=2).map(prompt::close_reply).collect::<Vec<_>>(),
         "quitting left prompts to the daemon's default verdict"
     );
-    assert!(harness.state().quit_requested);
     assert!(harness.state().prompt_ids().is_empty());
 }
 
@@ -236,6 +235,34 @@ fn editor_save_stays_reachable_on_a_short_viewport() {
         drain(&mut from_ui).is_empty(),
         "an invalid form must not reach the daemon"
     );
+}
+
+/// The main window's close button quits like Quit does: the prompts still
+/// on screen are denied-once rather than abandoned to the daemon's timeout,
+/// and the close is not cancelled. (It used to hide the window instead; the
+/// user experienced that as the close button not working.)
+#[test]
+fn closing_the_main_window_quits_and_answers_open_prompts() {
+    let (app, mut from_ui) = app_with_prompts(2);
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(820.0, 520.0))
+        .build_ui_state(|ui, app: &mut HallpassApp| app.main_window(ui), app);
+
+    harness
+        .input_mut()
+        .viewports
+        .entry(egui::ViewportId::ROOT)
+        .or_default()
+        .events
+        .push(egui::ViewportEvent::Close);
+    harness.step();
+
+    assert_eq!(
+        drain(&mut from_ui),
+        (1..=2).map(prompt::close_reply).collect::<Vec<_>>(),
+        "closing the window left prompts to the daemon's default verdict"
+    );
+    assert!(harness.state().prompt_ids().is_empty());
 }
 
 /// The checkbox in the rules list asks the daemon; it does not edit the row.
