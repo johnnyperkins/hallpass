@@ -38,7 +38,11 @@ use serde::{Deserialize, Serialize};
 /// down the connection carrying this client's prompts the first time the
 /// settings tab is opened. The exact-match handshake turns that mid-session
 /// break into a clean refusal at connect.
-pub const PROTOCOL_VERSION: u32 = 5;
+///
+/// v6: runtime mode. [`RuntimeConfig::enforce`] turns observe mode into a
+/// runtime setting instead of a startup-only one; the struct field is what
+/// forces the bump, as in v2.
+pub const PROTOCOL_VERSION: u32 = 6;
 
 /// Transport-layer protocol of a connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -825,10 +829,10 @@ pub struct Explanation {
 
 /// The daemon settings a client may read and change at runtime.
 ///
-/// Deliberately the two knobs the prompt path runs on and nothing more:
-/// everything else in the daemon's config (socket path, queue number, rules
-/// directory, bypass posture) shapes startup and cannot be re-applied to a
-/// running process without re-doing startup.
+/// Deliberately the knobs the verdict and prompt paths run on and nothing
+/// more: everything else in the daemon's config (socket path, queue number,
+/// rules directory, bypass posture) shapes startup and cannot be re-applied
+/// to a running process without re-doing startup.
 ///
 /// A change applies from the moment the daemon accepts it and lasts until
 /// the daemon restarts; it is not written back to config.toml, which stays
@@ -844,6 +848,11 @@ pub struct RuntimeConfig {
     pub prompt_timeout_secs: u64,
     /// Verdict applied when no rule matches and no prompt reply arrives.
     pub default_verdict: Verdict,
+    /// False in observe mode: policy is evaluated and every decision is
+    /// recorded ([`ConnEvent::enforced`] says so), but every packet is let
+    /// through. Applied from the moment the daemon accepts the change,
+    /// including to packets already held for a prompt reply.
+    pub enforce: bool,
 }
 
 /// Scope of the rule generated from an interactive prompt reply.

@@ -60,13 +60,11 @@ pub struct QueueDeps {
     pub exe_hash: Arc<ExeHashCache>,
     /// Verdict for packets rules cannot model (SCTP, ICMP, malformed).
     pub unhandled_verdict: Verdict,
-    /// False in observe mode: policy is evaluated and every decision is
-    /// recorded, but the packet is accepted whatever the verdict says.
-    pub enforcing: bool,
-    /// Source of the default verdict recorded for an unmatched connection
-    /// in observe mode, where nothing is held for a prompt. Read per
-    /// decision so it matches what the prompt path would apply if nobody
-    /// answered, including after a runtime settings change.
+    /// Source of the mode (enforce/observe) and of the default verdict
+    /// recorded for an observe-mode unmatched connection, where nothing is
+    /// held for a prompt. Both read per decision so a runtime settings
+    /// change covers the next packet, including one already held for a
+    /// prompt reply.
     pub settings: Arc<crate::config::RuntimeSettings>,
     pub shutdown: Arc<AtomicBool>,
     /// Signalled when the loop dies on a persistent error, so the daemon
@@ -117,8 +115,13 @@ fn applied_verdict(verdict: Verdict, enforcing: bool) -> Verdict {
 ///
 /// The verdict that is recorded and the verdict that is applied are the same
 /// thing only while enforcing. In observe mode the packet is always accepted,
-/// so the event carries what policy decided (marked unenforced by the event
-/// bus) and the operator gets the rollout number without the outage.
+/// so the event carries what policy decided (stamped unenforced) and the
+/// operator gets the rollout number without the outage.
+///
+/// `enforcing` is the caller's one read for the whole packet: the guard that
+/// skipped the prompt, this count, the event stamp and the application all
+/// see the same mode, so a toggle landing mid-decision cannot make them
+/// disagree about what happened to it.
 fn commit(
     queue: &mut Queue,
     msg: nfq::Message,
@@ -126,16 +129,17 @@ fn commit(
     rule_name: Option<String>,
     conn: Connection,
     deps: &QueueDeps,
+    enforcing: bool,
 ) {
     deps.stats.record_verdict(verdict);
     if let Some(name) = &rule_name {
         deps.rules.record_hit(name);
     }
-    if !deps.enforcing && verdict != Verdict::Allow {
+    if !enforcing && verdict != Verdict::Allow {
         deps.stats.record_observed_only();
     }
-    deps.events.emit(conn, verdict, rule_name);
-    apply_verdict(queue, msg, applied_verdict(verdict, deps.enforcing));
+    deps.events.emit(conn, verdict, rule_name, enforcing);
+    apply_verdict(queue, msg, applied_verdict(verdict, enforcing));
 }
 
 /// What to do with one received flow packet.
@@ -220,11 +224,16 @@ pub fn run(mut queue: Queue, queue_num: u16, mut deps: QueueDeps) -> std::io::Re
         while let Ok((seq, verdict)) = deps.verdict_rx.try_recv() {
             busy = true;
             if let Some(msg) = held.remove(&seq) {
-                // Through the helper like every other policy verdict. A
-                // packet only reaches here while enforcing (observe mode
-                // never holds one), so this is a no-op today and exists so
-                // that stays true if observe mode ever does hold a packet.
-                apply_verdict(&mut queue, msg, applied_verdict(verdict, deps.enforcing));
+                // Through the helper like every other policy verdict, with
+                // the mode read now, not when the packet was held: a packet
+                // is only held while enforcing, but the mode can flip while
+                // it waits, and "observe blocks nothing" is promised from
+                // the moment of the toggle.
+                apply_verdict(
+                    &mut queue,
+                    msg,
+                    applied_verdict(verdict, deps.settings.enforcing()),
+                );
             }
         }
 
@@ -254,13 +263,20 @@ pub fn run(mut queue: Queue, queue_num: u16, mut deps: QueueDeps) -> std::io::Re
                 // Transports the rule engine does not model (SCTP, ICMP,
                 // ...) and unparsable packets are never silently accepted:
                 // they are counted and resolved by the configured policy.
+                // One mode read governs this whole packet: the unhandled
+                // branch's log line and application, the prompt guard, and
+                // everything inside `commit`. Reading again at each site
+                // would let a toggle land between two of them and make the
+                // record disagree with what was done.
+                let enforcing = deps.settings.enforcing();
+
                 let packet::Parsed::Flow(tuple) = parsed else {
                     deps.stats.record_other_proto();
                     // These carry no Connection, so there is no event to
                     // emit and observe mode can only note it in the log.
                     if deps.unhandled_verdict == Verdict::Allow {
                         tracing::debug!(?parsed, "unhandled packet allowed by policy");
-                    } else if deps.enforcing {
+                    } else if enforcing {
                         // Blocked traffic must be findable without debug
                         // logging: this is the only trace of e.g. a dead
                         // ping under the hardened policy.
@@ -284,7 +300,7 @@ pub fn run(mut queue: Queue, queue_num: u16, mut deps: QueueDeps) -> std::io::Re
                             "observe mode: unhandled packet would be blocked by policy"
                         );
                     }
-                    let applied = applied_verdict(deps.unhandled_verdict, deps.enforcing);
+                    let applied = applied_verdict(deps.unhandled_verdict, enforcing);
                     apply_verdict(&mut queue, msg, applied);
                     continue;
                 };
@@ -306,7 +322,7 @@ pub fn run(mut queue: Queue, queue_num: u16, mut deps: QueueDeps) -> std::io::Re
                 };
                 match decide(tuple, iface, &ctx) {
                     Decision::Verdict(verdict, rule_name, conn) => {
-                        commit(&mut queue, msg, verdict, Some(rule_name), conn, &deps);
+                        commit(&mut queue, msg, verdict, Some(rule_name), conn, &deps, enforcing);
                     }
                     // Observe mode never holds a packet for a prompt: the
                     // operator would be asked to decide something that is
@@ -314,8 +330,9 @@ pub fn run(mut queue: Queue, queue_num: u16, mut deps: QueueDeps) -> std::io::Re
                     // policy from a dialog that changed nothing. Record the
                     // configured default instead, which is what an
                     // unanswered prompt resolves to anyway.
-                    Decision::Prompt(conn) if !deps.enforcing => {
-                        commit(&mut queue, msg, deps.settings.default_verdict(), None, conn, &deps);
+                    Decision::Prompt(conn) if !enforcing => {
+                        let verdict = deps.settings.default_verdict();
+                        commit(&mut queue, msg, verdict, None, conn, &deps, enforcing);
                     }
                     Decision::Prompt(conn) => {
                         let seq = next_seq;

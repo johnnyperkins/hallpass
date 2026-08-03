@@ -123,10 +123,11 @@ pub fn spawn(
                 rules.record_hit(name);
             }
             stats.record_verdict(verdict);
-            if !events.enforcing() && verdict != Verdict::Allow {
+            let enforcing = settings.enforcing();
+            if !enforcing && verdict != Verdict::Allow {
                 stats.record_observed_only();
             }
-            events.emit(conn, verdict, rule_name);
+            events.emit(conn, verdict, rule_name, enforcing);
             n += 1;
         }
     });

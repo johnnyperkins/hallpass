@@ -23,21 +23,17 @@ pub struct Counters {
     prompts_unanswered: AtomicU64,
     /// Prompt handlers evicted from the slot for not answering.
     prompt_handlers_evicted: AtomicU64,
-    /// False in observe mode. Reported so a client cannot read `denied` as
-    /// "blocked" when nothing was blocked.
-    enforcing: bool,
 }
 
 impl Default for Counters {
     fn default() -> Self {
-        Counters::new(true)
+        Counters::new()
     }
 }
 
 impl Counters {
-    /// Fresh counters. `enforcing` is false in observe mode and is reported
-    /// verbatim in the [`Stats`] snapshot.
-    pub fn new(enforcing: bool) -> Self {
+    /// Fresh counters.
+    pub fn new() -> Self {
         Counters {
             start: Instant::now(),
             connections_total: AtomicU64::new(0),
@@ -51,7 +47,6 @@ impl Counters {
             observed_only: AtomicU64::new(0),
             prompts_unanswered: AtomicU64::new(0),
             prompt_handlers_evicted: AtomicU64::new(0),
-            enforcing,
         }
     }
 
@@ -130,9 +125,11 @@ impl Counters {
     }
 
     /// Snapshot for the IPC reply. `rules_loaded` and `rules_skipped` come
-    /// from the rule store, `prompt_handler_connected` from the prompt table.
+    /// from the rule store, `prompt_handler_connected` from the prompt table,
+    /// `enforcing` from the runtime settings (reported so a client cannot
+    /// read `denied` as "blocked" when nothing was blocked).
     ///
-    /// Those three are passed in rather than mirrored into a counter here on
+    /// All four are passed in rather than mirrored into a counter here on
     /// purpose: they are facts owned elsewhere, and a copy kept in step by
     /// hand is a copy that eventually is not.
     pub fn snapshot(
@@ -140,6 +137,7 @@ impl Counters {
         rules_loaded: u32,
         rules_skipped: u64,
         prompt_handler_connected: bool,
+        enforcing: bool,
     ) -> Stats {
         Stats {
             connections_total: self.connections_total.load(Ordering::Relaxed),
@@ -154,7 +152,7 @@ impl Counters {
             other_proto_total: self.other_proto_total.load(Ordering::Relaxed),
             observed_only: self.observed_only.load(Ordering::Relaxed),
             dns_snoop_dropped: self.dns_snoop_dropped.load(Ordering::Relaxed),
-            enforcing: self.enforcing,
+            enforcing,
             prompt_handler_connected,
             prompts_unanswered: self.prompts_unanswered.load(Ordering::Relaxed),
             prompt_handlers_evicted: self.prompt_handlers_evicted.load(Ordering::Relaxed),
@@ -178,7 +176,7 @@ mod tests {
         c.record_prompt_overflow();
         c.record_prompt_unanswered();
         c.record_prompt_handler_evicted();
-        let s = c.snapshot(5, 4, true);
+        let s = c.snapshot(5, 4, true, true);
         assert_eq!(s.connections_total, 3);
         assert_eq!(s.allowed, 1);
         assert_eq!(s.denied, 2);
@@ -199,8 +197,8 @@ mod tests {
     #[test]
     fn prompt_handler_flag_is_passed_through() {
         let c = Counters::default();
-        assert!(!c.snapshot(0, 0, false).prompt_handler_connected);
-        assert!(c.snapshot(0, 0, true).prompt_handler_connected);
+        assert!(!c.snapshot(0, 0, false, true).prompt_handler_connected);
+        assert!(c.snapshot(0, 0, true, true).prompt_handler_connected);
     }
 
     /// Observe mode has to be visible in the snapshot: `denied` counts what
@@ -208,11 +206,11 @@ mod tests {
     /// traffic it stopped.
     #[test]
     fn observe_mode_is_reported() {
-        let c = Counters::new(false);
+        let c = Counters::default();
         c.record_verdict(Verdict::Deny);
         c.record_observed_only();
         c.record_dns_snoop_dropped();
-        let s = c.snapshot(0, 0, true);
+        let s = c.snapshot(0, 0, true, false);
         assert!(!s.enforcing);
         assert_eq!(s.denied, 1);
         assert_eq!(s.observed_only, 1);

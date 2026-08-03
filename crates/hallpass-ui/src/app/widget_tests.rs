@@ -239,6 +239,37 @@ fn settings_apply_asks_the_daemon_instead_of_editing_the_form() {
     );
 }
 
+/// The tab-bar mode switch asks the daemon and edits nothing locally, the
+/// same contract as Apply above: the switch position is whatever the daemon
+/// last reported, and it moves when the refetched config lands. Everything
+/// else in the config must ride along unchanged - a toggle that also reset
+/// the timeout would be a settings edit nobody made.
+#[test]
+fn the_mode_toggle_asks_the_daemon_instead_of_flipping_the_switch() {
+    let (mut app, mut from_ui) = app_with_prompts(0);
+    let cfg = runtime_config(45, Verdict::Deny);
+    app.daemon_config = Some(cfg);
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(820.0, 520.0))
+        .build_ui_state(|ui, app: &mut HallpassApp| app.main_window(ui), app);
+
+    harness.get_by_label("Enforce").click();
+    harness.run();
+
+    assert_eq!(
+        drain(&mut from_ui),
+        vec![ClientMsg::ConfigSet(hallpass_types::RuntimeConfig {
+            enforce: false,
+            ..cfg
+        })]
+    );
+    assert_eq!(
+        harness.state().daemon_config.map(|c| c.enforce),
+        Some(true),
+        "the switch moves when the daemon's answer lands, not before"
+    );
+}
+
 /// The rule editor's Save button stays reachable on a viewport far too
 /// short for the full form: the window caps itself to the screen and the
 /// form body scrolls, with Save pinned below the scroll area. Clicking

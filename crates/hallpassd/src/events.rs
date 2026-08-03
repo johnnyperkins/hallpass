@@ -45,48 +45,35 @@ pub struct EventBus {
     /// can ask as fast as it likes. The deep copy happens after the guard is
     /// dropped, where it costs the caller and nobody else.
     history: Mutex<VecDeque<Arc<ConnEvent>>>,
-    /// Stamped onto every event as `enforced`. False in observe mode, where
-    /// verdicts are recorded and nothing is applied.
-    enforcing: bool,
 }
 
 impl Default for EventBus {
     fn default() -> Self {
-        EventBus::new(true)
+        EventBus {
+            tx: broadcast::channel(CHANNEL_CAPACITY).0,
+            history: Mutex::new(VecDeque::with_capacity(HISTORY_CAPACITY)),
+        }
     }
 }
 
 impl EventBus {
-    /// Build a bus. `enforcing` is false in observe mode and is stamped onto
-    /// every event so no consumer has to be told separately.
-    pub fn new(enforcing: bool) -> Self {
-        EventBus {
-            tx: broadcast::channel(CHANNEL_CAPACITY).0,
-            history: Mutex::new(VecDeque::with_capacity(HISTORY_CAPACITY)),
-            enforcing,
-        }
-    }
-
-    /// Whether the daemon applies the verdicts it records.
-    pub fn enforcing(&self) -> bool {
-        self.enforcing
-    }
-
     /// Subscribe to the live stream; the receiver only sees events emitted
     /// after this call. Use [`EventBus::history`] for what came before.
     pub fn subscribe(&self) -> broadcast::Receiver<ConnEvent> {
         self.tx.subscribe()
     }
 
-    /// Record and broadcast a decision. `verdict` is what policy decided,
-    /// which in observe mode is not what happened to the packet.
-    pub fn emit(&self, conn: Connection, verdict: Verdict, rule_name: Option<String>) {
+    /// Record and broadcast a decision. `verdict` is what policy decided;
+    /// `enforced` is whether it was applied to the packet, supplied by the
+    /// caller so the stamp comes from the same mode read that governed the
+    /// application, never a second read a toggle could land between.
+    pub fn emit(&self, conn: Connection, verdict: Verdict, rule_name: Option<String>, enforced: bool) {
         let ev = ConnEvent {
             conn,
             verdict,
             rule_name,
             unix_ms: unix_ms_now(),
-            enforced: self.enforcing,
+            enforced,
         };
         self.push_history(Arc::new(ev.clone()));
         let _ = self.tx.send(ev);
@@ -181,7 +168,7 @@ mod tests {
     async fn subscriber_receives_emitted_event() {
         let bus = EventBus::default();
         let mut rx = bus.subscribe();
-        bus.emit(conn(), Verdict::Deny, Some("r".into()));
+        bus.emit(conn(), Verdict::Deny, Some("r".into()), true);
         let ev = rx.recv().await.unwrap();
         assert_eq!(ev.conn, conn());
         assert_eq!(ev.verdict, Verdict::Deny);
@@ -190,22 +177,25 @@ mod tests {
         assert!(ev.enforced);
     }
 
-    /// Observe mode must mark every event, including allows: a consumer that
-    /// only checked deny events would report the machine as filtered.
+    /// The caller's stamp lands on the event verbatim, allows included: a
+    /// consumer that only checked deny events would report an observe-mode
+    /// machine as filtered.
     #[test]
     fn observe_mode_marks_events_unenforced() {
-        let bus = EventBus::new(false);
-        assert!(!bus.enforcing());
-        bus.emit(conn(), Verdict::Allow, None);
-        bus.emit(conn(), Verdict::Deny, None);
+        let bus = EventBus::default();
+        bus.emit(conn(), Verdict::Allow, None, false);
+        bus.emit(conn(), Verdict::Deny, None, false);
         assert!(bus.history(10).iter().all(|ev| !ev.enforced));
+
+        bus.emit(conn(), Verdict::Deny, None, true);
+        assert!(bus.history(10).last().unwrap().enforced);
     }
 
     #[test]
     fn history_is_oldest_first_and_bounded() {
         let bus = EventBus::default();
         for i in 0..(HISTORY_CAPACITY + 50) {
-            bus.emit(conn(), Verdict::Allow, Some(format!("r{i}")));
+            bus.emit(conn(), Verdict::Allow, Some(format!("r{i}")), true);
         }
         let all = bus.history(usize::MAX);
         assert_eq!(all.len(), HISTORY_CAPACITY);
@@ -237,7 +227,7 @@ mod tests {
         for _ in 0..HISTORY_CAPACITY {
             let mut c = conn();
             c.cmdline = Some("A".repeat(8192));
-            bus.emit(c, Verdict::Allow, None);
+            bus.emit(c, Verdict::Allow, None, true);
         }
         let out = bus.history(usize::MAX);
         assert!(!out.is_empty(), "budget must not empty the reply");
@@ -257,11 +247,11 @@ mod tests {
     #[test]
     fn oversized_event_is_skipped_and_the_rest_still_answer() {
         let bus = EventBus::default();
-        bus.emit(conn(), Verdict::Allow, Some("before".into()));
+        bus.emit(conn(), Verdict::Allow, Some("before".into()), true);
         let mut huge = conn();
         huge.cmdline = Some("A".repeat(HISTORY_REPLY_BUDGET * 2));
-        bus.emit(huge, Verdict::Deny, None);
-        bus.emit(conn(), Verdict::Allow, Some("after".into()));
+        bus.emit(huge, Verdict::Deny, None, true);
+        bus.emit(conn(), Verdict::Allow, Some("after".into()), true);
 
         let out = bus.history(10);
         assert_eq!(out.len(), 2, "the oversized event must be the only one lost");

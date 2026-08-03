@@ -1,8 +1,8 @@
 //! Daemon configuration: /etc/hallpass/config.toml plus a --config override,
-//! and the two knobs of it that clients may change over IPC at runtime.
+//! and the knobs of it that clients may change over IPC at runtime.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 
 use hallpass_types::{RuntimeConfig, Verdict};
 use serde::Deserialize;
@@ -142,8 +142,10 @@ impl Default for Config {
 
 /// The settings clients may change over IPC, shared by everything that
 /// reads them: the prompt table (deadline and timer for each new prompt,
-/// verdict for each unanswered one), the queue thread (observe-mode
-/// unmatched connections), and the IPC server (get/set).
+/// verdict for each unanswered one), the queue thread (the mode, and the
+/// default recorded for an observe-mode unmatched connection), the event
+/// bus and counters (the `enforced`/`enforcing` stamps), and the IPC
+/// server (get/set).
 ///
 /// Runtime-only on purpose. config.toml is the operator's file - hand
 /// formatted, commented, root-owned - and a daemon rewriting it to persist
@@ -153,15 +155,21 @@ impl Default for Config {
 /// reads these, and the architecture promises it shares exactly one lock
 /// with the tokio side (the event-history mutex, see ARCHITECTURE.md
 /// "Threads and tasks"); a settings lock would quietly make that two.
-/// Each value is read independently at its use site, and the two do not
-/// need to change as one: a torn Get between the two stores of a Set
-/// reports a state the daemon really passed through. A future knob that
-/// must change atomically with another breaks this scheme; that is the
-/// point to revisit, not to extend.
+/// Each value is read independently at its use site, and none of them
+/// need to change as one: a torn Get between the stores of a Set reports
+/// a state the daemon really passed through. A future knob that must
+/// change atomically with another breaks this scheme; that is the point
+/// to revisit, not to extend.
 pub struct RuntimeSettings {
     prompt_timeout_secs: AtomicU64,
     /// A [`Verdict`] via [`verdict_to_u8`]; atomics do not hold enums.
     default_verdict: AtomicU8,
+    /// False in observe mode; see [`Mode`]. Read at every use site, so a
+    /// change covers the next packet, including one already held for a
+    /// prompt reply: `applied_verdict` reads it when the packet is handed
+    /// back, which is what keeps "observe blocks nothing" true from the
+    /// moment of the toggle.
+    enforcing: AtomicBool,
 }
 
 fn verdict_to_u8(v: Verdict) -> u8 {
@@ -187,6 +195,7 @@ impl RuntimeSettings {
         RuntimeSettings {
             prompt_timeout_secs: AtomicU64::new(initial.prompt_timeout_secs),
             default_verdict: AtomicU8::new(verdict_to_u8(initial.default_verdict)),
+            enforcing: AtomicBool::new(initial.enforce),
         }
     }
 
@@ -201,11 +210,17 @@ impl RuntimeSettings {
         verdict_from_u8(self.default_verdict.load(Ordering::Relaxed))
     }
 
-    /// Both settings, for [`hallpass_types::ClientMsg::ConfigGet`].
+    /// Whether verdicts are applied to packets. False in observe mode.
+    pub fn enforcing(&self) -> bool {
+        self.enforcing.load(Ordering::Relaxed)
+    }
+
+    /// The settings, for [`hallpass_types::ClientMsg::ConfigGet`].
     pub fn snapshot(&self) -> RuntimeConfig {
         RuntimeConfig {
             prompt_timeout_secs: self.prompt_timeout_secs(),
             default_verdict: self.default_verdict(),
+            enforce: self.enforcing(),
         }
     }
 
@@ -218,9 +233,25 @@ impl RuntimeSettings {
             .store(new.prompt_timeout_secs, Ordering::Relaxed);
         self.default_verdict
             .store(verdict_to_u8(new.default_verdict), Ordering::Relaxed);
+        let was_enforcing = self.enforcing.swap(new.enforce, Ordering::Relaxed);
+        // A mode flip is logged with the same loudness (and the same words,
+        // via the shared const) as the startup warning: it changes what the
+        // firewall does to every packet, and the journal is where an
+        // operator reconstructs when that happened.
+        if was_enforcing && !new.enforce {
+            tracing::warn!("{OBSERVE_MODE_WARNING}");
+        } else if !was_enforcing && new.enforce {
+            tracing::info!("enforce mode: verdicts apply to packets again");
+        }
         Ok(())
     }
 }
+
+/// The operator-facing journal line for a daemon that is not enforcing,
+/// shared by the startup path and the runtime toggle so the two cannot
+/// drift apart (the e2e suite greps for it).
+pub const OBSERVE_MODE_WARNING: &str =
+    "observe mode: policy is evaluated and recorded but NOT enforced, nothing will be blocked";
 
 /// The prompt-timeout bounds, shared by the config file and runtime sets so
 /// the two paths cannot drift apart.
@@ -243,6 +274,7 @@ impl Config {
         RuntimeConfig {
             prompt_timeout_secs: self.prompt_timeout_secs,
             default_verdict: self.default_verdict,
+            enforce: self.mode.enforcing(),
         }
     }
 
@@ -434,5 +466,27 @@ mod tests {
         assert_eq!(cfg.default_verdict, Verdict::Allow);
         assert_eq!(cfg.unhandled_proto_verdict, Verdict::Allow);
         assert!(cfg.queue_bypass);
+    }
+
+    /// The config file's mode seeds the runtime settings, and a runtime set
+    /// flips it without touching the other knobs; a rejected set leaves it
+    /// where it was, like the knobs it rides with.
+    #[test]
+    fn mode_is_seeded_from_the_file_and_toggles_at_runtime() {
+        let s = RuntimeSettings::new(parse(r#"mode = "observe""#).runtime());
+        assert!(!s.enforcing());
+
+        s.apply(&RuntimeConfig { enforce: true, ..s.snapshot() })
+            .expect("valid settings");
+        assert!(s.enforcing());
+        assert_eq!(s.snapshot().prompt_timeout_secs, 15);
+
+        let refused = RuntimeConfig {
+            prompt_timeout_secs: 0,
+            enforce: false,
+            ..s.snapshot()
+        };
+        s.apply(&refused).expect_err("zero timeout must be refused");
+        assert!(s.enforcing(), "a rejected set must not change the mode");
     }
 }

@@ -442,7 +442,12 @@ impl PromptTable {
         if let Some(name) = &rule {
             self.store.record_hit(name);
         }
-        self.events.emit(conn, verdict, rule);
+        // The mode is read here, when the decision is committed, like the
+        // packet path does: the stamp then matches the mode the released
+        // packets are handed back under (the queue thread re-reads at
+        // hand-back, so a toggle in between can still straddle, but never
+        // by more than the one packet already in flight).
+        self.events.emit(conn, verdict, rule, self.settings.enforcing());
     }
 
     /// Resolve packets with the configured default verdict (no handler,
@@ -542,7 +547,7 @@ mod tests {
         /// The stats snapshot a client would read, with the table's own
         /// handler state in it.
         fn snapshot(&self) -> hallpass_types::Stats {
-            self.stats.snapshot(0, 0, self.table.has_handler())
+            self.stats.snapshot(0, 0, self.table.has_handler(), true)
         }
     }
 
@@ -552,10 +557,7 @@ mod tests {
         let (verdict_tx, verdict_rx) = mpsc::unbounded_channel();
         let stats = Arc::new(Counters::default());
         let settings = Arc::new(crate::config::RuntimeSettings::new(
-            hallpass_types::RuntimeConfig {
-                prompt_timeout_secs: 5,
-                default_verdict: default,
-            },
+            crate::testutil::runtime_config(5, default),
         ));
         let table = Arc::new(PromptTable::new(
             verdict_tx,
@@ -982,10 +984,7 @@ mod tests {
         };
 
         h.settings
-            .apply(&hallpass_types::RuntimeConfig {
-                prompt_timeout_secs: 60,
-                default_verdict: Verdict::Deny,
-            })
+            .apply(&crate::testutil::runtime_config(60, Verdict::Deny))
             .expect("valid settings");
 
         // A prompt created after the change carries the longer deadline.
@@ -1008,10 +1007,7 @@ mod tests {
         // Out-of-range sets are refused and change nothing.
         let err = h
             .settings
-            .apply(&hallpass_types::RuntimeConfig {
-                prompt_timeout_secs: 0,
-                default_verdict: Verdict::Allow,
-            })
+            .apply(&crate::testutil::runtime_config(0, Verdict::Allow))
             .expect_err("zero timeout must be refused");
         assert!(err.contains("at least 1"), "{err}");
         assert_eq!(h.settings.snapshot().prompt_timeout_secs, 60);

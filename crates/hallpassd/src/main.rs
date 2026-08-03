@@ -70,16 +70,12 @@ async fn main() {
     };
     tracing::info!(?cfg, "hallpassd starting");
 
-    let enforcing = cfg.mode.enforcing();
-    if !enforcing {
+    if !cfg.mode.enforcing() {
         // Loud, and once at startup where an operator reading the journal
         // after a restart will see it: every other signal (events marked
         // unenforced, `enforcing` in the stats) is only visible to someone
         // already looking.
-        tracing::warn!(
-            "observe mode: policy is evaluated and recorded but NOT enforced, \
-             nothing will be blocked"
-        );
+        tracing::warn!("{}", config::OBSERVE_MODE_WARNING);
     }
 
     if rules::store::effective_uid() != Some(0) {
@@ -148,12 +144,19 @@ async fn main() {
         std::process::exit(101);
     }));
 
-    // Shared state. Observe mode is threaded through both of these rather
-    // than checked at every use: the event bus stamps `enforced` onto every
-    // event it emits, and the counters report `enforcing` in every snapshot,
-    // so no consumer has to be told about the mode separately.
-    let events = Arc::new(EventBus::new(enforcing));
-    let counters = Arc::new(Counters::new(enforcing));
+    // The prompt timeout, default verdict and mode, changeable over IPC
+    // for as long as the process lives; the config file remains the state
+    // a restart returns to. Everything that acts on the mode reads it from
+    // here at the moment it acts - the queue thread once per packet, the
+    // IPC server per snapshot - and stamps what it read onto what it
+    // produces (`enforced` on events, `enforcing` in stats), so a runtime
+    // toggle is reflected everywhere at once and no consumer of those
+    // outputs has to be told about the mode separately.
+    let settings = Arc::new(config::RuntimeSettings::new(cfg.runtime()));
+
+    // Shared state.
+    let events = Arc::new(EventBus::default());
+    let counters = Arc::new(Counters::default());
     let store = Arc::new(RuleStore::new(cfg.rules_dir.clone()));
     if let Err(e) = rules::store::spawn_watcher(Arc::clone(&store)) {
         tracing::warn!("rules dir watcher unavailable: {e}");
@@ -181,11 +184,6 @@ async fn main() {
     // error: the daemon must then shut down (tearing nftables down on the
     // way) rather than keep queueing traffic nobody drains.
     let (fatal_tx, mut fatal_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
-
-    // The prompt timeout and default verdict, changeable over IPC for as
-    // long as the process lives; the config file remains the state a
-    // restart returns to.
-    let settings = Arc::new(config::RuntimeSettings::new(cfg.runtime()));
 
     let prompts = Arc::new(PromptTable::new(
         verdict_tx,
@@ -266,7 +264,6 @@ async fn main() {
                 dns_cache,
                 exe_hash: Arc::new(attribution::hash::ExeHashCache::default()),
                 unhandled_verdict: cfg.unhandled_proto_verdict,
-                enforcing,
                 settings: Arc::clone(&settings),
                 shutdown: Arc::clone(&shutdown),
                 fatal_tx,

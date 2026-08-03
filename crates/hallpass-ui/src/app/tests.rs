@@ -136,6 +136,7 @@ pub(super) fn runtime_config(secs: u64, verdict: Verdict) -> hallpass_types::Run
     hallpass_types::RuntimeConfig {
         prompt_timeout_secs: secs,
         default_verdict: verdict,
+        enforce: true,
     }
 }
 

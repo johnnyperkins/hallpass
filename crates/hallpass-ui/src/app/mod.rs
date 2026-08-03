@@ -201,6 +201,12 @@ pub struct HallpassApp {
     /// has answered once, for the same reason `stats` starts None: the
     /// settings tab must not display values the daemon never confirmed.
     daemon_config: Option<RuntimeConfig>,
+    /// The daemon's most recent statement about the mode, from whichever
+    /// of the Stats and Config replies arrived last (both carry it, and
+    /// replies arrive in daemon order on the one stream, so last write is
+    /// freshest). One field so the banner and the toggle cannot disagree
+    /// about which source outranks the other. None until either reply.
+    enforcing: Option<bool>,
     /// The settings form's edited copies, reset to the daemon's values
     /// whenever a [`hallpass_types::DaemonMsg::Config`] reply lands (Apply
     /// refetches, so the form always settles on what the daemon actually
@@ -256,6 +262,7 @@ impl HallpassApp {
             filter: String::new(),
             group_by: traffic::GroupBy::default(),
             daemon_config: None,
+            enforcing: None,
             settings_timeout: String::new(),
             settings_verdict: Verdict::Allow,
             settings_error: None,
@@ -390,11 +397,15 @@ impl HallpassApp {
                 }
             }
             DaemonMsg::Rules(rules) => self.rules = rules,
-            DaemonMsg::Stats(stats) => self.stats = Some(stats),
+            DaemonMsg::Stats(stats) => {
+                self.enforcing = Some(stats.enforcing);
+                self.stats = Some(stats);
+            }
             // The settings form always settles on what the daemon actually
             // holds: every reply resets the drafts, and Apply refetches, so
             // the form cannot keep displaying an edit the daemon refused.
             DaemonMsg::Config(cfg) => {
+                self.enforcing = Some(cfg.enforce);
                 self.daemon_config = Some(cfg);
                 self.settings_timeout = cfg.prompt_timeout_secs.to_string();
                 self.settings_verdict = cfg.default_verdict;
@@ -489,11 +500,37 @@ impl HallpassApp {
 
     /// Whether the observe-mode banner belongs on screen.
     ///
-    /// Only once the daemon has said so: before the first stats reply there
-    /// is nothing to report, and reporting it anyway would announce that
+    /// Only once the daemon has said so: before the first reply there is
+    /// nothing to report, and reporting it anyway would announce that
     /// nothing is being blocked on a daemon that is blocking.
     fn observe_banner(&self) -> bool {
-        self.stats.is_some_and(|s| !s.enforcing)
+        self.enforcing == Some(false)
+    }
+
+    /// The enforce/observe switch, in the tab bar so the mode is visible
+    /// and changeable whatever tab is open.
+    ///
+    /// The checkbox edits a throwaway copy: like a rule row's checkbox, it
+    /// sends the change and keeps showing what the daemon last reported
+    /// until the ack's refetch lands. Absent until the first config reply,
+    /// because a switch drawn before the daemon has said which way it
+    /// points would have to lie. (`daemon_config`, not `enforcing`: the
+    /// send needs the other settings to carry along unchanged, so the
+    /// switch and its payload must come from the same reply.)
+    fn mode_toggle(&mut self, ui: &mut egui::Ui) {
+        let Some(current) = self.daemon_config else {
+            return;
+        };
+        let mut enforce = current.enforce;
+        let response = ui.checkbox(&mut enforce, "Enforce").on_hover_text(
+            "On: rules and prompts decide what connects (active). \
+             Off: observe mode, everything is recorded and nothing is \
+             blocked or prompted (passive). Lasts until the daemon \
+             restarts; the config file decides the mode it starts in.",
+        );
+        if response.changed() {
+            self.send(ClientMsg::ConfigSet(RuntimeConfig { enforce, ..current }));
+        }
     }
 
     /// Hand `ids` back to the daemon as denied.
@@ -539,9 +576,9 @@ impl HallpassApp {
             // Refresh data whenever a data tab is opened.
             match tab {
                 Tab::Rules => self.send(ClientMsg::RuleList),
-                // The banner and the observe-mode wording read from the
-                // stats, so opening Traffic refreshes them rather than
-                // showing whatever was current when the window last did.
+                // The stats reply also updates `enforcing`, so opening
+                // Traffic refreshes the observe banner rather than showing
+                // whatever was current when the window last did.
                 Tab::Stats | Tab::Traffic => self.send(ClientMsg::Stats),
                 // Re-read on open: another client may have changed the
                 // settings since this window last looked.
@@ -584,6 +621,9 @@ impl HallpassApp {
                         self.select_tab(tab);
                     }
                 }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    self.mode_toggle(ui);
+                });
             });
         });
 
@@ -1011,9 +1051,12 @@ impl HallpassApp {
                 match self.settings_timeout.trim().parse::<u64>() {
                     Ok(prompt_timeout_secs) => {
                         self.settings_error = None;
+                        // `..current` carries the mode (and any future
+                        // knob without its own form row) along unchanged.
                         self.send(ClientMsg::ConfigSet(RuntimeConfig {
                             prompt_timeout_secs,
                             default_verdict: self.settings_verdict,
+                            ..current
                         }));
                     }
                     Err(_) => {

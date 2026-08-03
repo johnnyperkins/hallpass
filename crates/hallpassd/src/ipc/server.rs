@@ -211,7 +211,7 @@ fn explain(req: &hallpass_types::ExplainRequest, deps: &IpcDeps) -> hallpass_typ
         verdict,
         would_prompt: rule_name.is_none(),
         rule_name,
-        enforced: deps.events.enforcing(),
+        enforced: deps.settings.enforcing(),
         trace: result.trace,
     }
 }
@@ -370,6 +370,7 @@ async fn message_loop(
                     rules,
                     skipped,
                     deps.prompts.has_handler(),
+                    deps.settings.enforcing(),
                 ))
             }
             ClientMsg::EventHistory { limit } => {
@@ -445,14 +446,11 @@ mod tests {
     fn test_deps(tag: &str) -> (Arc<IpcDeps>, crate::testutil::TestDir) {
         let dir = crate::testutil::TestDir::new(&format!("ipc-{tag}"));
         let store = Arc::new(RuleStore::new(dir.path().join("rules")));
+        let settings = Arc::new(crate::config::RuntimeSettings::new(
+            crate::testutil::runtime_config(5, Verdict::Allow),
+        ));
         let events = Arc::new(EventBus::default());
         let stats = Arc::new(Counters::default());
-        let settings = Arc::new(crate::config::RuntimeSettings::new(
-            hallpass_types::RuntimeConfig {
-                prompt_timeout_secs: 5,
-                default_verdict: Verdict::Allow,
-            },
-        ));
         let (verdict_tx, _verdict_rx) = mpsc::unbounded_channel();
         let prompts = Arc::new(PromptTable::new(
             verdict_tx,
@@ -553,15 +551,13 @@ mod tests {
         wire::write_msg(&mut c, &ClientMsg::ConfigGet).await.unwrap();
         assert_eq!(
             wire::read_msg::<DaemonMsg, _>(&mut c).await.unwrap(),
-            DaemonMsg::Config(hallpass_types::RuntimeConfig {
-                prompt_timeout_secs: 5,
-                default_verdict: Verdict::Allow,
-            })
+            DaemonMsg::Config(crate::testutil::runtime_config(5, Verdict::Allow))
         );
 
+        // The mode rides the same set: this one turns observe on.
         let new = hallpass_types::RuntimeConfig {
-            prompt_timeout_secs: 30,
-            default_verdict: Verdict::Deny,
+            enforce: false,
+            ..crate::testutil::runtime_config(30, Verdict::Deny)
         };
         wire::write_msg(&mut c, &ClientMsg::ConfigSet(new)).await.unwrap();
         assert_eq!(wire::read_msg::<DaemonMsg, _>(&mut c).await.unwrap(), DaemonMsg::Ok);
@@ -575,10 +571,7 @@ mod tests {
         // and the settings stay where the last valid set put them.
         wire::write_msg(
             &mut c,
-            &ClientMsg::ConfigSet(hallpass_types::RuntimeConfig {
-                prompt_timeout_secs: 3601,
-                default_verdict: Verdict::Allow,
-            }),
+            &ClientMsg::ConfigSet(crate::testutil::runtime_config(3601, Verdict::Allow)),
         )
         .await
         .unwrap();
