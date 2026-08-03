@@ -212,6 +212,32 @@ fn quitting_denies_the_prompts_left_on_screen() {
     assert!(harness.state().prompt_ids().is_empty());
 }
 
+/// The rule editor's Save button stays reachable on a viewport far too
+/// short for the full form: the window caps itself to the screen and the
+/// form body scrolls, with Save pinned below the scroll area. Clicking
+/// Save through that layout must still reach the form logic (here: the
+/// empty-name parse error keeps the editor open and nothing is sent).
+#[test]
+fn editor_save_stays_reachable_on_a_short_viewport() {
+    let (mut app, mut from_ui) = app_with_prompts(0);
+    app.editor = Some(RuleEditor::add());
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(600.0, 240.0))
+        .build_ui_state(|ui, app: &mut HallpassApp| app.editor_window(ui.ctx()), app);
+
+    harness.get_by_label("Save").click();
+    harness.run();
+
+    assert!(
+        harness.state().editor.is_some(),
+        "the empty form was rejected client-side, so the editor stays open"
+    );
+    assert!(
+        drain(&mut from_ui).is_empty(),
+        "an invalid form must not reach the daemon"
+    );
+}
+
 /// The checkbox in the rules list asks the daemon; it does not edit the row.
 /// A refused toggle would otherwise leave the operator believing a rule is
 /// off while it is still enforced, which claims less enforcement than there

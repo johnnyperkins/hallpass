@@ -280,11 +280,19 @@ impl RuleEditor {
             Some(name) => format!("Edit rule: {}", crate::prompt::ui_text(name)),
             None => "Add rule".to_string(),
         };
+        // The form is two dozen rows, so on a short viewport the window
+        // used to grow past the screen and put the title bar and Save out
+        // of reach (same defect class as the prompt-button overflow). Cap
+        // the window to the viewport; the form body scrolls inside it and
+        // the error line and Save stay pinned below the scroll area, so
+        // the button that retries a rejection is always next to it.
+        let max_height = (ctx.content_rect().height() - 48.0).max(160.0);
         egui::Window::new(title)
             .id(egui::Id::new("rule-editor"))
             .open(&mut open)
             .collapsible(false)
             .default_width(420.0)
+            .max_height(max_height)
             .show(ctx, |ui| {
                 self.form(ui, &mut saved);
             });
@@ -326,6 +334,51 @@ impl RuleEditor {
     }
 
     fn form(&mut self, ui: &mut egui::Ui, saved: &mut Option<Rule>) {
+        // Room kept under the scroll area for what must stay visible: the
+        // error line (two wrapped lines at its 120-char cap) and the Save
+        // row. Everything above scrolls when the window hits its cap.
+        let pinned = 96.0;
+        let body_height = (ui.available_height() - pinned).max(120.0);
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, true])
+            .max_height(body_height)
+            .show(ui, |ui| {
+                self.form_fields(ui);
+            });
+        if let Some(err) = &self.error {
+            // Bounded to its share of the pinned space: an error wrapping
+            // past two lines on a narrow window scrolls here instead of
+            // pushing Save below the window's height cap, which is the
+            // exact overflow this layout exists to prevent.
+            egui::ScrollArea::vertical()
+                .id_salt("rule-editor-error")
+                .max_height(40.0)
+                .show(ui, |ui| {
+                    ui.colored_label(crate::app::DENY_COLOR, err);
+                });
+        }
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(!self.awaiting, egui::Button::new("Save"))
+                .clicked()
+            {
+                match self.to_rule() {
+                    Ok(rule) => {
+                        self.error = None;
+                        *saved = Some(rule);
+                    }
+                    Err(e) => self.error = Some(e),
+                }
+            }
+            if self.awaiting {
+                ui.label("Saving...");
+            }
+        });
+    }
+
+    /// The scrolling half of the form: every editable field.
+    fn form_fields(&mut self, ui: &mut egui::Ui) {
         egui::Grid::new("rule-editor-grid")
             .num_columns(2)
             .spacing([8.0, 4.0])
@@ -431,27 +484,6 @@ impl RuleEditor {
         if self.editing.is_some() && self.duration == DurationChoice::Timed {
             ui.label("Saving a timed rule restarts its clock from now.");
         }
-        if let Some(err) = &self.error {
-            ui.colored_label(crate::app::DENY_COLOR, err);
-        }
-        ui.add_space(6.0);
-        ui.horizontal(|ui| {
-            if ui
-                .add_enabled(!self.awaiting, egui::Button::new("Save"))
-                .clicked()
-            {
-                match self.to_rule() {
-                    Ok(rule) => {
-                        self.error = None;
-                        *saved = Some(rule);
-                    }
-                    Err(e) => self.error = Some(e),
-                }
-            }
-            if self.awaiting {
-                ui.label("Saving...");
-            }
-        });
     }
 }
 
