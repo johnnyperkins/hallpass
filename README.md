@@ -152,11 +152,14 @@ dialog that changes nothing would be misleading. It exists because the honest
 answer to "what will this policy break" cannot be read off the rule files; it
 depends on what the host actually talks to. So the way to size a rollout is
 to run in observe mode, watch `hallpass-cli top` and `hallpass-cli events`
-for a while, and only then enforce. The mode is visible in `hallpass-cli
-status`, in every event as an unenforced verdict (a recorded block reads
-`WOULD-DENY`, never `DENY`), on syslog export as `enforced="false"`, and in a
-warning at startup. **It is not a security posture.** While it is on, this
-host is not filtered.
+for a while, and only then enforce. The GUI has an **Enforce** switch in its
+tab bar that flips the mode at runtime - active filtering on, passive
+watching off - lasting until the daemon restarts; the config file decides
+the mode it starts in. The mode is visible in `hallpass-cli status`, in
+every event as an unenforced verdict (a recorded block reads `WOULD-DENY`,
+never `DENY`), on syslog export as `enforced="false"`, in a warning at
+startup, and as a banner in the GUI. **It is not a security posture.** While
+it is on, this host is not filtered.
 
 Persistent rules are TOML files in `/etc/hallpass/rules.d/`, one rule per
 file:

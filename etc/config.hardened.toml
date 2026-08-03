@@ -9,6 +9,11 @@
 # operator copies to declare a posture: "observe" here would evaluate every
 # rule below and block nothing, and a hardened config that silently does
 # not enforce is the worst outcome this project has.
+#
+# Socket clients (the GUI's Enforce switch) can flip the mode at runtime
+# until the next restart. That is not a wider grant - anything on the
+# socket can already delete every rule - but the socket's group is the
+# thing this posture trusts.
 mode = "enforce"
 
 # Block when no rule matches and no client answers the prompt in time.

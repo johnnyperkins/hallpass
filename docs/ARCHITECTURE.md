@@ -210,6 +210,14 @@ packet is accepted anyway. It exists because the honest answer to "what will
 this policy break" cannot be read off the rule files: it depends on what the
 host actually talks to.
 
+The config file only seeds the mode. It is a runtime setting
+(`RuntimeConfig::enforce`, the UI's tab-bar switch), read at every use site,
+so a toggle covers the next packet - including one already held for a prompt
+reply, whose verdict is applied under the mode in force when it is handed
+back, not the one it was held under. Like the other runtime settings it is
+never written back to the file; a restart returns to the operator's declared
+mode.
+
 Every path that hands a packet back goes through one `applied_verdict`
 helper, which is the entire mechanism. That is deliberate: a single missed
 call site would start blocking traffic on a host whose operator was told
@@ -221,9 +229,10 @@ record `default_verdict`, which is what an unanswered prompt would have
 applied anyway, because asking an operator to decide something that will not
 be applied builds policy out of a dialog that changed nothing.
 
-Observe mode is loud on purpose: a warning at startup, `enforced = false` on
-every event, `enforcing` in the stats snapshot, `enforced="false"` on syslog
-export, and `WOULD-DENY` rather than `DENY` in the CLI.
+Observe mode is loud on purpose: a warning at startup and on every runtime
+toggle into it, `enforced = false` on every event, `enforcing` in the stats
+snapshot, `enforced="false"` on syslog export, `WOULD-DENY` rather than
+`DENY` in the CLI, and a banner in the UI.
 
 **Observe mode is not a security posture.** Nothing is blocked while it is
 on. It sizes a rollout; it does not defend a host.

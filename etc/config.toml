@@ -10,6 +10,9 @@
 # shows up as WOULD-DENY, and `hallpass-cli status` reports the mode.
 # Unmatched connections are recorded as default_verdict and never prompt,
 # since answering a prompt that changes nothing would be misleading.
+#
+# This only decides the mode the daemon starts in: the GUI's Enforce
+# switch flips it at runtime, until the next restart returns to this file.
 mode = "enforce"
 
 # Verdict applied when no rule matches and no client answers the prompt
