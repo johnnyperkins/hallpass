@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use eframe::egui::{self, Color32, RichText};
+use egui_extras::{Column, TableBuilder};
 use hallpass_types::{
     ClientMsg, ConnEvent, Connection, PromptScope, Rule, RuleDuration, Stats, Verdict,
 };
@@ -598,47 +599,64 @@ impl HallpassApp {
             return;
         }
         let mut new_rule_from: Option<Connection> = None;
-        let row_height = ui.text_style_height(&egui::TextStyle::Body);
-        // show_rows virtualizes the list: only visible rows are formatted.
-        egui::ScrollArea::vertical()
-            .auto_shrink([false, false])
+        let (header_h, row_h) = table_heights(ui);
+        // A table, not a Grid inside show_rows: show_rows assumed every
+        // virtual row was exactly one body-text line, while the grid added
+        // its own header row and button-height rows, so the estimated and
+        // laid-out content heights disagreed and the stuck-to-bottom
+        // offset bounced as rows arrived. The table owns both its header
+        // and its virtualization, so the two heights cannot drift, and
+        // the remainder column keeps the grid tracking the window width.
+        data_table(ui, "events_table")
             .stick_to_bottom(true)
-            .show_rows(ui, row_height, shown.len(), |ui, range| {
-                egui::Grid::new("events_grid")
-                    .striped(true)
-                    .num_columns(6)
-                    .show(ui, |ui| {
-                        ui.strong("Time");
-                        ui.strong("Verdict");
-                        ui.strong("Application");
-                        ui.strong("Destination");
-                        ui.strong("Rule");
-                        ui.strong("");
-                        ui.end_row();
-                        for i in range {
-                            let ev = shown[i];
-                            ui.monospace(format_time(ev.unix_ms));
-                            // verdict_label comes from the event, not the
-                            // verdict, so an unenforced deny reads
-                            // "would-deny": the connection went out.
-                            ui.colored_label(event_color(ev), ev.verdict_label());
-                            ui.label(prompt::exe_name(&ev.conn));
-                            ui.monospace(format!(
-                                "{} {}",
-                                ev.conn.tuple.proto,
-                                prompt::format_dest(&ev.conn)
-                            ));
-                            ui.label(prompt::ui_text(ev.rule_name.as_deref().unwrap_or("-")));
-                            if ui
-                                .small_button("Rule")
-                                .on_hover_text("Create a rule from this connection")
-                                .clicked()
-                            {
-                                new_rule_from = Some(ev.conn.clone());
-                            }
-                            ui.end_row();
+            .column(Column::auto()) // Time
+            .column(Column::auto()) // Verdict
+            .column(Column::auto().clip(true).at_least(60.0)) // Application
+            .column(Column::auto().clip(true).at_least(80.0)) // Destination
+            .column(Column::remainder().clip(true).at_least(60.0)) // Rule
+            .column(Column::auto()) // rule-from-row button
+            .header(header_h, |mut header| {
+                for title in ["Time", "Verdict", "Application", "Destination", "Rule", ""] {
+                    header.col(|ui| {
+                        ui.strong(title);
+                    });
+                }
+            })
+            .body(|body| {
+                body.rows(row_h, shown.len(), |mut row| {
+                    let ev = shown[row.index()];
+                    row.col(|ui| {
+                        ui.monospace(format_time(ev.unix_ms));
+                    });
+                    row.col(|ui| {
+                        // verdict_label comes from the event, not the
+                        // verdict, so an unenforced deny reads
+                        // "would-deny": the connection went out.
+                        ui.colored_label(event_color(ev), ev.verdict_label());
+                    });
+                    row.col(|ui| {
+                        ui.label(prompt::exe_name(&ev.conn));
+                    });
+                    row.col(|ui| {
+                        ui.monospace(format!(
+                            "{} {}",
+                            ev.conn.tuple.proto,
+                            prompt::format_dest(&ev.conn)
+                        ));
+                    });
+                    row.col(|ui| {
+                        ui.label(prompt::ui_text(ev.rule_name.as_deref().unwrap_or("-")));
+                    });
+                    row.col(|ui| {
+                        if ui
+                            .small_button("Rule")
+                            .on_hover_text("Create a rule from this connection")
+                            .clicked()
+                        {
+                            new_rule_from = Some(ev.conn.clone());
                         }
                     });
+                });
             });
         if let Some(conn) = new_rule_from {
             self.editor = Some(RuleEditor::from_connection(&conn));
@@ -682,32 +700,55 @@ impl HallpassApp {
             );
         }
         let rows = agg.top(TRAFFIC_ROWS);
-        egui::ScrollArea::vertical()
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                egui::Grid::new("traffic_grid")
-                    .striped(true)
-                    .num_columns(7)
-                    .show(ui, |ui| {
-                        ui.strong(self.group_by.label());
-                        ui.strong("Total");
-                        ui.strong("Allowed");
-                        ui.strong("Blocked");
-                        ui.strong("Would block");
-                        ui.strong("Peers");
-                        ui.strong("Last seen");
-                        ui.end_row();
-                        for row in &rows {
-                            ui.label(prompt::ui_text(&row.key));
-                            ui.monospace(row.total.to_string());
-                            ui.colored_label(ALLOW_COLOR, row.allowed.to_string());
-                            ui.colored_label(DENY_COLOR, row.blocked.to_string());
-                            ui.colored_label(REJECT_COLOR, row.would_block.to_string());
-                            ui.monospace(row.peers.to_string());
-                            ui.monospace(format_time(row.last_ms));
-                            ui.end_row();
-                        }
+        let (header_h, row_h) = table_heights(ui);
+        data_table(ui, "traffic_table")
+            .column(Column::remainder().clip(true).at_least(120.0)) // key
+            .column(Column::auto()) // Total
+            .column(Column::auto()) // Allowed
+            .column(Column::auto()) // Blocked
+            .column(Column::auto()) // Would block
+            .column(Column::auto()) // Peers
+            .column(Column::auto()) // Last seen
+            .header(header_h, |mut header| {
+                for title in [
+                    self.group_by.label(),
+                    "Total",
+                    "Allowed",
+                    "Blocked",
+                    "Would block",
+                    "Peers",
+                    "Last seen",
+                ] {
+                    header.col(|ui| {
+                        ui.strong(title);
                     });
+                }
+            })
+            .body(|body| {
+                body.rows(row_h, rows.len(), |mut table_row| {
+                    let row = &rows[table_row.index()];
+                    table_row.col(|ui| {
+                        ui.label(prompt::ui_text(&row.key));
+                    });
+                    table_row.col(|ui| {
+                        ui.monospace(row.total.to_string());
+                    });
+                    table_row.col(|ui| {
+                        ui.colored_label(ALLOW_COLOR, row.allowed.to_string());
+                    });
+                    table_row.col(|ui| {
+                        ui.colored_label(DENY_COLOR, row.blocked.to_string());
+                    });
+                    table_row.col(|ui| {
+                        ui.colored_label(REJECT_COLOR, row.would_block.to_string());
+                    });
+                    table_row.col(|ui| {
+                        ui.monospace(row.peers.to_string());
+                    });
+                    table_row.col(|ui| {
+                        ui.monospace(format_time(row.last_ms));
+                    });
+                });
             });
     }
 
@@ -730,40 +771,56 @@ impl HallpassApp {
         let mut toggle: Option<(String, bool)> = None;
         let mut delete: Option<String> = None;
         let mut edit: Option<RuleEditor> = None;
-        egui::ScrollArea::vertical()
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                egui::Grid::new("rules_grid")
-                    .striped(true)
-                    .num_columns(7)
-                    .show(ui, |ui| {
-                        ui.strong("On");
-                        ui.strong("Name");
-                        ui.strong("Action");
-                        ui.strong("Match");
-                        ui.strong("Priority");
-                        ui.strong("");
-                        ui.strong("");
-                        ui.end_row();
-                        for rule in &mut self.rules {
-                            let mut enabled = rule.enabled;
-                            if ui.checkbox(&mut enabled, "").changed() {
-                                toggle = Some((rule.name.clone(), enabled));
-                            }
-                            ui.label(prompt::ui_text(&rule.name));
-                            let v = Verdict::from(rule.action);
-                            ui.colored_label(verdict_color(v), verdict_label(v));
-                            ui.monospace(prompt::ui_text(&rule.matcher.summary()));
-                            ui.label(rule.priority.to_string());
-                            if ui.button("Edit").clicked() {
-                                edit = Some(RuleEditor::edit(rule));
-                            }
-                            if ui.button("Delete").clicked() {
-                                delete = Some(rule.name.clone());
-                            }
-                            ui.end_row();
+        let (header_h, row_h) = table_heights(ui);
+        let rules = &self.rules;
+        data_table(ui, "rules_table")
+            .column(Column::auto()) // On
+            .column(Column::auto().clip(true).at_least(60.0)) // Name
+            .column(Column::auto()) // Action
+            .column(Column::remainder().clip(true).at_least(80.0)) // Match
+            .column(Column::auto()) // Priority
+            .column(Column::auto()) // Edit
+            .column(Column::auto()) // Delete
+            .header(header_h, |mut header| {
+                for title in ["On", "Name", "Action", "Match", "Priority", "", ""] {
+                    header.col(|ui| {
+                        ui.strong(title);
+                    });
+                }
+            })
+            .body(|body| {
+                body.rows(row_h, rules.len(), |mut row| {
+                    let rule = &rules[row.index()];
+                    row.col(|ui| {
+                        let mut enabled = rule.enabled;
+                        if ui.checkbox(&mut enabled, "").changed() {
+                            toggle = Some((rule.name.clone(), enabled));
                         }
                     });
+                    row.col(|ui| {
+                        ui.label(prompt::ui_text(&rule.name));
+                    });
+                    row.col(|ui| {
+                        let v = Verdict::from(rule.action);
+                        ui.colored_label(verdict_color(v), verdict_label(v));
+                    });
+                    row.col(|ui| {
+                        ui.monospace(prompt::ui_text(&rule.matcher.summary()));
+                    });
+                    row.col(|ui| {
+                        ui.label(rule.priority.to_string());
+                    });
+                    row.col(|ui| {
+                        if ui.button("Edit").clicked() {
+                            edit = Some(RuleEditor::edit(rule));
+                        }
+                    });
+                    row.col(|ui| {
+                        if ui.button("Delete").clicked() {
+                            delete = Some(rule.name.clone());
+                        }
+                    });
+                });
             });
 
         if let Some(editor) = edit {
@@ -1285,6 +1342,27 @@ impl eframe::App for HallpassApp {
 }
 
 // ---- small display helpers ----------------------------------------------
+
+/// (header, row) heights for the data tables. Rows hold buttons and
+/// checkboxes as well as text, so they are sized to the interact height:
+/// the table lays every virtual row out at exactly this height, and the
+/// declared and rendered heights agreeing is what keeps stick-to-bottom
+/// from bouncing.
+fn table_heights(ui: &egui::Ui) -> (f32, f32) {
+    let text = ui.text_style_height(&egui::TextStyle::Body);
+    (text + 6.0, ui.spacing().interact_size.y.max(text) + 2.0)
+}
+
+/// The style every data table shares, so it cannot drift per tab. The
+/// columns and cells stay at each call site, where they are load-bearing.
+fn data_table<'a>(ui: &'a mut egui::Ui, salt: &'static str) -> TableBuilder<'a> {
+    TableBuilder::new(ui)
+        .id_salt(salt)
+        .striped(true)
+        .resizable(true)
+        .auto_shrink([false, false])
+        .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+}
 
 fn verdict_label(v: Verdict) -> &'static str {
     match v {
