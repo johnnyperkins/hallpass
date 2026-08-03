@@ -12,8 +12,18 @@ pub struct PromptState {
     pub conn: Connection,
     /// Deadline as Unix milliseconds.
     pub deadline_ms: u64,
-    /// Unix milliseconds when the prompt was received (countdown start).
+    /// Unix milliseconds when the prompt was received.
     pub received_ms: u64,
+    /// Unix milliseconds when this prompt first became the front of its
+    /// popup window, stamped by the popup's render pass.
+    ///
+    /// The progress bar drains from here rather than from `received_ms`: a
+    /// prompt that queued behind another in the same window would otherwise
+    /// appear already part-elapsed the moment it surfaces. The deadline
+    /// itself is untouched - the daemon armed it at creation and holding
+    /// packets longer is not this side's call - so the bar restarting only
+    /// changes what "full" means, never when the default verdict lands.
+    pub fronted_ms: Option<u64>,
     /// Selected rule duration.
     pub duration: RuleDuration,
     /// Selected rule scope.
@@ -28,9 +38,16 @@ impl PromptState {
             conn,
             deadline_ms,
             received_ms,
+            fronted_ms: None,
             duration: RuleDuration::Session,
             scope: PromptScope::ThisPort,
         }
+    }
+
+    /// Where the visible countdown starts: the moment this prompt reached
+    /// the front of its window, or its arrival until it has.
+    fn countdown_start(&self) -> u64 {
+        self.fronted_ms.unwrap_or(self.received_ms)
     }
 
     /// Build the reply message for the given verdict.
@@ -44,9 +61,9 @@ impl PromptState {
     }
 
     /// Remaining fraction of the countdown in `[0.0, 1.0]` at `now_ms`.
-    /// 1.0 = just received, 0.0 = deadline reached.
+    /// 1.0 = just surfaced, 0.0 = deadline reached.
     pub fn remaining_fraction(&self, now_ms: u64) -> f32 {
-        remaining_fraction(self.received_ms, self.deadline_ms, now_ms)
+        remaining_fraction(self.countdown_start(), self.deadline_ms, now_ms)
     }
 
     /// Whole seconds left until the deadline at `now_ms`.
@@ -175,6 +192,21 @@ mod tests {
         assert_eq!(remaining_fraction(5000, 5000, 5000), 0.0);
         // Deadline before start (daemon clock skew) must not panic.
         assert_eq!(remaining_fraction(9000, 5000, 7000), 0.0);
+    }
+
+    /// A prompt that queued behind another starts its bar full when it
+    /// surfaces, draining over the time it actually has left; the seconds
+    /// text and the deadline are untouched.
+    #[test]
+    fn countdown_restarts_when_the_prompt_reaches_the_front() {
+        // Received at t=0 with a 30s deadline, surfaced at t=20s.
+        let mut p = PromptState::new(1, conn(None, None), 30_000, 0);
+        assert!((p.remaining_fraction(20_000) - 1.0 / 3.0).abs() < 1e-6);
+        p.fronted_ms = Some(20_000);
+        assert_eq!(p.remaining_fraction(20_000), 1.0, "bar restarts full");
+        assert_eq!(p.remaining_fraction(25_000), 0.5, "drains over what is left");
+        assert_eq!(p.remaining_fraction(30_000), 0.0, "deadline unchanged");
+        assert_eq!(p.remaining_secs(20_000), 10, "seconds stay honest");
     }
 
     #[test]

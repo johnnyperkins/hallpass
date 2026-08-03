@@ -1028,6 +1028,14 @@ fn prompt_popup(
                 .iter_mut()
                 .find(|p| p.id == ids[0])
                 .expect("front id was just read from this list");
+            // First pass with this prompt in front: restart the visible
+            // countdown from now. Its deadline is unchanged (see
+            // PromptState::fronted_ms), so this cannot delay the default
+            // verdict; it only stops a prompt that queued behind another
+            // from surfacing with its bar already part-drained.
+            if front.fronted_ms.is_none() {
+                front.fronted_ms = Some(now_ms);
+            }
             prompt_ui(ui, front, now_ms, &rest, &mut answered);
             // Answers first, removed inside the same lock hold that read
             // the list, so the dismissal below never speaks for a prompt
