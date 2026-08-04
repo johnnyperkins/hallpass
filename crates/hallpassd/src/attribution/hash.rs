@@ -1,11 +1,12 @@
 //! SHA-256 of executable files, cached by file identity.
 //!
 //! Hashing runs on the packet-decision thread, so results are cached keyed
-//! by the file's (dev, inode, mtime, size): a rebuilt or replaced binary
-//! gets a fresh hash, an unchanged one is hashed exactly once regardless of
-//! the path it was reached through (`/proc/<pid>/exe` of different pids of
-//! the same binary share one entry). Unreadable paths are cheap failures
-//! and are not cached.
+//! by the file's (dev, inode, mtime, ctime, size): a rebuilt, replaced or
+//! rewritten binary gets a fresh hash, an unchanged one is hashed exactly
+//! once regardless of the path it was reached through (`/proc/<pid>/exe` of
+//! different pids of the same binary share one entry). Unreadable paths are
+//! cheap failures and are not cached. See [`FileId`] for why ctime is in
+//! that key and not just mtime.
 
 use std::num::NonZeroUsize;
 use std::os::unix::fs::MetadataExt;
@@ -26,6 +27,17 @@ pub(crate) struct FileId {
     // Seconds-only mtime misses a same-size rewrite within one second;
     // nanoseconds close that window on filesystems that record them.
     mtime_nsec: i64,
+    // Modification times are writable by the file's owner (utimensat), so
+    // mtime and size alone are a key the attacker holds: rewrite the binary
+    // in place at the same length, put the old mtime back, and the cache
+    // keeps serving the pre-tamper hash for the life of the daemon. That
+    // defeats exactly what exe_sha256 is bought for, and the victim only has
+    // to run the program normally. ctime is the one field the owner cannot
+    // set - utimensat bumps it too - and it moves on any write, chmod, or
+    // rename. Probe-confirmed: after such a rewrite every other field here
+    // was unchanged and ctime was the only one that moved.
+    ctime: i64,
+    ctime_nsec: i64,
     size: u64,
 }
 
@@ -36,6 +48,8 @@ impl FileId {
             ino: meta.ino(),
             mtime: meta.mtime(),
             mtime_nsec: meta.mtime_nsec(),
+            ctime: meta.ctime(),
+            ctime_nsec: meta.ctime_nsec(),
             size: meta.size(),
         }
     }
@@ -106,8 +120,8 @@ impl ExeHashCache {
     }
 
     /// SHA-256 of the file at `path` as lowercase hex, or `None` if it
-    /// cannot be read. Served from cache while (dev, ino, mtime, size)
-    /// are unchanged.
+    /// cannot be read. Served from cache while (dev, ino, mtime, ctime,
+    /// size) are unchanged.
     ///
     /// The file is opened first and the identity taken from the open fd,
     /// so the cached key always describes the bytes actually hashed - a
@@ -165,6 +179,49 @@ mod tests {
         assert_eq!(
             cache.sha256(&path).unwrap(),
             "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+        );
+    }
+
+    /// The tamper the cache key has to survive: rewrite the binary in place
+    /// at the same length and put the old mtime back with utimensat, which
+    /// any owner can do unprivileged. Every other stat field the key could
+    /// use is unchanged by that, so before ctime joined the key the daemon
+    /// served the pre-tamper hash for the rest of its life and a hash-pinned
+    /// allow rule kept matching code nobody approved. The victim only has to
+    /// run the program normally, so this is not covered by the documented
+    /// exec-after-connect caveat.
+    #[test]
+    fn same_size_rewrite_with_restored_mtime_is_not_served_from_cache() {
+        use std::io::{Seek, Write};
+
+        let dir = TestDir::new("hash-tamper");
+        let path = dir.path().join("bin");
+        std::fs::write(&path, b"aaaaa").unwrap();
+        let before = std::fs::metadata(&path).unwrap();
+        let times = std::fs::FileTimes::new()
+            .set_accessed(before.accessed().unwrap())
+            .set_modified(before.modified().unwrap());
+
+        let cache = ExeHashCache::default();
+        let original = cache.sha256(&path).unwrap();
+
+        // In place, same length, no truncation: the inode and size cannot
+        // move. Then restore the timestamps the owner controls.
+        let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.seek(std::io::SeekFrom::Start(0)).unwrap();
+        file.write_all(b"bbbbb").unwrap();
+        file.set_times(times).unwrap();
+        drop(file);
+
+        let after = std::fs::metadata(&path).unwrap();
+        assert_eq!(after.len(), before.len(), "the rewrite kept the size");
+        assert_eq!(after.mtime(), before.mtime(), "the rewrite restored mtime");
+        assert_eq!(after.mtime_nsec(), before.mtime_nsec(), "including nanoseconds");
+
+        assert_ne!(
+            cache.sha256(&path).unwrap(),
+            original,
+            "a tampered binary must not keep serving its old hash"
         );
     }
 

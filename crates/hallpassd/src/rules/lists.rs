@@ -7,7 +7,7 @@
 //! reload for free: the directory watcher triggers a rules reload, which
 //! recompiles rules and re-reads their lists.
 //!
-//! Parsed lists are cached by file identity (dev, ino, mtime, size), so a
+//! Parsed lists are cached by file identity (dev, ino, mtime, ctime, size), so a
 //! rebuild triggered by an unrelated rule change, or several rules sharing
 //! one blocklist, do not re-read and re-parse a multi-megabyte file. The
 //! identity is taken from the opened file's fd, so the trust check, the
