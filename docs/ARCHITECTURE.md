@@ -222,6 +222,16 @@ The snoop queues always keep `bypass` regardless, and always fail open on a
 full queue. They are observational, so dropping DNS with the daemon gone (or
 under a reply flood) would cost availability and buy no enforcement.
 
+**The table is watched, not just installed.** `nft flush ruleset` takes every
+table with it, and ordinary things run it: a firewalld restart, an
+`nftables.service` reload, container tooling. Nothing about that is visible
+from inside the daemon - the kernel simply stops queueing, which the verdict
+loop cannot tell from a quiet network - so a `nft list table` probe runs every
+ten seconds and reinstalls what it finds missing, loudly. Under
+`queue_bypass = false` a reinstall that fails is fatal, for the same reason a
+failed install at startup is: with no table there is nothing enforcing, and
+running on would deliver neither of the things that posture promises.
+
 **Observe mode** (`mode = "observe"`) is a separate axis. Policy is evaluated
 exactly as it would be when enforcing, the decision is recorded, and then the
 packet is accepted anyway. It exists because the honest answer to "what will
