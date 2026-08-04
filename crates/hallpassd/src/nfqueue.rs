@@ -265,6 +265,36 @@ fn set_fail_open(queue: &mut Queue, queue_num: u16, enabled: bool) -> bool {
 /// one (queue fd gone) must not spin forever either.
 const MAX_RECV_ERRORS: u32 = 50;
 
+/// Most packets held for prompt decisions at once, across every pending
+/// prompt.
+///
+/// A held packet occupies a slot in the kernel's queue for the whole prompt
+/// window, and that queue is 1024 entries deep by default. Nothing else
+/// bounds this: prompts coalesce by (exe, proto, dst ip, dst port), so one
+/// process looping connect() to one endpoint produces a single prompt (a
+/// single popup) that holds a packet per attempt. Left uncapped it fills the
+/// kernel queue, and every other new connection on the host is then resolved
+/// by the queue-full behaviour rather than by policy: dropped when
+/// fail-closed, and unjudged when fail-open. Either way an unprivileged
+/// local process decides what happens to everyone else's traffic.
+///
+/// Well under the kernel's depth so the rest of the queue stays available
+/// for traffic that can still be judged. Past the cap a connection is
+/// resolved with the default verdict instead of being held, which is the
+/// same failure the pending-prompt table already has when it is full, and it
+/// is counted the same way.
+const MAX_HELD_PACKETS: usize = 256;
+
+/// The kernel's default nfnetlink_queue depth. Nothing calls
+/// `set_queue_max_len`, so this is the real budget the daemon is spending
+/// out of, and the check below fails the build rather than a test run if a
+/// future bump to [`MAX_HELD_PACKETS`] starts crowding it.
+const KERNEL_QUEUE_DEPTH: usize = 1024;
+const _: () = assert!(
+    MAX_HELD_PACKETS <= KERNEL_QUEUE_DEPTH / 2,
+    "the held-packet budget must leave most of the kernel queue for traffic that can still be judged"
+);
+
 pub fn run(mut queue: Queue, queue_num: u16, mut deps: QueueDeps) -> std::io::Result<()> {
     let snoop_queue = crate::nft::snoop_queue(queue_num);
     let iface_map = crate::iface::IfaceMap::default();
@@ -390,6 +420,21 @@ pub fn run(mut queue: Queue, queue_num: u16, mut deps: QueueDeps) -> std::io::Re
                     // configured default instead, which is what an
                     // unanswered prompt resolves to anyway.
                     Decision::Prompt(conn) if !enforcing => {
+                        let verdict = deps.settings.default_verdict();
+                        commit(&mut queue, msg, verdict, None, conn, &deps, enforcing);
+                    }
+                    // Holding budget spent: decide with the default rather
+                    // than take a kernel queue slot this daemon cannot give
+                    // back in time. See MAX_HELD_PACKETS for why the budget
+                    // exists; the counter is the same one the pending-prompt
+                    // table's overflow uses, because it is the same outcome:
+                    // a connection nobody was asked about.
+                    Decision::Prompt(conn) if held.len() >= MAX_HELD_PACKETS => {
+                        deps.stats.record_prompt_overflow();
+                        tracing::warn!(
+                            held = held.len(),
+                            "held-packet budget full, applying default verdict"
+                        );
                         let verdict = deps.settings.default_verdict();
                         commit(&mut queue, msg, verdict, None, conn, &deps, enforcing);
                     }

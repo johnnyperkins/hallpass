@@ -40,6 +40,39 @@ struct Pending {
     deadline_ms: u64,
 }
 
+/// Most packets one prompt will hold while it waits for an answer.
+///
+/// Coalescing is what makes this necessary: every connection attempt with
+/// the same (exe, proto, dst ip, dst port) joins one prompt, so a process
+/// looping connect() adds a held packet per attempt to a single popup the
+/// operator sees once. Each of those pins a kernel queue slot until the
+/// prompt resolves. The queue thread caps the total
+/// ([`crate::nfqueue`]'s `MAX_HELD_PACKETS`); this caps one flow's share of
+/// it, so a loud connector cannot starve every other prompt on the host.
+///
+/// Generous next to a real application's retry behaviour (a TCP SYN is
+/// retransmitted about six times), and the failure past it costs the extra
+/// packets the default verdict, never the prompt: the operator is still
+/// asked, and their answer still governs the flow from then on.
+const MAX_PACKETS_PER_PROMPT: usize = 32;
+
+/// Most packets one executable will hold across all of its prompts.
+///
+/// The per-prompt budget alone is a per-destination budget: eight
+/// ip:port pairs at 32 packets each is the queue thread's whole global
+/// budget, spent by one process with a couple of hundred connect() calls,
+/// and past that no connection on the host gets a prompt at all until they
+/// drain. This is a quarter of the global budget, so it takes four
+/// misbehaving executables rather than one to reach that state, and a
+/// well-behaved application never comes close: it is 64 packets in flight
+/// to unanswered prompts at once.
+///
+/// Computed by walking the pending prompts rather than kept as a running
+/// count, deliberately. The table is capped at `max_pending_prompts` (64 by
+/// default) so the walk is short, and a counter maintained across the five
+/// paths that add or remove packets is a class of bug this does not need.
+const MAX_PACKETS_PER_EXE: usize = 64;
+
 /// Consecutive timed-out prompts before the handler slot is taken back.
 ///
 /// Not one: a prompt can time out with a perfectly healthy handler on the
@@ -167,6 +200,36 @@ impl PromptTable {
             conn.tuple.dst.port(),
         );
         let mut inner = self.inner.lock().unwrap();
+
+        // Both budgets, before either path can take a slot: one caps what a
+        // single destination holds, the other what one executable holds
+        // across all of its destinations.
+        let exe_held: usize = inner
+            .by_id
+            .values()
+            .filter(|p| p.conn.exe_path == conn.exe_path)
+            .map(|p| p.packets.len())
+            .sum();
+        let over_budget = exe_held >= MAX_PACKETS_PER_EXE
+            || inner
+                .by_key
+                .get(&key)
+                .and_then(|id| inner.by_id.get(id))
+                .is_some_and(|p| p.packets.len() >= MAX_PACKETS_PER_PROMPT);
+        if over_budget {
+            drop(inner);
+            // No event: this flow either has a prompt already or is about to
+            // be represented by one, and that prompt's decision is what the
+            // record should carry. Counted like any other connection
+            // resolved without being asked about, and released now so the
+            // kernel gets its queue slot back rather than at the deadline.
+            self.stats.record_prompt_overflow();
+            tracing::debug!("prompt packet budget full, applying default verdict");
+            let _ = self
+                .verdict_tx
+                .send((seq, self.settings.default_verdict()));
+            return;
+        }
 
         if let Some(&id) = inner.by_key.get(&key) {
             if let Some(pending) = inner.by_id.get_mut(&id) {
@@ -949,6 +1012,83 @@ mod tests {
         // Different key while table is full.
         h.table.handle_new(conn("/bin/b", "2.2.2.2:80"), 2);
         assert_eq!(h.verdict_rx.recv().await, Some((2, Verdict::Deny)));
+    }
+
+    /// One flow cannot hold packets without limit. Coalescing means a
+    /// process looping connect() to one endpoint adds a packet per attempt
+    /// to a single prompt, and each held packet pins a kernel queue slot, so
+    /// past the budget the extras take the default verdict immediately while
+    /// the prompt itself stays open and answerable.
+    #[tokio::test]
+    async fn one_prompt_holds_a_bounded_number_of_packets() {
+        let mut h = harness("packetcap", 4, Verdict::Deny);
+        let (tx, mut prompt_rx) = mpsc::channel(16);
+        assert!(h.table.set_handler(tx.clone()));
+
+        for seq in 0..MAX_PACKETS_PER_PROMPT as u64 {
+            h.table.handle_new(conn("/bin/a", "1.1.1.1:443"), seq);
+        }
+        let DaemonMsg::PromptRequest { id, .. } = prompt_rx.recv().await.unwrap() else {
+            panic!("expected PromptRequest");
+        };
+        assert!(
+            h.verdict_rx.try_recv().is_err(),
+            "packets inside the budget stay held for the operator"
+        );
+
+        // One past the budget: released now, and counted as a connection
+        // nobody was asked about.
+        h.table.handle_new(conn("/bin/a", "1.1.1.1:443"), 999);
+        assert_eq!(h.verdict_rx.recv().await, Some((999, Verdict::Deny)));
+        assert_eq!(h.snapshot().prompts_overflowed, 1);
+
+        // The prompt is untouched: still one popup, still answerable, and
+        // its answer still governs every packet it did hold.
+        h.table
+            .reply(&tx, id, Verdict::Allow, RuleDuration::Once, PromptScope::ThisPort)
+            .expect("the prompt survives the packet budget");
+        assert_eq!(h.verdict_rx.recv().await, Some((0, Verdict::Allow)));
+    }
+
+    /// The per-prompt budget is per destination, so without a second budget
+    /// one process spreading connections over a handful of ip:port pairs
+    /// still holds every packet the queue thread will hold, and then nothing
+    /// on the host gets a prompt until they drain.
+    #[tokio::test]
+    async fn one_executable_holds_a_bounded_number_of_packets_across_destinations() {
+        // Room for more prompts than this test opens, so the pending-table
+        // cap cannot be what resolves them.
+        let mut h = harness("exebudget", MAX_PACKETS_PER_EXE * 2, Verdict::Deny);
+        let (tx, _prompt_rx) = mpsc::channel(256);
+        assert!(h.table.set_handler(tx.clone()));
+
+        // Spread over destinations so the per-prompt budget never applies:
+        // MAX_PACKETS_PER_EXE packets, none of them a repeat.
+        let mut seq = 0u64;
+        for port in 0..(MAX_PACKETS_PER_EXE as u16) {
+            h.table
+                .handle_new(conn("/bin/loud", &format!("1.1.1.1:{}", 1000 + port)), seq);
+            seq += 1;
+        }
+        assert!(
+            h.verdict_rx.try_recv().is_err(),
+            "packets inside the budget stay held"
+        );
+
+        // One more from the same executable, to a fresh destination: over
+        // budget, released immediately rather than holding another slot.
+        h.table.handle_new(conn("/bin/loud", "1.1.1.1:9999"), seq);
+        assert_eq!(h.verdict_rx.recv().await, Some((seq, Verdict::Deny)));
+        assert_eq!(h.snapshot().prompts_overflowed, 1);
+
+        // A different executable is unaffected: this is a per-exe share, not
+        // a global stop.
+        seq += 1;
+        h.table.handle_new(conn("/bin/quiet", "2.2.2.2:443"), seq);
+        assert!(
+            h.verdict_rx.try_recv().is_err(),
+            "one loud executable must not deny everyone else a prompt"
+        );
     }
 
     #[tokio::test(start_paused = true)]

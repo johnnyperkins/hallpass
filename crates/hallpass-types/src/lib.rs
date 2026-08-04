@@ -702,8 +702,10 @@ pub struct Stats {
     /// Rule files skipped while loading (bad permissions, unparsable, or a
     /// duplicate name).
     pub rules_skipped: u64,
-    /// Connections resolved with the default verdict because the pending
-    /// prompt table was full.
+    /// Connections resolved with the default verdict because a hold limit
+    /// was reached rather than because anyone decided: the pending prompt
+    /// table was full, one prompt's packet budget was full, or the daemon
+    /// was already holding as many packets as it will hold at once.
     pub prompts_overflowed: u64,
     /// Packets whose transport the rule engine does not model (SCTP,
     /// ICMP, ...) or that failed to parse, resolved by the

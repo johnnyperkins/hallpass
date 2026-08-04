@@ -70,8 +70,12 @@ impl Counters {
         self.dns_spoof_rejected.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Count a connection resolved by default because the prompt table was
-    /// full.
+    /// Count a connection resolved by default because a hold limit was
+    /// reached: the prompt table was full, this prompt's packet budget was
+    /// full, or the daemon was already holding all the packets it will hold
+    /// at once. One counter for all three because they are one outcome to an
+    /// operator - a connection nobody was asked about - and the log line at
+    /// each site says which limit it was.
     pub fn record_prompt_overflow(&self) {
         self.prompts_overflowed.fetch_add(1, Ordering::Relaxed);
     }
