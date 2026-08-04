@@ -6,7 +6,7 @@
 //! RFC 1035 to pull A/AAAA/CNAME answers out of a response. Anything
 //! malformed returns `None`; it never panics on untrusted input.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::num::NonZeroUsize;
 use std::sync::Mutex;
@@ -203,19 +203,37 @@ pub fn parse_response(msg: &[u8]) -> Option<SnoopedResponse> {
         pos = rdata_pos + rdlen;
     }
 
-    // Expand the alias set from the query name across CNAME edges until
-    // stable. Bounded: each pass adds at least one name or stops, and
-    // there are at most `cnames.len()` names to add.
+    // Follow the CNAME chain from the query name once, through an index.
+    //
+    // This used to be a fixpoint over the edge list, re-scanning every edge
+    // until the alias set stopped growing. Its own termination argument was
+    // the worst case: a chain listed in reverse order adds one alias per
+    // pass, so n edges cost n passes. Nothing bounded n but the packet size
+    // (~4700 edges fit a 64KB response with compression pointers), and this
+    // runs before the response has been validated against an observed query
+    // - an unsolicited datagram from source port 53 is enough - so a crafted
+    // reply bought seconds of CPU on the runtime that also serves prompts
+    // and IPC. Measured at 1.63s for one 64KB packet before this change.
+    //
+    // One pass to index, then each name expanded once: linear, and a chain
+    // that loops back on itself stops at the first name already seen.
+    //
+    // The index holds every target of an owner, not just one. A name with
+    // two CNAMEs violates RFC 1034 and a correct server does not send it,
+    // but misconfigured zones do, and keeping only one target would silently
+    // drop the addresses under the other branch: a domain rule that quietly
+    // stops matching is worse than the work of following both.
+    let mut index: HashMap<&str, Vec<&str>> = HashMap::new();
+    for (owner, target) in &cnames {
+        index.entry(owner.as_str()).or_default().push(target.as_str());
+    }
     let mut aliases: HashSet<&str> = HashSet::from([query_name.as_str()]);
-    loop {
-        let before = aliases.len();
-        for (owner, target) in &cnames {
-            if aliases.contains(owner.as_str()) {
-                aliases.insert(target.as_str());
+    let mut queue = vec![query_name.as_str()];
+    while let Some(name) = queue.pop() {
+        for target in index.get(name).into_iter().flatten() {
+            if aliases.insert(target) {
+                queue.push(target);
             }
-        }
-        if aliases.len() == before {
-            break;
         }
     }
 
@@ -547,6 +565,74 @@ mod tests {
                 ("1.2.3.5".parse().unwrap(), 30)
             ]
         );
+    }
+
+    /// The shape that made the old fixpoint quadratic: a long chain listed
+    /// in reverse, so each pass over the edge list learned exactly one new
+    /// alias. The result must still be correct, and it must not be paid for
+    /// per edge per edge - one crafted 64KB response cost 1.63s of CPU on
+    /// the runtime that also serves prompts and IPC, before validation had
+    /// even decided the response was unsolicited.
+    #[test]
+    fn a_long_reverse_ordered_cname_chain_is_cheap_and_correct() {
+        const LINKS: usize = 600;
+        let name = |i: usize| format!("h{i}.example.org");
+        // Edges last-to-first: hN-1 -> hN, ..., query -> h1.
+        let mut msg = header(0x8180, 1, (LINKS + 1) as u16);
+        msg.extend(question("start.example.org"));
+        for i in (1..LINKS).rev() {
+            msg.extend(record(wire_name(&name(i)), TYPE_CNAME, 300, &wire_name(&name(i + 1))));
+        }
+        msg.extend(record(wire_name("start.example.org"), TYPE_CNAME, 300, &wire_name(&name(1))));
+        msg.extend(record(wire_name(&name(LINKS)), TYPE_A, 30, &[7, 7, 7, 7]));
+
+        let start = std::time::Instant::now();
+        let resp = parse_response(&msg).expect("the chain still resolves");
+        let elapsed = start.elapsed();
+        assert_eq!(resp.query_name, "start.example.org");
+        assert_eq!(resp.addrs, vec![("7.7.7.7".parse().unwrap(), 30)]);
+        // Loose by design: this fails on a return to quadratic (seconds),
+        // not on a slow machine (milliseconds).
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "{LINKS} CNAME links took {elapsed:?}; alias expansion is superlinear again"
+        );
+    }
+
+    /// Two CNAMEs at one owner is invalid DNS that misconfigured zones send
+    /// anyway. Both branches have to be followed: keeping one would drop the
+    /// other's addresses, and a domain rule that quietly stops matching is
+    /// the worst way to lose them.
+    #[test]
+    fn both_branches_of_a_duplicated_cname_owner_are_followed() {
+        let mut msg = header(0x8180, 1, 4);
+        msg.extend(question("split.example.org"));
+        msg.extend(record(wire_name("split.example.org"), TYPE_CNAME, 300, &wire_name("a.example.org")));
+        msg.extend(record(wire_name("split.example.org"), TYPE_CNAME, 300, &wire_name("b.example.org")));
+        msg.extend(record(wire_name("a.example.org"), TYPE_A, 30, &[1, 1, 1, 1]));
+        msg.extend(record(wire_name("b.example.org"), TYPE_A, 30, &[2, 2, 2, 2]));
+        let resp = parse_response(&msg).unwrap();
+        let mut addrs: Vec<IpAddr> = resp.addrs.iter().map(|(ip, _)| *ip).collect();
+        addrs.sort();
+        assert_eq!(
+            addrs,
+            vec![
+                "1.1.1.1".parse::<IpAddr>().unwrap(),
+                "2.2.2.2".parse::<IpAddr>().unwrap()
+            ]
+        );
+    }
+
+    /// A chain that points back into itself must end, not spin.
+    #[test]
+    fn a_looping_cname_chain_terminates() {
+        let mut msg = header(0x8180, 1, 3);
+        msg.extend(question("a.example.org"));
+        msg.extend(record(wire_name("a.example.org"), TYPE_CNAME, 300, &wire_name("b.example.org")));
+        msg.extend(record(wire_name("b.example.org"), TYPE_CNAME, 300, &wire_name("a.example.org")));
+        msg.extend(record(wire_name("b.example.org"), TYPE_A, 30, &[5, 5, 5, 5]));
+        let resp = parse_response(&msg).expect("the loop still yields its address");
+        assert_eq!(resp.addrs, vec![("5.5.5.5".parse().unwrap(), 30)]);
     }
 
     #[test]
