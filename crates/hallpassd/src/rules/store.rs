@@ -519,6 +519,9 @@ impl RuleStore {
         };
         if let Some(pos) = existing {
             let old = entries.remove(pos);
+            // Replacement by name is the API, but it is also how a rule an
+            // operator approved earlier disappears, so it leaves a trace.
+            tracing::info!(rule = %old.rule.name, "replacing an existing rule of the same name");
             // Replacing a disk rule with a session rule must not leave a
             // stale file that would resurrect the old rule on reload.
             if let Origin::Disk(old_path) = &old.origin {

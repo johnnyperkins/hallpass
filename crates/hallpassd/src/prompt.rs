@@ -116,6 +116,13 @@ pub struct PromptTable {
     /// decision is actually applied.
     settings: Arc<crate::config::RuntimeSettings>,
     max_pending: usize,
+    /// Distinguishes this daemon run in the names of rules generated from
+    /// prompt replies. Prompt ids restart at 1 every run while `Forever`
+    /// rules persist, so `prompt-<exe>-<id>` alone collided across restarts,
+    /// and [`RuleStore::add`] replaces by name: the first curl prompt after
+    /// a restart silently overwrote the rule an operator approved for curl
+    /// before it, file and all.
+    run_tag: String,
 }
 
 impl PromptTable {
@@ -136,6 +143,11 @@ impl PromptTable {
             store,
             settings,
             max_pending,
+            // Milliseconds and the pid, hex. Seconds alone were not enough:
+            // `Restart=on-failure` restarts within the same second by
+            // default, and a crash loop is exactly when prompt ids restart
+            // at 1 while the old run's rules are still on disk.
+            run_tag: format!("{:x}-{:x}", unix_ms_now(), std::process::id()),
         }
     }
 
@@ -321,7 +333,7 @@ impl PromptTable {
         let mut rule_name = None;
         let mut added_rule = None;
         if duration != RuleDuration::Once {
-            match rule_from_reply(id, &pending.conn, verdict, duration, scope) {
+            match rule_from_reply(&self.run_tag, id, &pending.conn, verdict, duration, scope) {
                 Some(rule) => {
                     rule_name = Some(rule.name.clone());
                     if let Err(e) = self.store.add(rule.clone()) {
@@ -522,7 +534,6 @@ impl PromptTable {
     }
 }
 
-/// Build the rule a prompt reply asks for. `None` when the connection has
 /// Longest executable stem carried into a generated rule name.
 const MAX_RULE_STEM_CHARS: usize = 40;
 
@@ -546,8 +557,13 @@ fn sanitize_rule_stem(raw: &str) -> String {
         .collect()
 }
 
+/// Build the rule a prompt reply asks for. `None` when the connection has
 /// no attributed executable (a rule would then match far too broadly).
+///
+/// `run_tag` makes the generated name unique across daemon restarts; see
+/// [`PromptTable::run_tag`].
 fn rule_from_reply(
+    run_tag: &str,
     id: u64,
     conn: &Connection,
     verdict: Verdict,
@@ -582,7 +598,7 @@ fn rule_from_reply(
         PromptScope::AppAnywhere => {}
     }
     Some(Rule {
-        name: format!("prompt-{stem}-{id}"),
+        name: format!("prompt-{stem}-{run_tag}-{id}"),
         action: verdict.into(),
         duration,
         priority: PROMPT_RULE_PRIORITY,
@@ -754,6 +770,7 @@ mod tests {
         let mut c = conn(hostile, "1.1.1.1:443");
         c.exe_path = Some(PathBuf::from(hostile));
         let rule = rule_from_reply(
+            "abc",
             7,
             &c,
             Verdict::Deny,
@@ -1180,13 +1197,13 @@ mod tests {
     #[test]
     fn scope_matchers() {
         let c = conn("/usr/bin/curl", "9.9.9.9:853");
-        let r = rule_from_reply(1, &c, Verdict::Deny, RuleDuration::Session, PromptScope::ThisPort)
+        let r = rule_from_reply("abc", 1, &c, Verdict::Deny, RuleDuration::Session, PromptScope::ThisPort)
             .unwrap();
         assert_eq!(r.matcher.dest.as_deref(), Some("9.9.9.9"));
         assert_eq!(r.matcher.port, Some(853));
         assert_eq!(r.action, hallpass_types::Action::Deny);
 
-        let r = rule_from_reply(2, &c, Verdict::Allow, RuleDuration::Forever, PromptScope::AppAnywhere)
+        let r = rule_from_reply("abc", 2, &c, Verdict::Allow, RuleDuration::Forever, PromptScope::AppAnywhere)
             .unwrap();
         assert_eq!(r.matcher.dest, None);
         assert_eq!(r.matcher.port, None);
@@ -1194,6 +1211,6 @@ mod tests {
 
         let mut anon = c.clone();
         anon.exe_path = None;
-        assert!(rule_from_reply(3, &anon, Verdict::Allow, RuleDuration::Session, PromptScope::AppAnywhere).is_none());
+        assert!(rule_from_reply("abc", 3, &anon, Verdict::Allow, RuleDuration::Session, PromptScope::AppAnywhere).is_none());
     }
 }
