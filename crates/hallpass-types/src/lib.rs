@@ -739,9 +739,10 @@ pub struct Stats {
     /// desktop, and nothing else distinguishes the two, so a status display
     /// that omits this cannot tell an operator their prompts stopped working.
     pub prompt_handler_connected: bool,
-    /// Connections resolved with the default verdict because nobody answered:
-    /// no client held the prompt slot, or the client holding it let the
-    /// prompt time out.
+    /// Connections resolved with the default verdict because nobody
+    /// answered: no client held the prompt slot, the client holding it let
+    /// the prompt time out, or enforcement was switched off while the prompt
+    /// was open.
     ///
     /// Counts decisions made by nobody. A rising number with
     /// [`Stats::prompt_handler_connected`] true is a handler that is

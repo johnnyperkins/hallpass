@@ -386,7 +386,15 @@ async fn message_loop(
                 // grant; the log line is what makes the change auditable.
                 tracing::info!(?peer_uid, ?new, "runtime settings change");
                 match deps.settings.apply(&new) {
-                    Ok(()) => DaemonMsg::Ok,
+                    Ok(()) => {
+                        // Prompts opened while enforcing would otherwise
+                        // keep their packets held across the toggle, which
+                        // is a delay observe mode promises not to impose.
+                        if !new.enforce {
+                            deps.prompts.resolve_pending_for_observe();
+                        }
+                        DaemonMsg::Ok
+                    }
                     Err(message) => DaemonMsg::Err { message },
                 }
             }

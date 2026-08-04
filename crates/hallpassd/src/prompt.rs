@@ -205,6 +205,18 @@ impl PromptTable {
     /// or resolves immediately with the default verdict (no handler
     /// connected, or the pending table is full).
     pub fn handle_new(self: &Arc<Self>, conn: Connection, seq: u64) {
+        // The queue thread does not hand over packets while observing, but
+        // it reads the mode per packet and this runs on a different task, so
+        // a toggle can land between the two: without this check a packet
+        // already in flight opens a fresh prompt after
+        // `resolve_pending_for_observe` has drained the table, and is then
+        // held for the full timeout under a mode that promises to hold
+        // nothing.
+        if !self.settings.enforcing() {
+            self.stats.record_prompt_unanswered();
+            self.finish_default(conn, vec![seq]);
+            return;
+        }
         let key: Key = (
             conn.exe_path.clone(),
             conn.tuple.proto,
@@ -371,6 +383,13 @@ impl PromptTable {
     /// the same reason replies sweep: an already-open prompt the new
     /// rule covers must not fall through to the timeout default.
     pub fn resolve_covered_by(&self, rule: &Rule) {
+        // The packet path evaluates enabled rules only, so a disabled one
+        // must not decide anything here either: a client may add a rule with
+        // `enabled = false`, and sweeping with it resolved live prompts with
+        // a verdict no packet would ever have been given.
+        if !rule.enabled {
+            return;
+        }
         let compiled = match crate::rules::model::CompiledRule::compile(rule) {
             Ok(c) => c,
             Err(e) => {
@@ -408,6 +427,42 @@ impl PromptTable {
                 verdict,
                 Some(rule.name.clone()),
             );
+            if let Some(h) = &handler {
+                let _ = h.try_send(DaemonMsg::PromptExpired { id });
+            }
+        }
+    }
+
+    /// Resolve every pending prompt because the daemon has stopped
+    /// enforcing.
+    ///
+    /// Observe mode never holds a packet for a prompt, but prompts opened
+    /// while enforcing outlive the toggle, and their packets stay held until
+    /// somebody answers or the deadline passes - up to an hour at the
+    /// maximum timeout. That contradicts what the toggle promises: observe
+    /// mode is supposed to stop changing what reaches the wire from the
+    /// moment it is turned on, and a held packet is delayed even though it
+    /// will eventually be accepted. The verdict recorded is the configured
+    /// default, which is what an observe-mode unmatched connection records
+    /// anyway; the packets themselves are accepted, since the queue thread
+    /// reads the mode when it hands them back.
+    pub fn resolve_pending_for_observe(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        let pending: Vec<(u64, Pending)> = inner.by_id.drain().collect();
+        inner.by_key.clear();
+        let handler = inner.handler.as_ref().map(|h| h.tx.clone());
+        drop(inner);
+
+        if pending.is_empty() {
+            return;
+        }
+        tracing::info!(
+            count = pending.len(),
+            "observe mode: releasing prompts opened while enforcing"
+        );
+        for (id, p) in pending {
+            self.stats.record_prompt_unanswered();
+            self.finish_default(p.conn, p.packets);
             if let Some(h) = &handler {
                 let _ = h.try_send(DaemonMsg::PromptExpired { id });
             }
@@ -1106,6 +1161,66 @@ mod tests {
             h.verdict_rx.try_recv().is_err(),
             "one loud executable must not deny everyone else a prompt"
         );
+    }
+
+    /// Turning enforcement off must not leave packets held behind a prompt
+    /// nobody is going to answer: the operator was told nothing is being
+    /// blocked, and a packet held to its deadline is delayed by up to an
+    /// hour.
+    #[tokio::test]
+    async fn switching_to_observe_releases_prompts_opened_while_enforcing() {
+        let mut h = harness("observe-release", 8, Verdict::Allow);
+        let (tx, mut prompt_rx) = mpsc::channel(16);
+        assert!(h.table.set_handler(tx.clone()));
+        h.table.handle_new(conn("/bin/a", "1.1.1.1:443"), 11);
+        let DaemonMsg::PromptRequest { id, .. } = prompt_rx.recv().await.unwrap() else {
+            panic!("expected PromptRequest");
+        };
+
+        h.table.resolve_pending_for_observe();
+
+        assert_eq!(h.verdict_rx.recv().await, Some((11, Verdict::Allow)));
+        assert_eq!(prompt_rx.recv().await, Some(DaemonMsg::PromptExpired { id }));
+        // The prompt is gone from the table, so a late answer is refused
+        // rather than resolving a flow that was already released.
+        assert!(h
+            .table
+            .reply(&tx, id, Verdict::Deny, RuleDuration::Once, PromptScope::ThisPort)
+            .is_err());
+    }
+
+    /// The sweep must apply the same enabled filter the packet path does. A
+    /// client can add a disabled rule, and sweeping with it resolved live
+    /// prompts with a verdict no packet would ever have been given.
+    #[tokio::test]
+    async fn a_disabled_rule_does_not_resolve_prompts() {
+        let mut h = harness("disabled-sweep", 8, Verdict::Deny);
+        let (tx, mut prompt_rx) = mpsc::channel(16);
+        assert!(h.table.set_handler(tx.clone()));
+        h.table.handle_new(conn("/bin/a", "1.1.1.1:443"), 21);
+        let _ = prompt_rx.recv().await.unwrap();
+
+        let mut rule = Rule {
+            name: "off-allow".into(),
+            action: hallpass_types::Action::Allow,
+            duration: RuleDuration::Session,
+            priority: 1,
+            enabled: false,
+            matcher: RuleMatch {
+                exe: Some(PathBuf::from("/bin/a")),
+                ..Default::default()
+            },
+        };
+        h.table.resolve_covered_by(&rule);
+        assert!(
+            h.verdict_rx.try_recv().is_err(),
+            "a disabled rule must not decide a prompt"
+        );
+
+        // Enabled, the same rule sweeps it.
+        rule.enabled = true;
+        h.table.resolve_covered_by(&rule);
+        assert_eq!(h.verdict_rx.recv().await, Some((21, Verdict::Allow)));
     }
 
     #[tokio::test(start_paused = true)]

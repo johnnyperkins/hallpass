@@ -112,8 +112,10 @@ impl Counters {
     }
 
     /// Count a connection the default verdict decided because nobody
-    /// answered: no client held the prompt slot, or the one that did let the
-    /// prompt time out.
+    /// answered: no client held the prompt slot, the one that did let the
+    /// prompt time out, or the daemon stopped enforcing while the prompt was
+    /// open (observe mode never holds a packet, so the ones already held are
+    /// released with the default).
     ///
     /// Separate from [`Counters::record_prompt_overflow`], which is the
     /// daemon's own limit rather than a missing operator, because the two
