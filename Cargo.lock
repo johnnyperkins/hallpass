@@ -1662,6 +1662,7 @@ dependencies = [
  "notify",
  "serde",
  "sha2",
+ "socket2",
  "tokio",
  "toml 0.8.23",
  "tracing",

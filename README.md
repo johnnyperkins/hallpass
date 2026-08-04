@@ -217,9 +217,13 @@ addr = "10.0.0.9:514"     # literal IP:port; hostnames are not resolved
 Export runs as an ordinary event subscriber, so a stalled or unreachable
 collector costs events, never verdicts. Values are escaped and capped, and
 control characters are neutralized, so a process cannot forge log records
-through its own command line. A UDP collector needs a rule allowing
-hallpassd to reach it, since export datagrams are outbound traffic like
-any other.
+through its own command line. Export datagrams do not need a rule: the
+daemon marks its own export socket and the ruleset accepts that mark from
+root-owned sockets, so they never enter the verdict queue. Filtering them
+would not just cost logs under a default-deny posture, it would feed the
+daemon its own tail - an unanswered UDP flow stays `ct state new`, so each
+exported event would be decided as a new connection and emit the event that
+produces the next datagram.
 
 ## Usage
 

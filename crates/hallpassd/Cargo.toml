@@ -44,6 +44,14 @@ sha2 = { workspace = true }
 # unsafe_code and std has no netlink socket. Chosen over neli (proc-macro
 # subtree) for pulling only bytes, libc and log, all already in the tree.
 netlink-sys = { version = "0.8", default-features = false }
+# SO_MARK on the syslog export socket, so the daemon's own log traffic can
+# be exempted from its own verdict queue (see nft::EXPORT_MARK). std cannot
+# set it and this crate denies unsafe_code, so the raw setsockopt has to come
+# from somewhere; socket2 is already in the tree under tokio.
+# "all" is not optional: set_mark lives behind that feature. It compiles
+# without it only because tokio happens to enable it, which is a dependency
+# of a dependency's choice to rely on.
+socket2 = { version = "0.6", features = ["all"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

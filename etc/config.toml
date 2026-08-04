@@ -61,9 +61,12 @@ queue_bypass = true
 #
 # ...or a remote collector. The address must be a literal IP and port
 # (no hostnames: resolving one would run through the daemon's own DNS
-# path at startup). Export datagrams are themselves outbound traffic and
-# get filtered like any other, so add a rule allowing hallpassd to reach
-# the collector - otherwise a default-deny posture blocks its own logs.
+# path at startup). Export datagrams skip the verdict queue: the daemon
+# marks its own export socket and the ruleset accepts that mark, so no
+# rule is needed for the collector and a default-deny posture does not
+# block the daemon's own logs. That exemption is not a convenience - an
+# unanswered UDP flow never leaves `ct state new`, so without it every
+# exported event produced a datagram that produced another event.
 # [syslog.target]
 # kind = "udp"
 # addr = "10.0.0.9:514"

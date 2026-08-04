@@ -247,6 +247,36 @@ enum Sink {
     Udp { sock: UdpSocket, addr: SocketAddr },
 }
 
+/// Mark the export socket so the ruleset lets its datagrams past the
+/// verdict queue; see [`crate::nft::EXPORT_MARK`] for the loop this closes.
+///
+/// A failure costs the exemption, not the export, so it warns rather than
+/// refusing to start: SO_MARK needs CAP_NET_ADMIN, which a development run
+/// as an ordinary user does not have, and such a run has no nftables table
+/// to be exempted from either.
+fn mark_exempt(sock: &UdpSocket) {
+    if let Err(e) = socket2::SockRef::from(sock).set_mark(crate::nft::EXPORT_MARK) {
+        tracing::warn!(
+            "could not mark the syslog export socket; its datagrams will be \
+             filtered like any other traffic, and each one exported will \
+             produce another event: {e}"
+        );
+        return;
+    }
+    // The exemption rule also requires the socket to be root-owned, so
+    // setting the mark is only half of it. A daemon running non-root with
+    // CAP_NET_ADMIN granted (an ambient capability in a modified unit) marks
+    // the socket successfully and still gets filtered, which would bring the
+    // loop back with nothing in the log to explain it.
+    if crate::rules::store::effective_uid() != Some(0) {
+        tracing::warn!(
+            "syslog export socket marked, but this daemon is not root and the \
+             exemption rule requires a root-owned socket: export datagrams will \
+             be filtered, and each exported event will produce another"
+        );
+    }
+}
+
 impl Sink {
     async fn open(target: &SyslogTarget) -> Result<Sink, String> {
         match target {
@@ -267,6 +297,7 @@ impl Sink {
                 let sock = UdpSocket::bind(bind)
                     .await
                     .map_err(|e| format!("udp socket: {e}"))?;
+                mark_exempt(&sock);
                 Ok(Sink::Udp { sock, addr })
             }
         }

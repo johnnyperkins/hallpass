@@ -50,6 +50,30 @@ use std::time::Duration;
 /// marks other tooling typically uses.
 pub const REJECT_MARK: u32 = 0x4841_4c50;
 
+/// Packet mark the daemon sets on its own syslog export socket, accepted by
+/// the first rule of the output chain so those datagrams never re-enter the
+/// verdict queue.
+///
+/// Without it, UDP export is a loop that feeds itself: an unanswered UDP
+/// flow never leaves `ct state new` (NEW means "not seen packets in both
+/// directions", and a syslog collector does not answer), so every export
+/// datagram is queued, decided, and emitted as an event, which the exporter
+/// turns into the next datagram. Probe-confirmed on a live host: five
+/// datagrams of one such flow produced five separate events. It runs in both
+/// postures, since a dropped packet does not confirm its conntrack entry
+/// either, and an allow rule for the collector only makes it run faster.
+///
+/// The exemption is paired with `meta skuid 0` in the ruleset, so the mark
+/// alone is not a way past the firewall. Setting SO_MARK needs CAP_NET_ADMIN
+/// or (since Linux 5.17) CAP_NET_RAW, which is a capability an ordinary
+/// unprivileged process does not hold but a `ping`-style binary or a
+/// container process can; requiring the socket to be root-owned as well
+/// narrows who could use it to root, who is already past every boundary
+/// this daemon has.
+///
+/// Distinct from [`REJECT_MARK`] and equally distinctive ("HALE").
+pub const EXPORT_MARK: u32 = 0x4841_4c45;
+
 /// Queue number for DNS snoop traffic (verdict queue + 1).
 pub fn snoop_queue(queue_num: u16) -> u16 {
     // Config validation guarantees queue_num < u16::MAX.
@@ -60,6 +84,7 @@ pub fn snoop_queue(queue_num: u16) -> u16 {
 fn ruleset(queue_num: u16, verdict_bypass: bool) -> String {
     let snoop = snoop_queue(queue_num);
     let mark = REJECT_MARK;
+    let export = EXPORT_MARK;
     let bypass = if verdict_bypass { " bypass" } else { "" };
     // `reject_marked` is its own base chain at a later priority than `output`,
     // so a packet the daemon accepted with REJECT_MARK reaches it: reinjection
@@ -73,6 +98,7 @@ fn ruleset(queue_num: u16, verdict_bypass: bool) -> String {
         "table inet hallpass {{\n\
          \tchain output {{\n\
          \t\ttype filter hook output priority mangle; policy accept;\n\
+         \t\tmeta skuid 0 meta mark {export} accept\n\
          \t\tct state new queue num {queue_num}{bypass}\n\
          \t\tudp dport 53 ct state != new queue num {snoop} bypass\n\
          \t}}\n\
@@ -382,6 +408,33 @@ mod tests {
                  --- ruleset ---\n{text}"
             );
         }
+    }
+
+    /// The daemon's own export traffic must be accepted before the queue
+    /// rule can see it. Behind it, UDP syslog export feeds itself: an
+    /// unanswered UDP flow stays `ct state new`, so every datagram is
+    /// queued, decided, and emitted as the event that produces the next
+    /// datagram.
+    #[test]
+    fn export_mark_is_accepted_before_the_queue_rule() {
+        for bypass in [true, false] {
+            let r = ruleset(3, bypass);
+            let output = r
+                .split("\tchain reject_marked {")
+                .next()
+                .expect("output chain precedes the reject chain");
+            let accept = output
+                .find(&format!("meta skuid 0 meta mark {EXPORT_MARK} accept"))
+                .expect("the export exemption must be in the output chain, and root-only");
+            let queue = output
+                .find("ct state new queue num 3")
+                .expect("the queue rule must be in the output chain");
+            assert!(
+                accept < queue,
+                "the export exemption must precede the queue rule:\n{r}"
+            );
+        }
+        assert_ne!(EXPORT_MARK, REJECT_MARK, "the two marks must not collide");
     }
 
     #[test]
