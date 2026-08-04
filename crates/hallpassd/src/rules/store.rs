@@ -6,7 +6,7 @@
 //! reads rules lock-free.
 
 use std::io::Read;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -712,10 +712,53 @@ impl RuleStore {
         }
     }
 
+    /// Write a rule file so that it is either the old rule or the new one,
+    /// never half of either.
+    ///
+    /// Writing in place truncates first, so a crash or a full disk mid-write
+    /// left a partial file, which the next scan refuses as unparsable and
+    /// silently drops from policy: for a deny rule that is a rule that stops
+    /// denying. The temp file is dot-prefixed and not `.toml`, so `load_dir`
+    /// skips it if a scan catches it mid-write, and the rename is atomic
+    /// within the directory.
     fn persist_to(&self, rule: &Rule, path: &Path) -> Result<(), String> {
+        use std::io::Write;
+
         let text = toml::to_string_pretty(rule).map_err(|e| format!("serialize rule: {e}"))?;
-        std::fs::write(path, text).map_err(|e| format!("write {}: {e}", path.display()))?;
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644));
+        let dir = path.parent().unwrap_or(Path::new("."));
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        let tmp = dir.join(format!(".{name}.tmp"));
+        // A leftover from an interrupted write, so create_new below does not
+        // refuse. Nothing else owns this name.
+        let _ = std::fs::remove_file(&tmp);
+        // create_new plus O_NOFOLLOW plus an explicit mode, not fs::write:
+        // fs::write follows a symlink at the target and creates with
+        // 0666 & ~umask, so a planted link would aim a root write anywhere,
+        // and under a permissive umask there is a window where the file
+        // about to become live policy is world-writable. unique_path already
+        // refuses to reuse a path it does not own; the temp path needs the
+        // same care.
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .custom_flags(O_NOFOLLOW)
+            .mode(0o644)
+            .open(&tmp)
+            .map_err(|e| format!("write {}: {e}", tmp.display()))?;
+        let written = file
+            .write_all(text.as_bytes())
+            // The bytes have to be on disk before the rename publishes them,
+            // or a crash can leave the new name pointing at an empty file.
+            .and_then(|()| file.sync_all());
+        if let Err(e) = written {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(format!("write {}: {e}", tmp.display()));
+        }
+        drop(file);
+        std::fs::rename(&tmp, path).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            format!("write {}: {e}", path.display())
+        })?;
         Ok(())
     }
 }
@@ -802,6 +845,7 @@ mod tests {
     use super::*;
     use crate::testutil::TestDir;
     use hallpass_types::{Action, RuleDuration, RuleMatch};
+    use std::os::unix::fs::PermissionsExt;
 
     fn rule(name: &str, duration: RuleDuration) -> Rule {
         Rule {

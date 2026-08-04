@@ -86,14 +86,19 @@ impl Client {
             .await
             .map_err(|e| CliError::Connect(format!("handshake failed: {e}")))?
         {
-            DaemonMsg::HelloAck { version } => {
-                if version != PROTOCOL_VERSION {
-                    eprintln!(
-                        "warning: daemon protocol v{version}, client v{PROTOCOL_VERSION}"
-                    );
-                }
-                Ok(Client { stream })
+            // A mismatch is fatal, not a warning. The daemon refuses the
+            // connection outright on its side, so carrying on only produced
+            // a second, less clear failure (an unexpected EOF) after the
+            // warning had scrolled past; and where a version does answer,
+            // guessing at frames the other end decodes differently is how a
+            // client silently misreads policy.
+            DaemonMsg::HelloAck { version } if version != PROTOCOL_VERSION => {
+                Err(CliError::Connect(format!(
+                    "protocol version mismatch: daemon v{version}, client v{PROTOCOL_VERSION}; \
+                     the daemon, CLI and UI ship together and must be upgraded together"
+                )))
             }
+            DaemonMsg::HelloAck { .. } => Ok(Client { stream }),
             DaemonMsg::Err { message } => Err(CliError::Connect(format!(
                 "daemon rejected handshake: {message}"
             ))),
