@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use globset::{Glob, GlobMatcher};
+use globset::GlobMatcher;
 use ipnet::IpNet;
 use hallpass_types::{Action, Connection, Proto, Rule};
 
@@ -100,8 +100,17 @@ impl CompiledRule {
         let src = m.src.as_deref().map(|s| parse_net("src", s)).transpose()?;
         let exe_glob = match &m.exe_glob {
             None => None,
+            // literal_separator, so `*` and `?` stop at a path separator the
+            // way a shell's do. Off (the crate default) `/usr/bin/*` also
+            // covered `/usr/bin/anything/deep/evil`, so a rule an operator
+            // wrote for one directory silently carried every subtree under
+            // it, and a binary dropped in a writable subdirectory of an
+            // allowed tree inherited the verdict. A subtree is still
+            // expressible, now on purpose: `/opt/app/**`.
             Some(g) => Some(
-                Glob::new(g)
+                globset::GlobBuilder::new(g)
+                    .literal_separator(true)
+                    .build()
                     .map_err(|e| format!("bad exe_glob {g:?}: {e}"))?
                     .compile_matcher(),
             ),
@@ -317,6 +326,51 @@ mod tests {
             enabled: true,
             matcher,
         }
+    }
+
+    /// `*` covers one path level, `**` covers the subtree. Off (the crate
+    /// default) an operator writing `/usr/bin/*` also allowed anything at
+    /// any depth beneath it, so a binary dropped into a writable
+    /// subdirectory of an allowed tree inherited that rule's verdict.
+    #[test]
+    fn exe_glob_star_does_not_cross_a_path_separator() {
+        let matches = |pattern: &str, exe: &str| {
+            let compiled = CompiledRule::compile(&rule_with(RuleMatch {
+                exe_glob: Some(pattern.into()),
+                ..Default::default()
+            }))
+            .expect("valid glob");
+            let c = Connection {
+                tuple: hallpass_types::FlowTuple {
+                    proto: Proto::Tcp,
+                    src: "10.0.0.1:40000".parse().unwrap(),
+                    dst: "1.2.3.4:443".parse().unwrap(),
+                },
+                uid: None,
+                pid: None,
+                exe_path: Some(exe.into()),
+                cmdline: None,
+                parent_exe: None,
+                domain: None,
+                iface: None,
+            };
+            compiled.matches(&c, None)
+        };
+
+        assert!(matches("/usr/bin/*", "/usr/bin/curl"), "one level still matches");
+        assert!(
+            !matches("/usr/bin/*", "/usr/bin/nested/evil"),
+            "* must not cross a separator"
+        );
+        assert!(
+            !matches("/usr/lib/firefox/*", "/usr/lib/firefox/plugins/writable/evil"),
+            "the README's own example must not carry a whole subtree"
+        );
+        assert!(
+            matches("/opt/app/**", "/opt/app/deep/nested/bin"),
+            "** is how a subtree is asked for"
+        );
+        assert!(!matches("/usr/bin/?", "/usr/bin//"), "? must not cross either");
     }
 
     #[test]

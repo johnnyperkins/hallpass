@@ -142,6 +142,12 @@ pub struct RuleMatch {
     /// Exact executable path.
     pub exe: Option<PathBuf>,
     /// Glob pattern matched against the executable path.
+    ///
+    /// `*` and `?` stop at `/`, as in a shell: `/usr/bin/*` is the binaries
+    /// directly in that directory, not everything beneath it. Use `**` for a
+    /// whole subtree (`/opt/app/**`), which is worth meaning deliberately -
+    /// any writable directory under the prefix then inherits the rule's
+    /// verdict.
     pub exe_glob: Option<String>,
     /// SHA-256 of the executable file, as 64 hex digits (case-insensitive).
     /// Pins the rule to the exact binary contents, not just its path.
