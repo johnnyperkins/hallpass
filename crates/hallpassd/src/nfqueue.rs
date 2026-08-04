@@ -110,6 +110,29 @@ fn applied_verdict(verdict: Verdict, enforcing: bool) -> Verdict {
     }
 }
 
+/// Whether the kernel should accept rather than drop when the verdict queue
+/// is full.
+///
+/// Fail-closed is a deliberate trade of availability for enforcement, so it
+/// holds while the daemon is enforcing. Observe mode makes no such trade:
+/// its whole contract is that nothing this daemon does changes what reaches
+/// the wire, and a kernel-side overflow drop would break that with no event
+/// and no counter, so starting in observe mode forces the flag on whatever
+/// the posture says.
+///
+/// Read once, at bind, and deliberately not re-issued when the mode is
+/// toggled at runtime. Setting it is a netlink round trip on the queue's own
+/// socket, and the crate's ack read hands every message in the arriving
+/// batch to a callback that discards them: packets already queued would be
+/// thrown away without a verdict, holding kernel slots forever. Losing
+/// traffic to relax a flag that only matters while the queue is overflowing
+/// is a bad trade, so a runtime toggle to observe under a fail-closed
+/// posture keeps dropping on overflow. `mode = "observe"` in the config file
+/// gets the relaxed flag; a restart is what applies it.
+pub fn want_fail_open(queue_bypass: bool, enforcing: bool) -> bool {
+    queue_bypass || !enforcing
+}
+
 /// Commit a decision: count it, record it as an event, and hand the packet
 /// back to the kernel.
 ///
@@ -191,14 +214,50 @@ fn decide(tuple: FlowTuple, iface: Option<String>, ctx: &DecideCtx) -> Decision 
 /// fail-open, dropped under fail-closed. Either way the configured
 /// default verdict and rules are silently skipped for however long the
 /// gap lasts, so the gap must not exist.
-pub fn bind(queue_num: u16) -> std::io::Result<Queue> {
+///
+/// `fail_open` is a *different* flag from the ruleset's `bypass`, and both
+/// are needed for the posture the config promises. nftables `bypass` is
+/// consulted when the enqueue fails with `-ESRCH` (nobody bound to the
+/// queue); a queue that is bound but full fails with `-ENOSPC`, which the
+/// kernel resolves by dropping unless this queue carries
+/// `NFQA_CFG_F_FAIL_OPEN`. Setting only the first means an overflowing
+/// queue drops packets on a host whose operator asked for fail-open, with
+/// no event and no counter to say so.
+pub fn bind(queue_num: u16, fail_open: bool) -> std::io::Result<Queue> {
     let snoop_queue = crate::nft::snoop_queue(queue_num);
     let mut queue = Queue::open()?;
     queue.bind(queue_num)?;
     queue.bind(snoop_queue)?;
+    let _ = set_fail_open(&mut queue, queue_num, fail_open);
+    // The snoop queue is observational: its packets are accepted the moment
+    // they are read, so a full snoop queue must never cost a DNS reply. It
+    // keeps fail-open in every posture, matching its always-`bypass` rule.
+    let _ = set_fail_open(&mut queue, snoop_queue, true);
     queue.set_nonblocking(true);
-    tracing::info!(queue_num, snoop_queue, "nfqueues bound");
+    tracing::info!(queue_num, snoop_queue, fail_open, "nfqueues bound");
     Ok(queue)
+}
+
+/// Ask the kernel to accept rather than drop when `queue_num` is full.
+/// Returns whether the kernel took it.
+///
+/// A failure here costs the posture, not the daemon: warn and carry on, the
+/// same way the socket chown does. Old kernels without the flag answer
+/// EOPNOTSUPP, and refusing to start over it would be worse than running
+/// with the pre-existing behaviour.
+#[must_use]
+fn set_fail_open(queue: &mut Queue, queue_num: u16, enabled: bool) -> bool {
+    match queue.set_fail_open(queue_num, enabled) {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::warn!(
+                queue_num,
+                enabled,
+                "could not set the nfqueue fail-open flag, a full queue will drop: {e}"
+            );
+            false
+        }
+    }
 }
 
 /// Give up after this many recv failures in a row: one transient error
@@ -499,6 +558,21 @@ mod tests {
                 "observe mode must accept {verdict:?}"
             );
         }
+    }
+
+    /// The kernel's fail-open flag follows the configured posture while
+    /// enforcing, and is forced on when the daemon starts in observe mode: a
+    /// queue-full drop there would change what reaches the wire, which is
+    /// the one thing observe mode promises never to do.
+    #[test]
+    fn observe_mode_forces_fail_open_on_a_full_queue() {
+        assert!(want_fail_open(true, true), "fail-open posture, enforcing");
+        assert!(!want_fail_open(false, true), "fail-closed posture, enforcing");
+        assert!(want_fail_open(true, false), "fail-open posture, observing");
+        assert!(
+            want_fail_open(false, false),
+            "observe mode must not drop packets even under a fail-closed posture"
+        );
     }
 
     #[test]

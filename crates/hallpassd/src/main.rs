@@ -109,7 +109,12 @@ async fn main() {
     // fail-open that silently allows what a rule would deny, for however
     // long the listener takes to arrive. Binding first means the moment
     // packets can be queued, something is there to judge them.
-    let queue = match nfqueue::bind(cfg.queue_num) {
+    // Starting in observe mode forces the kernel's fail-open flag on
+    // regardless of posture, and it is not re-issued later; see
+    // nfqueue::want_fail_open for why a live queue is the wrong place to
+    // change it.
+    let fail_open = nfqueue::want_fail_open(cfg.queue_bypass, cfg.mode.enforcing());
+    let queue = match nfqueue::bind(cfg.queue_num, fail_open) {
         Ok(q) => Some(q),
         Err(e) if cfg.queue_bypass => {
             // Without privileges (development runs) the bind fails and

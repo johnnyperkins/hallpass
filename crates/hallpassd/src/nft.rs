@@ -29,8 +29,14 @@
 //! gone would cost availability and buy no enforcement. The verdict queue's
 //! `bypass` is configurable (`queue_bypass`): with it, traffic keeps
 //! flowing if the daemon dies without tearing the table down (fail open);
-//! without it, new connections are dropped when no daemon is listening or
-//! the queue overflows (fail closed).
+//! without it, new connections are dropped when no daemon is listening
+//! (fail closed).
+//!
+//! `bypass` covers a queue nobody is bound to, and nothing else. A queue
+//! that is bound but *full* is a different kernel path (`-ENOSPC` rather
+//! than `-ESRCH`) governed by the queue's own `NFQA_CFG_F_FAIL_OPEN` flag,
+//! which [`crate::nfqueue::bind`] sets. Both are needed for the posture the
+//! config promises; this file only owns the first.
 
 use std::io::Write;
 use std::path::Path;

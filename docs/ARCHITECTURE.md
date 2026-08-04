@@ -189,9 +189,27 @@ one bounded copy.
 `queue_bypass` decides what happens when no live daemon is deciding.
 
 With `queue_bypass = true` (the default) the verdict queue carries the
-NFQUEUE `bypass` flag, so a dead daemon or a full queue means traffic flows
-unfiltered. Availability wins. On clean shutdown and on panic the table is
-removed, so a crashed daemon does not leave a queue nobody drains.
+NFQUEUE `bypass` flag *and* the queue's own `NFQA_CFG_F_FAIL_OPEN` flag, so
+a dead daemon or a full queue means traffic flows unfiltered. Availability
+wins. On clean shutdown and on panic the table is removed, so a crashed
+daemon does not leave a queue nobody drains.
+
+The two flags are not interchangeable, and setting only one is how this was
+wrong: `bypass` lives in the ruleset and the kernel consults it when nothing
+is bound to the queue at all (`-ESRCH`), while a queue that is bound but full
+(`-ENOSPC`) is resolved by `NFQA_CFG_F_FAIL_OPEN`, which `nfqueue::bind`
+sets. Starting in observe mode forces the second one on whatever the posture
+says, since a queue-full drop there would change what reaches the wire.
+
+That flag is set once, at bind, and is deliberately not re-issued when the
+mode is toggled at runtime: setting it is a netlink round trip on the queue's
+own socket, and the ack read in `nfq` hands every message in the arriving
+batch to a callback that discards them, so packets already queued would be
+thrown away without a verdict and hold kernel slots forever. Losing traffic
+to relax a flag that only matters while the queue is overflowing is the worse
+trade. The consequence to know: toggling to observe at runtime under
+`queue_bypass = false` keeps dropping on overflow, and `mode = "observe"` in
+the config file plus a restart is what relaxes it.
 
 With `queue_bypass = false` those packets are dropped instead. Enforcement
 wins, and the arrangement inverts to match: an nfqueue bind failure or an
@@ -200,9 +218,9 @@ panic hook deliberately leaves the table standing because the table *is* the
 enforcement, and a fatal queue-loop error leaves it standing too. Clean
 shutdown still removes it.
 
-The snoop queues always keep `bypass` regardless. They are observational, so
-dropping DNS with the daemon gone would cost availability and buy no
-enforcement.
+The snoop queues always keep `bypass` regardless, and always fail open on a
+full queue. They are observational, so dropping DNS with the daemon gone (or
+under a reply flood) would cost availability and buy no enforcement.
 
 **Observe mode** (`mode = "observe"`) is a separate axis. Policy is evaluated
 exactly as it would be when enforcing, the decision is recorded, and then the
@@ -293,9 +311,12 @@ now buffer in the queue and are judged when it drains.
 
 **2b. The install happens last, after the verdict loop is draining.** Binding
 is only half of it. A bound queue with nobody calling `recv` fills to its
-depth and then overflows, and an overflowed queue is resolved by the same
-`bypass` flag: the buffering above only covers as many packets as the queue
-holds. The install used to sit before `RuleStore::new`, which reads every rule
+depth and then overflows, and an overflowed queue is resolved without ever
+consulting policy: the buffering above only covers as many packets as the
+queue holds. Overflow is governed by the queue's `NFQA_CFG_F_FAIL_OPEN` flag
+(`nfqueue::bind`), not by the ruleset's `bypass` keyword, which the kernel
+consults only when nothing is bound to the queue at all. The two are set
+together so the configured posture holds in both cases. The install used to sit before `RuleStore::new`, which reads every rule
 file and every domain, IP and hash list in `rules.d`, so the undrained window
 was as long as that takes and bounded by nothing the daemon controls. It is
 now the last thing startup does. The cost is that the host is unfiltered for

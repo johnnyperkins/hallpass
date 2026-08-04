@@ -39,8 +39,9 @@ max_pending_prompts = 128
 # ("allow") keeps ping and friends working, "deny" closes the channel.
 unhandled_proto_verdict = "deny"
 
-# Drop the NFQUEUE `bypass` flag from the verdict queue: new connections
-# are dropped, not allowed, when the daemon is dead or the queue is full.
+# Drop the NFQUEUE `bypass` flag from the verdict queue, and with it the
+# queue's fail-open flag: new connections are dropped, not allowed, when
+# the daemon is dead or the queue is full.
 # Availability cost: a crashed daemon takes new outbound connections down
 # with it until it restarts (established flows keep working, and the
 # table is removed on clean shutdown). The DNS snoop queues always keep

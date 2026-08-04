@@ -40,7 +40,11 @@ unhandled_proto_verdict = "allow"
 
 # Whether the verdict queue fails open (`true`: traffic flows when the
 # daemon is dead or the queue is full) or closed (`false`: those packets
-# are dropped). See etc/config.hardened.toml.
+# are dropped). See etc/config.hardened.toml. Starting in observe mode
+# (`mode = "observe"` below) fails open on a full queue whatever this
+# says, since a dropped packet there would contradict the one thing that
+# mode promises; toggling to observe at runtime does not relax it, so a
+# measurement run on a fail-closed host wants the mode set here.
 queue_bypass = true
 
 # Optional: export every decided connection to syslog. Omit the whole
