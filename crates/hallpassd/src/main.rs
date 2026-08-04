@@ -139,9 +139,17 @@ async fn main() {
     // to be in place before the table can exist: a panic in the setup between
     // the two would otherwise leave a queue nobody drains behind under
     // fail-open, which is the state this hook exists to prevent.
+    // Created here rather than next to the queue thread because the panic
+    // hook below needs it: the hook tears the table down, and the table
+    // watchdog must be told to stop before that happens or it can put the
+    // table back as the process dies.
+    let shutdown = Arc::new(AtomicBool::new(false));
+
     let default_hook = std::panic::take_hook();
     let teardown_on_panic = cfg.queue_bypass;
+    let panic_shutdown = Arc::clone(&shutdown);
     std::panic::set_hook(Box::new(move |info| {
+        panic_shutdown.store(true, Ordering::Relaxed);
         if teardown_on_panic {
             nft::teardown();
         }
@@ -189,6 +197,11 @@ async fn main() {
     // error: the daemon must then shut down (tearing nftables down on the
     // way) rather than keep queueing traffic nobody drains.
     let (fatal_tx, mut fatal_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+    // Second sender, for the table watchdog: with no table there is nothing
+    // to enforce with, so under a fail-closed posture it shuts the daemon
+    // down the same way a dead queue loop does.
+    let fatal_tx_watchdog = fatal_tx.clone();
+    let mut nft_watchdog: Option<tokio::task::JoinHandle<()>> = None;
 
     let prompts = Arc::new(PromptTable::new(
         verdict_tx,
@@ -249,7 +262,6 @@ async fn main() {
     // Blocking nfqueue loop on its own thread, over the queue bound
     // before the nftables install. None means interception is off for
     // this run (no privileges); rule management still works over IPC.
-    let shutdown = Arc::new(AtomicBool::new(false));
     let queue_thread = queue.map(|queue| {
         // Started before the install below: everything the loop needs
         // (the rule store, the domain cache, the prompt table) is built
@@ -298,6 +310,12 @@ async fn main() {
         Some(_) => match nft::install(cfg.queue_num, cfg.queue_bypass) {
             Ok(()) => {
                 tracing::info!("nftables ruleset installed");
+                nft_watchdog = Some(nft::spawn_watchdog(
+                    cfg.queue_num,
+                    cfg.queue_bypass,
+                    Arc::clone(&shutdown),
+                    fatal_tx_watchdog,
+                ));
                 true
             }
             Err(e) if cfg.queue_bypass => {
@@ -370,6 +388,11 @@ async fn main() {
     tracing::info!("shutting down");
     shutdown.store(true, Ordering::Relaxed);
     ipc_task.abort();
+    // Before the teardown below, or the watchdog would put back the table
+    // this is about to remove.
+    if let Some(w) = nft_watchdog {
+        w.abort();
+    }
     // Same rule as the panic hook: in fail-closed mode the table IS the
     // enforcement, so a daemon dying unexpectedly must leave it standing.
     // Tearing it down here handed an operator who chose queue_bypass = false
@@ -378,7 +401,21 @@ async fn main() {
     if nft_installed && !keep_table_for_enforcement {
         nft::teardown();
     } else if keep_table_for_enforcement {
-        tracing::warn!("leaving nftables table installed: fail-closed enforcement holds until restart");
+        // Only claim enforcement holds if the table is actually there. The
+        // watchdog signals the same fatal channel the queue loop does, and
+        // it fires precisely when the table is gone, so the unconditional
+        // version of this line told an operator their host was still
+        // protected at the exact moment it was not.
+        if nft::table_present() {
+            tracing::warn!(
+                "leaving nftables table installed: fail-closed enforcement holds until restart"
+            );
+        } else {
+            tracing::error!(
+                "the nftables table is gone and could not be restored: this host is \
+                 unfiltered until the daemon is restarted"
+            );
+        }
     }
     if let Err(e) = std::fs::remove_file(&cfg.socket_path) {
         if e.kind() != std::io::ErrorKind::NotFound {

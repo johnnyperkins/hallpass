@@ -41,7 +41,9 @@
 use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 /// Packet mark the nfqueue thread sets to ask nftables to reject a packet.
 /// A large, distinctive value ("HALP") to avoid colliding with the small
@@ -95,9 +97,152 @@ pub fn install(queue_num: u16, verdict_bypass: bool) -> std::io::Result<()> {
     run_nft(&["-f", "-"], Some(&ruleset(queue_num, verdict_bypass)))
 }
 
+/// Whether the hallpass table is still installed.
+///
+/// `nft list table` exits non-zero when the table is absent, which is the
+/// distinction this needs, and the two failures must not be confused: a
+/// clean non-zero exit means the table is gone, while being unable to run
+/// `nft` at all (fork failure under memory pressure, the binary momentarily
+/// absent during a package upgrade) says nothing about the table. Reported
+/// as present, so a transient fork failure cannot make the watchdog
+/// "repair" a table that is fine and, under a fail-closed posture, shut the
+/// daemon down when the repair also fails to fork.
+pub fn table_present() -> bool {
+    match nft_exit_status(&["list", "table", "inet", "hallpass"]) {
+        Ok(present) => present,
+        Err(e) => {
+            tracing::warn!("could not run nft to check the table, assuming it is there: {e}");
+            true
+        }
+    }
+}
+
+/// Run `nft` and report whether it exited zero, distinguishing that from
+/// not being able to run it at all.
+fn nft_exit_status(args: &[&str]) -> std::io::Result<bool> {
+    let out = Command::new(nft_binary())
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .output()?;
+    Ok(out.status.success())
+}
+
+/// How often to check that the table is still there.
+///
+/// The window between an external flush and the repair is the window in
+/// which nothing is filtered, so this is short; a check is one `nft` fork
+/// that reads one table, which is cheap enough to run at this cadence
+/// forever.
+const WATCHDOG_INTERVAL: Duration = Duration::from_secs(10);
+
+/// How long to wait on one check before giving up on it and ticking again.
+const WATCHDOG_CALL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Serializes the watchdog's repair against [`teardown`].
+///
+/// The two are the only things that create and destroy the table after
+/// startup, and they run on different threads with opposite intentions, so
+/// interleaving them can leave the table installed after the daemon has
+/// exited. Poisoning is ignored: a panicking holder means the daemon is on
+/// its way out, and blocking the teardown behind a poisoned lock would be
+/// the worse outcome.
+static TABLE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Watch for the hallpass table disappearing and put it back.
+///
+/// Nothing else notices. `nft flush ruleset` takes every table with it, and
+/// it is run by ordinary things: a firewalld restart, `nftables.service`
+/// reloading, container tooling. Afterwards the kernel queues nothing, so
+/// the verdict loop sees an idle queue rather than an error, the daemon
+/// stays up, the socket answers, the stats look healthy, and the host is
+/// unfiltered until someone restarts the daemon. Under a fail-closed posture
+/// that is the exact inversion of what the operator asked for, which is why
+/// a failed repair is fatal there.
+///
+/// `shutdown` is what stops a repair from undoing the daemon's own teardown,
+/// and it is read under [`TABLE_LOCK`] inside the blocking closure rather
+/// than only before it: aborting this task cannot cancel a `spawn_blocking`
+/// closure that has already been handed to a worker, so a check dispatched
+/// just before shutdown would otherwise see the torn-down table, conclude it
+/// had been flushed, and reinstall it as the process exits. That leaves a
+/// queue rule behind with nobody bound to it, which under a fail-closed
+/// posture drops every new connection on the host until someone removes the
+/// table by hand.
+pub fn spawn_watchdog(
+    queue_num: u16,
+    verdict_bypass: bool,
+    shutdown: Arc<AtomicBool>,
+    fatal_tx: tokio::sync::mpsc::UnboundedSender<()>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(WATCHDOG_INTERVAL);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            if shutdown.load(Ordering::Relaxed) {
+                return;
+            }
+            // Blocking: both calls fork `nft`.
+            let stopping = Arc::clone(&shutdown);
+            let check = tokio::task::spawn_blocking(move || {
+                let _guard = TABLE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+                // Under the lock, so this cannot straddle a teardown that is
+                // running right now.
+                if stopping.load(Ordering::Relaxed) || table_present() {
+                    return None;
+                }
+                Some(install(queue_num, verdict_bypass))
+            });
+            // A hung `nft` would otherwise park this loop forever and the
+            // watching would stop with no trace. The blocking thread stays
+            // parked either way, but the next tick still runs, and the lock
+            // keeps the two from overlapping.
+            let outcome = match tokio::time::timeout(WATCHDOG_CALL_TIMEOUT, check).await {
+                Ok(joined) => joined,
+                Err(_) => {
+                    tracing::warn!("nft table check has not returned; still watching");
+                    continue;
+                }
+            };
+            let Ok(Some(reinstalled)) = outcome else {
+                continue;
+            };
+            if shutdown.load(Ordering::Relaxed) {
+                return;
+            }
+            match reinstalled {
+                Ok(()) => tracing::error!(
+                    "the hallpass nftables table was gone (something flushed it); \
+                     reinstalled it, but every connection in the meantime was unfiltered"
+                ),
+                Err(e) if verdict_bypass => {
+                    tracing::error!("the hallpass nftables table is gone and reinstalling it failed, \
+                         traffic is unfiltered: {e}");
+                }
+                Err(e) => {
+                    // Fail-closed was chosen to trade availability for
+                    // enforcement. With no table there is no enforcement, so
+                    // running on would silently deliver neither.
+                    tracing::error!(
+                        "the hallpass nftables table is gone, reinstalling it failed and \
+                         queue_bypass is off, shutting down: {e}"
+                    );
+                    let _ = fatal_tx.send(());
+                    return;
+                }
+            }
+        }
+    })
+}
+
 /// Remove the hallpass table. Failure is logged, not fatal: this runs on
 /// shutdown paths where there is nothing better to do.
 pub fn teardown() {
+    // Held for the delete so a watchdog repair cannot run between the check
+    // it already made and this removal; see spawn_watchdog.
+    let _guard = TABLE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     if let Err(e) = run_nft(&["delete", "table", "inet", "hallpass"], None) {
         tracing::warn!("nft teardown failed: {e}");
     }

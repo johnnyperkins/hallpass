@@ -809,6 +809,59 @@ fn no_rule_default_deny_blocks() {
     );
 }
 
+/// Something else flushing nftables must not leave the daemon running and
+/// filtering nothing. `nft flush ruleset` is run by ordinary things (a
+/// firewalld restart, an `nftables.service` reload, container tooling), and
+/// the daemon cannot tell the resulting silence from a quiet network: the
+/// kernel simply stops queueing. Before the watchdog, the host stayed
+/// unfiltered until someone restarted the daemon, with every health signal
+/// reading normal.
+#[test]
+#[ignore = "requires root and network namespaces"]
+fn a_flushed_ruleset_is_detected_and_reinstalled() {
+    let Some(mut env) = TestEnv::setup("flushed") else { return };
+    env.start_listener(19009);
+    env.start_daemon("deny", &[]);
+    env.assert_daemon_alive();
+    assert!(!env.connect(19009), "sanity: daemon should be denying");
+
+    // What a firewalld restart does to every table on the host.
+    ns_run(&env.ns_cli, &["nft", "flush", "ruleset"]);
+    assert!(
+        !ns_run(&env.ns_cli, &["nft", "list", "table", "inet", "hallpass"])
+            .status
+            .success(),
+        "the flush should have removed the table"
+    );
+
+    // The watchdog polls on a ten-second cadence, so allow a couple of
+    // rounds rather than racing it.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < deadline {
+        if ns_run(&env.ns_cli, &["nft", "list", "table", "inet", "hallpass"])
+            .status
+            .success()
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    env.assert_daemon_alive();
+    assert!(
+        ns_run(&env.ns_cli, &["nft", "list", "table", "inet", "hallpass"])
+            .status
+            .success(),
+        "the table should have been reinstalled; daemon log:\n{}",
+        env.daemon_log()
+    );
+    // And enforcement is real again, not just a table that exists.
+    assert!(
+        !env.connect(19009),
+        "policy should apply again after the reinstall; daemon log:\n{}",
+        env.daemon_log()
+    );
+}
+
 #[test]
 #[ignore = "requires root and network namespaces"]
 fn queue_bypass_keeps_traffic_flowing_after_daemon_crash() {
