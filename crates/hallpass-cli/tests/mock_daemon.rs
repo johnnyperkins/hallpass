@@ -6,8 +6,8 @@ use std::path::PathBuf;
 use hallpass_cli::client::Client;
 use hallpass_types::wire;
 use hallpass_types::{
-    ClientMsg, DaemonMsg, Explanation, Proto, RuleTrace, Stats, TraceOutcome, Verdict,
-    PROTOCOL_VERSION,
+    ClientMsg, DaemonMsg, Explanation, Proto, RuleTrace, RuntimeConfig, Stats, TraceOutcome,
+    Verdict, PROTOCOL_VERSION,
 };
 use tokio::net::UnixListener;
 
@@ -88,6 +88,111 @@ async fn handshake_and_stats_roundtrip() {
         DaemonMsg::Stats(got) => assert_eq!(got, stats),
         other => panic!("unexpected reply: {other:?}"),
     }
+
+    daemon.await.expect("daemon task");
+    let _ = std::fs::remove_file(&path);
+}
+
+/// `config` is one `ConfigGet`; the daemon's reply is what gets printed.
+#[tokio::test]
+async fn config_show_roundtrip() {
+    let path = temp_sock("config-show");
+    let listener = UnixListener::bind(&path).expect("bind");
+
+    let daemon = tokio::spawn(mock_daemon(listener, |mut stream| async move {
+        let req: ClientMsg = wire::read_msg(&mut stream).await.expect("read req");
+        assert_eq!(req, ClientMsg::ConfigGet);
+        let reply = DaemonMsg::Config(RuntimeConfig {
+            prompt_timeout_secs: 30,
+            default_verdict: Verdict::Deny,
+            enforce: true,
+        });
+        wire::write_msg(&mut stream, &reply).await.expect("write config");
+    }));
+
+    let args = argv(&path, &["config"]);
+    assert_eq!(hallpass_cli::run(&args).await, hallpass_cli::EXIT_OK);
+
+    daemon.await.expect("daemon task");
+    let _ = std::fs::remove_file(&path);
+}
+
+/// `config set` is a read-modify-write: the settings not named on the
+/// command line must reach the daemon carrying its own current values, not
+/// defaults. The final `ConfigGet` is the refetch that gets printed.
+#[tokio::test]
+async fn config_set_carries_unnamed_settings_forward() {
+    let path = temp_sock("config-set");
+    let listener = UnixListener::bind(&path).expect("bind");
+
+    let current = RuntimeConfig {
+        prompt_timeout_secs: 30,
+        default_verdict: Verdict::Deny,
+        enforce: false,
+    };
+    let daemon = tokio::spawn(mock_daemon(listener, move |mut stream| async move {
+        let req: ClientMsg = wire::read_msg(&mut stream).await.expect("read get");
+        assert_eq!(req, ClientMsg::ConfigGet);
+        wire::write_msg(&mut stream, &DaemonMsg::Config(current))
+            .await
+            .expect("write current");
+
+        let req: ClientMsg = wire::read_msg(&mut stream).await.expect("read set");
+        let ClientMsg::ConfigSet(new) = req else {
+            panic!("expected ConfigSet, got {req:?}");
+        };
+        // --timeout was given; verdict and mode were not and must carry the
+        // daemon's values (deny, observe), not the client's idea of defaults.
+        assert_eq!(
+            new,
+            RuntimeConfig {
+                prompt_timeout_secs: 60,
+                ..current
+            }
+        );
+        wire::write_msg(&mut stream, &DaemonMsg::Ok).await.expect("write ok");
+
+        let req: ClientMsg = wire::read_msg(&mut stream).await.expect("read refetch");
+        assert_eq!(req, ClientMsg::ConfigGet);
+        wire::write_msg(&mut stream, &DaemonMsg::Config(new))
+            .await
+            .expect("write refetch");
+    }));
+
+    let args = argv(&path, &["config", "set", "--timeout", "60"]);
+    assert_eq!(hallpass_cli::run(&args).await, hallpass_cli::EXIT_OK);
+
+    daemon.await.expect("daemon task");
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A daemon that refuses the change (an out-of-bounds timeout) surfaces its
+/// message and the exit code says so; nothing gets printed as if applied.
+#[tokio::test]
+async fn config_set_surfaces_daemon_rejection() {
+    let path = temp_sock("config-reject");
+    let listener = UnixListener::bind(&path).expect("bind");
+
+    let daemon = tokio::spawn(mock_daemon(listener, |mut stream| async move {
+        let req: ClientMsg = wire::read_msg(&mut stream).await.expect("read get");
+        assert_eq!(req, ClientMsg::ConfigGet);
+        let reply = DaemonMsg::Config(RuntimeConfig {
+            prompt_timeout_secs: 30,
+            default_verdict: Verdict::Deny,
+            enforce: true,
+        });
+        wire::write_msg(&mut stream, &reply).await.expect("write current");
+
+        let req: ClientMsg = wire::read_msg(&mut stream).await.expect("read set");
+        assert!(matches!(req, ClientMsg::ConfigSet(_)));
+        let err = DaemonMsg::Err {
+            message: "prompt_timeout_secs must be at most 3600".into(),
+        };
+        wire::write_msg(&mut stream, &err).await.expect("write err");
+    }));
+
+    let args = argv(&path, &["config", "set", "--timeout", "9999"]);
+    assert_eq!(hallpass_cli::run(&args).await, hallpass_cli::EXIT_ERR);
 
     daemon.await.expect("daemon task");
     let _ = std::fs::remove_file(&path);

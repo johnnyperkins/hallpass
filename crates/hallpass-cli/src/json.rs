@@ -16,7 +16,7 @@ use std::path::PathBuf;
 
 use hallpass_types::{
     sanitize_for_display, ConnEvent, Connection, Explanation, Rule, RuleHit, RuleMatch,
-    RuleTrace, Stats, TraceOutcome,
+    RuleTrace, RuntimeConfig, Stats, TraceOutcome,
 };
 use serde::Serialize;
 
@@ -36,6 +36,12 @@ pub fn to_json<T: Serialize>(value: &T) -> Result<String, CliError> {
 /// nothing here to sanitize.
 pub fn stats(s: &Stats) -> Result<String, CliError> {
     to_json(s)
+}
+
+/// The runtime settings as one JSON object. Plain numbers, an enum, and a
+/// bool, so nothing to sanitize.
+pub fn config(c: &RuntimeConfig) -> Result<String, CliError> {
+    to_json(c)
 }
 
 /// The rule list as a JSON array.

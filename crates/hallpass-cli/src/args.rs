@@ -33,6 +33,10 @@ USAGE:
 
 COMMANDS:
     status                       Show daemon statistics
+    config                       Show the runtime settings
+    config set [OPTIONS]         Change runtime settings. Runtime only: a
+                                 change lasts until the daemon restarts, and
+                                 config.toml stays the operator's file
     rules [--stats]              List rules; --stats adds hit counts
     rules add [OPTIONS]          Add a rule
     rules rm NAME                Delete a rule
@@ -46,6 +50,20 @@ COMMANDS:
     watch                        Interactively answer connection prompts
     explain [OPTIONS]            Say what policy would do with a hypothetical
                                  connection, and which rule decides it
+
+CONFIG SET OPTIONS:
+    --timeout SECS               Seconds a prompt waits before the default
+                                 action applies
+    --default allow|deny|reject  Action when no rule matches and nobody
+                                 answers the prompt
+    --enforce                    Apply verdicts to packets
+    --observe                    Evaluate and record only, blocking nothing
+                                 host-wide; requires --yes
+    --yes                        Confirm --observe
+
+    Settings not named keep the daemon's current values: the whole set is
+    written back in one request, so when two clients change settings at
+    once the last write wins, exactly as it does between two GUI windows.
 
 EVENTS OPTIONS:
     --last N                     Replay the last N decided connections before
@@ -246,6 +264,10 @@ impl Default for TopOpts {
 pub enum Cmd {
     /// `status`
     Status,
+    /// `config`
+    ConfigShow,
+    /// `config set ...`
+    ConfigSet(ConfigSetOpts),
     /// `rules [--stats]`
     RulesList {
         /// Whether to fetch and show per-rule hit counts.
@@ -280,6 +302,19 @@ pub enum Cmd {
     Watch,
     /// `explain [OPTIONS]`
     Explain(ExplainRequest),
+}
+
+/// What `config set` changes. Only the named settings move; the rest are
+/// read from the daemon and written back unchanged (see the usage note on
+/// the read-modify-write).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ConfigSetOpts {
+    /// New prompt timeout in seconds, if given.
+    pub timeout_secs: Option<u64>,
+    /// New default verdict, if given.
+    pub default_verdict: Option<Verdict>,
+    /// New enforcement state: `--enforce` is true, `--observe` false.
+    pub enforce: Option<bool>,
 }
 
 /// Fully parsed command line.
@@ -341,6 +376,7 @@ pub fn parse(argv: &[String]) -> Result<Parsed, String> {
     let cmd = match rest.split_first() {
         None => return Err("no command given".into()),
         Some((&"status", [])) => Cmd::Status,
+        Some((&"config", sub)) => parse_config(sub)?,
         Some((&"watch", [])) => Cmd::Watch,
         Some((&"events", flags)) => Cmd::Events(parse_events(flags)?),
         Some((&"top", flags)) => Cmd::Top(parse_top(flags)?),
@@ -361,6 +397,73 @@ pub fn parse(argv: &[String]) -> Result<Parsed, String> {
         color,
         cmd,
     }))
+}
+
+/// Parse the `config` subcommands: bare show, or `set` with changes.
+fn parse_config(sub: &[&str]) -> Result<Cmd, String> {
+    match sub.split_first() {
+        None => Ok(Cmd::ConfigShow),
+        Some((&"set", flags)) => parse_config_set(flags),
+        Some((&other, _)) => Err(format!("unknown config subcommand '{other}'")),
+    }
+}
+
+fn parse_config_set(flags: &[&str]) -> Result<Cmd, String> {
+    let mut opts = ConfigSetOpts::default();
+    let mut yes = false;
+
+    let mut it = flags.iter();
+    while let Some(flag) = it.next() {
+        match *flag {
+            "--enforce" | "--observe" => {
+                if opts.enforce.is_some() {
+                    return Err("give at most one of --observe and --enforce".into());
+                }
+                opts.enforce = Some(*flag == "--enforce");
+            }
+            "--yes" => yes = true,
+            "--timeout" | "--default" => {
+                let value = *it
+                    .next()
+                    .ok_or_else(|| format!("{flag} requires a value"))?;
+                match *flag {
+                    "--timeout" => {
+                        // Range-checked by the daemon, the same bounds the
+                        // config file is held to; the client only parses.
+                        opts.timeout_secs = Some(
+                            value
+                                .parse::<u64>()
+                                .map_err(|_| format!("invalid --timeout '{value}'"))?,
+                        );
+                    }
+                    _ => {
+                        opts.default_verdict = Some(match value {
+                            "allow" => Verdict::Allow,
+                            "deny" => Verdict::Deny,
+                            "reject" => Verdict::Reject,
+                            other => return Err(format!("invalid --default '{other}'")),
+                        });
+                    }
+                }
+            }
+            other => return Err(format!("unknown flag '{other}'")),
+        }
+    }
+
+    if opts == ConfigSetOpts::default() {
+        return Err("nothing to change: give --timeout, --default, --observe or --enforce".into());
+    }
+    // A speed bump, not a security boundary: anyone on the socket can flip
+    // the mode anyway. It exists because this command ends up in scripts and
+    // automation, where one mistyped flag would silently stop the firewall
+    // blocking anything on the whole host.
+    if opts.enforce == Some(false) && !yes {
+        return Err(
+            "--observe stops the firewall blocking anything host-wide; add --yes to confirm"
+                .into(),
+        );
+    }
+    Ok(Cmd::ConfigSet(opts))
 }
 
 fn parse_events(flags: &[&str]) -> Result<EventsOpts, String> {
@@ -747,6 +850,50 @@ mod tests {
         assert_eq!(parse_ok(&["status", "--color", "always"]).color, ColorChoice::Always);
         assert!(parse_err(&["status", "--color", "maybe"]).contains("invalid --color"));
         assert!(parse_err(&["status", "--color"]).contains("requires a value"));
+    }
+
+    #[test]
+    fn config_commands() {
+        assert_eq!(parse_ok(&["config"]).cmd, Cmd::ConfigShow);
+        assert_eq!(
+            parse_ok(&["config", "set", "--timeout", "60", "--default", "deny"]).cmd,
+            Cmd::ConfigSet(ConfigSetOpts {
+                timeout_secs: Some(60),
+                default_verdict: Some(Verdict::Deny),
+                enforce: None,
+            })
+        );
+        assert!(parse_err(&["config", "nope"]).contains("unknown config subcommand"));
+        assert!(parse_err(&["config", "set"]).contains("nothing to change"));
+        assert!(parse_err(&["config", "set", "--timeout", "x"]).contains("invalid --timeout"));
+        assert!(parse_err(&["config", "set", "--default", "maybe"]).contains("invalid --default"));
+        assert!(
+            parse_err(&["config", "set", "--observe", "--enforce"]).contains("at most one")
+        );
+    }
+
+    /// `--observe` alone is refused: it stops enforcement host-wide, and in
+    /// a script one mistyped flag should not be able to do that silently.
+    /// `--enforce` needs no confirmation; turning the firewall on is the
+    /// safe direction.
+    #[test]
+    fn observe_requires_yes() {
+        assert!(parse_err(&["config", "set", "--observe"]).contains("--yes"));
+        assert_eq!(
+            parse_ok(&["config", "set", "--observe", "--yes"]).cmd,
+            Cmd::ConfigSet(ConfigSetOpts {
+                timeout_secs: None,
+                default_verdict: None,
+                enforce: Some(false),
+            })
+        );
+        assert_eq!(
+            parse_ok(&["config", "set", "--enforce"]).cmd,
+            Cmd::ConfigSet(ConfigSetOpts {
+                enforce: Some(true),
+                ..ConfigSetOpts::default()
+            })
+        );
     }
 
     #[test]

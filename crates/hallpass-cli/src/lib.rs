@@ -17,9 +17,11 @@ pub mod watch;
 use std::io::IsTerminal;
 use std::path::Path;
 
-use hallpass_types::{sanitize_for_display, ClientMsg, ConnEvent, DaemonMsg, ExplainRequest};
+use hallpass_types::{
+    sanitize_for_display, ClientMsg, ConnEvent, DaemonMsg, ExplainRequest, RuntimeConfig,
+};
 
-use crate::args::{Cmd, EventsOpts};
+use crate::args::{Cmd, ConfigSetOpts, EventsOpts};
 use crate::client::{CliError, Client};
 use crate::fmt::Output;
 
@@ -64,6 +66,8 @@ pub async fn run(argv: &[String]) -> i32 {
 
     let result = match cli.cmd {
         Cmd::Status => status(&mut client, out).await,
+        Cmd::ConfigShow => config_show(&mut client, out).await,
+        Cmd::ConfigSet(opts) => config_set(&mut client, opts, out).await,
         Cmd::RulesList { stats } => rules_list(&mut client, stats, out).await,
         Cmd::RulesAdd(rule) => expect_ok(&mut client, ClientMsg::RuleAdd(rule)).await,
         Cmd::RulesRm { name } => expect_ok(&mut client, ClientMsg::RuleDelete { name }).await,
@@ -101,6 +105,53 @@ async fn status(client: &mut Client, out: Output) -> Result<(), CliError> {
         }
         other => Err(CliError::unexpected(&other)),
     }
+}
+
+async fn config_show(client: &mut Client, out: Output) -> Result<(), CliError> {
+    match client.request(ClientMsg::ConfigGet).await? {
+        DaemonMsg::Config(cfg) => print_config(&cfg, out),
+        other => Err(CliError::unexpected(&other)),
+    }
+}
+
+/// Change the runtime settings, carrying the unnamed ones forward.
+///
+/// `ConfigSet` carries the whole struct, so a partial update is a
+/// read-modify-write, the same shape the GUI settings tab uses. Two clients
+/// changing settings at once can clobber each other; last write wins (the
+/// usage text says so), and what is printed afterwards is refetched rather
+/// than echoed, so it is what the daemon actually holds.
+async fn config_set(
+    client: &mut Client,
+    opts: ConfigSetOpts,
+    out: Output,
+) -> Result<(), CliError> {
+    let current = match client.request(ClientMsg::ConfigGet).await? {
+        DaemonMsg::Config(cfg) => cfg,
+        other => return Err(CliError::unexpected(&other)),
+    };
+    let new = RuntimeConfig {
+        prompt_timeout_secs: opts.timeout_secs.unwrap_or(current.prompt_timeout_secs),
+        default_verdict: opts.default_verdict.unwrap_or(current.default_verdict),
+        enforce: opts.enforce.unwrap_or(current.enforce),
+    };
+    match client.request(ClientMsg::ConfigSet(new)).await? {
+        DaemonMsg::Ok => {}
+        other => return Err(CliError::unexpected(&other)),
+    }
+    match client.request(ClientMsg::ConfigGet).await? {
+        DaemonMsg::Config(cfg) => print_config(&cfg, out),
+        other => Err(CliError::unexpected(&other)),
+    }
+}
+
+fn print_config(cfg: &RuntimeConfig, out: Output) -> Result<(), CliError> {
+    if out.json {
+        println!("{}", json::config(cfg)?);
+    } else {
+        print!("{}", fmt::format_config(cfg, out.palette));
+    }
+    Ok(())
 }
 
 async fn rules_list(client: &mut Client, stats: bool, out: Output) -> Result<(), CliError> {

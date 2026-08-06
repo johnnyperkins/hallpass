@@ -5,7 +5,7 @@ use std::fmt::Write;
 
 use hallpass_types::{
     format_ts, sanitize_for_display, ConnEvent, Connection, Explanation, PromptScope, Rule,
-    RuleHit, RuleTrace, Stats, TraceOutcome, Verdict,
+    RuleHit, RuleTrace, RuntimeConfig, Stats, TraceOutcome, Verdict,
 };
 
 use crate::args::ColorChoice;
@@ -192,6 +192,39 @@ pub fn format_stats(s: &Stats, pal: Palette) -> String {
             "policy is evaluated and recorded, but every packet is let through"
         );
     }
+    out
+}
+
+/// Format the runtime settings as an aligned key/value table.
+///
+/// Mode leads for the same reason it leads the stats table, and the trailing
+/// note repeats what the GUI settings tab says: a change lasts until the
+/// daemon restarts, and config.toml is where to make it permanent.
+pub fn format_config(c: &RuntimeConfig, pal: Palette) -> String {
+    let rows = [
+        (
+            "mode",
+            if c.enforce {
+                "enforcing".to_string()
+            } else {
+                pal.paint(Style::Warn, "observe (not enforcing)")
+            },
+        ),
+        ("prompt timeout", format!("{}s", c.prompt_timeout_secs)),
+        ("default action", c.default_verdict.as_str().to_string()),
+    ];
+    let width = rows.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
+    let mut out = String::new();
+    for (k, v) in rows {
+        let _ = writeln!(out, "{k:width$}  {v}");
+    }
+    if !c.enforce {
+        let _ = writeln!(out, "{}", pal.paint(Style::Warn, OBSERVE_WARNING));
+    }
+    let _ = writeln!(
+        out,
+        "runtime only: changes last until the daemon restarts; config.toml is unchanged"
+    );
     out
 }
 
@@ -699,6 +732,41 @@ mod tests {
         assert!(out.contains("mode                observe (not enforcing)\n"), "{out}");
         assert!(out.contains(OBSERVE_WARNING), "{out}");
         assert!(out.contains("every packet is let through"), "{out}");
+    }
+
+    #[test]
+    fn config_table() {
+        let out = format_config(
+            &RuntimeConfig {
+                prompt_timeout_secs: 30,
+                default_verdict: Verdict::Deny,
+                enforce: true,
+            },
+            plain(),
+        );
+        assert!(out.contains("mode            enforcing\n"), "{out}");
+        assert!(out.contains("prompt timeout  30s\n"), "{out}");
+        assert!(out.contains("default action  deny\n"), "{out}");
+        // The settings are runtime-only, and this output is where a headless
+        // operator learns that; the GUI settings tab carries the same note.
+        assert!(out.contains("runtime only"), "{out}");
+        assert!(!out.contains("OBSERVE"), "{out}");
+    }
+
+    /// Same rule as the stats table: settings output that looks routine
+    /// while nothing is filtered must say so.
+    #[test]
+    fn config_table_flags_observe_mode() {
+        let out = format_config(
+            &RuntimeConfig {
+                prompt_timeout_secs: 30,
+                default_verdict: Verdict::Allow,
+                enforce: false,
+            },
+            plain(),
+        );
+        assert!(out.contains("mode            observe (not enforcing)\n"), "{out}");
+        assert!(out.contains(OBSERVE_WARNING), "{out}");
     }
 
     /// The rule listing is what an operator reads to audit policy, and rule
