@@ -42,7 +42,15 @@ use serde::{Deserialize, Serialize};
 /// v6: runtime mode. [`RuntimeConfig::enforce`] turns observe mode into a
 /// runtime setting instead of a startup-only one; the struct field is what
 /// forces the bump, as in v2.
-pub const PROTOCOL_VERSION: u32 = 6;
+///
+/// v7: kernel queue counters. Eight [`Stats`] fields
+/// (`verdict_queue_dropped` and friends) carrying what the kernel counted
+/// about the nfqueues, read from /proc/net/netfilter/nfnetlink_queue when a
+/// client asks, plus the effective fail-open flag per queue, known at bind.
+/// They close the one blind spot the daemon's own counters cannot see: a
+/// packet resolved because the queue was full never reached userspace, so
+/// no counter here moved. The struct fields force the bump, as in v2.
+pub const PROTOCOL_VERSION: u32 = 7;
 
 /// Transport-layer protocol of a connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -753,6 +761,65 @@ pub struct Stats {
     /// Non-zero means the slot was taken back at least once so another client
     /// could have it. See [`DaemonMsg::PromptHandlerRevoked`].
     pub prompt_handlers_evicted: u64,
+    /// Packets the kernel dropped because the verdict queue was full,
+    /// counted by the kernel and read from
+    /// `/proc/net/netfilter/nfnetlink_queue` when a client asks for stats.
+    ///
+    /// These packets never reached the daemon, so nothing else here counts
+    /// them: they were dropped without policy running and without an event,
+    /// the silent-outage number. The kernel counts only what it drops. A
+    /// queue whose fail-open flag is on resolves overflow by reinjecting
+    /// the packet with accept, unjudged and counted nowhere, so with
+    /// [`Stats::verdict_queue_fail_open`] true this stays zero while that
+    /// bypass happens and [`Stats::verdict_queue_depth`] is the only
+    /// pressure signal. Nonzero therefore always means real drops, and on
+    /// a host that asked for fail-open it means the flag did not take.
+    ///
+    /// `None` when the file or this queue's row is unavailable (interception
+    /// off, file moved). A missing number must not render as zero - zero is
+    /// the claim that nothing was dropped, the same distinction
+    /// [`RuleHit::last_hit_ms`] makes.
+    pub verdict_queue_dropped: Option<u64>,
+    /// Verdict-queue packets dropped because delivery to the daemon failed
+    /// (the kernel's `user_dropped` counter). Same fail-open caveat and
+    /// same `None` semantics as [`Stats::verdict_queue_dropped`].
+    pub verdict_queue_user_dropped: Option<u64>,
+    /// Packets sitting in the verdict queue right now, awaiting a verdict.
+    ///
+    /// A live pressure gauge against the kernel's default queue length of
+    /// 1024, and on a fail-open queue the only overflow signal there is:
+    /// a depth pinned at the limit means overflow is being resolved
+    /// without policy right now.
+    pub verdict_queue_depth: Option<u64>,
+    /// Packets the kernel dropped because the DNS snoop queue was full.
+    ///
+    /// Costs domain annotations, never a verdict; the userspace half of the
+    /// same loss is [`Stats::dns_snoop_dropped`], which only counts packets
+    /// that made it to the daemon. Same fail-open caveat as the verdict
+    /// queue: the snoop queue wants fail-open in every posture, so nonzero
+    /// here means [`Stats::snoop_queue_fail_open`] is false.
+    pub snoop_queue_dropped: Option<u64>,
+    /// Snoop-queue packets dropped because delivery to the daemon failed.
+    pub snoop_queue_user_dropped: Option<u64>,
+    /// Packets sitting in the DNS snoop queue right now.
+    pub snoop_queue_depth: Option<u64>,
+    /// Whether the verdict queue's kernel fail-open flag is active, decided
+    /// once at bind and never re-issued (a runtime mode toggle does not
+    /// change it; see the architecture notes on `set_fail_open`).
+    ///
+    /// This is the key for reading the two drop counters above. True:
+    /// overflow passes traffic through unjudged and uncounted, the
+    /// counters cannot move, and depth is the only signal. False: overflow
+    /// drops and is counted. On a host configured fail-open, false means
+    /// the flag did not take at bind and the posture is not what the
+    /// operator asked for.
+    ///
+    /// `None` when no queue is bound by this daemon.
+    pub verdict_queue_fail_open: Option<bool>,
+    /// Same for the DNS snoop queue, which wants fail-open in every
+    /// posture. False means a reply flood can cost DNS replies themselves
+    /// rather than only their annotations.
+    pub snoop_queue_fail_open: Option<bool>,
 }
 
 /// How often one rule has decided a connection, for [`ClientMsg::RuleStats`].

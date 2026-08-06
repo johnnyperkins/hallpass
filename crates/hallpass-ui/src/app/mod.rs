@@ -999,6 +999,59 @@ impl HallpassApp {
             ui.label("Rules loaded");
             ui.monospace(s.rules_loaded.to_string());
             ui.end_row();
+            // The kernel's own queue counters: a packet dropped from a full
+            // verdict queue never reached the daemon, so no counter above
+            // moved for it. Red when nonzero because packets were dropped
+            // without policy running; "unavailable" (never 0) when nothing
+            // was read. Drops only: a working fail-open queue passes its
+            // overflow through unjudged and uncounted, which is what the
+            // fail-open row below is for reading this one.
+            ui.label("Verdict queue kernel drops");
+            let missed = match (s.verdict_queue_dropped, s.verdict_queue_user_dropped) {
+                // Saturating, as everywhere a stats reply is rendered: the
+                // sum must not be able to panic on socket input.
+                (Some(dropped), Some(undelivered)) => {
+                    Some(dropped.saturating_add(undelivered))
+                }
+                _ => None,
+            };
+            match missed {
+                Some(0) => ui.monospace("0"),
+                Some(n) => ui.colored_label(
+                    DENY_COLOR,
+                    format!("{n} packets dropped before policy saw them"),
+                ),
+                None => ui.monospace("unavailable"),
+            };
+            ui.end_row();
+            // Plain even when "no": that is the intended state under a
+            // fail-closed posture, which this panel cannot see.
+            ui.label("Verdict queue fail-open");
+            match s.verdict_queue_fail_open {
+                Some(true) => ui.monospace("yes"),
+                Some(false) => ui.monospace("no"),
+                None => ui.monospace("unavailable"),
+            };
+            ui.end_row();
+            ui.label("Verdict queue depth");
+            match s.verdict_queue_depth {
+                // 1024 is the kernel's default queue length, which the
+                // daemon deliberately never changes; the depth only reads
+                // as pressure against that ceiling.
+                Some(n) => ui.monospace(format!("{n} of 1024")),
+                None => ui.monospace("unavailable"),
+            };
+            ui.end_row();
+            ui.label("Snoop queue kernel drops");
+            // Domain annotations, not verdicts, so never painted; the
+            // userspace half of the same loss is dns_snoop_dropped.
+            match (s.snoop_queue_dropped, s.snoop_queue_user_dropped) {
+                (Some(dropped), Some(undelivered)) => {
+                    ui.monospace(dropped.saturating_add(undelivered).to_string())
+                }
+                _ => ui.monospace("unavailable"),
+            };
+            ui.end_row();
             ui.label("Daemon uptime");
             ui.monospace(format_uptime(s.uptime_secs));
             ui.end_row();

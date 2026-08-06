@@ -25,6 +25,12 @@ pub struct IpcDeps {
     pub events: Arc<EventBus>,
     pub stats: Arc<Counters>,
     pub settings: Arc<crate::config::RuntimeSettings>,
+    /// What bind established, when this run bound its nfqueues: the queue
+    /// numbers and each queue's effective fail-open flag. None (development
+    /// runs, bind failure) keeps the kernel queue counters out of the stats
+    /// reply: with nothing bound by us, the /proc rows for these queue
+    /// numbers are either absent or someone else's.
+    pub queues: Option<crate::nfqueue::BoundQueues>,
 }
 
 /// Look up a group's GID in /etc/group.
@@ -366,11 +372,27 @@ async fn message_loop(
             ClientMsg::Stats => {
                 let rules = deps.store.ruleset().rule_count() as u32;
                 let skipped = deps.store.rules_skipped();
+                // Read on demand, here and nowhere else: one small /proc
+                // read per status request, on the async side. The verdict
+                // thread takes no new dependency for observability. The
+                // fail-open flags ride along from bind, because they are
+                // what makes the drop counters readable and /proc does not
+                // carry them.
+                let queues = match deps.queues {
+                    Some(q) => {
+                        let mut s = crate::stats::read_queue_stats(q.queue_num);
+                        s.verdict_fail_open = Some(q.verdict_fail_open);
+                        s.snoop_fail_open = Some(q.snoop_fail_open);
+                        s
+                    }
+                    None => Default::default(),
+                };
                 DaemonMsg::Stats(deps.stats.snapshot(
                     rules,
                     skipped,
                     deps.prompts.has_handler(),
                     deps.settings.enforcing(),
+                    queues,
                 ))
             }
             ClientMsg::EventHistory { limit } => {
@@ -475,6 +497,9 @@ mod tests {
                 events,
                 stats,
                 settings,
+                // No queues bound in tests; the reply must carry None for
+                // every kernel queue counter, not another process's row.
+                queues: None,
             }),
             dir,
         )

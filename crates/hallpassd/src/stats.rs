@@ -1,9 +1,92 @@
-//! Lock-free daemon statistics.
+//! Lock-free daemon statistics, and the kernel's own nfqueue counters.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use hallpass_types::{Stats, Verdict};
+
+/// One queue's counters as the kernel reports them in
+/// `/proc/net/netfilter/nfnetlink_queue`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueueCounters {
+    /// Packets in the queue right now (`queue_total`).
+    pub depth: u64,
+    /// Packets discarded because the queue was full (`queue_dropped`).
+    pub dropped: u64,
+    /// Packets that failed delivery to userspace (`user_dropped`).
+    pub user_dropped: u64,
+}
+
+/// The kernel's counters for both queues this daemon binds, for the stats
+/// snapshot. `None` per queue when its row (or the whole file) is missing:
+/// a number nobody counted must not be reported as zero.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct QueueStats {
+    /// The verdict queue. Drops here are packets policy never saw.
+    pub verdict: Option<QueueCounters>,
+    /// The DNS snoop queue. Drops here cost domain annotations.
+    pub snoop: Option<QueueCounters>,
+    /// Effective kernel fail-open flag per queue, from bind rather than
+    /// /proc (the kernel does not report it there). Filled by the IPC
+    /// handler from `nfqueue::BoundQueues`; the parser leaves them `None`.
+    /// These make the counters above readable: a fail-open queue resolves
+    /// overflow by reinjecting with accept, unjudged and counted nowhere,
+    /// so its drop counters can only move while the flag is off.
+    pub verdict_fail_open: Option<bool>,
+    /// See [`QueueStats::verdict_fail_open`].
+    pub snoop_fail_open: Option<bool>,
+}
+
+/// Read the kernel's counters for the verdict queue and its snoop queue.
+///
+/// Called from the IPC `Stats` handler, on demand and never on the packet
+/// path: one small /proc read per status request. Any failure (file absent,
+/// row absent, column unparsable) degrades to `None` rather than zero.
+pub fn read_queue_stats(verdict_queue: u16) -> QueueStats {
+    match std::fs::read_to_string("/proc/net/netfilter/nfnetlink_queue") {
+        Ok(text) => parse_queue_stats(&text, verdict_queue),
+        Err(_) => QueueStats::default(),
+    }
+}
+
+/// Parse the seq_file: one row per bound queue, no header. The column order
+/// is not a documented ABI; it was verified against a live read with the
+/// daemon running (2026-08-06, both queues bound, portid matching the
+/// daemon's pid):
+///
+/// ```text
+/// queue_num portid queue_total copy_mode copy_range queue_dropped
+/// user_dropped id_sequence 1
+/// ```
+fn parse_queue_stats(text: &str, verdict_queue: u16) -> QueueStats {
+    let snoop_queue = crate::nft::snoop_queue(verdict_queue);
+    let mut stats = QueueStats::default();
+    for line in text.lines() {
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        if cols.len() < 7 {
+            continue;
+        }
+        let (Ok(queue_num), Ok(depth), Ok(dropped), Ok(user_dropped)) = (
+            cols[0].parse::<u16>(),
+            cols[2].parse::<u64>(),
+            cols[5].parse::<u64>(),
+            cols[6].parse::<u64>(),
+        ) else {
+            continue;
+        };
+        let counters = QueueCounters {
+            depth,
+            dropped,
+            user_dropped,
+        };
+        if queue_num == verdict_queue {
+            stats.verdict = Some(counters);
+        } else if queue_num == snoop_queue {
+            stats.snoop = Some(counters);
+        }
+    }
+    stats
+}
 
 /// Atomic counters snapshot into [`Stats`] for the IPC `Stats` reply.
 pub struct Counters {
@@ -133,17 +216,19 @@ impl Counters {
     /// Snapshot for the IPC reply. `rules_loaded` and `rules_skipped` come
     /// from the rule store, `prompt_handler_connected` from the prompt table,
     /// `enforcing` from the runtime settings (reported so a client cannot
-    /// read `denied` as "blocked" when nothing was blocked).
+    /// read `denied` as "blocked" when nothing was blocked), `queues` from
+    /// the kernel via [`read_queue_stats`].
     ///
-    /// All four are passed in rather than mirrored into a counter here on
-    /// purpose: they are facts owned elsewhere, and a copy kept in step by
-    /// hand is a copy that eventually is not.
+    /// All of those are passed in rather than mirrored into a counter here
+    /// on purpose: they are facts owned elsewhere, and a copy kept in step
+    /// by hand is a copy that eventually is not.
     pub fn snapshot(
         &self,
         rules_loaded: u32,
         rules_skipped: u64,
         prompt_handler_connected: bool,
         enforcing: bool,
+        queues: QueueStats,
     ) -> Stats {
         Stats {
             connections_total: self.connections_total.load(Ordering::Relaxed),
@@ -162,6 +247,14 @@ impl Counters {
             prompt_handler_connected,
             prompts_unanswered: self.prompts_unanswered.load(Ordering::Relaxed),
             prompt_handlers_evicted: self.prompt_handlers_evicted.load(Ordering::Relaxed),
+            verdict_queue_dropped: queues.verdict.map(|q| q.dropped),
+            verdict_queue_user_dropped: queues.verdict.map(|q| q.user_dropped),
+            verdict_queue_depth: queues.verdict.map(|q| q.depth),
+            snoop_queue_dropped: queues.snoop.map(|q| q.dropped),
+            snoop_queue_user_dropped: queues.snoop.map(|q| q.user_dropped),
+            snoop_queue_depth: queues.snoop.map(|q| q.depth),
+            verdict_queue_fail_open: queues.verdict_fail_open,
+            snoop_queue_fail_open: queues.snoop_fail_open,
         }
     }
 }
@@ -182,7 +275,7 @@ mod tests {
         c.record_prompt_overflow();
         c.record_prompt_unanswered();
         c.record_prompt_handler_evicted();
-        let s = c.snapshot(5, 4, true, true);
+        let s = c.snapshot(5, 4, true, true, QueueStats::default());
         assert_eq!(s.connections_total, 3);
         assert_eq!(s.allowed, 1);
         assert_eq!(s.denied, 2);
@@ -203,8 +296,8 @@ mod tests {
     #[test]
     fn prompt_handler_flag_is_passed_through() {
         let c = Counters::default();
-        assert!(!c.snapshot(0, 0, false, true).prompt_handler_connected);
-        assert!(c.snapshot(0, 0, true, true).prompt_handler_connected);
+        assert!(!c.snapshot(0, 0, false, true, QueueStats::default()).prompt_handler_connected);
+        assert!(c.snapshot(0, 0, true, true, QueueStats::default()).prompt_handler_connected);
     }
 
     /// Observe mode has to be visible in the snapshot: `denied` counts what
@@ -216,10 +309,109 @@ mod tests {
         c.record_verdict(Verdict::Deny);
         c.record_observed_only();
         c.record_dns_snoop_dropped();
-        let s = c.snapshot(0, 0, true, false);
+        let s = c.snapshot(0, 0, true, false, QueueStats::default());
         assert!(!s.enforcing);
         assert_eq!(s.denied, 1);
         assert_eq!(s.observed_only, 1);
         assert_eq!(s.dns_snoop_dropped, 1);
+    }
+
+    /// Verbatim from the live read that pinned the column order
+    /// (2026-08-06, daemon pid 162691 bound to queues 0 and 1).
+    const PROC_SAMPLE: &str = "    0 162691     0 2 65531     0     0     1278  1\n    1 162691     0 2 65531     0     0      707  1\n";
+
+    /// A synthetic sample with every counter distinct, so a column swap in
+    /// the parser cannot pass by symmetry (the live sample is mostly zeros).
+    const PROC_DISTINCT: &str = "    0 162691    11 2 65531    22    33     1278  1\n    1 162691    44 2 65531    55    66      707  1\n";
+
+    #[test]
+    fn parses_the_live_sample() {
+        let s = parse_queue_stats(PROC_SAMPLE, 0);
+        assert_eq!(
+            s.verdict,
+            Some(QueueCounters {
+                depth: 0,
+                dropped: 0,
+                user_dropped: 0
+            })
+        );
+        assert_eq!(
+            s.snoop,
+            Some(QueueCounters {
+                depth: 0,
+                dropped: 0,
+                user_dropped: 0
+            })
+        );
+    }
+
+    #[test]
+    fn columns_map_to_the_right_counters() {
+        let s = parse_queue_stats(PROC_DISTINCT, 0);
+        assert_eq!(
+            s.verdict,
+            Some(QueueCounters {
+                depth: 11,
+                dropped: 22,
+                user_dropped: 33
+            })
+        );
+        assert_eq!(
+            s.snoop,
+            Some(QueueCounters {
+                depth: 44,
+                dropped: 55,
+                user_dropped: 66
+            })
+        );
+    }
+
+    /// Rows for queues this daemon did not bind (another instance on a
+    /// different queue number) must not be picked up as ours.
+    #[test]
+    fn foreign_queue_rows_are_ignored() {
+        let s = parse_queue_stats(PROC_DISTINCT, 40);
+        assert_eq!(s, QueueStats::default());
+    }
+
+    /// The fail-open flags ride through the snapshot untouched: they come
+    /// from bind, not /proc, and the parser must leave them None.
+    #[test]
+    fn fail_open_flags_pass_through() {
+        assert_eq!(parse_queue_stats(PROC_SAMPLE, 0).verdict_fail_open, None);
+        let c = Counters::default();
+        let s = c.snapshot(
+            0,
+            0,
+            true,
+            true,
+            QueueStats {
+                verdict_fail_open: Some(true),
+                snoop_fail_open: Some(false),
+                ..Default::default()
+            },
+        );
+        assert_eq!(s.verdict_queue_fail_open, Some(true));
+        assert_eq!(s.snoop_queue_fail_open, Some(false));
+        // Counters stay independently None: the flag being known does not
+        // invent numbers nobody read.
+        assert_eq!(s.verdict_queue_dropped, None);
+    }
+
+    /// A missing row, an empty file, or a row that stops parsing must all
+    /// degrade to None, never to zero: zero claims nothing was dropped.
+    #[test]
+    fn unparsable_input_degrades_to_none() {
+        assert_eq!(parse_queue_stats("", 0), QueueStats::default());
+        // Verdict row present, snoop row missing.
+        let s = parse_queue_stats("    0 1 5 2 65531 6 7 8 1\n", 0);
+        assert!(s.verdict.is_some());
+        assert_eq!(s.snoop, None);
+        // Truncated and non-numeric rows are skipped, not zeroed.
+        assert_eq!(parse_queue_stats("    0 1 5\n", 0), QueueStats::default());
+        assert_eq!(
+            parse_queue_stats("    0 1 x 2 65531 y z 8 1\n", 0),
+            QueueStats::default()
+        );
     }
 }

@@ -681,7 +681,8 @@ mod tests {
         /// The stats snapshot a client would read, with the table's own
         /// handler state in it.
         fn snapshot(&self) -> hallpass_types::Stats {
-            self.stats.snapshot(0, 0, self.table.has_handler(), true)
+            self.stats
+                .snapshot(0, 0, self.table.has_handler(), true, Default::default())
         }
     }
 

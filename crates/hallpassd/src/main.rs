@@ -114,13 +114,13 @@ async fn main() {
     // nfqueue::want_fail_open for why a live queue is the wrong place to
     // change it.
     let fail_open = nfqueue::want_fail_open(cfg.queue_bypass, cfg.mode.enforcing());
-    let queue = match nfqueue::bind(cfg.queue_num, fail_open) {
-        Ok(q) => Some(q),
+    let (queue, bound_queues) = match nfqueue::bind(cfg.queue_num, fail_open) {
+        Ok((q, bound)) => (Some(q), Some(bound)),
         Err(e) if cfg.queue_bypass => {
             // Without privileges (development runs) the bind fails and
             // interception is off; IPC and rule management still work.
             tracing::error!("nfqueue bind failed, continuing without interception: {e}");
-            None
+            (None, None)
         }
         Err(e) => {
             tracing::error!("nfqueue bind failed and queue_bypass is off: {e}");
@@ -352,6 +352,11 @@ async fn main() {
         events,
         stats: counters,
         settings,
+        // Only when this run bound its queues: without that, the /proc rows
+        // for these queue numbers are absent or belong to another daemon
+        // (a dev daemon next to the installed one), and reporting someone
+        // else's counters is worse than reporting none.
+        queues: bound_queues,
     });
     let ipc_task = tokio::spawn(async move {
         if let Err(e) = ipc::server::serve(ipc_listener, ipc_deps).await {

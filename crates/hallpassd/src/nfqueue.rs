@@ -222,20 +222,52 @@ fn decide(tuple: FlowTuple, iface: Option<String>, ctx: &DecideCtx) -> Decision 
 /// kernel resolves by dropping unless this queue carries
 /// `NFQA_CFG_F_FAIL_OPEN`. Setting only the first means an overflowing
 /// queue drops packets on a host whose operator asked for fail-open, with
-/// no event and no counter to say so.
-pub fn bind(queue_num: u16, fail_open: bool) -> std::io::Result<Queue> {
+/// no event to say so; the kernel's own `queue_dropped` counter is the one
+/// trace, which is why the stats surface it together with the effective
+/// flag state ([`BoundQueues`]).
+pub fn bind(queue_num: u16, fail_open: bool) -> std::io::Result<(Queue, BoundQueues)> {
     let snoop_queue = crate::nft::snoop_queue(queue_num);
     let mut queue = Queue::open()?;
     queue.bind(queue_num)?;
     queue.bind(snoop_queue)?;
-    let _ = set_fail_open(&mut queue, queue_num, fail_open);
+    let verdict_set = set_fail_open(&mut queue, queue_num, fail_open);
     // The snoop queue is observational: its packets are accepted the moment
     // they are read, so a full snoop queue must never cost a DNS reply. It
     // keeps fail-open in every posture, matching its always-`bypass` rule.
-    let _ = set_fail_open(&mut queue, snoop_queue, true);
+    let snoop_set = set_fail_open(&mut queue, snoop_queue, true);
     queue.set_nonblocking(true);
     tracing::info!(queue_num, snoop_queue, fail_open, "nfqueues bound");
-    Ok(queue)
+    Ok((
+        queue,
+        BoundQueues {
+            queue_num,
+            // Effective state, not the request: asked-for-off and
+            // failed-to-set both leave the kernel's default, off.
+            verdict_fail_open: fail_open && verdict_set,
+            snoop_fail_open: snoop_set,
+        },
+    ))
+}
+
+/// What [`bind`] established, for the stats snapshot: which queue numbers
+/// this daemon owns and the *effective* kernel fail-open state of each.
+///
+/// Decided once at bind and never re-issued, so these stay authoritative
+/// for the process lifetime (the runtime mode toggle deliberately does not
+/// touch the flag; see [`set_fail_open`] on why a live queue is the wrong
+/// place to change it). They are what makes the kernel's drop counters
+/// readable: a fail-open queue resolves overflow by reinjecting with
+/// accept, unjudged and counted nowhere, so its drop counters can only
+/// move if the flag is off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BoundQueues {
+    /// The verdict queue number; the snoop queue is this plus one.
+    pub queue_num: u16,
+    /// Verdict queue: overflow passes unjudged (true) or drops (false).
+    pub verdict_fail_open: bool,
+    /// Snoop queue: wanted true in every posture, so false means the flag
+    /// did not take and a reply flood can cost DNS replies.
+    pub snoop_fail_open: bool,
 }
 
 /// Ask the kernel to accept rather than drop when `queue_num` is full.

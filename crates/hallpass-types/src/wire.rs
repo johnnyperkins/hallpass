@@ -228,6 +228,15 @@ mod tests {
                 prompt_handler_connected: true,
                 prompts_unanswered: 13,
                 prompt_handlers_evicted: 2,
+                // A Some/None mix, so the roundtrip covers both encodings.
+                verdict_queue_dropped: Some(7),
+                verdict_queue_user_dropped: Some(0),
+                verdict_queue_depth: Some(12),
+                snoop_queue_dropped: None,
+                snoop_queue_user_dropped: None,
+                snoop_queue_depth: Some(1),
+                verdict_queue_fail_open: Some(false),
+                snoop_queue_fail_open: None,
             }),
             DaemonMsg::Ok,
             DaemonMsg::Err {

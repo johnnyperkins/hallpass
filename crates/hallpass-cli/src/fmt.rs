@@ -176,6 +176,36 @@ pub fn format_stats(s: &Stats, pal: Palette) -> String {
         ("dns snoop dropped", s.dns_snoop_dropped.to_string()),
         ("prompt overflows", s.prompts_overflowed.to_string()),
         ("other protocols", s.other_proto_total.to_string()),
+        // The kernel's own counters, from /proc: packets on a full verdict
+        // queue never reach the daemon, so no counter above sees them. The
+        // counters count drops only - a fail-open queue resolves overflow
+        // by letting packets through unjudged and counted nowhere, which
+        // is what the fail-open rows are for reading them. Drop rows are
+        // painted when nonzero because they mean packets were dropped
+        // without policy running; the snoop queue's cost is only domain
+        // annotations, so its rows stay plain like `dns snoop dropped`.
+        ("verdict queue depth", kernel_count(s.verdict_queue_depth)),
+        (
+            "verdict queue dropped",
+            warn_if_positive(pal, s.verdict_queue_dropped),
+        ),
+        (
+            "verdict queue undelivered",
+            warn_if_positive(pal, s.verdict_queue_user_dropped),
+        ),
+        // Plain even when "no": false is the intended state under a
+        // fail-closed posture, and this table cannot see the posture.
+        (
+            "verdict queue fail-open",
+            kernel_flag(s.verdict_queue_fail_open),
+        ),
+        ("snoop queue depth", kernel_count(s.snoop_queue_depth)),
+        ("snoop queue dropped", kernel_count(s.snoop_queue_dropped)),
+        (
+            "snoop queue undelivered",
+            kernel_count(s.snoop_queue_user_dropped),
+        ),
+        ("snoop queue fail-open", kernel_flag(s.snoop_queue_fail_open)),
         ("uptime", format_uptime(s.uptime_secs)),
     ];
     // Keys are ASCII literals, so bytes and characters agree here; the value
@@ -185,6 +215,24 @@ pub fn format_stats(s: &Stats, pal: Palette) -> String {
     for (k, v) in rows {
         let _ = writeln!(out, "{k:width$}  {v}");
     }
+    // Kernel drops on the verdict queue answer "was the firewall consulted
+    // for everything" with no, which a skimmed row of counters can miss.
+    // Saturating: the daemon is trusted, but a stats reply is still socket
+    // input and a rendering path must not be able to panic on it.
+    let missed = s
+        .verdict_queue_dropped
+        .unwrap_or(0)
+        .saturating_add(s.verdict_queue_user_dropped.unwrap_or(0));
+    if missed > 0 {
+        let _ = writeln!(
+            out,
+            "{}",
+            pal.paint(
+                Style::Warn,
+                &format!("{missed} packets were dropped by the kernel before policy saw them"),
+            )
+        );
+    }
     if !s.enforcing {
         let _ = writeln!(out, "{}", pal.paint(Style::Warn, OBSERVE_WARNING));
         let _ = writeln!(
@@ -193,6 +241,35 @@ pub fn format_stats(s: &Stats, pal: Palette) -> String {
         );
     }
     out
+}
+
+/// Render a kernel-reported counter: the number, or "unavailable" when
+/// nothing was read. Never zero for a missing value - zero is the claim
+/// that nothing was missed.
+fn kernel_count(n: Option<u64>) -> String {
+    match n {
+        Some(n) => n.to_string(),
+        None => "unavailable".to_string(),
+    }
+}
+
+/// [`kernel_count`], painted as a warning when positive: these counters
+/// mean packets were dropped without policy running.
+fn warn_if_positive(pal: Palette, n: Option<u64>) -> String {
+    match n {
+        Some(v) if v > 0 => pal.paint(Style::Warn, &v.to_string()),
+        _ => kernel_count(n),
+    }
+}
+
+/// Render a queue's effective fail-open flag, known at bind rather than
+/// read from /proc; "unavailable" when no queue is bound.
+fn kernel_flag(n: Option<bool>) -> String {
+    match n {
+        Some(true) => "yes".to_string(),
+        Some(false) => "no".to_string(),
+        None => "unavailable".to_string(),
+    }
 }
 
 /// Format the runtime settings as an aligned key/value table.
@@ -687,21 +764,36 @@ mod tests {
             prompt_handler_connected: true,
             prompts_unanswered: 9,
             prompt_handlers_evicted: 2,
+            verdict_queue_dropped: Some(0),
+            verdict_queue_user_dropped: Some(0),
+            verdict_queue_depth: Some(3),
+            snoop_queue_dropped: Some(0),
+            snoop_queue_user_dropped: Some(0),
+            snoop_queue_depth: Some(0),
+            verdict_queue_fail_open: Some(true),
+            snoop_queue_fail_open: Some(true),
         }
+    }
+
+    /// One stats-table row as [`format_stats`] pads it. The width is the
+    /// longest key; keeping it here in one place is what lets the row
+    /// assertions survive a new longest key.
+    fn row(k: &str, v: &str) -> String {
+        format!("{k:25}  {v}\n")
     }
 
     #[test]
     fn stats_table() {
         let out = format_stats(&stats(true), plain());
-        assert!(out.contains("mode                enforcing\n"), "{out}");
-        assert!(out.contains("connections         100\n"), "{out}");
-        assert!(out.contains("observed only       4\n"), "{out}");
-        assert!(out.contains("rules loaded        3\n"), "{out}");
-        assert!(out.contains("rules skipped       2\n"), "{out}");
-        assert!(out.contains("dns spoofed         7\n"), "{out}");
-        assert!(out.contains("dns snoop dropped   6\n"), "{out}");
-        assert!(out.contains("prompt overflows    1\n"), "{out}");
-        assert!(out.contains("uptime              1h 0m 0s\n"), "{out}");
+        assert!(out.contains(&row("mode", "enforcing")), "{out}");
+        assert!(out.contains(&row("connections", "100")), "{out}");
+        assert!(out.contains(&row("observed only", "4")), "{out}");
+        assert!(out.contains(&row("rules loaded", "3")), "{out}");
+        assert!(out.contains(&row("rules skipped", "2")), "{out}");
+        assert!(out.contains(&row("dns spoofed", "7")), "{out}");
+        assert!(out.contains(&row("dns snoop dropped", "6")), "{out}");
+        assert!(out.contains(&row("prompt overflows", "1")), "{out}");
+        assert!(out.contains(&row("uptime", "1h 0m 0s")), "{out}");
         // No warning while enforcing.
         assert!(!out.contains("OBSERVE"), "{out}");
     }
@@ -712,15 +804,14 @@ mod tests {
     #[test]
     fn stats_table_reports_the_prompt_handler() {
         let out = format_stats(&stats(true), plain());
-        assert!(out.contains("prompt handler      connected\n"), "{out}");
-        assert!(out.contains("prompts unanswered  9\n"), "{out}");
-        assert!(out.contains("handlers evicted    2\n"), "{out}");
+        assert!(out.contains(&row("prompt handler", "connected")), "{out}");
+        assert!(out.contains(&row("prompts unanswered", "9")), "{out}");
+        assert!(out.contains(&row("handlers evicted", "2")), "{out}");
 
         let mut s = stats(true);
         s.prompt_handler_connected = false;
         let out = format_stats(&s, plain());
-        assert!(out.contains("prompt handler      none"), "{out}");
-        assert!(out.contains("take the default"), "{out}");
+        assert!(out.contains(&row("prompt handler", "none (unmatched connections take the default)")), "{out}");
     }
 
     /// A status table that looks healthy while nothing is filtered is the
@@ -729,9 +820,70 @@ mod tests {
     #[test]
     fn stats_table_flags_observe_mode() {
         let out = format_stats(&stats(false), plain());
-        assert!(out.contains("mode                observe (not enforcing)\n"), "{out}");
+        assert!(out.contains(&row("mode", "observe (not enforcing)")), "{out}");
         assert!(out.contains(OBSERVE_WARNING), "{out}");
         assert!(out.contains("every packet is let through"), "{out}");
+    }
+
+    /// The kernel queue rows: numbers render as numbers, a healthy zero is
+    /// unpainted, and nothing extra is claimed while nothing was dropped.
+    #[test]
+    fn stats_table_kernel_queue_rows() {
+        let out = format_stats(&stats(true), plain());
+        assert!(out.contains(&row("verdict queue depth", "3")), "{out}");
+        assert!(out.contains(&row("verdict queue dropped", "0")), "{out}");
+        assert!(out.contains(&row("verdict queue undelivered", "0")), "{out}");
+        assert!(out.contains(&row("verdict queue fail-open", "yes")), "{out}");
+        assert!(out.contains(&row("snoop queue depth", "0")), "{out}");
+        assert!(out.contains(&row("snoop queue dropped", "0")), "{out}");
+        assert!(out.contains(&row("snoop queue undelivered", "0")), "{out}");
+        assert!(out.contains(&row("snoop queue fail-open", "yes")), "{out}");
+        assert!(!out.contains("dropped by the kernel"), "{out}");
+    }
+
+    /// The flag is rendered plainly either way: "no" is the intended state
+    /// under a fail-closed posture, which this table cannot see.
+    #[test]
+    fn stats_table_fail_open_flag_renders_no() {
+        let mut s = stats(true);
+        s.verdict_queue_fail_open = Some(false);
+        let out = format_stats(&s, plain());
+        assert!(out.contains(&row("verdict queue fail-open", "no")), "{out}");
+    }
+
+    /// A missing counter reads "unavailable", never zero: zero claims the
+    /// kernel dropped nothing, and nobody knows that.
+    #[test]
+    fn stats_table_missing_kernel_counters_are_not_zero() {
+        let mut s = stats(true);
+        s.verdict_queue_dropped = None;
+        s.verdict_queue_user_dropped = None;
+        s.verdict_queue_depth = None;
+        s.verdict_queue_fail_open = None;
+        let out = format_stats(&s, plain());
+        assert!(out.contains(&row("verdict queue dropped", "unavailable")), "{out}");
+        assert!(out.contains(&row("verdict queue depth", "unavailable")), "{out}");
+        assert!(out.contains(&row("verdict queue fail-open", "unavailable")), "{out}");
+        assert!(!out.contains("dropped by the kernel"), "{out}");
+    }
+
+    /// Kernel drops on the verdict queue are packets policy never saw, the
+    /// one thing this table exists to make loud: painted in the row and
+    /// summed in a trailing warning.
+    #[test]
+    fn stats_table_flags_verdict_queue_drops() {
+        let mut s = stats(true);
+        s.verdict_queue_dropped = Some(4);
+        s.verdict_queue_user_dropped = Some(1);
+        let out = format_stats(&s, plain());
+        assert!(
+            out.contains("5 packets were dropped by the kernel before policy saw them"),
+            "{out}"
+        );
+        // Painted when color is on, and only the affected rows.
+        let painted = format_stats(&s, Palette::new(true));
+        assert!(painted.contains("\x1b[1;33m4\x1b[0m"), "{painted:?}");
+        assert!(painted.contains("\x1b[1;33m1\x1b[0m"), "{painted:?}");
     }
 
     #[test]

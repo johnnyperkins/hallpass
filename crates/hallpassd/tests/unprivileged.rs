@@ -181,6 +181,11 @@ fn stays_up_without_privileges_and_serves_the_control_socket() {
         hallpass_types::DaemonMsg::Stats(stats) => {
             assert_eq!(stats.rules_loaded, 0);
             assert!(stats.enforcing, "default mode is enforce");
+            // No queue was bound, so there is no kernel counter to report:
+            // None, not zero, and never another process's /proc row.
+            assert_eq!(stats.verdict_queue_dropped, None);
+            assert_eq!(stats.snoop_queue_depth, None);
+            assert_eq!(stats.verdict_queue_fail_open, None);
         }
         other => panic!("expected Stats, got {other:?}; log:\n{}", env.log()),
     }

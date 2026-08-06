@@ -284,12 +284,18 @@ mod tests {
             observed_only: 4,
             dns_snoop_dropped: 2,
             enforcing: false,
+            verdict_queue_dropped: Some(7),
             ..Default::default()
         };
         let out = stats(&s).expect("encode");
         assert!(out.contains("\"observed_only\":4"), "{out}");
         assert!(out.contains("\"dns_snoop_dropped\":2"), "{out}");
         assert!(out.contains("\"enforcing\":false"), "{out}");
+        // A kernel counter nobody read is null, not 0: a JSON consumer must
+        // be able to tell "nothing dropped" from "nothing known".
+        assert!(out.contains("\"verdict_queue_dropped\":7"), "{out}");
+        assert!(out.contains("\"snoop_queue_dropped\":null"), "{out}");
+        assert!(out.contains("\"verdict_queue_fail_open\":null"), "{out}");
     }
 
     /// The counters ride alongside the rule's own fields, and a rule the
