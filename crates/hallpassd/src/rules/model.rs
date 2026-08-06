@@ -107,13 +107,28 @@ impl CompiledRule {
             // it, and a binary dropped in a writable subdirectory of an
             // allowed tree inherited the verdict. A subtree is still
             // expressible, now on purpose: `/opt/app/**`.
-            Some(g) => Some(
-                globset::GlobBuilder::new(g)
-                    .literal_separator(true)
-                    .build()
-                    .map_err(|e| format!("bad exe_glob {g:?}: {e}"))?
-                    .compile_matcher(),
-            ),
+            Some(g) => {
+                // The one shape where the narrowing bites silently: a deny
+                // written as `/opt/app/*` for a subtree now blocks only the
+                // top level, and blocking less produces no visible failure.
+                // Said here, at compile, because it reaches operators who
+                // never read a release note.
+                if g.ends_with("/*") {
+                    tracing::info!(
+                        rule = %rule.name,
+                        glob = %g,
+                        "exe_glob ending in /* matches one directory level; \
+                         use /** for the whole subtree"
+                    );
+                }
+                Some(
+                    globset::GlobBuilder::new(g)
+                        .literal_separator(true)
+                        .build()
+                        .map_err(|e| format!("bad exe_glob {g:?}: {e}"))?
+                        .compile_matcher(),
+                )
+            }
         };
         if let Some((lo, hi)) = m.port_range {
             if lo > hi {
