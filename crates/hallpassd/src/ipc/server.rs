@@ -51,7 +51,9 @@ fn parse_group_line(line: &str, group: &str) -> Option<u32> {
 }
 
 /// Bind the socket with restrictive permissions: parent dir 0750, socket
-/// 0660, group `hallpass` if it exists.
+/// 0660, group `hallpass` if it exists. `hallpass-cli doctor` states this
+/// contract independently in its socket check; changing it means updating
+/// the expectations there.
 ///
 /// Separate from [`serve`] so the daemon can take the socket before it
 /// installs any nftables rules: losing the control channel is a security

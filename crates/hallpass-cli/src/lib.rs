@@ -8,6 +8,7 @@
 
 pub mod args;
 pub mod client;
+pub mod doctor;
 pub mod fmt;
 pub mod json;
 pub mod rules_file;
@@ -59,12 +60,19 @@ pub async fn run(argv: &[String]) -> i32 {
         std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty()),
     );
 
+    // Doctor owns its own connection attempt: a dead daemon is a finding
+    // for it to report, not a reason the command cannot run.
+    if cli.cmd == Cmd::Doctor {
+        return doctor::run(&cli.socket, out).await;
+    }
+
     let mut client = match Client::connect(&cli.socket).await {
         Ok(c) => c,
         Err(e) => return report(e),
     };
 
     let result = match cli.cmd {
+        Cmd::Doctor => unreachable!("dispatched before connecting"),
         Cmd::Status => status(&mut client, out).await,
         Cmd::ConfigShow => config_show(&mut client, out).await,
         Cmd::ConfigSet(opts) => config_set(&mut client, opts, out).await,

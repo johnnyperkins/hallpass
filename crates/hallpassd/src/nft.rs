@@ -94,6 +94,10 @@ fn ruleset(queue_num: u16, verdict_bypass: bool) -> String {
     // Not named `reject`: that is an nftables keyword, and using it makes the
     // whole ruleset fail to parse. `install` then leaves no table at all, so
     // nothing is filtered.
+    //
+    // `hallpass-cli doctor` verifies the output chain by token-matching the
+    // listed rules ("meta skuid 0" + "accept" before "ct state new" +
+    // "queue num"); reshaping those rules means updating its chain_order.
     format!(
         "table inet hallpass {{\n\
          \tchain output {{\n\

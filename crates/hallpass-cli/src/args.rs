@@ -33,6 +33,9 @@ USAGE:
 
 COMMANDS:
     status                       Show daemon statistics
+    doctor                       Check the install: daemon, queues, socket,
+                                 group, nftables (root), BTF. Exits non-zero
+                                 if anything failed
     config                       Show the runtime settings
     config set [OPTIONS]         Change runtime settings. Runtime only: a
                                  change lasts until the daemon restarts, and
@@ -264,6 +267,8 @@ impl Default for TopOpts {
 pub enum Cmd {
     /// `status`
     Status,
+    /// `doctor`
+    Doctor,
     /// `config`
     ConfigShow,
     /// `config set ...`
@@ -376,6 +381,7 @@ pub fn parse(argv: &[String]) -> Result<Parsed, String> {
     let cmd = match rest.split_first() {
         None => return Err("no command given".into()),
         Some((&"status", [])) => Cmd::Status,
+        Some((&"doctor", [])) => Cmd::Doctor,
         Some((&"config", sub)) => parse_config(sub)?,
         Some((&"watch", [])) => Cmd::Watch,
         Some((&"events", flags)) => Cmd::Events(parse_events(flags)?),
@@ -383,7 +389,7 @@ pub fn parse(argv: &[String]) -> Result<Parsed, String> {
         Some((&"explain", flags)) => Cmd::Explain(parse_explain(flags)?),
         Some((&"rules", sub)) => parse_rules(sub)?,
         Some((&cmd, extra)) => {
-            return Err(if matches!(cmd, "status" | "watch") {
+            return Err(if matches!(cmd, "status" | "watch" | "doctor") {
                 format!("unexpected arguments after '{cmd}': {extra:?}")
             } else {
                 format!("unknown command '{cmd}'")
@@ -825,6 +831,8 @@ mod tests {
     #[test]
     fn simple_commands() {
         assert_eq!(parse_ok(&["status"]).cmd, Cmd::Status);
+        assert_eq!(parse_ok(&["doctor"]).cmd, Cmd::Doctor);
+        parse_err(&["doctor", "extra"]);
         assert_eq!(parse_ok(&["watch"]).cmd, Cmd::Watch);
         assert_eq!(parse_ok(&["rules"]).cmd, Cmd::RulesList { stats: false });
         assert_eq!(

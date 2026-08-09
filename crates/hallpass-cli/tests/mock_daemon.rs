@@ -364,3 +364,107 @@ async fn connect_failure_exit_code() {
     assert_eq!(err.exit_code(), hallpass_cli::EXIT_CONN);
     assert!(err.to_string().contains("is hallpassd running?"));
 }
+
+/// A stats reply a healthy enforcing daemon would give.
+fn healthy_stats() -> Stats {
+    Stats {
+        connections_total: 10,
+        allowed: 10,
+        denied: 0,
+        prompted: 0,
+        rules_loaded: 3,
+        uptime_secs: 5,
+        dns_spoof_rejected: 0,
+        rules_skipped: 0,
+        prompts_overflowed: 0,
+        other_proto_total: 0,
+        observed_only: 0,
+        dns_snoop_dropped: 0,
+        enforcing: true,
+        prompt_handler_connected: true,
+        prompts_unanswered: 0,
+        prompt_handlers_evicted: 0,
+        verdict_queue_dropped: Some(0),
+        verdict_queue_user_dropped: Some(0),
+        verdict_queue_depth: Some(0),
+        snoop_queue_dropped: Some(0),
+        snoop_queue_user_dropped: Some(0),
+        snoop_queue_depth: Some(0),
+        verdict_queue_fail_open: Some(true),
+        snoop_queue_fail_open: Some(true),
+    }
+}
+
+/// Whether this test process runs as root, in which case doctor's nftables
+/// check runs for real and would fail on a host without the table.
+fn running_as_root() -> bool {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata("/proc/self").is_ok_and(|m| m.uid() == 0)
+}
+
+/// Doctor against a healthy daemon exits zero: the local environment checks
+/// (socket mode, group membership, BTF) may warn on a dev machine, but only
+/// failures move the exit code.
+#[tokio::test]
+async fn doctor_healthy_daemon_exits_zero() {
+    if running_as_root() {
+        return;
+    }
+    let path = temp_sock("doctor-ok");
+    let listener = UnixListener::bind(&path).expect("bind");
+
+    let daemon = tokio::spawn(mock_daemon(listener, move |mut stream| async move {
+        let req: ClientMsg = wire::read_msg(&mut stream).await.expect("read req");
+        assert_eq!(req, ClientMsg::Stats);
+        wire::write_msg(&mut stream, &DaemonMsg::Stats(healthy_stats()))
+            .await
+            .expect("write stats");
+    }));
+
+    let args = argv(&path, &["doctor"]);
+    assert_eq!(hallpass_cli::run(&args).await, hallpass_cli::EXIT_OK);
+
+    daemon.await.expect("daemon task");
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Kernel-counted verdict-queue drops are packets resolved without policy,
+/// so doctor must fail on them.
+#[tokio::test]
+async fn doctor_fails_on_verdict_queue_drops() {
+    if running_as_root() {
+        return;
+    }
+    let path = temp_sock("doctor-drops");
+    let listener = UnixListener::bind(&path).expect("bind");
+
+    let daemon = tokio::spawn(mock_daemon(listener, move |mut stream| async move {
+        let req: ClientMsg = wire::read_msg(&mut stream).await.expect("read req");
+        assert_eq!(req, ClientMsg::Stats);
+        let stats = Stats {
+            verdict_queue_dropped: Some(7),
+            ..healthy_stats()
+        };
+        wire::write_msg(&mut stream, &DaemonMsg::Stats(stats))
+            .await
+            .expect("write stats");
+    }));
+
+    let args = argv(&path, &["doctor"]);
+    assert_eq!(hallpass_cli::run(&args).await, hallpass_cli::EXIT_ERR);
+
+    daemon.await.expect("daemon task");
+    let _ = std::fs::remove_file(&path);
+}
+
+/// An unreachable daemon is doctor's headline finding, reported with exit 1
+/// rather than the connection-failure exit other commands use: the command
+/// itself ran and produced its report.
+#[tokio::test]
+async fn doctor_reports_unreachable_daemon() {
+    // No root guard: an unreachable daemon fails the exit code by itself,
+    // whatever the root-only nftables check adds.
+    let path = temp_sock("doctor-down");
+    let args = argv(&path, &["doctor"]);
+    assert_eq!(hallpass_cli::run(&args).await, hallpass_cli::EXIT_ERR);
+}
