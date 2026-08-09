@@ -18,6 +18,7 @@ use crate::editor::RuleEditor;
 use crate::net::{self, UiEvent};
 use crate::prompt::{self, PromptState};
 use crate::traffic;
+use crate::tray::TrayMsg;
 
 /// Maximum number of events kept in the scrollback.
 const MAX_EVENTS: usize = 1000;
@@ -221,20 +222,39 @@ pub struct HallpassApp {
     /// the one moment it gets its focus and attention requests; replaced
     /// wholesale every frame, so it stays bounded by the live windows.
     surfaced_popups: std::collections::HashSet<egui::ViewportId>,
+    /// Tray activation channel; None when no tray service was started
+    /// (no X11-capable display, or tests).
+    from_tray: Option<Receiver<TrayMsg>>,
+    /// Whether the close button parks the window in the tray instead of
+    /// quitting. Starts true only where a tray can exist, and drops back
+    /// to false if the tray service finds no StatusNotifier host:
+    /// parking must never outlive the icon that un-parks it.
+    park_on_close: bool,
+    /// Set by the quit paths so the close request they issue is not
+    /// intercepted and parked.
+    quitting: bool,
 }
 
 impl HallpassApp {
     /// The eframe entry point: connect to `socket` on the network thread.
     ///
     /// The creation context contributes exactly one thing, the [`egui::Context`]
-    /// the network thread wakes the event loop with.
-    pub fn new(cc: &eframe::CreationContext<'_>, socket: PathBuf) -> Self {
+    /// the network and tray threads wake the event loop with. `tray` is
+    /// whether the session can re-show a hidden window (the X11 backend);
+    /// without that, a tray icon would offer a Show that does nothing, so
+    /// none is started and close keeps quitting.
+    pub fn new(cc: &eframe::CreationContext<'_>, socket: PathBuf, tray: bool) -> Self {
         let (to_daemon, from_ui) = tokio::sync::mpsc::unbounded_channel();
         let (to_ui, from_net) = std::sync::mpsc::channel();
         let (to_notify, from_net_notify) = std::sync::mpsc::channel();
         crate::notify::spawn(from_net_notify);
         net::spawn(socket, to_ui, from_ui, cc.egui_ctx.clone(), to_notify);
-        Self::with_channels(to_daemon, from_net)
+        let mut app = Self::with_channels(to_daemon, from_net);
+        if tray {
+            app.from_tray = Some(crate::tray::spawn(cc.egui_ctx.clone()));
+            app.park_on_close = true;
+        }
+        app
     }
 
     /// An app wired to nothing but this channel pair.
@@ -267,11 +287,55 @@ impl HallpassApp {
             settings_verdict: Verdict::Allow,
             settings_error: None,
             surfaced_popups: std::collections::HashSet::new(),
+            from_tray: None,
+            park_on_close: false,
+            quitting: false,
         }
     }
 
     fn send(&mut self, msg: ClientMsg) {
         self.link.send(msg);
+    }
+
+    /// The one real exit path: every quit control funnels here so open
+    /// prompts are always denied-once (releasing the handler slot
+    /// cleanly) before the window goes down, and so the close request it
+    /// issues is not intercepted and parked.
+    fn quit(&mut self, ctx: &egui::Context) {
+        self.quitting = true;
+        self.abandon_open_prompts();
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+    }
+
+    /// Drain tray activations, like [`Self::drain_net`] but for the tray
+    /// thread. A parked window still runs this: the tray pairs every
+    /// message with a repaint request, and a hidden X11 window's frame
+    /// loop keeps servicing those.
+    fn drain_tray(&mut self, ctx: &egui::Context) {
+        let Some(from_tray) = &self.from_tray else {
+            return;
+        };
+        // Collected first: the receiver borrow must end before the
+        // handlers take &mut self.
+        let msgs: Vec<TrayMsg> = from_tray.try_iter().collect();
+        for msg in msgs {
+            match msg {
+                TrayMsg::Show => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                }
+                TrayMsg::Quit => self.quit(ctx),
+                TrayMsg::Unavailable => {
+                    self.park_on_close = false;
+                    // The failure may have lost a race with a park (close
+                    // clicked before the tray gave up, or a --hidden
+                    // start): a hidden window with no icon is unreachable,
+                    // so re-show unconditionally. On a visible window the
+                    // command is a no-op.
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                }
+            }
+        }
     }
 
     /// Test seams: the shared state is behind locks the tests should not
@@ -592,18 +656,29 @@ impl HallpassApp {
 
     fn main_window(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
-        // Closing the main window quits, exactly like Quit. It used to hide
-        // the window so popups kept serving, but an app that survives its
-        // own close button is a surprise, not a feature. The cost is stated
-        // where it is paid: quitting releases the prompt-handler slot, and
+        // Closing the main window parks it in the tray when there is a
+        // tray to come back through: prompts stay armed and keep popping
+        // while the window is away, which is what makes the close button
+        // safe to press on a prompt surface. (An earlier version hid
+        // unconditionally; on Wayland's no-op hide that read as the close
+        // button not working, which is why hiding is gated on the tray
+        // and the tray on the X11 backend.) Without a tray - no X11
+        // display, no StatusNotifier host, or a quit already under way -
+        // close still quits exactly like Quit, with the cost stated where
+        // it is paid: quitting releases the prompt-handler slot, and
         // every later unmatched connection takes the daemon's default
         // verdict with nothing on screen; the prompts still open are
-        // denied-once first rather than left to time out. The dismissal is
-        // idempotent (ids no longer pending are skipped), so re-running on
-        // the teardown frames costs nothing; any future exit path (a tray
-        // item, a quit accelerator) must abandon open prompts the same way.
+        // denied-once first rather than left to time out. The dismissal
+        // is idempotent (ids no longer pending are skipped), so re-running
+        // on the teardown frames costs nothing; every exit path funnels
+        // through `quit` so prompts are always abandoned the same way.
         if ctx.input(|i| i.viewport().close_requested()) {
-            self.abandon_open_prompts();
+            if self.park_on_close && !self.quitting {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            } else {
+                self.abandon_open_prompts();
+            }
         }
 
         egui::Panel::top("tabs").show(ui, |ui| {
@@ -649,8 +724,7 @@ impl HallpassApp {
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("Quit").clicked() {
-                        self.abandon_open_prompts();
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        self.quit(&ctx);
                     }
                 });
             });
@@ -1558,6 +1632,7 @@ impl eframe::App for HallpassApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.drain_net();
+        self.drain_tray(&ctx);
         self.main_window(ui);
         self.editor_window(&ctx);
         self.prompt_windows(&ctx);

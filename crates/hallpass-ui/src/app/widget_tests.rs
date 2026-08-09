@@ -296,10 +296,13 @@ fn editor_save_stays_reachable_on_a_short_viewport() {
     );
 }
 
-/// The main window's close button quits like Quit does: the prompts still
-/// on screen are denied-once rather than abandoned to the daemon's timeout,
-/// and the close is not cancelled. (It used to hide the window instead; the
-/// user experienced that as the close button not working.)
+/// Without a tray to come back through (`park_on_close` false: native
+/// Wayland, a hostless session, or these tests), the close button quits
+/// like Quit does: the prompts still on screen are denied-once rather
+/// than abandoned to the daemon's timeout, and the close is not
+/// cancelled. (An early version hid the window unconditionally; on
+/// Wayland's no-op hide the user experienced that as the close button
+/// not working, which is why parking is gated on a working tray.)
 #[test]
 fn closing_the_main_window_quits_and_answers_open_prompts() {
     let (app, mut from_ui) = app_with_prompts(2);
@@ -322,6 +325,76 @@ fn closing_the_main_window_quits_and_answers_open_prompts() {
         "closing the window left prompts to the daemon's default verdict"
     );
     assert!(harness.state().prompt_ids().is_empty());
+}
+
+/// With a tray to come back through, close parks instead of quitting: the
+/// prompts stay pending and nothing reaches the daemon. Keeping the prompt
+/// surface alive across a close is the reason the tray exists.
+#[test]
+fn closing_with_a_tray_parks_and_keeps_prompts() {
+    let (mut app, mut from_ui) = app_with_prompts(2);
+    app.park_on_close = true;
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(820.0, 520.0))
+        .build_ui_state(|ui, app: &mut HallpassApp| app.main_window(ui), app);
+
+    harness
+        .input_mut()
+        .viewports
+        .entry(egui::ViewportId::ROOT)
+        .or_default()
+        .events
+        .push(egui::ViewportEvent::Close);
+    harness.step();
+
+    assert!(
+        drain(&mut from_ui).is_empty(),
+        "parking answered prompts it should have kept armed"
+    );
+    assert_eq!(harness.state().prompt_ids(), vec![1, 2]);
+}
+
+/// A quit already under way must not be re-intercepted by the park path:
+/// the teardown frames re-deliver the close request, and cancelling it
+/// would turn Quit into hide.
+#[test]
+fn quit_is_not_parked_even_with_a_tray() {
+    let (mut app, mut from_ui) = app_with_prompts(2);
+    app.park_on_close = true;
+    let ctx = egui::Context::default();
+    app.quit(&ctx);
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(820.0, 520.0))
+        .build_ui_state(|ui, app: &mut HallpassApp| app.main_window(ui), app);
+
+    harness
+        .input_mut()
+        .viewports
+        .entry(egui::ViewportId::ROOT)
+        .or_default()
+        .events
+        .push(egui::ViewportEvent::Close);
+    harness.step();
+
+    assert_eq!(
+        drain(&mut from_ui),
+        (1..=2).map(prompt::close_reply).collect::<Vec<_>>(),
+        "quit left prompts unanswered"
+    );
+    assert!(harness.state().prompt_ids().is_empty());
+}
+
+/// The tray reporting no StatusNotifier host flips the window back to
+/// quit-on-close; parking must never outlive the icon that un-parks it.
+#[test]
+fn tray_unavailable_falls_back_to_quit_on_close() {
+    let (mut app, _from_ui) = app_with_prompts(0);
+    let (to_ui, from_tray) = std::sync::mpsc::channel();
+    app.from_tray = Some(from_tray);
+    app.park_on_close = true;
+    to_ui.send(crate::tray::TrayMsg::Unavailable).unwrap();
+    app.drain_tray(&egui::Context::default());
+    assert!(!app.park_on_close);
 }
 
 /// The checkbox in the rules list asks the daemon; it does not edit the row.

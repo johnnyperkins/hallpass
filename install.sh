@@ -88,8 +88,10 @@ install -Dm644 etc/hallpass-cli.1 /usr/share/man/man1/hallpass-cli.1
 # systemd unit and desktop entries.
 install -Dm644 etc/hallpassd.service   /etc/systemd/system/hallpassd.service
 install -Dm644 etc/hallpass-ui.desktop /usr/share/applications/hallpass-ui.desktop
-# Autostart the UI so prompts appear without launching anything by hand.
-install -Dm644 etc/hallpass-ui.desktop /etc/xdg/autostart/hallpass-ui.desktop
+# Autostart the UI parked in the tray, so login gets a prompt surface
+# without a window in the way (--hidden; the app-menu entry above opens
+# the window as usual).
+install -Dm644 etc/hallpass-ui-autostart.desktop /etc/xdg/autostart/hallpass-ui.desktop
 
 # Let the installing user manage the daemon without sudo.
 groupadd -f hallpass

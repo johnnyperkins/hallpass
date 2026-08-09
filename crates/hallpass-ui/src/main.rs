@@ -10,6 +10,7 @@ mod net;
 mod notify;
 mod prompt;
 mod traffic;
+mod tray;
 
 use std::path::PathBuf;
 
@@ -17,6 +18,15 @@ use eframe::egui;
 
 /// Default daemon socket path.
 const DEFAULT_SOCKET: &str = "/run/hallpass/hallpass.sock";
+
+/// Command line, parsed by [`parse_args`].
+struct Args {
+    socket: PathBuf,
+    /// Start parked in the tray instead of showing the window. The
+    /// autostart entry uses this so login gets a prompt surface without a
+    /// window; ignored when the session cannot re-show a hidden window.
+    hidden: bool,
+}
 
 fn main() -> eframe::Result {
     tracing_subscriber::fmt()
@@ -26,44 +36,68 @@ fn main() -> eframe::Result {
         )
         .init();
 
-    let socket = parse_socket_arg(std::env::args().skip(1)).unwrap_or_else(|e| {
+    let args = parse_args(std::env::args().skip(1)).unwrap_or_else(|e| {
         eprintln!("{e}");
-        eprintln!("usage: hallpass-ui [--socket PATH]");
+        eprintln!("usage: hallpass-ui [--socket PATH] [--hidden]");
         std::process::exit(2);
     });
 
-    let options = eframe::NativeOptions {
+    // Close-to-tray needs capabilities winit's Wayland backend does not
+    // have: `Visible(false)` / `Visible(true)` are no-ops there, and a
+    // minimized window stops getting frames entirely (repaint requests
+    // included), which would freeze prompt popups for as long as it stayed
+    // minimized. On X11 a hidden window's frame loop keeps running, popups
+    // born while hidden surface normally, and re-show plus focus work. All
+    // probe-verified 2026-08-09 (facts recorded in TODO.md), so any X11
+    // display - XWayland included - is preferred over native Wayland, and
+    // sessions with neither keep the old behavior: visible window, close
+    // quits.
+    let x11 = std::env::var_os("DISPLAY").is_some();
+
+    let mut options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([820.0, 520.0])
             .with_min_inner_size([480.0, 320.0])
-            .with_app_id("hallpass-ui"),
+            .with_app_id("hallpass-ui")
+            .with_visible(!(args.hidden && x11)),
         ..Default::default()
     };
+    if x11 {
+        options.event_loop_builder = Some(Box::new(|builder| {
+            use winit::platform::x11::EventLoopBuilderExtX11;
+            builder.with_x11();
+        }));
+    }
 
     eframe::run_native(
         "Hallpass",
         options,
-        Box::new(move |cc| Ok(Box::new(app::HallpassApp::new(cc, socket)))),
+        Box::new(move |cc| Ok(Box::new(app::HallpassApp::new(cc, args.socket, x11)))),
     )
 }
 
-/// Parse `--socket PATH` (or `--socket=PATH`) from the argument list.
-fn parse_socket_arg(args: impl IntoIterator<Item = String>) -> Result<PathBuf, String> {
-    let mut socket = PathBuf::from(DEFAULT_SOCKET);
+/// Parse `--socket PATH` (or `--socket=PATH`) and `--hidden`.
+fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
+    let mut parsed = Args {
+        socket: PathBuf::from(DEFAULT_SOCKET),
+        hidden: false,
+    };
     let mut iter = args.into_iter();
     while let Some(arg) = iter.next() {
         if arg == "--socket" {
             match iter.next() {
-                Some(path) => socket = PathBuf::from(path),
+                Some(path) => parsed.socket = PathBuf::from(path),
                 None => return Err("--socket requires a path argument".into()),
             }
         } else if let Some(path) = arg.strip_prefix("--socket=") {
-            socket = PathBuf::from(path);
+            parsed.socket = PathBuf::from(path);
+        } else if arg == "--hidden" {
+            parsed.hidden = true;
         } else {
             return Err(format!("unknown argument: {arg}"));
         }
     }
-    Ok(socket)
+    Ok(parsed)
 }
 
 #[cfg(test)]
@@ -71,24 +105,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn socket_arg_default() {
-        assert_eq!(
-            parse_socket_arg(Vec::new()).unwrap(),
-            PathBuf::from(DEFAULT_SOCKET)
-        );
+    fn args_default() {
+        let args = parse_args(Vec::new()).unwrap();
+        assert_eq!(args.socket, PathBuf::from(DEFAULT_SOCKET));
+        assert!(!args.hidden);
     }
 
     #[test]
     fn socket_arg_separate_and_equals() {
         let args = vec!["--socket".to_string(), "/tmp/s.sock".to_string()];
-        assert_eq!(parse_socket_arg(args).unwrap(), PathBuf::from("/tmp/s.sock"));
+        assert_eq!(parse_args(args).unwrap().socket, PathBuf::from("/tmp/s.sock"));
         let args = vec!["--socket=/tmp/t.sock".to_string()];
-        assert_eq!(parse_socket_arg(args).unwrap(), PathBuf::from("/tmp/t.sock"));
+        assert_eq!(parse_args(args).unwrap().socket, PathBuf::from("/tmp/t.sock"));
     }
 
     #[test]
-    fn socket_arg_errors() {
-        assert!(parse_socket_arg(vec!["--socket".to_string()]).is_err());
-        assert!(parse_socket_arg(vec!["--bogus".to_string()]).is_err());
+    fn hidden_flag() {
+        assert!(parse_args(vec!["--hidden".to_string()]).unwrap().hidden);
+    }
+
+    #[test]
+    fn arg_errors() {
+        assert!(parse_args(vec!["--socket".to_string()]).is_err());
+        assert!(parse_args(vec!["--bogus".to_string()]).is_err());
     }
 }
