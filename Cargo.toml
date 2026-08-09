@@ -28,3 +28,10 @@ serde_json = "1"
 
 [workspace.lints.rust]
 unsafe_code = "deny"
+
+# Line tables keep file:line in backtraces at a fraction of the disk.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.test]
+debug = "line-tables-only"
