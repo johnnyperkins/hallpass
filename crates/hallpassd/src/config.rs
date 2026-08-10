@@ -121,6 +121,12 @@ pub struct Config {
     pub queue_bypass: bool,
     /// `"enforce"` (default) or `"observe"`. See [`Mode`].
     pub mode: Mode,
+    /// Whether a ruleset change also deletes the conntrack entries of
+    /// established flows the new ruleset denies, so the deny applies now
+    /// rather than to the next connection. `true` by default: an operator
+    /// who writes "deny" means the traffic, not the handshake. Never
+    /// active in observe mode.
+    pub kill_established: bool,
 }
 
 impl Default for Config {
@@ -136,6 +142,7 @@ impl Default for Config {
             syslog: None,
             queue_bypass: true,
             mode: Mode::Enforce,
+            kill_established: true,
         }
     }
 }
@@ -159,7 +166,10 @@ impl Default for Config {
 /// need to change as one: a torn Get between the stores of a Set reports
 /// a state the daemon really passed through. A future knob that must
 /// change atomically with another breaks this scheme; that is the point
-/// to revisit, not to extend.
+/// to revisit, not to extend. (The watch channel below does not breach
+/// the one-lock promise: only the IPC apply path sends on it and only
+/// the flow-kill sweeper subscribes; the verdict thread never touches
+/// it.)
 pub struct RuntimeSettings {
     prompt_timeout_secs: AtomicU64,
     /// A [`Verdict`] via [`verdict_to_u8`]; atomics do not hold enums.
@@ -170,6 +180,11 @@ pub struct RuntimeSettings {
     /// back, which is what keeps "observe blocks nothing" true from the
     /// moment of the toggle.
     enforcing: AtomicBool,
+    /// Bumped on an observe-to-enforce flip, and only that direction: it
+    /// wakes the flow-kill sweeper, which has nothing to do when
+    /// enforcement stops. See the struct comment on why this channel does
+    /// not breach the atomics-only design.
+    now_enforcing: tokio::sync::watch::Sender<()>,
 }
 
 fn verdict_to_u8(v: Verdict) -> u8 {
@@ -196,7 +211,13 @@ impl RuntimeSettings {
             prompt_timeout_secs: AtomicU64::new(initial.prompt_timeout_secs),
             default_verdict: AtomicU8::new(verdict_to_u8(initial.default_verdict)),
             enforcing: AtomicBool::new(initial.enforce),
+            now_enforcing: tokio::sync::watch::channel(()).0,
         }
+    }
+
+    /// A receiver that wakes on an observe-to-enforce flip.
+    pub fn enforce_signal(&self) -> tokio::sync::watch::Receiver<()> {
+        self.now_enforcing.subscribe()
     }
 
     /// Seconds a new prompt waits before the default verdict applies.
@@ -242,6 +263,10 @@ impl RuntimeSettings {
             tracing::warn!("{OBSERVE_MODE_WARNING}");
         } else if !was_enforcing && new.enforce {
             tracing::info!("enforce mode: verdicts apply to packets again");
+            // After the swap, so a woken sweeper reads the new mode. What
+            // observe only recorded starts being denied now, and that must
+            // include flows that are already established.
+            self.now_enforcing.send_replace(());
         }
         Ok(())
     }
@@ -466,6 +491,25 @@ mod tests {
         assert_eq!(cfg.default_verdict, Verdict::Allow);
         assert_eq!(cfg.unhandled_proto_verdict, Verdict::Allow);
         assert!(cfg.queue_bypass);
+    }
+
+    /// The enforce signal fires on an observe-to-enforce flip and only
+    /// that direction: the flow-kill sweeper it wakes has nothing to do
+    /// when enforcement stops.
+    #[test]
+    fn enforce_signal_fires_only_on_the_enforcing_edge() {
+        let s = RuntimeSettings::new(parse(r#"mode = "observe""#).runtime());
+        let rx = s.enforce_signal();
+        assert!(!rx.has_changed().expect("sender alive"));
+
+        s.apply(&RuntimeConfig { enforce: true, ..s.snapshot() })
+            .expect("valid settings");
+        assert!(rx.has_changed().expect("sender alive"));
+
+        let rx = s.enforce_signal();
+        s.apply(&RuntimeConfig { enforce: false, ..s.snapshot() })
+            .expect("valid settings");
+        assert!(!rx.has_changed().expect("sender alive"));
     }
 
     /// The config file's mode seeds the runtime settings, and a runtime set

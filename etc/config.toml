@@ -47,6 +47,14 @@ unhandled_proto_verdict = "allow"
 # measurement run on a fail-closed host wants the mode set here.
 queue_bypass = true
 
+# When the ruleset changes, delete the conntrack entries of established
+# flows the new ruleset denies, so a deny rule applies to running
+# connections rather than only the next one. The flow's next packet is
+# then judged as a new connection by the same rules as any other. Off,
+# a long-lived connection (a VPN, a websocket) opened before a deny rule
+# keeps flowing until it ends on its own. Never active in observe mode.
+kill_established = true
+
 # Optional: export every decided connection to syslog. Omit the whole
 # [syslog] section for no export. Export is a plain event subscriber, so
 # a stalled collector costs events, never verdicts. Facility is auth, so

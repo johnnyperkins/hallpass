@@ -47,6 +47,11 @@ pub struct RuleStore {
     /// it: an operator editing one rule file should not lose the answer to
     /// "is anything hitting this".
     hits: RwLock<HashMap<String, Hit>>,
+    /// Bumped by every [`RuleStore::rebuild`], i.e. whenever the active
+    /// ruleset may have changed. What the flow-kill sweeper watches; a
+    /// watch channel rather than a notify so a subscriber that was busy
+    /// during two changes still wakes once for the latest.
+    changed: tokio::sync::watch::Sender<()>,
 }
 
 /// Hit accounting for one rule name.
@@ -383,6 +388,7 @@ impl RuleStore {
             rules_dir,
             rules_skipped: AtomicU64::new(loaded.skipped),
             hits: RwLock::new(HashMap::new()),
+            changed: tokio::sync::watch::channel(()).0,
         };
         store.rebuild();
         store
@@ -651,6 +657,15 @@ impl RuleStore {
         let rules: Vec<Rule> = self.list();
         self.prune_hits(&rules);
         self.active.store(Arc::new(RuleSet::compile(&rules)));
+        // After the swap, so a woken subscriber always sees the new set.
+        // send_replace, not send: this must not depend on a receiver being
+        // subscribed yet, and the startup rebuild has none.
+        self.changed.send_replace(());
+    }
+
+    /// A receiver that wakes whenever the active ruleset may have changed.
+    pub fn change_signal(&self) -> tokio::sync::watch::Receiver<()> {
+        self.changed.subscribe()
     }
 
     /// Drop hit counters for rules that are no longer loaded.

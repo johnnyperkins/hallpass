@@ -144,6 +144,23 @@ systemctl enable --now hallpassd
 Configuration lives in `/etc/hallpass/config.toml` (default verdict, prompt
 timeout, queue number, socket path, rules directory).
 
+A deny rule applies to established flows too, not only the next
+connection: on every ruleset change (and on an observe-to-enforce flip)
+the daemon deletes the conntrack entries of flows the changed ruleset
+explicitly denies, so each one's next packet is judged as a new
+connection and the rule catches it there. Flows the ruleset leaves
+unmatched are never touched (a rule edit cannot cause a prompt storm),
+observe mode kills nothing, and every kill is logged with the rule that
+caused it. Best-effort by design: the daemon finds these flows in its
+recent-decision history (the newest 1024 decisions, kept since daemon
+start), so a flow whose decision has aged out of that window, or that
+predates the daemon, keeps running until it ends; a rule that matches
+only by executable hash cannot identify flows to kill; and a flow whose
+peer is transmitting can re-establish its conntrack entry from the
+unfiltered inbound side before its next outbound packet, surviving the
+kill until it goes quiet. `kill_established = false` restores the old
+next-connection-only behavior.
+
 Setting `mode = "observe"` there evaluates policy and records what it
 decided without applying any of it. Nothing is blocked: a rule that would
 deny is recorded as a deny and the connection goes out anyway, and unmatched

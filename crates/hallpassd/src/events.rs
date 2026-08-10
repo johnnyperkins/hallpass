@@ -79,6 +79,13 @@ impl EventBus {
         let _ = self.tx.send(ev);
     }
 
+    /// The whole history ring as shared pointers, oldest first. For
+    /// in-process consumers (the flow-kill sweeper): no wire-reply byte
+    /// budget and no deep copy, just pointer clones under the lock.
+    pub fn recent(&self) -> Vec<Arc<ConnEvent>> {
+        self.lock_history().iter().cloned().collect()
+    }
+
     /// Up to `limit` most recent events, oldest first so a client can print
     /// them as a continuation of the live stream.
     ///
@@ -121,10 +128,12 @@ impl EventBus {
         guard.push_back(ev);
     }
 
-    /// A poisoned history lock must not take the daemon down: history is a
-    /// convenience and enforcement never reads it, so recovering the
-    /// contents is strictly better than propagating the panic into the
-    /// verdict path or the control channel.
+    /// A poisoned history lock must not take the daemon down: no verdict is
+    /// ever decided from history, so recovering the contents is strictly
+    /// better than propagating the panic into the verdict path or the
+    /// control channel. (The flow-kill sweeper does read history, so losing
+    /// it now also costs best-effort kill coverage - but a kill only ever
+    /// re-routes a flow into the normal verdict path, never decides one.)
     fn lock_history(&self) -> std::sync::MutexGuard<'_, VecDeque<Arc<ConnEvent>>> {
         self.history.lock().unwrap_or_else(|e| e.into_inner())
     }

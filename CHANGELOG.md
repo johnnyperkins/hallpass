@@ -7,6 +7,33 @@ carries what an upgrade changes on a running host.
 
 ### Added
 
+- **Deny rules now apply to established flows (`kill_established`).**
+  Enforcement only queues `ct state new`, so until now a deny rule added
+  while a connection was already up (a VPN, a websocket, a long upload)
+  did not touch it: the rule quietly applied to the *next* connection
+  only. On every ruleset change (and on an observe-to-enforce flip) the
+  daemon now deletes the conntrack entries of flows the changed ruleset
+  explicitly denies, which makes each flow's next packet `ct state new`
+  again; it re-enters the verdict queue and the deny rule catches it
+  there. Nothing is decided outside the normal path, flows the ruleset
+  leaves unmatched are never touched (no prompt storms from a rule
+  edit), and observe mode kills nothing. Each kill is logged with the
+  rule that caused it. Best-effort by design: candidates come from the
+  daemon's recent-decision ring (newest 1024 decisions, since daemon
+  start), so flows older than that window or predating the daemon keep
+  running until they end; hash-pinned rules cannot identify flows to
+  kill; and a flow whose peer keeps transmitting can re-establish its
+  conntrack entry from the unfiltered inbound side and survive the kill
+  until it goes quiet. Opt out with `kill_established = false` in
+  config.toml.
+- **`hallpass-cli doctor`.** One command for the post-install and
+  post-deploy checklist: daemon reachable and speaking the CLI's wire
+  protocol, queues bound with drop counters at zero, observe mode and a
+  missing prompt handler surfaced, socket permissions, hallpass group
+  membership (including "added on disk but this session predates it"),
+  the nftables output chain shape (root only), and kernel BTF. Exits
+  non-zero exactly when something failed, so scripts can gate on it.
+
 - **Kernel queue counters in `status` (wire protocol v7).** The daemon's
   own counters cannot see a packet the kernel resolves because an nfqueue
   is full: it never reaches userspace, so no event and no daemon counter

@@ -13,6 +13,7 @@
 
 mod attribution;
 mod config;
+mod conntrack;
 #[cfg(feature = "dev-fixtures")]
 mod devfixtures;
 mod dns;
@@ -177,6 +178,18 @@ async fn main() {
     rules::store::spawn_expiry_sweeper(Arc::clone(&store));
     if let Some(syslog_cfg) = cfg.syslog.clone() {
         syslog::spawn(Arc::clone(&events), syslog_cfg);
+    }
+    if cfg.kill_established {
+        conntrack::spawn_kill_sweeper(
+            Arc::clone(&store),
+            Arc::clone(&events),
+            Arc::clone(&settings),
+        );
+    } else {
+        tracing::info!(
+            "kill_established is off: a new deny rule applies to new connections only, \
+             established flows keep running until they end"
+        );
     }
 
     // Channels between the queue thread and the async side.
