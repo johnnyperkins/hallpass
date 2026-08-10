@@ -12,6 +12,7 @@ pub mod doctor;
 pub mod fmt;
 pub mod json;
 pub mod rules_file;
+pub mod suggest;
 pub mod top;
 pub mod watch;
 
@@ -84,6 +85,7 @@ pub async fn run(argv: &[String]) -> i32 {
         }
         Cmd::RulesExport => rules_export(&mut client).await,
         Cmd::RulesImport { path } => rules_import(&mut client, &path).await,
+        Cmd::Suggest(opts) => suggest::run(&mut client, opts, out).await,
         Cmd::Events(opts) => events(client, opts, out).await,
         Cmd::Top(opts) => top::top(client, opts, out.json, out.palette).await,
         Cmd::Watch => watch::watch(client).await,

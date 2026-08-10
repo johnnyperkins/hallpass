@@ -169,7 +169,11 @@ dialog that changes nothing would be misleading. It exists because the honest
 answer to "what will this policy break" cannot be read off the rule files; it
 depends on what the host actually talks to. So the way to size a rollout is
 to run in observe mode, watch `hallpass-cli top` and `hallpass-cli events`
-for a while, and only then enforce. The GUI has an **Enforce** switch in its
+for a while, then fold what was observed into a reviewable ruleset with
+`hallpass-cli suggest` (one proposed allow rule per executable, protocol,
+port and destination, wildcarded where enough hosts share a suffix; the
+output is a `rules export`-shaped document for `rules import`), and only
+then enforce. The GUI has an **Enforce** switch in its
 tab bar that flips the mode at runtime - active filtering on, passive
 watching off - lasting until the daemon restarts; the config file decides
 the mode it starts in. The mode is visible in `hallpass-cli status`, in
@@ -257,6 +261,7 @@ hallpass-cli rules --stats                 # list rules with hit counts
 hallpass-cli rules export > policy.toml    # the whole ruleset as one document
 hallpass-cli rules import policy.toml      # add every rule in a document
 hallpass-cli explain --exe /usr/bin/curl --dest 1.1.1.1 --port 443
+hallpass-cli suggest --exe firefox > proposed.toml   # propose rules from history
 ```
 
 `explain` asks what policy would do with a connection without sending a

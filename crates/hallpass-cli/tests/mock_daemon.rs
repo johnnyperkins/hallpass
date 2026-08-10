@@ -472,3 +472,68 @@ async fn doctor_reports_unreachable_daemon() {
     let args = argv(&path, &["doctor"]);
     assert_eq!(hallpass_cli::run(&args).await, hallpass_cli::EXIT_ERR);
 }
+
+/// `suggest` folds a served history into a TOML proposal and exits zero.
+#[tokio::test]
+async fn suggest_folds_history_into_rules() {
+    use hallpass_types::{ConnEvent, Connection, FlowTuple};
+
+    let path = temp_sock("suggest");
+    let listener = UnixListener::bind(&path).expect("bind");
+
+    let daemon = tokio::spawn(mock_daemon(listener, move |mut stream| async move {
+        let req: ClientMsg = wire::read_msg(&mut stream).await.expect("read req");
+        assert!(matches!(req, ClientMsg::EventHistory { .. }));
+        let ev = ConnEvent {
+            conn: Connection {
+                tuple: FlowTuple {
+                    proto: Proto::Tcp,
+                    src: "10.0.0.1:40000".parse().unwrap(),
+                    dst: "1.1.1.1:443".parse().unwrap(),
+                },
+                uid: Some(1000),
+                pid: None,
+                exe_path: Some("/usr/bin/curl".into()),
+                cmdline: None,
+                parent_exe: None,
+                domain: Some("example.org".into()),
+                iface: None,
+            },
+            verdict: Verdict::Allow,
+            rule_name: None,
+            unix_ms: 0,
+            enforced: true,
+        };
+        wire::write_msg(&mut stream, &DaemonMsg::Events(vec![ev]))
+            .await
+            .expect("write events");
+    }));
+
+    let args = argv(&path, &["suggest"]);
+    assert_eq!(hallpass_cli::run(&args).await, hallpass_cli::EXIT_OK);
+
+    daemon.await.expect("daemon task");
+    let _ = std::fs::remove_file(&path);
+}
+
+/// An empty history is a non-zero exit: nothing was proposed, and a script
+/// piping the output into a file must not mistake silence for policy.
+#[tokio::test]
+async fn suggest_with_no_history_exits_non_zero() {
+    let path = temp_sock("suggest-empty");
+    let listener = UnixListener::bind(&path).expect("bind");
+
+    let daemon = tokio::spawn(mock_daemon(listener, move |mut stream| async move {
+        let req: ClientMsg = wire::read_msg(&mut stream).await.expect("read req");
+        assert!(matches!(req, ClientMsg::EventHistory { .. }));
+        wire::write_msg(&mut stream, &DaemonMsg::Events(vec![]))
+            .await
+            .expect("write events");
+    }));
+
+    let args = argv(&path, &["suggest"]);
+    assert_eq!(hallpass_cli::run(&args).await, hallpass_cli::EXIT_ERR);
+
+    daemon.await.expect("daemon task");
+    let _ = std::fs::remove_file(&path);
+}

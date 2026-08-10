@@ -59,7 +59,9 @@ use serde::{Deserialize, Serialize};
 pub const PROTOCOL_VERSION: u32 = 8;
 
 /// Transport-layer protocol of a connection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+// Ord so protocol can be part of a sorted grouping key (the CLI's suggest
+// command); the order itself carries no meaning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Proto {
     /// Transmission Control Protocol.

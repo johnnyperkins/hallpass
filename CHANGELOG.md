@@ -7,6 +7,18 @@ carries what an upgrade changes on a running host.
 
 ### Added
 
+- **`hallpass-cli suggest`: propose rules from what actually happened.**
+  Observe mode answers "what would this policy break"; suggest answers
+  the next question, "what rules do I write". It folds the daemon's
+  recent allowed, attributed connections into the narrowest allow rules
+  that keep that traffic flowing (one per executable, protocol, port and
+  destination; per-host domains collapse to `*.suffix` at three or more
+  hosts), printed as the same TOML document `rules export` writes, for
+  review and `rules import`. Nothing is applied, unattributed traffic is
+  never folded, and the header warns that domain rules are convenience,
+  not boundary. `--exe` narrows to one application; the proposal caps at
+  200 rules and says when it dropped smaller groups.
+
 - **Table flushes are now visible in `status` (wire protocol v8).** The
   watchdog has always repaired an externally flushed nftables table
   within seconds, but the only evidence was a journal line: `status`

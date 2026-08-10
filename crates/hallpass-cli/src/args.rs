@@ -48,6 +48,9 @@ COMMANDS:
                                  document (always TOML, never JSON)
     rules import PATH            Add every rule in such a document, reporting
                                  each one; exits non-zero if any failed
+    suggest [OPTIONS]            Propose allow rules from the daemon's recent
+                                 decisions, as a TOML document for review and
+                                 `rules import`. Nothing is applied
     events [OPTIONS]             Stream connection events until Ctrl-C
     top [OPTIONS]                Live aggregate view of connection activity
     watch                        Interactively answer connection prompts
@@ -67,6 +70,14 @@ CONFIG SET OPTIONS:
     Settings not named keep the daemon's current values: the whole set is
     written back in one request, so when two clients change settings at
     once the last write wins, exactly as it does between two GUI windows.
+
+SUGGEST OPTIONS:
+    --exe SUBSTR                 Only executables whose path contains SUBSTR
+                                 (repeatable, any of them matches)
+    --domain SUBSTR              Only destinations whose domain contains
+                                 SUBSTR (repeatable, any of them matches)
+    --last N                     How many recent decisions to fold (default
+                                 and maximum 10000)
 
 EVENTS OPTIONS:
     --last N                     Replay the last N decided connections before
@@ -299,6 +310,8 @@ pub enum Cmd {
         /// Path of the TOML document to read.
         path: PathBuf,
     },
+    /// `suggest [OPTIONS]`
+    Suggest(SuggestOpts),
     /// `events [OPTIONS]`
     Events(EventsOpts),
     /// `top [OPTIONS]`
@@ -320,6 +333,18 @@ pub struct ConfigSetOpts {
     pub default_verdict: Option<Verdict>,
     /// New enforcement state: `--enforce` is true, `--observe` false.
     pub enforce: Option<bool>,
+}
+
+/// What `suggest` folds: how deep into history, and which events.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SuggestOpts {
+    /// Exe/domain narrowing, shared with `events` so the matching policy
+    /// (raw metadata, not the sanitized form) lives in one place. The
+    /// verdict filter stays empty: which verdicts fold is suggest's own
+    /// call, not an option.
+    pub filters: Filters,
+    /// How many recent decisions to request (clamped to [`MAX_HISTORY`]).
+    pub last: u32,
 }
 
 /// Fully parsed command line.
@@ -384,6 +409,7 @@ pub fn parse(argv: &[String]) -> Result<Parsed, String> {
         Some((&"doctor", [])) => Cmd::Doctor,
         Some((&"config", sub)) => parse_config(sub)?,
         Some((&"watch", [])) => Cmd::Watch,
+        Some((&"suggest", flags)) => Cmd::Suggest(parse_suggest(flags)?),
         Some((&"events", flags)) => Cmd::Events(parse_events(flags)?),
         Some((&"top", flags)) => Cmd::Top(parse_top(flags)?),
         Some((&"explain", flags)) => Cmd::Explain(parse_explain(flags)?),
@@ -472,6 +498,37 @@ fn parse_config_set(flags: &[&str]) -> Result<Cmd, String> {
     Ok(Cmd::ConfigSet(opts))
 }
 
+/// Parse a `--last N` value: positive, clamped to [`MAX_HISTORY`].
+fn parse_last(value: &str) -> Result<u32, String> {
+    let n: u32 = value
+        .parse()
+        .map_err(|_| format!("invalid --last '{value}'"))?;
+    if n == 0 {
+        return Err("--last must be at least 1".into());
+    }
+    Ok(n.min(MAX_HISTORY))
+}
+
+fn parse_suggest(flags: &[&str]) -> Result<SuggestOpts, String> {
+    let mut opts = SuggestOpts {
+        filters: Filters::default(),
+        last: MAX_HISTORY,
+    };
+    let mut it = flags.iter();
+    while let Some(flag) = it.next() {
+        let value = *it
+            .next()
+            .ok_or_else(|| format!("{flag} requires a value"))?;
+        match *flag {
+            "--exe" => opts.filters.exe.push(value.to_string()),
+            "--domain" => opts.filters.domain.push(value.to_string()),
+            "--last" => opts.last = parse_last(value)?,
+            other => return Err(format!("unknown suggest option '{other}'")),
+        }
+    }
+    Ok(opts)
+}
+
 fn parse_events(flags: &[&str]) -> Result<EventsOpts, String> {
     let mut opts = EventsOpts {
         last: None,
@@ -489,15 +546,7 @@ fn parse_events(flags: &[&str]) -> Result<EventsOpts, String> {
             .next()
             .ok_or_else(|| format!("{flag} requires a value"))?;
         match *flag {
-            "--last" => {
-                let n: u32 = value
-                    .parse()
-                    .map_err(|_| format!("invalid --last '{value}'"))?;
-                if n == 0 {
-                    return Err("--last must be at least 1".into());
-                }
-                opts.last = Some(n.min(MAX_HISTORY));
-            }
+            "--last" => opts.last = Some(parse_last(value)?),
             "--exe" => opts.filters.exe.push(value.to_string()),
             "--domain" => opts.filters.domain.push(value.to_string()),
             "--verdict" => match value {
