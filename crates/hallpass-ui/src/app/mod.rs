@@ -1143,6 +1143,18 @@ impl HallpassApp {
                 ),
             };
             ui.end_row();
+            // Volume from conntrack teardown accounting; zero when
+            // flow_accounting is off, like any counter the host is not
+            // producing.
+            ui.label("Flows accounted");
+            ui.monospace(s.flows_accounted.to_string());
+            ui.end_row();
+            ui.label("Flow bytes");
+            ui.monospace(hallpass_types::human_bytes(s.flow_bytes));
+            ui.end_row();
+            ui.label("Flow packets");
+            ui.monospace(s.flow_packets.to_string());
+            ui.end_row();
             ui.label("Daemon uptime");
             ui.monospace(format_uptime(s.uptime_secs));
             ui.end_row();

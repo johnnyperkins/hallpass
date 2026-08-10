@@ -61,48 +61,19 @@ use netlink_sys::Socket;
 
 use crate::config::RuntimeSettings;
 use crate::events::EventBus;
+use crate::netlink::{
+    nla, AF_INET, AF_INET6, CTA_IP_V4_DST, CTA_IP_V4_SRC, CTA_IP_V6_DST, CTA_IP_V6_SRC,
+    CTA_PROTO_DST_PORT, CTA_PROTO_NUM, CTA_PROTO_SRC_PORT, CTA_TUPLE_IP, CTA_TUPLE_ORIG,
+    CTA_TUPLE_PROTO, IPPROTO_TCP, IPPROTO_UDP, NLA_F_NESTED, NLMSG_ERROR, NLMSG_HDRLEN,
+};
 use crate::rules::engine::RuleSet;
 use crate::rules::store::RuleStore;
 
 /// Netlink message type: ctnetlink subsystem (1) << 8 | CT_DELETE (2).
 const CTNL_MSG_CT_DELETE: u16 = (1 << 8) | 2;
-/// Netlink message type of an ack/errno reply.
-const NLMSG_ERROR: u16 = 2;
 /// "Answer this request" plus "acknowledge even success", so every delete
 /// gets exactly one reply to check.
 const NLM_F_REQUEST_ACK: u16 = 1 | 4;
-
-const AF_INET: u8 = 2;
-const AF_INET6: u8 = 10;
-const IPPROTO_TCP: u8 = 6;
-const IPPROTO_UDP: u8 = 17;
-
-/// Conntrack attribute types used in the request.
-const CTA_TUPLE_ORIG: u16 = 1;
-const CTA_TUPLE_IP: u16 = 1;
-const CTA_TUPLE_PROTO: u16 = 2;
-const CTA_IP_V4_SRC: u16 = 1;
-const CTA_IP_V4_DST: u16 = 2;
-const CTA_IP_V6_SRC: u16 = 3;
-const CTA_IP_V6_DST: u16 = 4;
-const CTA_PROTO_NUM: u16 = 1;
-const CTA_PROTO_SRC_PORT: u16 = 2;
-const CTA_PROTO_DST_PORT: u16 = 3;
-/// Set on an attribute whose payload is more attributes.
-const NLA_F_NESTED: u16 = 0x8000;
-
-const NLMSG_HDRLEN: usize = 16;
-
-/// One netlink attribute: 4-byte header, payload, padding to 4.
-fn nla(kind: u16, payload: &[u8]) -> Vec<u8> {
-    let len = 4 + payload.len();
-    let mut out = Vec::with_capacity((len + 3) & !3);
-    out.extend_from_slice(&(len as u16).to_ne_bytes());
-    out.extend_from_slice(&kind.to_ne_bytes());
-    out.extend_from_slice(payload);
-    out.resize((len + 3) & !3, 0);
-    out
-}
 
 /// The delete request for `tuple`'s original-direction conntrack entry.
 ///

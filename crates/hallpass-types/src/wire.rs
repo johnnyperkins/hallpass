@@ -241,6 +241,10 @@ mod tests {
                 // strong encodings, not just postcard's single zero byte.
                 nft_flushes: 3,
                 nft_last_flush_ms: Some(1_720_000_000_000),
+                // v9 flow-accounting tail, likewise nonzero.
+                flows_accounted: 41,
+                flow_bytes: 9_000_000,
+                flow_packets: 7_200,
             }),
             DaemonMsg::Ok,
             DaemonMsg::Err {

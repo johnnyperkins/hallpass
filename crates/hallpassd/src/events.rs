@@ -4,7 +4,7 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
-use hallpass_types::{unix_ms_now, ConnEvent, Connection, Verdict};
+use hallpass_types::{unix_ms_now, ConnEvent, Connection, FlowTuple, Verdict};
 use tokio::sync::broadcast;
 
 const CHANNEL_CAPACITY: usize = 256;
@@ -84,6 +84,20 @@ impl EventBus {
     /// budget and no deep copy, just pointer clones under the lock.
     pub fn recent(&self) -> Vec<Arc<ConnEvent>> {
         self.lock_history().iter().cloned().collect()
+    }
+
+    /// The most recent decision for `tuple`, if it is still in history.
+    ///
+    /// For flow accounting, which learns a flow's volume only at teardown
+    /// and joins it back to the connection the daemon decided at the start.
+    /// Best-effort by the ring's bound. Returns the whole event by shared
+    /// pointer - the primitive the deferred teardown-enrichment and
+    /// resurrection-redelete follow-ups both need - so the only work under
+    /// the lock is a scan and one `Arc` clone; the caller reads fields
+    /// after the guard drops.
+    pub fn latest_for_tuple(&self, tuple: &FlowTuple) -> Option<Arc<ConnEvent>> {
+        let guard = self.lock_history();
+        guard.iter().rev().find(|ev| ev.conn.tuple == *tuple).cloned()
     }
 
     /// Up to `limit` most recent events, oldest first so a client can print

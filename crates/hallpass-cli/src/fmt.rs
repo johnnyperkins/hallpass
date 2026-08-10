@@ -4,8 +4,8 @@ use std::collections::HashMap;
 use std::fmt::Write;
 
 use hallpass_types::{
-    format_ts, sanitize_for_display, ConnEvent, Connection, Explanation, PromptScope, Rule,
-    RuleHit, RuleTrace, RuntimeConfig, Stats, TraceOutcome, Verdict,
+    format_ts, human_bytes, sanitize_for_display, ConnEvent, Connection, Explanation,
+    PromptScope, Rule, RuleHit, RuleTrace, RuntimeConfig, Stats, TraceOutcome, Verdict,
 };
 
 use crate::args::ColorChoice;
@@ -216,6 +216,12 @@ pub fn format_stats(s: &Stats, pal: Palette) -> String {
             s.nft_last_flush_ms
                 .map_or_else(|| "-".to_string(), format_ts),
         ),
+        // Volume from conntrack teardown accounting. Zero everywhere when
+        // flow_accounting is off, like any other counter the host is not
+        // producing; the byte total reads as a human size.
+        ("flows accounted", s.flows_accounted.to_string()),
+        ("flow bytes", format!("{} ({})", s.flow_bytes, human_bytes(s.flow_bytes))),
+        ("flow packets", s.flow_packets.to_string()),
         ("uptime", format_uptime(s.uptime_secs)),
     ];
     // Keys are ASCII literals, so bytes and characters agree here; the value
@@ -784,6 +790,9 @@ mod tests {
             snoop_queue_fail_open: Some(true),
             nft_flushes: 0,
             nft_last_flush_ms: None,
+            flows_accounted: 0,
+            flow_bytes: 0,
+            flow_packets: 0,
         }
     }
 
@@ -855,6 +864,20 @@ mod tests {
             out.contains(&row("nft last flush", "2024-07-03 09:46:40")),
             "{out}"
         );
+    }
+
+    #[test]
+    fn stats_table_shows_flow_accounting_rows() {
+        let s = Stats {
+            flows_accounted: 41,
+            flow_bytes: 9_000_000,
+            flow_packets: 7_200,
+            ..stats(true)
+        };
+        let out = format_stats(&s, Palette::new(false));
+        assert!(out.contains(&row("flows accounted", "41")), "{out}");
+        assert!(out.contains(&row("flow bytes", "9000000 (8.6 MiB)")), "{out}");
+        assert!(out.contains(&row("flow packets", "7200")), "{out}");
     }
 
     #[test]

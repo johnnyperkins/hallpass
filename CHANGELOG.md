@@ -7,6 +7,23 @@ carries what an upgrade changes on a running host.
 
 ### Added
 
+- **Flow accounting: how much each connection moved (wire protocol v9).**
+  The daemon decides a connection from its first packet and never saw its
+  volume. With `flow_accounting = true` it joins the conntrack destroy
+  multicast group and, as each flow ends, records the bytes and packets
+  the kernel counted for it. Each teardown is logged with the executable
+  the daemon attributed to the flow and how much it sent and received, and
+  `Stats` gains aggregate totals (`flows_accounted`, `flow_bytes`,
+  `flow_packets`) shown by `hallpass-cli status` and the GUI. The destroy
+  group carries every host teardown, so only flows matching a connection
+  still in the daemon's decision history are counted: the totals are
+  hallpass-governed traffic, not whole-host volume. Needs
+  `net.netfilter.nf_conntrack_acct=1` and `nf_conntrack_events=1`; a
+  startup warning names either if it is off. Observe-only: it reads
+  notifications the kernel sends anyway and never affects a verdict. Off
+  by default. The protocol bump means daemon, CLI and UI must be upgraded
+  together.
+
 - **`hallpass-cli suggest`: propose rules from what actually happened.**
   Observe mode answers "what would this policy break"; suggest answers
   the next question, "what rules do I write". It folds the daemon's

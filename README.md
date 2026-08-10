@@ -224,6 +224,20 @@ Reinstalling never overwrites it, so your edits survive upgrades. **If you
 installed before this changed, check that file:** the old copy shipped
 `enabled = true` and an upgrade will not touch it.
 
+With `flow_accounting = true` the daemon also records how much each
+connection moved. It joins the conntrack destroy multicast group and, as
+each flow ends, reads the bytes and packets the kernel counted for it
+(needs `net.netfilter.nf_conntrack_acct=1` and
+`net.netfilter.nf_conntrack_events=1`), logs a line naming the executable
+the flow was attributed to and how much it sent and received, and folds
+the totals into `hallpass-cli status` (`flows accounted`, `flow bytes`,
+`flow packets`). The group carries every conntrack teardown on the host,
+so only flows matching a connection still in the daemon's decision history
+are counted - the totals are hallpass-governed traffic, not whole-host
+volume, and a hallpass flow whose decision has aged out of that short
+history is missed. It is observe-only: it reads notifications the kernel
+sends anyway and never affects a verdict.
+
 Decided connections can also be exported to syslog (local socket or a
 remote collector) for SIEM ingestion, as RFC 5424 structured data or JSON:
 

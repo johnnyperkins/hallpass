@@ -55,6 +55,15 @@ queue_bypass = true
 # keeps flowing until it ends on its own. Never active in observe mode.
 kill_established = true
 
+# Tally per-flow byte and packet totals from conntrack teardown
+# notifications, so status can answer "how much did hallpass-governed
+# traffic move" and the journal names what each application sent. Only
+# flows matching a connection the daemon decided are counted, not every
+# host teardown. Off by default: it needs the kernel's nf_conntrack_acct
+# and nf_conntrack_events sysctls set to 1 and joins the conntrack destroy
+# multicast group. Observe-only; it never affects a verdict.
+flow_accounting = false
+
 # Optional: export every decided connection to syslog. Omit the whole
 # [syslog] section for no export. Export is a plain event subscriber, so
 # a stalled collector costs events, never verdicts. Facility is auth, so

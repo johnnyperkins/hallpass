@@ -14,6 +14,8 @@
 mod attribution;
 mod config;
 mod conntrack;
+mod conntrack_events;
+mod netlink;
 #[cfg(feature = "dev-fixtures")]
 mod devfixtures;
 mod dns;
@@ -178,6 +180,13 @@ async fn main() {
     rules::store::spawn_expiry_sweeper(Arc::clone(&store));
     if let Some(syslog_cfg) = cfg.syslog.clone() {
         syslog::spawn(Arc::clone(&events), syslog_cfg);
+    }
+    if cfg.flow_accounting {
+        conntrack_events::spawn(
+            Arc::clone(&events),
+            Arc::clone(&counters),
+            Arc::clone(&shutdown),
+        );
     }
     if cfg.kill_established {
         conntrack::spawn_kill_sweeper(

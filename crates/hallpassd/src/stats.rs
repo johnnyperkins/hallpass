@@ -110,6 +110,12 @@ pub struct Counters {
     nft_flushes: AtomicU64,
     /// Unix ms of the most recent detection; 0 means never.
     nft_last_flush_ms: AtomicU64,
+    /// Flows the conntrack accounting listener has tallied at teardown.
+    flows_accounted: AtomicU64,
+    /// Total bytes across those flows (both directions).
+    flow_bytes: AtomicU64,
+    /// Total packets across those flows (both directions).
+    flow_packets: AtomicU64,
 }
 
 impl Default for Counters {
@@ -136,7 +142,17 @@ impl Counters {
             prompt_handlers_evicted: AtomicU64::new(0),
             nft_flushes: AtomicU64::new(0),
             nft_last_flush_ms: AtomicU64::new(0),
+            flows_accounted: AtomicU64::new(0),
+            flow_bytes: AtomicU64::new(0),
+            flow_packets: AtomicU64::new(0),
         }
+    }
+
+    /// Fold one ended flow's totals into the accounting counters.
+    pub fn record_flow(&self, bytes: u64, packets: u64) {
+        self.flows_accounted.fetch_add(1, Ordering::Relaxed);
+        self.flow_bytes.fetch_add(bytes, Ordering::Relaxed);
+        self.flow_packets.fetch_add(packets, Ordering::Relaxed);
     }
 
     /// Count the watchdog finding the nftables table gone.
@@ -290,6 +306,9 @@ impl Counters {
                 0 => None,
                 ms => Some(ms),
             },
+            flows_accounted: self.flows_accounted.load(Ordering::Relaxed),
+            flow_bytes: self.flow_bytes.load(Ordering::Relaxed),
+            flow_packets: self.flow_packets.load(Ordering::Relaxed),
         }
     }
 }

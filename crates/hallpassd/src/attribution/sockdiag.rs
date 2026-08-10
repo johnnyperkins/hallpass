@@ -31,25 +31,21 @@ use hallpass_types::{FlowTuple, Proto};
 use netlink_sys::protocols::NETLINK_SOCK_DIAG;
 use netlink_sys::Socket;
 
+use crate::netlink::{AF_INET, AF_INET6, IPPROTO_TCP, IPPROTO_UDP, NLMSG_ERROR, NLMSG_HDRLEN};
+
 use super::procfs::SocketEntry;
 
 /// Netlink message type of both the request and a found-socket reply.
 const SOCK_DIAG_BY_FAMILY: u16 = 20;
-/// Netlink message type of an errno reply.
-const NLMSG_ERROR: u16 = 2;
 /// "Answer this request." Deliberately without `NLM_F_DUMP`, which is what
 /// turns the request into the whole-table walk this module exists to avoid.
 const NLM_F_REQUEST: u16 = 1;
 
-const AF_INET: u8 = 2;
-const AF_INET6: u8 = 10;
-const IPPROTO_TCP: u8 = 6;
-const IPPROTO_UDP: u8 = 17;
+// The address-family, protocol, error-type and header-length constants are
+// shared across the daemon's netlink clients; see crate::netlink.
 
 /// Total size of the request message: netlink header plus `inet_diag_req_v2`.
 const REQUEST_LEN: usize = 16 + 56;
-/// Size of the netlink header at the front of every message.
-const NLMSG_HDRLEN: usize = 16;
 /// Size of the fixed part of a found-socket reply (`inet_diag_msg`);
 /// attributes may follow and are not read.
 const DIAG_MSG_LEN: usize = 72;

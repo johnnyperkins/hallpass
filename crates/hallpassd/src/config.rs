@@ -127,6 +127,11 @@ pub struct Config {
     /// who writes "deny" means the traffic, not the handshake. Never
     /// active in observe mode.
     pub kill_established: bool,
+    /// Whether to tally per-flow byte and packet totals from conntrack
+    /// teardown notifications. `false` by default: it needs the kernel's
+    /// `nf_conntrack_acct` and joins the conntrack destroy multicast group,
+    /// and a host that does not want volume accounting should not subscribe.
+    pub flow_accounting: bool,
 }
 
 impl Default for Config {
@@ -143,6 +148,7 @@ impl Default for Config {
             queue_bypass: true,
             mode: Mode::Enforce,
             kill_established: true,
+            flow_accounting: false,
         }
     }
 }

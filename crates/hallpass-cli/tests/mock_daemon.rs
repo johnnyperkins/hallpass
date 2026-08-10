@@ -84,6 +84,9 @@ async fn handshake_and_stats_roundtrip() {
         snoop_queue_fail_open: None,
         nft_flushes: 0,
         nft_last_flush_ms: None,
+        flows_accounted: 0,
+        flow_bytes: 0,
+        flow_packets: 0,
     };
     let daemon = tokio::spawn(mock_daemon(listener, move |mut stream| async move {
         let req: ClientMsg = wire::read_msg(&mut stream).await.expect("read req");
@@ -396,6 +399,9 @@ fn healthy_stats() -> Stats {
         snoop_queue_fail_open: Some(true),
         nft_flushes: 0,
         nft_last_flush_ms: None,
+        flows_accounted: 0,
+        flow_bytes: 0,
+        flow_packets: 0,
     }
 }
 

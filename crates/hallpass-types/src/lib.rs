@@ -56,7 +56,13 @@ use serde::{Deserialize, Serialize};
 /// the watchdog repaired it) was a journal line; status and doctor could
 /// not surface it or say how recent it was. The struct fields force the
 /// bump, as in v2.
-pub const PROTOCOL_VERSION: u32 = 8;
+///
+/// v9: [`Stats::flows_accounted`], [`Stats::flow_bytes`],
+/// [`Stats::flow_packets`]. The daemon decides a connection from its first
+/// packet and never saw its volume; with `flow_accounting` on it now tallies
+/// each flow's bytes and packets from conntrack teardown notifications. The
+/// struct fields force the bump, as in v2.
+pub const PROTOCOL_VERSION: u32 = 9;
 
 /// Transport-layer protocol of a connection.
 // Ord so protocol can be part of a sorted grouping key (the CLI's suggest
@@ -477,6 +483,28 @@ pub fn format_ts(unix_ms: u64) -> String {
     format!("{y:04}-{m:02}-{d:02} {h:02}:{min:02}:{s:02}")
 }
 
+/// A byte count as a short human-readable size in binary units. Whole
+/// numbers of bytes stay whole; larger units get one decimal. Shared by the
+/// CLI and GUI, which both render the flow-accounting totals.
+pub fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 6] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    // 1023.95 rather than 1024.0: the value is shown rounded to one
+    // decimal, and anything at or above 1023.95 rounds to "1024.0", which
+    // must roll to the next unit instead of printing a nonsensical
+    // "1024.0 KiB".
+    while value >= 1023.95 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
 /// Unix milliseconds as an RFC 3339 UTC timestamp with milliseconds.
 pub fn format_rfc3339(unix_ms: u64) -> String {
     let (y, m, d, h, min, s, ms) = civil_from_unix_ms(unix_ms);
@@ -604,6 +632,18 @@ mod time_tests {
         // 2024-07-03 09:46:40.123 UTC.
         assert_eq!(format_ts(1_720_000_000_123), "2024-07-03 09:46:40");
         assert_eq!(format_rfc3339(1_720_000_000_123), "2024-07-03T09:46:40.123Z");
+    }
+
+    #[test]
+    fn human_bytes_scales_to_binary_units() {
+        assert_eq!(human_bytes(0), "0 B");
+        assert_eq!(human_bytes(512), "512 B");
+        assert_eq!(human_bytes(1024), "1.0 KiB");
+        assert_eq!(human_bytes(1_572_864), "1.5 MiB");
+        assert_eq!(human_bytes(9_000_000), "8.6 MiB");
+        // Just under a unit boundary must roll up, not print "1024.0".
+        assert_eq!(human_bytes(1_048_575), "1.0 MiB");
+        assert_eq!(human_bytes(1_073_741_823), "1.0 GiB");
     }
 }
 
@@ -842,6 +882,13 @@ pub struct Stats {
     /// [`RuleHit::last_hit_ms`]). What separates "active problem" from
     /// "once, weeks ago" without opening the journal.
     pub nft_last_flush_ms: Option<u64>,
+    /// Flows the conntrack accounting listener tallied at teardown. Zero
+    /// when `flow_accounting` is off or the kernel lacks `nf_conntrack_acct`.
+    pub flows_accounted: u64,
+    /// Total bytes across those flows, both directions.
+    pub flow_bytes: u64,
+    /// Total packets across those flows, both directions.
+    pub flow_packets: u64,
 }
 
 /// How often one rule has decided a connection, for [`ClientMsg::RuleStats`].
