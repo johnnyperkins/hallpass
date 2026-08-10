@@ -50,7 +50,13 @@ use serde::{Deserialize, Serialize};
 /// They close the one blind spot the daemon's own counters cannot see: a
 /// packet resolved because the queue was full never reached userspace, so
 /// no counter here moved. The struct fields force the bump, as in v2.
-pub const PROTOCOL_VERSION: u32 = 7;
+///
+/// v8: [`Stats::nft_flushes`] and [`Stats::nft_last_flush_ms`]. Until now
+/// the only evidence that something flushed the nftables table (and that
+/// the watchdog repaired it) was a journal line; status and doctor could
+/// not surface it or say how recent it was. The struct fields force the
+/// bump, as in v2.
+pub const PROTOCOL_VERSION: u32 = 8;
 
 /// Transport-layer protocol of a connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -820,6 +826,20 @@ pub struct Stats {
     /// posture. False means a reply flood can cost DNS replies themselves
     /// rather than only their annotations.
     pub snoop_queue_fail_open: Option<bool>,
+    /// Times the watchdog found the hallpass nftables table gone. Zero is
+    /// the healthy value. Nonzero means something else on this host
+    /// flushes rulesets (a firewalld restart, `nftables.service`
+    /// reloading, container tooling), and every connection between the
+    /// flush and the repair went unfiltered. Counts detections, not
+    /// successful repairs: the watchdog reinstalls the table on each one,
+    /// and whether a repair failed is in the journal (loud, and fatal
+    /// under a fail-closed posture).
+    pub nft_flushes: u64,
+    /// When the most recent flush was detected, as Unix milliseconds;
+    /// None if never (the same None-is-not-zero distinction as
+    /// [`RuleHit::last_hit_ms`]). What separates "active problem" from
+    /// "once, weeks ago" without opening the journal.
+    pub nft_last_flush_ms: Option<u64>,
 }
 
 /// How often one rule has decided a connection, for [`ClientMsg::RuleStats`].

@@ -1126,6 +1126,23 @@ impl HallpassApp {
                 _ => ui.monospace("unavailable"),
             };
             ui.end_row();
+            // Every detected flush is a window in which the host was
+            // unfiltered; red for the same reason the kernel-drop row is.
+            // The watchdog repairs each one; a failed repair is in the
+            // journal, so this row claims detection, not success.
+            ui.label("Table flushes");
+            match (s.nft_flushes, s.nft_last_flush_ms) {
+                (0, _) => ui.monospace("0"),
+                (n, ms) => ui.colored_label(
+                    DENY_COLOR,
+                    format!(
+                        "{n} - something flushed the nftables ruleset, last {}",
+                        ms.map(hallpass_types::format_ts)
+                            .unwrap_or_else(|| "unknown".into()),
+                    ),
+                ),
+            };
+            ui.end_row();
             ui.label("Daemon uptime");
             ui.monospace(format_uptime(s.uptime_secs));
             ui.end_row();

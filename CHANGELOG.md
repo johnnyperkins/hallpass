@@ -7,6 +7,20 @@ carries what an upgrade changes on a running host.
 
 ### Added
 
+- **Table flushes are now visible in `status` (wire protocol v8).** The
+  watchdog has always repaired an externally flushed nftables table
+  within seconds, but the only evidence was a journal line: `status`
+  looked healthy on a host that had been repeatedly unfiltered. `Stats`
+  now carries `nft_flushes` (times the watchdog found the table gone)
+  and the time of the most recent one, rendered by `hallpass-cli status`
+  (highlighted when nonzero), the GUI stats tab, and a `doctor` warning;
+  every flush is a window in which connections went unfiltered, and the
+  timestamp separates "active problem" from "once, weeks ago" without
+  opening the journal. The count is detections, not successful repairs:
+  whether a repair failed is in the journal (and fatal under a
+  fail-closed posture). The protocol bump means daemon, CLI and UI must
+  be upgraded together; a version mismatch is refused at connect.
+
 - **Deny rules now apply to established flows (`kill_established`).**
   Enforcement only queues `ct state new`, so until now a deny rule added
   while a connection was already up (a VPN, a websocket, a long upload)

@@ -106,6 +106,10 @@ pub struct Counters {
     prompts_unanswered: AtomicU64,
     /// Prompt handlers evicted from the slot for not answering.
     prompt_handlers_evicted: AtomicU64,
+    /// Times the nft watchdog found the table gone (repairs attempted).
+    nft_flushes: AtomicU64,
+    /// Unix ms of the most recent detection; 0 means never.
+    nft_last_flush_ms: AtomicU64,
 }
 
 impl Default for Counters {
@@ -130,7 +134,23 @@ impl Counters {
             observed_only: AtomicU64::new(0),
             prompts_unanswered: AtomicU64::new(0),
             prompt_handlers_evicted: AtomicU64::new(0),
+            nft_flushes: AtomicU64::new(0),
+            nft_last_flush_ms: AtomicU64::new(0),
         }
+    }
+
+    /// Count the watchdog finding the nftables table gone.
+    ///
+    /// The timestamp goes first and the count publishes it (Release paired
+    /// with the Acquire in [`Counters::snapshot`]): a snapshot that sees
+    /// the incremented count is guaranteed to see the timestamp that came
+    /// with it, so status can never pair a nonzero count with a stale
+    /// time. `.max(1)` keeps a host whose clock reads the epoch (no RTC,
+    /// NTP not yet synced) from storing 0, which is the never sentinel.
+    pub fn record_nft_flush(&self) {
+        self.nft_last_flush_ms
+            .store(hallpass_types::unix_ms_now().max(1), Ordering::Relaxed);
+        self.nft_flushes.fetch_add(1, Ordering::Release);
     }
 
     /// Count a decided connection.
@@ -230,6 +250,10 @@ impl Counters {
         enforcing: bool,
         queues: QueueStats,
     ) -> Stats {
+        // Acquire pairs with record_nft_flush's Release; loaded once,
+        // before the struct build, because the timestamp field is gated on
+        // it below.
+        let nft_flushes = self.nft_flushes.load(Ordering::Acquire);
         Stats {
             connections_total: self.connections_total.load(Ordering::Relaxed),
             allowed: self.allowed.load(Ordering::Relaxed),
@@ -255,6 +279,17 @@ impl Counters {
             snoop_queue_depth: queues.snoop.map(|q| q.depth),
             verdict_queue_fail_open: queues.verdict_fail_open,
             snoop_queue_fail_open: queues.snoop_fail_open,
+            nft_flushes,
+            // Gated on the count so the pair can never contradict itself
+            // in either direction: a timestamp is reported exactly when at
+            // least one flush is. (record_nft_flush stores a nonzero
+            // timestamp before publishing the count, so the 0 arm is
+            // belt-and-braces.)
+            nft_last_flush_ms: match self.nft_last_flush_ms.load(Ordering::Relaxed) {
+                _ if nft_flushes == 0 => None,
+                0 => None,
+                ms => Some(ms),
+            },
         }
     }
 }
@@ -262,6 +297,23 @@ impl Counters {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A recorded flush publishes count and timestamp together, the
+    /// timestamp is never the 0 sentinel, and a zero count reports no
+    /// timestamp at all.
+    #[test]
+    fn nft_flush_count_and_timestamp_agree() {
+        let c = Counters::default();
+        let before = c.snapshot(0, 0, false, true, QueueStats::default());
+        assert_eq!(before.nft_flushes, 0);
+        assert_eq!(before.nft_last_flush_ms, None);
+
+        c.record_nft_flush();
+        let after = c.snapshot(0, 0, false, true, QueueStats::default());
+        assert_eq!(after.nft_flushes, 1);
+        let ms = after.nft_last_flush_ms.expect("a flush carries its time");
+        assert!(ms >= 1);
+    }
 
     #[test]
     fn counts_by_verdict() {

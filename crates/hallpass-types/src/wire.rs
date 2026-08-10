@@ -237,6 +237,10 @@ mod tests {
                 snoop_queue_depth: Some(1),
                 verdict_queue_fail_open: Some(false),
                 snoop_queue_fail_open: None,
+                // Nonzero and Some, so the appended v8 tail round-trips its
+                // strong encodings, not just postcard's single zero byte.
+                nft_flushes: 3,
+                nft_last_flush_ms: Some(1_720_000_000_000),
             }),
             DaemonMsg::Ok,
             DaemonMsg::Err {

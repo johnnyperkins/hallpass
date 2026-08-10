@@ -261,6 +261,25 @@ fn stats_checks(s: &Stats, checks: &mut Vec<Check>) {
         "DNS packets were dropped by the daemon under load (annotations, not verdicts)",
     );
 
+    if s.nft_flushes > 0 {
+        let last = s
+            .nft_last_flush_ms
+            .map(hallpass_types::format_ts)
+            .unwrap_or_else(|| "unknown".into());
+        checks.push(Check::warn(
+            "table-flushes",
+            format!(
+                "the nftables table was flushed out from under the daemon {} times since \
+                 start, most recently {last}; every connection inside those windows went \
+                 unfiltered. The watchdog reinstalls it each time; whether any repair \
+                 failed is in the journal",
+                s.nft_flushes
+            ),
+            Some("something on this host flushes rulesets (firewalld, nftables.service, \
+                  container tooling); the journal has the details".into()),
+        ));
+    }
+
     if s.rules_skipped > 0 {
         checks.push(Check::warn(
             "rules",

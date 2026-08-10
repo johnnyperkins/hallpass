@@ -205,6 +205,7 @@ pub fn spawn_watchdog(
     verdict_bypass: bool,
     shutdown: Arc<AtomicBool>,
     fatal_tx: tokio::sync::mpsc::UnboundedSender<()>,
+    counters: Arc<crate::stats::Counters>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(WATCHDOG_INTERVAL);
@@ -214,54 +215,65 @@ pub fn spawn_watchdog(
             if shutdown.load(Ordering::Relaxed) {
                 return;
             }
-            // Blocking: both calls fork `nft`.
+            // Blocking: both calls fork `nft`. The repair's outcome is
+            // handled inside the closure, not after the join: the timeout
+            // below abandons the join, never the closure, and a check that
+            // outlives it may still find the table gone and repair it. If
+            // the counting, the logging, and above all the fail-closed
+            // escalation lived after the join, the slow-nft case - the
+            // loaded host, exactly where flushes and failures cluster -
+            // would repair silently and never escalate a failed repair.
             let stopping = Arc::clone(&shutdown);
+            let counters = Arc::clone(&counters);
+            let fatal = fatal_tx.clone();
             let check = tokio::task::spawn_blocking(move || {
                 let _guard = TABLE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
                 // Under the lock, so this cannot straddle a teardown that is
                 // running right now.
                 if stopping.load(Ordering::Relaxed) || table_present() {
-                    return None;
+                    return;
                 }
-                Some(install(queue_num, verdict_bypass))
+                let repaired = install(queue_num, verdict_bypass);
+                // Still under the lock. A shutdown that started after the
+                // check dispatched is about to tear the table down anyway;
+                // counting or escalating its repair would be noise.
+                if stopping.load(Ordering::Relaxed) {
+                    return;
+                }
+                // Counted whether or not the repair succeeded: the number
+                // answers "how often was this host unfiltered because
+                // something flushed the table", and a failed repair is
+                // that too.
+                counters.record_nft_flush();
+                match repaired {
+                    Ok(()) => tracing::error!(
+                        "the hallpass nftables table was gone (something flushed it); \
+                         reinstalled it, but every connection in the meantime was unfiltered"
+                    ),
+                    Err(e) if verdict_bypass => {
+                        tracing::error!(
+                            "the hallpass nftables table is gone and reinstalling it failed, \
+                             traffic is unfiltered: {e}"
+                        );
+                    }
+                    Err(e) => {
+                        // Fail-closed was chosen to trade availability for
+                        // enforcement. With no table there is no enforcement,
+                        // so running on would silently deliver neither.
+                        tracing::error!(
+                            "the hallpass nftables table is gone, reinstalling it failed and \
+                             queue_bypass is off, shutting down: {e}"
+                        );
+                        let _ = fatal.send(());
+                    }
+                }
             });
             // A hung `nft` would otherwise park this loop forever and the
             // watching would stop with no trace. The blocking thread stays
             // parked either way, but the next tick still runs, and the lock
             // keeps the two from overlapping.
-            let outcome = match tokio::time::timeout(WATCHDOG_CALL_TIMEOUT, check).await {
-                Ok(joined) => joined,
-                Err(_) => {
-                    tracing::warn!("nft table check has not returned; still watching");
-                    continue;
-                }
-            };
-            let Ok(Some(reinstalled)) = outcome else {
-                continue;
-            };
-            if shutdown.load(Ordering::Relaxed) {
-                return;
-            }
-            match reinstalled {
-                Ok(()) => tracing::error!(
-                    "the hallpass nftables table was gone (something flushed it); \
-                     reinstalled it, but every connection in the meantime was unfiltered"
-                ),
-                Err(e) if verdict_bypass => {
-                    tracing::error!("the hallpass nftables table is gone and reinstalling it failed, \
-                         traffic is unfiltered: {e}");
-                }
-                Err(e) => {
-                    // Fail-closed was chosen to trade availability for
-                    // enforcement. With no table there is no enforcement, so
-                    // running on would silently deliver neither.
-                    tracing::error!(
-                        "the hallpass nftables table is gone, reinstalling it failed and \
-                         queue_bypass is off, shutting down: {e}"
-                    );
-                    let _ = fatal_tx.send(());
-                    return;
-                }
+            if tokio::time::timeout(WATCHDOG_CALL_TIMEOUT, check).await.is_err() {
+                tracing::warn!("nft table check has not returned; still watching");
             }
         }
     })

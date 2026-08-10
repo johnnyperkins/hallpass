@@ -206,6 +206,16 @@ pub fn format_stats(s: &Stats, pal: Palette) -> String {
             kernel_count(s.snoop_queue_user_dropped),
         ),
         ("snoop queue fail-open", kernel_flag(s.snoop_queue_fail_open)),
+        // Painted when nonzero: every detected flush is a window in which
+        // this host was unfiltered. The watchdog repairs each one; whether
+        // a repair failed is in the journal.
+        ("nft table flushes", warn_if_positive(pal, Some(s.nft_flushes))),
+        // "-" for never, like a rule that never hit.
+        (
+            "nft last flush",
+            s.nft_last_flush_ms
+                .map_or_else(|| "-".to_string(), format_ts),
+        ),
         ("uptime", format_uptime(s.uptime_secs)),
     ];
     // Keys are ASCII literals, so bytes and characters agree here; the value
@@ -772,6 +782,8 @@ mod tests {
             snoop_queue_depth: Some(0),
             verdict_queue_fail_open: Some(true),
             snoop_queue_fail_open: Some(true),
+            nft_flushes: 0,
+            nft_last_flush_ms: None,
         }
     }
 
@@ -793,6 +805,8 @@ mod tests {
         assert!(out.contains(&row("dns spoofed", "7")), "{out}");
         assert!(out.contains(&row("dns snoop dropped", "6")), "{out}");
         assert!(out.contains(&row("prompt overflows", "1")), "{out}");
+        assert!(out.contains(&row("nft table flushes", "0")), "{out}");
+        assert!(out.contains(&row("nft last flush", "-")), "{out}");
         assert!(out.contains(&row("uptime", "1h 0m 0s")), "{out}");
         // No warning while enforcing.
         assert!(!out.contains("OBSERVE"), "{out}");
@@ -827,6 +841,22 @@ mod tests {
 
     /// The kernel queue rows: numbers render as numbers, a healthy zero is
     /// unpainted, and nothing extra is claimed while nothing was dropped.
+    /// A nonzero flush count renders painted, with its timestamp beside it.
+    #[test]
+    fn stats_table_flush_rows_when_flushed() {
+        let s = Stats {
+            nft_flushes: 2,
+            nft_last_flush_ms: Some(1_720_000_000_000),
+            ..stats(true)
+        };
+        let out = format_stats(&s, Palette::new(false));
+        assert!(out.contains(&row("nft table flushes", "2")), "{out}");
+        assert!(
+            out.contains(&row("nft last flush", "2024-07-03 09:46:40")),
+            "{out}"
+        );
+    }
+
     #[test]
     fn stats_table_kernel_queue_rows() {
         let out = format_stats(&stats(true), plain());

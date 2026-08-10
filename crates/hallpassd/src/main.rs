@@ -328,6 +328,7 @@ async fn main() {
                     cfg.queue_bypass,
                     Arc::clone(&shutdown),
                     fatal_tx_watchdog,
+                    Arc::clone(&counters),
                 ));
                 true
             }
