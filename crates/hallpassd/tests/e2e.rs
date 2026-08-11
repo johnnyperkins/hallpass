@@ -146,6 +146,31 @@ else:
     s.recvfrom(512)
 "#;
 
+/// Counting UDP collector for the syslog export tests. Publishes its
+/// running total by writing it to a file, replaced atomically so a reader
+/// polling the file never sees a half-written number, and at most every
+/// 50ms so that publishing does not become the bottleneck the test is
+/// trying to measure.
+const SYSLOG_SINK: &str = r#"import os, socket, sys, time
+
+path, port = sys.argv[1], int(sys.argv[2])
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+# A generous receive buffer: the negative control deliberately produces a
+# flood, and datagrams dropped for want of buffer would understate it.
+s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 22)
+s.bind(("127.0.0.1", port))
+n, last = 0, 0.0
+while True:
+    s.recvfrom(65535)
+    n += 1
+    now = time.monotonic()
+    if now - last >= 0.05:
+        last = now
+        with open(path + ".tmp", "w") as f:
+            f.write(str(n))
+        os.replace(path + ".tmp", path)
+"#;
+
 /// Everything one test needs; `Drop` tears it all down even on panic.
 struct TestEnv {
     ns_cli: String,
@@ -155,6 +180,9 @@ struct TestEnv {
     daemon: Option<Child>,
     listeners: Vec<Child>,
     dns_server: Option<Child>,
+    /// Long-lived helpers (clients held open, collectors) that are neither
+    /// listeners nor the DNS server, killed on teardown like the rest.
+    helpers: Vec<Child>,
 }
 
 impl TestEnv {
@@ -184,6 +212,7 @@ impl TestEnv {
             daemon: None,
             listeners: Vec::new(),
             dns_server: None,
+            helpers: Vec::new(),
         };
 
         assert_ok(&run("ip", &["netns", "add", &ns_cli]), "netns add cli");
@@ -525,11 +554,188 @@ impl TestEnv {
         std::fs::write(&path, contents).expect("write aux file");
         path
     }
+
+    /// Poll the daemon log until it contains `needle`.
+    fn wait_for_log(&self, needle: &str, limit: Duration) -> bool {
+        wait_until(limit, || self.daemon_log().contains(needle)).is_some()
+    }
+
+    /// A long-lived TCP client in the cli namespace: `nc` with a piped
+    /// stdin, so the connection stays open until the test writes to it.
+    /// Returns once the socket is established, which is what makes the
+    /// flow a conntrack entry a ruleset change can sweep.
+    fn open_stream(&mut self, port: u16) -> Child {
+        let child = Command::new("ip")
+            .args(["netns", "exec", &self.ns_cli])
+            .args(["nc", SRV_IP, &port.to_string()])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn nc client");
+        let established = wait_until(Duration::from_secs(5), || {
+            let ss = ns_run(&self.ns_cli, &["ss", "-tnH"]);
+            String::from_utf8_lossy(&ss.stdout)
+                .lines()
+                .any(|l| l.contains("ESTAB") && l.contains(&format!("{SRV_IP}:{port}")))
+        });
+        assert!(
+            established.is_some(),
+            "the client never established a connection to port {port}; daemon log:\n{}",
+            self.daemon_log()
+        );
+        child
+    }
+
+    /// Write to a held-open client until it dies, up to `limit`; true when
+    /// it died. A killed conntrack entry costs the flow nothing until its
+    /// next packet, so the write is what makes the new verdict observable.
+    fn poke_until_gone(&self, client: &mut Child, limit: Duration) -> bool {
+        use std::io::Write;
+        let deadline = Instant::now() + limit;
+        loop {
+            if client.try_wait().expect("try_wait").is_some() {
+                return true;
+            }
+            if Instant::now() > deadline {
+                return false;
+            }
+            if let Some(stdin) = client.stdin.as_mut() {
+                // A failed write means the socket is already gone; the
+                // next try_wait reports it.
+                let _ = stdin.write_all(b"ping\n");
+                let _ = stdin.flush();
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+    }
+
+    /// Set a sysctl inside the cli namespace. False when the knob does not
+    /// exist there, which is a reason to skip rather than to fail: the
+    /// conntrack knobs only appear once the module is loaded.
+    fn set_ns_sysctl(&self, key: &str, value: &str) -> bool {
+        ns_run(&self.ns_cli, &["sysctl", "-qw", &format!("{key}={value}")])
+            .status
+            .success()
+    }
+
+    /// Ask the daemon for its counters over IPC.
+    fn stats(&self) -> hallpass_types::Stats {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        rt.block_on(async {
+            let mut sock = tokio::net::UnixStream::connect(&self.socket_path)
+                .await
+                .expect("connect IPC socket");
+            wire::write_msg(&mut sock, &ClientMsg::Hello { version: PROTOCOL_VERSION })
+                .await
+                .expect("send hello");
+            let ack: DaemonMsg = wire::read_msg(&mut sock).await.expect("read ack");
+            assert_eq!(ack, DaemonMsg::HelloAck { version: PROTOCOL_VERSION });
+            wire::write_msg(&mut sock, &ClientMsg::Stats)
+                .await
+                .expect("send stats request");
+            loop {
+                let msg: DaemonMsg = tokio::time::timeout(Duration::from_secs(10), async {
+                    wire::read_msg(&mut sock).await
+                })
+                .await
+                .expect("timed out waiting for stats")
+                .expect("read stats reply");
+                if let DaemonMsg::Stats(s) = msg {
+                    return s;
+                }
+            }
+        })
+    }
+
+    /// Start a helper process inside the cli namespace, tracked for
+    /// teardown.
+    fn start_helper(&mut self, args: &[&str]) {
+        let child = Command::new("ip")
+            .args(["netns", "exec", &self.ns_cli])
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn helper");
+        self.helpers.push(child);
+    }
+
+    /// Start the counting UDP collector on `port` in the cli namespace and
+    /// return the file it publishes its running total to.
+    fn start_syslog_sink(&mut self, port: u16) -> PathBuf {
+        let script = self.tmp.join("sink.py");
+        std::fs::write(&script, SYSLOG_SINK).expect("write sink helper");
+        let count_path = self.tmp.join("sink.count");
+        self.start_helper(&[
+            "python3",
+            &script.to_string_lossy(),
+            &count_path.to_string_lossy(),
+            &port.to_string(),
+        ]);
+        let bound = wait_until(Duration::from_secs(5), || {
+            let ss = ns_run(&self.ns_cli, &["ss", "-lunH"]);
+            String::from_utf8_lossy(&ss.stdout).contains(&format!(":{port} "))
+        });
+        assert!(bound.is_some(), "syslog collector never bound port {port}");
+        count_path
+    }
+
+    /// Delete the root-only export exemption from the *live* output chain,
+    /// the negative control for the export loop. The watchdog only checks
+    /// that the table exists, so an edited chain stays edited.
+    fn delete_export_exemption(&self) {
+        let out = ns_run(
+            &self.ns_cli,
+            &["nft", "-a", "list", "chain", "inet", "hallpass", "output"],
+        );
+        assert_ok(&out, "nft -a list chain");
+        let text = String::from_utf8_lossy(&out.stdout);
+        let handle = text
+            .lines()
+            .find(|l| l.contains("meta skuid 0") && l.contains("accept"))
+            .and_then(|l| l.rsplit("# handle ").next())
+            .and_then(|h| h.trim().parse::<u64>().ok())
+            .unwrap_or_else(|| panic!("no export exemption rule to delete in:\n{text}"));
+        assert_ok(
+            &ns_run(
+                &self.ns_cli,
+                &[
+                    "nft",
+                    "delete",
+                    "rule",
+                    "inet",
+                    "hallpass",
+                    "output",
+                    "handle",
+                    &handle.to_string(),
+                ],
+            ),
+            "nft delete rule",
+        );
+    }
+}
+
+/// Running total published by [`TestEnv::start_syslog_sink`]. Zero until
+/// the first datagram arrives.
+fn sink_count(path: &Path) -> u64 {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0)
 }
 
 impl Drop for TestEnv {
     fn drop(&mut self) {
         self.stop_listeners();
+        for mut h in self.helpers.drain(..) {
+            let _ = h.kill();
+            let _ = h.wait();
+        }
         if let Some(mut d) = self.dns_server.take() {
             let _ = d.kill();
             let _ = d.wait();
@@ -1542,5 +1748,298 @@ fn libc_resolver_uprobes_feed_the_domain_cache() {
         !env.connect(PORT),
         "the domain rule should block once the resolution is cached; daemon log:\n{}",
         env.daemon_log()
+    );
+}
+
+/// A deny added while a connection is live tears the established flow
+/// down, so the rule applies to traffic already running rather than only
+/// to the next handshake.
+///
+/// The ctnetlink delete message is unit-tested byte by byte; what only a
+/// live kernel can prove is that it accepts it and drops the entry. The
+/// rule rejects rather than denies so the kill is observable from the
+/// client: once the entry is gone, the flow's next packet is judged as a
+/// new connection, matches the rule, and the reject chain answers it with
+/// an RST. A deny would be equally dead and look identical to a stall.
+#[test]
+#[ignore = "requires root and network namespaces"]
+fn a_rule_added_mid_flow_kills_the_established_flow() {
+    const PORT: u16 = 19021;
+    let Some(mut env) = TestEnv::setup("killest") else {
+        return;
+    };
+    env.start_listener(PORT);
+    env.start_daemon("allow", &[]);
+    let mut client = env.open_stream(PORT);
+
+    std::fs::write(env.rule_path(0), rule("e2e-kill", Action::Reject, PORT)).expect("write rule");
+
+    assert!(
+        env.wait_for_log("killed an established flow", Duration::from_secs(15)),
+        "the ruleset change should have swept the live flow; daemon log:\n{}",
+        env.daemon_log()
+    );
+    assert!(
+        env.poke_until_gone(&mut client, Duration::from_secs(15)),
+        "a swept flow should die on its next packet; daemon log:\n{}",
+        env.daemon_log()
+    );
+}
+
+/// The negative control for the sweep: a rule that denies the same port
+/// but only for a different binary matches nothing that is running, so it
+/// kills nothing.
+///
+/// Without this, a sweeper that deleted every conntrack entry on any
+/// ruleset change would pass the test above.
+#[test]
+#[ignore = "requires root and network namespaces"]
+fn a_rule_scoped_to_another_binary_leaves_the_flow_alone() {
+    const PORT: u16 = 19022;
+    let Some(mut env) = TestEnv::setup("killother") else {
+        return;
+    };
+    env.start_listener(PORT);
+    env.start_daemon("allow", &[]);
+    let mut client = env.open_stream(PORT);
+
+    std::fs::write(
+        env.rule_path(0),
+        rule_with("e2e-kill-other", Action::Reject, PORT, |m| {
+            m.proto = Some(Proto::Tcp);
+            // Any path the client is not: the flow is nc's.
+            m.exe = Some(PathBuf::from("/bin/true"));
+        }),
+    )
+    .expect("write rule");
+
+    assert!(
+        env.wait_for_log("rules reloaded from disk", Duration::from_secs(15)),
+        "the daemon never picked the new rule up; daemon log:\n{}",
+        env.daemon_log()
+    );
+    // The sweep runs off the same signal the reload raises, so it has
+    // already been given its chance by the time the client is poked.
+    assert!(
+        !env.poke_until_gone(&mut client, Duration::from_secs(5)),
+        "a rule matching another binary should leave this flow alone; daemon log:\n{}",
+        env.daemon_log()
+    );
+    let log = env.daemon_log();
+    assert!(
+        !log.contains("killed an established flow"),
+        "nothing should have been swept; daemon log:\n{log}"
+    );
+}
+
+/// With `flow_accounting` on, a finished flow's byte and packet totals
+/// reach both the journal and the counters, attributed to the binary that
+/// opened it.
+///
+/// The netlink attribute walk is unit-tested against captured message
+/// bytes. What needs a live kernel is the rest of the path: that the
+/// daemon's subscription actually receives the destroy multicast, that
+/// the counters are present at all (they exist only under
+/// `nf_conntrack_acct`), and that the teardown tuple still joins to the
+/// decision the daemon made when the flow opened.
+#[test]
+#[ignore = "requires root and network namespaces"]
+fn flow_accounting_reports_a_finished_flows_volume() {
+    const PORT: u16 = 19023;
+    let Some(mut env) = TestEnv::setup("flowacct") else {
+        return;
+    };
+    let Some(nc) = tool_path("nc") else {
+        eprintln!("SKIP e2e flowacct: cannot resolve the nc binary");
+        return;
+    };
+    if !tool_available("sysctl", "--version") {
+        eprintln!("SKIP e2e flowacct: `sysctl` not found in PATH");
+        return;
+    }
+    // Accounting is off by default on most kernels, and without it the
+    // teardown message carries no counters at all.
+    if !env.set_ns_sysctl("net.netfilter.nf_conntrack_acct", "1") {
+        eprintln!("SKIP e2e flowacct: no nf_conntrack_acct knob in this namespace");
+        return;
+    }
+    // Conntrack holds a closed TCP entry for a minute or two by default,
+    // depending on which state it lands in, which is longer than any
+    // reasonable test deadline. These knobs change when the entry is
+    // destroyed, not what the notification carries.
+    //
+    // Reported rather than ignored: a knob that silently fails to take is
+    // exactly what turns this test into a slow flake (the teardown then
+    // arrives on the kernel's own schedule and races the deadline below),
+    // and the failure message is where that has to be visible.
+    let mut unset = Vec::new();
+    for knob in [
+        "nf_conntrack_tcp_timeout_time_wait",
+        "nf_conntrack_tcp_timeout_close",
+        "nf_conntrack_tcp_timeout_close_wait",
+        "nf_conntrack_tcp_timeout_fin_wait",
+        "nf_conntrack_tcp_timeout_last_ack",
+    ] {
+        if !env.set_ns_sysctl(&format!("net.netfilter.{knob}"), "1") {
+            unset.push(knob);
+        }
+    }
+
+    env.start_listener(PORT);
+    env.start_daemon_with("allow", &[], "flow_accounting = true\n");
+    assert!(
+        env.wait_for_log("flow accounting on", Duration::from_secs(10)),
+        "the daemon never joined the conntrack destroy group; daemon log:\n{}",
+        env.daemon_log()
+    );
+
+    assert!(
+        env.connect(PORT),
+        "sanity: the connection should be allowed; daemon log:\n{}",
+        env.daemon_log()
+    );
+    // Generous, because the shortened timeouts above are what should make
+    // this quick and a kernel that ignored them still has to be allowed to
+    // finish rather than reported as a missing feature.
+    assert!(
+        env.wait_for_log("flow ended", Duration::from_secs(150)),
+        "no teardown was accounted for (timeouts that would not set: {unset:?}); \
+         daemon log:\n{}",
+        env.daemon_log()
+    );
+
+    let log = env.daemon_log();
+    // Anchored to the accounting line rather than to a field prefix: the
+    // subscriber writes ANSI escapes around field *names* even when its
+    // writer is a file, so `contains("exe=...")` matches nothing no matter
+    // what the daemon attributed. The line itself is the anchor, and the
+    // path is what has to be on it.
+    let accounted = log
+        .lines()
+        .find(|l| l.contains("flow ended"))
+        .unwrap_or_else(|| panic!("no accounting line after waiting for one; log:\n{log}"));
+    assert!(
+        accounted.contains(&nc.display().to_string()),
+        "the accounted flow should name the binary that opened it: {accounted}"
+    );
+    let stats = env.stats();
+    assert!(
+        stats.flows_accounted >= 1 && stats.flow_bytes > 0 && stats.flow_packets > 0,
+        "the counters should carry the finished flow, got {} flows / {} bytes / {} packets; \
+         daemon log:\n{log}",
+        stats.flows_accounted,
+        stats.flow_bytes,
+        stats.flow_packets
+    );
+}
+
+/// UDP syslog export is exempt from the daemon's own verdict queue, and
+/// the negative control shows what the exemption prevents: a self-feeding
+/// loop where each exported datagram is itself a new connection, judged,
+/// recorded, and exported again.
+///
+/// Nothing else in this suite configures a UDP collector, so `SO_MARK` on
+/// the export socket and the `meta skuid 0 meta mark` rule that reads it
+/// have never run together. The listing check on the way through is the
+/// same shape `hallpass-cli doctor` parses, asserted against a real
+/// kernel's canonicalized output rather than the text the daemon feeds in.
+#[test]
+#[ignore = "requires root and network namespaces"]
+fn udp_syslog_export_is_exempt_from_its_own_verdict_queue() {
+    const PORT: u16 = 19024;
+    const PORT_AGAIN: u16 = 19025;
+    const COLLECTOR_PORT: u16 = 5514;
+    /// Records a single judged connection may reasonably produce.
+    const QUIET_BUDGET: u64 = 30;
+    /// Records that only a loop can produce in the same kind of window.
+    const LOOP_FLOOR: u64 = 100;
+
+    let Some(mut env) = TestEnv::setup("syslogudp") else {
+        return;
+    };
+    if !tool_available("python3", "--version") {
+        eprintln!("SKIP e2e syslogudp: `python3` not found in PATH");
+        return;
+    }
+    env.start_listener(PORT);
+    env.start_listener(PORT_AGAIN);
+    let counts = env.start_syslog_sink(COLLECTOR_PORT);
+
+    env.start_daemon_with(
+        "allow",
+        &[],
+        &format!(
+            "[syslog]\n\
+             format = \"json\"\n\
+             [syslog.target]\n\
+             kind = \"udp\"\n\
+             addr = \"127.0.0.1:{COLLECTOR_PORT}\"\n"
+        ),
+    );
+    let log = env.daemon_log();
+    assert!(
+        !log.contains("could not mark the syslog export socket"),
+        "the export socket must carry the mark the exemption matches; daemon log:\n{log}"
+    );
+
+    let listing = ns_run(
+        &env.ns_cli,
+        &["nft", "list", "chain", "inet", "hallpass", "output"],
+    );
+    assert_ok(&listing, "nft list chain");
+    let text = String::from_utf8_lossy(&listing.stdout);
+    let exemption = text
+        .lines()
+        .position(|l| l.contains("meta skuid 0") && l.contains("accept"));
+    let queue = text
+        .lines()
+        .position(|l| l.contains("ct state new") && l.contains("queue"));
+    assert!(
+        matches!((exemption, queue), (Some(e), Some(q)) if e < q),
+        "the live chain must accept marked export before the queue rule; listing:\n{text}"
+    );
+
+    // One real connection, which is one exported record plus whatever its
+    // own teardown produces.
+    assert!(
+        env.connect(PORT),
+        "sanity: the connection should be allowed; daemon log:\n{}",
+        env.daemon_log()
+    );
+    assert!(
+        wait_until(Duration::from_secs(10), || sink_count(&counts) > 0).is_some(),
+        "no exported record ever reached the collector; daemon log:\n{}",
+        env.daemon_log()
+    );
+
+    let before = sink_count(&counts);
+    std::thread::sleep(Duration::from_secs(3));
+    let after = sink_count(&counts);
+    assert!(
+        after - before <= QUIET_BUDGET,
+        "export must not feed itself: {} records in 3 idle seconds",
+        after - before
+    );
+
+    // Negative control. Without the exemption the export datagrams are
+    // themselves `ct state new` and get queued, so judging one produces
+    // the next. Seed it with a single connection, measure, and stop the
+    // daemon immediately: the loop has no other end.
+    env.delete_export_exemption();
+    assert!(
+        env.connect(PORT_AGAIN),
+        "sanity: the seed connection should be allowed; daemon log:\n{}",
+        env.daemon_log()
+    );
+    let loop_before = sink_count(&counts);
+    std::thread::sleep(Duration::from_secs(2));
+    let loop_after = sink_count(&counts);
+    env.kill_daemon_hard();
+    assert!(
+        loop_after - loop_before >= LOOP_FLOOR,
+        "removing the exemption should let export feed itself, saw only {} records in 2s \
+         (quiet window was {}); this test proves nothing if the loop does not appear",
+        loop_after - loop_before,
+        after - before
     );
 }
