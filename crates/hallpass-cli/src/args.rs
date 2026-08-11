@@ -53,6 +53,11 @@ COMMANDS:
                                  `rules import`. Nothing is applied
     events [OPTIONS]             Stream connection events until Ctrl-C
     top [OPTIONS]                Live aggregate view of connection activity
+    run -- CMD [ARGS...]         Run CMD with a session grant: while it runs,
+                                 connections from it and its descendants that
+                                 no rule matches are allowed instead of
+                                 prompting. The grant ends when it exits
+    sessions                     List the session grants open right now
     watch                        Interactively answer connection prompts
     explain [OPTIONS]            Say what policy would do with a hypothetical
                                  connection, and which rule decides it
@@ -284,6 +289,13 @@ pub enum Cmd {
     Status,
     /// `doctor`
     Doctor,
+    /// `run -- CMD [ARGS...]`
+    Run {
+        /// The command and its arguments, verbatim.
+        argv: Vec<String>,
+    },
+    /// `sessions`
+    Sessions,
     /// `config`
     ConfigShow,
     /// `config set ...`
@@ -384,6 +396,43 @@ pub fn parse(argv: &[String]) -> Result<Parsed, String> {
 
     let mut it = argv.iter();
     while let Some(a) = it.next() {
+        // Everything after `run` belongs to the command being wrapped, and
+        // is taken verbatim: without this, a child's own `--json` or
+        // `--color` would be read as this CLI's, and a wrapped command
+        // could not be given the flags it needs.
+        //
+        // Only in command position, which `rest` being empty is what says:
+        // `run` is also a perfectly good value for an option elsewhere
+        // (`explain --exe run`), and intercepting it there would turn
+        // another command's argument into this one.
+        if a == "run" && rest.is_empty() {
+            let mut argv: Vec<String> = it.cloned().collect();
+            // `--` is the conventional separator and is documented, but it
+            // is a separator rather than a requirement: `run -- curl` and
+            // `run curl` mean the same thing.
+            let separated = argv.first().is_some_and(|a| a == "--");
+            if separated {
+                argv.remove(0);
+            }
+            if argv.is_empty() {
+                return Err("run needs a command: hallpass-cli run -- CMD [ARGS...]".into());
+            }
+            // Asked before the command is taken verbatim, and only in the
+            // first position: `hallpass-cli run --help` is someone asking
+            // what `run` does, not someone asking to execute a program
+            // named `--help`. After a `--` separator, or anywhere later in
+            // the line, it belongs to the wrapped command like every other
+            // word does.
+            if !separated && matches!(argv[0].as_str(), "-h" | "--help") {
+                return Ok(Parsed::Help);
+            }
+            return Ok(Parsed::Cli(Cli {
+                socket,
+                json,
+                color,
+                cmd: Cmd::Run { argv },
+            }));
+        }
         match a.as_str() {
             "-h" | "--help" => return Ok(Parsed::Help),
             "--json" => json = true,
@@ -410,6 +459,7 @@ pub fn parse(argv: &[String]) -> Result<Parsed, String> {
     let cmd = match rest.split_first() {
         None => return Err("no command given".into()),
         Some((&"status", [])) => Cmd::Status,
+        Some((&"sessions", [])) => Cmd::Sessions,
         Some((&"doctor", [])) => Cmd::Doctor,
         Some((&"config", sub)) => parse_config(sub)?,
         Some((&"watch", [])) => Cmd::Watch,
@@ -419,7 +469,7 @@ pub fn parse(argv: &[String]) -> Result<Parsed, String> {
         Some((&"explain", flags)) => Cmd::Explain(parse_explain(flags)?),
         Some((&"rules", sub)) => parse_rules(sub)?,
         Some((&cmd, extra)) => {
-            return Err(if matches!(cmd, "status" | "watch" | "doctor") {
+            return Err(if matches!(cmd, "status" | "watch" | "doctor" | "sessions") {
                 format!("unexpected arguments after '{cmd}': {extra:?}")
             } else {
                 format!("unknown command '{cmd}'")
@@ -907,6 +957,69 @@ mod tests {
     fn parse_err(args: &[&str]) -> String {
         let argv: Vec<String> = args.iter().map(|s| s.to_string()).collect();
         parse(&argv).unwrap_err()
+    }
+
+    /// The wrapped command's own flags belong to it, not to this CLI.
+    #[test]
+    fn run_takes_its_command_verbatim() {
+        assert_eq!(
+            parse_ok(&["run", "--", "curl", "--json", "https://example.org"]).cmd,
+            Cmd::Run {
+                argv: vec!["curl".into(), "--json".into(), "https://example.org".into()]
+            },
+            "flags after the command are the command's, including ones this CLI has"
+        );
+        assert_eq!(
+            parse_ok(&["run", "curl"]).cmd,
+            Cmd::Run { argv: vec!["curl".into()] },
+            "the separator is conventional, not required"
+        );
+        // Global options still work, as long as they precede `run`.
+        let cli = parse_ok(&["--socket", "/tmp/s.sock", "run", "--", "curl"]);
+        assert_eq!(cli.socket, std::path::PathBuf::from("/tmp/s.sock"));
+        assert_eq!(cli.cmd, Cmd::Run { argv: vec!["curl".into()] });
+
+        assert!(parse_err(&["run"]).contains("needs a command"));
+        // `run --help` is a question about `run`, not a program to execute.
+        assert_eq!(parse(&["run".to_string(), "--help".to_string()]).unwrap(), Parsed::Help);
+        assert_eq!(
+            parse_ok(&["run", "--", "--help"]).cmd,
+            Cmd::Run { argv: vec!["--help".into()] },
+            "after the separator it is the wrapped command's argument"
+        );
+        assert_eq!(
+            parse_ok(&["run", "curl", "--help"]).cmd,
+            Cmd::Run { argv: vec!["curl".into(), "--help".into()] },
+            "and later in the line it is always the command's"
+        );
+        // `run` is only a command in command position; elsewhere it is
+        // whatever the option it follows says it is.
+        assert_eq!(
+            parse_ok(&["explain", "--dest", "1.1.1.1", "--port", "443", "--exe", "run"]).cmd,
+            Cmd::Explain(ExplainRequest {
+                conn: Connection {
+                    tuple: FlowTuple {
+                        proto: Proto::Tcp,
+                        src: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+                        dst: "1.1.1.1:443".parse().unwrap(),
+                    },
+                    uid: None,
+                    pid: None,
+                    exe_path: Some("run".into()),
+                    cmdline: None,
+                    parent_exe: None,
+                    domain: None,
+                    iface: None,
+                    app_id: None,
+                    first_seen: None,
+                },
+                exe_sha256: None,
+            }),
+            "an option value that happens to be `run` stays that option's value"
+        );
+        assert!(parse_err(&["run", "--"]).contains("needs a command"));
+        assert_eq!(parse_ok(&["sessions"]).cmd, Cmd::Sessions);
+        parse_err(&["sessions", "extra"]);
     }
 
     #[test]

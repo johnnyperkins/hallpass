@@ -7,6 +7,20 @@ carries what an upgrade changes on a running host.
 
 ### Added
 
+- **`hallpass-cli run -- <cmd>`: one-off network grants (wire protocol
+  v13).** A build, an installer or a test suite either meant answering a
+  prompt per connection or writing a permanent allow rule for a one-off.
+  `run` wraps the command instead: while it runs, connections from it and
+  everything it spawns that no rule matches are allowed rather than
+  prompted, and the grant ends when it exits (including on `kill -9`, since
+  the daemon ties it to the wrapper's control connection). The command's
+  exit status is the wrapper's, and SIGINT/SIGTERM are forwarded to it.
+  Allowed connections report `run-session:<id>` in the rule-name field every
+  client already shows, `hallpass-cli sessions` lists what is open, and
+  `suggest` leaves these connections out of the rules it proposes so a
+  one-off does not become policy. An explicit rule still decides: a deny
+  denies inside a session, coverage is limited to the user that opened it
+  (so `sudo` inside one still prompts), and anything ambiguous prompts.
 - **Richer prompt context (wire protocol v12).** A prompt showed the
   connection and little else, so deciding one often meant going elsewhere to
   find out what the program was. Prompt requests now carry four more facts,

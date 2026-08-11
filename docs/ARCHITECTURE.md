@@ -123,9 +123,25 @@ A new outbound connection then travels like this:
    apply, because hashing reads the binary off disk on the verdict thread.
 
 7. **Decided, or held.** A match produces a verdict, a rule name, and the
-   connection. No match produces a prompt. Either way the decision is
-   counted, the rule's hit counter is bumped, and an event is emitted before
-   the packet is handed back.
+   connection. No match consults the live session grants, and otherwise
+   produces a prompt. Either way the decision is counted, the rule's hit
+   counter is bumped, and an event is emitted before the packet is handed
+   back.
+
+   The grant check sits in the no-match arm on purpose: a session
+   (`hallpass-cli run`) suppresses a question, it does not answer one, so an
+   explicit rule of either kind is decided above it and never sees a
+   session. A covered connection is allowed under the synthetic rule name
+   `run-session:<id>`, which is why nothing on the wire changed for it -
+   every client already renders a rule name. Coverage is the connecting
+   process's ancestry, walked with the same `(pid, start time)` per-hop
+   guards as the prompt's ancestry and capped at 32 hops, up to the process
+   the wrapper's IPC connection is rooted at, with the connection's uid
+   required to match the session's. Cost when nothing is open is one length
+   check on an `ArcSwap` snapshot, taken per unmatched connection rather
+   than per packet; while a session is live it is one `/proc` start-time
+   read per connection against an LRU keyed by `(pid, start time)`, owned by
+   the verdict thread.
 
 8. **Handed back.** `Allow` is an NFQUEUE accept and `Deny` is a drop.
    `Reject` cannot be issued from the queue at all, so the packet is accepted
@@ -215,7 +231,13 @@ The daemon is one multi-threaded tokio runtime plus one std thread.
   packet and counts it, which costs a domain annotation and never a verdict.
 - **The IPC server** (task) accepts connections and spawns a task per client,
   which in turn spawns a writer task draining a bounded outbound channel and,
-  on the first `Subscribe`, one event-forwarder task. An accept error backs
+  on the first `Subscribe`, one event-forwarder task. A client task also owns
+  any session grant opened on its connection, and ends it on the way out,
+  which is what makes a SIGKILLed `hallpass-cli run` leave nothing behind:
+  there is no end message that can be lost.
+  The registry those grants live in adds no lock to the packet path - it is
+  an `ArcSwap` snapshot like the ruleset, with a mutex serializing only the
+  two writers, both of which are IPC tasks. An accept error backs
   off and retries but never ends the loop, because retiring the control
   channel while enforcement continued is the exact state the bind-first
   ordering exists to prevent.

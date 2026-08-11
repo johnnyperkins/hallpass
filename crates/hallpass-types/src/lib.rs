@@ -82,7 +82,44 @@ use serde::{Deserialize, Serialize};
 /// looking for a different binary, and how often this program has been denied
 /// lately: the facts an operator needs to answer the question, none of which
 /// the connection itself carries. The struct field forces the bump, as in v2.
-pub const PROTOCOL_VERSION: u32 = 12;
+///
+/// v13: session grants. [`ClientMsg::RunSessionStart`],
+/// [`ClientMsg::RunSessionList`], [`DaemonMsg::RunSessionStarted`] and
+/// [`DaemonMsg::RunSessions`], all appended variants carrying no new struct
+/// fields. Bumped for the v5 reason rather than the v3 one: the handshake is
+/// an exact match on this number, so it only separates builds that disagree
+/// about it. Two builds both calling themselves v12 while disagreeing about
+/// which frames exist is exactly what v5 was bumped to avoid - a wrapper
+/// sending a frame the daemon cannot decode tears down the connection the
+/// session lives on, mid-session, instead of being refused at connect.
+pub const PROTOCOL_VERSION: u32 = 13;
+
+/// Prefix reserved for the synthetic rule name a session grant reports.
+///
+/// A grant is not a rule: it suppresses a prompt at decision time and names
+/// itself `run-session:<id>` in the rule-name field every client already
+/// renders. The prefix is reserved in both directions so that name cannot be
+/// forged or harvested: [`Rule`] names starting with it are refused when a
+/// rule is added, and the CLI's policy generator drops events carrying it
+/// rather than folding one-off grants into permanent allow rules.
+pub const RUN_SESSION_RULE_PREFIX: &str = "run-session:";
+
+/// One live session grant, for [`ClientMsg::RunSessionList`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunSessionInfo {
+    /// Session id, as it appears in the `run-session:<id>` rule name.
+    pub id: u64,
+    /// UID the session covers. Only connections from this user are.
+    pub uid: u32,
+    /// PID of the wrapper the session is rooted at.
+    pub root_pid: u32,
+    /// What the wrapper is running, for display only.
+    pub label: String,
+    /// Connections this grant has allowed so far.
+    pub allowed: u64,
+    /// Seconds since the session started.
+    pub age_secs: u64,
+}
 
 /// Transport-layer protocol of a connection.
 // Ord so protocol can be part of a sorted grouping key (the CLI's suggest
@@ -1421,6 +1458,21 @@ pub enum ClientMsg {
     /// config file enforces). See [`RuntimeConfig`] for what a change
     /// means for prompts already on screen.
     ConfigSet(RuntimeConfig),
+    /// Open a session grant rooted at this client's own process, covering
+    /// its descendants for as long as this connection lives. Answered with
+    /// [`DaemonMsg::RunSessionStarted`], or Err.
+    ///
+    /// Nothing here is claimed: the daemon reads the process to root the
+    /// session at from the socket's peer credentials, so a client cannot
+    /// name someone else's. The label is display text only.
+    RunSessionStart {
+        /// What the wrapper is about to run, for the journal and
+        /// [`ClientMsg::RunSessionList`]. Bounded like a rule name.
+        label: String,
+    },
+    /// Request the live session grants. Answered with
+    /// [`DaemonMsg::RunSessions`].
+    RunSessionList,
 }
 
 /// Messages sent from the daemon to a client.
@@ -1488,4 +1540,15 @@ pub enum DaemonMsg {
     /// effect, whichever of the config file and later `ConfigSet`s put
     /// them there.
     Config(RuntimeConfig),
+    /// Response to [`ClientMsg::RunSessionStart`]: the grant is live and
+    /// covers descendants of the client from now on.
+    ///
+    /// The wrapper must wait for this before spawning anything: a child that
+    /// exists before the session does can connect while nothing covers it.
+    RunSessionStarted {
+        /// Session id, as it appears in the `run-session:<id>` rule name.
+        id: u64,
+    },
+    /// Response to [`ClientMsg::RunSessionList`].
+    RunSessions(Vec<RunSessionInfo>),
 }

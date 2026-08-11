@@ -537,10 +537,15 @@ impl HallpassApp {
                         .to_string(),
                 );
             }
-            // Neither is requested by this client yet. Ignoring them keeps
-            // the connection alive: the alternative on an unexpected reply
-            // would be tearing down the stream that carries prompts.
-            DaemonMsg::RuleHits(_) | DaemonMsg::Explanation(_) => {}
+            // None of these are requested by this client. Ignoring them
+            // keeps the connection alive: the alternative on an unexpected
+            // reply would be tearing down the stream that carries prompts.
+            // Session grants surface here anyway, through the rule name on
+            // the events they allow, so nothing is hidden by not asking.
+            DaemonMsg::RuleHits(_)
+            | DaemonMsg::Explanation(_)
+            | DaemonMsg::RunSessionStarted { .. }
+            | DaemonMsg::RunSessions(_) => {}
             DaemonMsg::HelloAck { .. } => {}
         }
     }

@@ -113,6 +113,12 @@ jobs:
         run: cargo xtask build-ebpf
       # Build unprivileged so the cache and target/ stay runner-user-owned;
       # only the test run itself needs root.
+      # The session-grant tests drive the real CLI wrapper, which is not a
+      # dependency of the daemon and so is not built by the line below. The
+      # suite skips those tests when it is missing, and the skip guard on
+      # the run step turns a skip into a failed job.
+      - name: Build the CLI (driven by the session-grant tests)
+        run: cargo build -p hallpass-cli
       - name: Build e2e test binary
         run: cargo test -p hallpassd --test e2e --features ebpf --no-run
       - name: Run e2e tests

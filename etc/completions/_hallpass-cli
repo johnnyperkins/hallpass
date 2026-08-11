@@ -15,6 +15,10 @@ _hallpass-cli_commands() {
     local -a commands
     commands=(
         'status:show daemon statistics'
+        'doctor:check the install and exit non-zero if anything failed'
+        'run:run a command under a one-off session grant'
+        'sessions:list the session grants open right now'
+        'suggest:propose allow rules from the daemon recent decisions'
         'rules:list, add, remove, toggle, export or import rules'
         'events:stream connection events until Ctrl-C'
         'top:live aggregate view of connection activity'
@@ -59,8 +63,12 @@ _hallpass-cli() {
     fi
 
     case $words[1] in
-    status|watch)
+    status|doctor|sessions|watch)
         _arguments -s $global_args && ret=0
+        ;;
+    # The words after `run` are the wrapped command's, not this CLI's.
+    run)
+        _normal && ret=0
         ;;
     events)
         _arguments -s $global_args \

@@ -341,6 +341,32 @@ mod tests {
         }
     }
 
+    /// The session-grant frames, in both directions. Appended variants are
+    /// only compatible if they decode to what was sent.
+    #[tokio::test]
+    async fn session_messages_roundtrip() {
+        let start = ClientMsg::RunSessionStart {
+            label: "curl".into(),
+        };
+        assert_eq!(roundtrip(&start).await, start);
+        assert_eq!(
+            roundtrip(&ClientMsg::RunSessionList).await,
+            ClientMsg::RunSessionList
+        );
+
+        let started = DaemonMsg::RunSessionStarted { id: 7 };
+        assert_eq!(roundtrip(&started).await, started);
+        let listed = DaemonMsg::RunSessions(vec![crate::RunSessionInfo {
+            id: 7,
+            uid: 1000,
+            root_pid: 4242,
+            label: "curl".into(),
+            allowed: 3,
+            age_secs: 12,
+        }]);
+        assert_eq!(roundtrip(&listed).await, listed);
+    }
+
     #[test]
     fn encode_rejects_oversize() {
         let big = vec![0u8; MAX_FRAME_SIZE + 1];

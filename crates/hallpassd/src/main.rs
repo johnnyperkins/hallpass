@@ -28,6 +28,7 @@ mod nft;
 mod packet;
 mod prompt;
 mod rules;
+mod session;
 mod stats;
 mod syslog;
 #[cfg(test)]
@@ -175,6 +176,9 @@ async fn main() {
     let events = Arc::new(EventBus::default());
     let counters = Arc::new(Counters::default());
     let store = Arc::new(RuleStore::new(cfg.rules_dir.clone()));
+    // Shared by the verdict thread (reader) and the IPC tasks (writers).
+    // Empty until someone runs `hallpass run`, which costs nothing to have.
+    let sessions = Arc::new(session::SessionRegistry::default());
     if let Err(e) = rules::store::spawn_watcher(Arc::clone(&store)) {
         tracing::warn!("rules dir watcher unavailable: {e}");
     }
@@ -319,6 +323,7 @@ async fn main() {
                 shutdown: Arc::clone(&shutdown),
                 fatal_tx,
                 first_seen,
+                sessions: Arc::clone(&sessions),
             },
         )
     });
@@ -393,6 +398,7 @@ async fn main() {
         // (a dev daemon next to the installed one), and reporting someone
         // else's counters is worse than reporting none.
         queues: bound_queues,
+        sessions,
     });
     let ipc_task = tokio::spawn(async move {
         if let Err(e) = ipc::server::serve(ipc_listener, ipc_deps).await {

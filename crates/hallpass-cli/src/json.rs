@@ -16,7 +16,7 @@ use std::path::PathBuf;
 
 use hallpass_types::{
     sanitize_for_display, ConnEvent, Connection, Explanation, Rule, RuleHit, RuleMatch,
-    RuleTrace, RuntimeConfig, Stats, TraceOutcome,
+    RuleTrace, RunSessionInfo, RuntimeConfig, Stats, TraceOutcome,
 };
 use serde::Serialize;
 
@@ -42,6 +42,19 @@ pub fn stats(s: &Stats) -> Result<String, CliError> {
 /// bool, so nothing to sanitize.
 pub fn config(c: &RuntimeConfig) -> Result<String, CliError> {
     to_json(c)
+}
+
+/// The live session grants as a JSON array. The label came from a client,
+/// so it is sanitized like any other daemon-carried string.
+pub fn sessions(sessions: &[RunSessionInfo]) -> Result<String, CliError> {
+    let clean: Vec<RunSessionInfo> = sessions
+        .iter()
+        .map(|s| RunSessionInfo {
+            label: sanitize_for_display(&s.label).into_owned(),
+            ..s.clone()
+        })
+        .collect();
+    to_json(&clean)
 }
 
 /// The rule list as a JSON array.

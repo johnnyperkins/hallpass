@@ -84,7 +84,21 @@ fn parse_net(field: &str, raw: &str) -> Result<IpNet, String> {
 
 impl CompiledRule {
     /// Compile a rule, validating cidr/glob/range fields.
+    ///
+    /// Also where the session-grant name prefix is reserved, rather than in
+    /// `RuleStore::add`: `add` is only the IPC and prompt path, and a rule
+    /// file on disk reaches the ruleset through `load_dir`, which compiles
+    /// but never calls `add`. A rule named after a live grant is exactly the
+    /// ambiguity the reservation exists to remove - it would be
+    /// indistinguishable from one in every event, listing and export - so
+    /// the check belongs on the one path both entrances share.
     pub fn compile(rule: &Rule) -> Result<CompiledRule, String> {
+        if rule.name.starts_with(hallpass_types::RUN_SESSION_RULE_PREFIX) {
+            return Err(format!(
+                "rule names starting with `{}` are reserved for session grants",
+                hallpass_types::RUN_SESSION_RULE_PREFIX
+            ));
+        }
         let m = &rule.matcher;
         // A criteria-free matcher matches every connection. That is a valid
         // thing to want (a final catch-all), but it is never a thing to want

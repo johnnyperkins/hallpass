@@ -518,17 +518,40 @@ fn ppid_of(proc_root: &Path, pid: u32) -> Option<u32> {
 /// [`super::cached_still_valid`] checks before reusing an attribution, and
 /// it is returned so a caller walking further can keep checking it.
 fn parent_step(proc_root: &Path, pid: u32) -> Option<(u32, PathBuf, u64)> {
+    let (ppid, started) = parent_of(proc_root, pid)?;
+    let exe = std::fs::read_link(proc_root.join(ppid.to_string()).join("exe")).ok()?;
+    // Re-checked after the readlink as well as inside `parent_of`: the exe
+    // just read has to belong to the incarnation being returned.
+    let stable = ppid_of(proc_root, pid) == Some(ppid)
+        && starttime_of(proc_root, ppid) == Some(started);
+    stable.then_some((ppid, exe, started))
+}
+
+/// One step up the process tree as identity alone: `pid`'s parent, as
+/// (ppid, the parent's start time).
+///
+/// Separated from [`parent_step`] because reading an executable is not free
+/// and, for a caller that only asks whose child this is, not merely wasteful
+/// but wrong: `/proc/<pid>/exe` is unreadable for a process that is exiting
+/// (and for a kernel thread), so requiring it turns a live parent into "no
+/// parent". [`ancestry_of`] can afford that - a broken hop truncates display
+/// text - while [`covering_root`] cannot, because there it silently drops a
+/// session grant and changes a verdict.
+///
+/// The same two re-reads guard the hop: the ppid, so a parent exiting
+/// mid-read cannot have its replacement pinned, and the parent's start time,
+/// so a recycled pid is not mistaken for the process that owned it.
+fn parent_of(proc_root: &Path, pid: u32) -> Option<(u32, u64)> {
     let ppid = ppid_of(proc_root, pid)?;
     // pid 1's parent, and the answer for a process whose stat could not be
-    // parsed. There is no /proc/0 to read an executable from.
+    // parsed. There is no /proc/0.
     if ppid == 0 {
         return None;
     }
     let started = starttime_of(proc_root, ppid)?;
-    let exe = std::fs::read_link(proc_root.join(ppid.to_string()).join("exe")).ok()?;
     let stable = ppid_of(proc_root, pid) == Some(ppid)
         && starttime_of(proc_root, ppid) == Some(started);
-    stable.then_some((ppid, exe, started))
+    stable.then_some((ppid, started))
 }
 
 /// Best-effort executable path of `pid`'s parent process.
@@ -580,11 +603,60 @@ pub(super) fn ancestry_of(proc_root: &Path, pid: u32, max: usize) -> Vec<PathBuf
     out
 }
 
+/// Index of the innermost of `roots` that `pid` descends from, or is.
+///
+/// The membership question behind a session grant, and a walk with the same
+/// guards as [`ancestry_of`]: each hop is validated by [`parent_of`], and
+/// the join between hops re-checks that the pid a ppid resolved to is still
+/// the same incarnation, so a recycled pid ends the walk rather than
+/// splicing a stranger's ancestors onto this one's. It asks for identity
+/// only, never an executable: see [`parent_of`] for why requiring one here
+/// would drop coverage for a tree whose intermediate process is exiting.
+///
+/// Where the two differ is in what a broken chain means. Ancestry renders a
+/// prefix and truncation costs display text; here a walk that cannot be
+/// completed returns `None`, because the only thing a caller does with
+/// `Some` is skip a prompt. Every ambiguity - an unreadable start time, a
+/// hop that will not validate, a chain deeper than `max` - therefore reads
+/// as "not covered".
+///
+/// The start pid is compared before the first hop, so a session's own root
+/// process is covered by its session. `roots` is (pid, start time) pairs;
+/// the innermost match wins, which is what makes nested sessions report the
+/// one that actually covers the process.
+pub(crate) fn covering_root(
+    proc_root: &Path,
+    pid: u32,
+    roots: &[(u32, u64)],
+    max: usize,
+) -> Option<usize> {
+    let mut cur = pid;
+    let mut cur_started = starttime_of(proc_root, pid)?;
+    for _ in 0..max {
+        if let Some(i) = roots
+            .iter()
+            .position(|&(root_pid, root_started)| root_pid == cur && root_started == cur_started)
+        {
+            return Some(i);
+        }
+        let (ppid, started) = parent_of(proc_root, cur)?;
+        // The hop above read `cur`'s parent; this proves `cur` was still the
+        // process this walk had reached while it did, which is what makes
+        // the result one chain rather than two spliced at a reused pid.
+        if starttime_of(proc_root, cur) != Some(cur_started) {
+            return None;
+        }
+        cur = ppid;
+        cur_started = started;
+    }
+    None
+}
+
 /// Process start time (clock ticks since boot) from /proc/pid/stat field
 /// 22, parsed after the comm field's closing paren like [`ppid_of`]. The
 /// (pid, starttime) pair identifies one process incarnation: a recycled
 /// pid gets a new starttime.
-pub(super) fn starttime_of(proc_root: &Path, pid: u32) -> Option<u64> {
+pub(crate) fn starttime_of(proc_root: &Path, pid: u32) -> Option<u64> {
     let stat = std::fs::read_to_string(proc_root.join(pid.to_string()).join("stat")).ok()?;
     let after_comm = stat.rsplit_once(')')?.1;
     after_comm.split_whitespace().nth(19)?.parse().ok()
@@ -905,6 +977,105 @@ mod tests {
             ancestry_of(&dir, 9, 8),
             [PathBuf::from("/usr/bin/proc8")],
             "the unreadable ancestor truncates the chain"
+        );
+    }
+
+    /// Session membership: the walk that decides whether a connection is
+    /// covered by a grant, and every direction in which it must not be.
+    #[test]
+    fn covering_root_finds_the_session_a_process_belongs_to() {
+        let td = crate::testutil::TestDir::new("procfs-covering");
+        let dir = td.path().to_path_buf();
+        // 9 -> 8 -> 7 -> 1, with each start time derived from the pid so a
+        // fixture can name one incarnation exactly.
+        let chain = [(9u32, 8u32), (8, 7), (7, 1), (1, 0)];
+        let started = |pid: u32| u64::from(pid) * 100;
+        for (pid, ppid) in chain {
+            std::fs::create_dir_all(dir.join(pid.to_string())).unwrap();
+            let padding = "0 ".repeat(17);
+            std::fs::write(
+                dir.join(pid.to_string()).join("stat"),
+                format!("{pid} (proc{pid}) S {ppid} {padding}{}", started(pid)),
+            )
+            .unwrap();
+            std::os::unix::fs::symlink(
+                format!("/usr/bin/proc{pid}"),
+                dir.join(pid.to_string()).join("exe"),
+            )
+            .unwrap();
+        }
+
+        // The root of a session is covered by its own session.
+        assert_eq!(covering_root(&dir, 7, &[(7, started(7))], 32), Some(0));
+        // A descendant three hops down is covered.
+        assert_eq!(covering_root(&dir, 9, &[(7, started(7))], 32), Some(0));
+        // Nested sessions: the innermost one wins, whatever order the
+        // roots are given in.
+        assert_eq!(
+            covering_root(&dir, 9, &[(7, started(7)), (8, started(8))], 32),
+            Some(1),
+            "the nearer root covers the process"
+        );
+        assert_eq!(
+            covering_root(&dir, 9, &[(8, started(8)), (7, started(7))], 32),
+            Some(0),
+            "and it wins regardless of the order the roots are listed in"
+        );
+
+        // Every failure direction resolves to "not covered".
+        assert_eq!(
+            covering_root(&dir, 9, &[(7, started(7) + 1)], 32),
+            None,
+            "a root pid whose start time does not match is a different process"
+        );
+        assert_eq!(
+            covering_root(&dir, 9, &[(8, started(8))], 1),
+            None,
+            "the depth cap stops the walk short rather than guessing"
+        );
+        assert_eq!(covering_root(&dir, 9, &[], 32), None, "no sessions, no coverage");
+        assert_eq!(
+            covering_root(&dir, 4242, &[(7, started(7))], 32),
+            None,
+            "a process that is already gone is covered by nothing"
+        );
+
+        // A hop that cannot be pinned to one incarnation ends the walk, so
+        // a grant cannot be inherited across a recycled pid: rewrite 8's
+        // stat so its start time no longer matches what 9's hop resolved.
+        let padding = "0 ".repeat(17);
+        std::fs::write(
+            dir.join("8").join("stat"),
+            format!("8 (proc8) S 7 {padding}{}", started(8)),
+        )
+        .unwrap();
+        assert_eq!(
+            covering_root(&dir, 9, &[(8, started(8))], 32),
+            Some(0),
+            "sanity: the chain is intact before it is broken"
+        );
+        std::fs::remove_file(dir.join("8/stat")).unwrap();
+        assert_eq!(
+            covering_root(&dir, 9, &[(7, started(7))], 32),
+            None,
+            "an unreadable hop stops the walk instead of skipping over it"
+        );
+
+        // But an ancestor whose *executable* cannot be read is still an
+        // ancestor. `/proc/<pid>/exe` is gone for a process that is exiting,
+        // and a build tree's intermediate shells exit constantly; requiring
+        // the link here would drop the grant for whatever ran underneath.
+        let padding = "0 ".repeat(17);
+        std::fs::write(
+            dir.join("8").join("stat"),
+            format!("8 (proc8) S 7 {padding}{}", started(8)),
+        )
+        .unwrap();
+        std::fs::remove_file(dir.join("8/exe")).unwrap();
+        assert_eq!(
+            covering_root(&dir, 9, &[(7, started(7))], 32),
+            Some(0),
+            "a hop with no readable executable still connects the chain"
         );
     }
 

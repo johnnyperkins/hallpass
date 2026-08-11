@@ -31,6 +31,9 @@ pub struct IpcDeps {
     /// reply: with nothing bound by us, the /proc rows for these queue
     /// numbers are either absent or someone else's.
     pub queues: Option<crate::nfqueue::BoundQueues>,
+    /// Live session grants. A client opens one over its own connection and
+    /// it ends with that connection, whatever ends it.
+    pub sessions: Arc<crate::session::SessionRegistry>,
 }
 
 /// Look up a group's GID in /etc/group.
@@ -167,7 +170,18 @@ const ACCEPT_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis
 const OUT_QUEUE_CAP: usize = 512;
 
 async fn handle_conn(stream: UnixStream, deps: Arc<IpcDeps>) -> Result<(), wire::WireError> {
-    let peer_uid = stream.peer_cred().ok().map(|c| c.uid());
+    let peer = stream.peer_cred().ok();
+    let peer_uid = peer.as_ref().map(|c| c.uid());
+    // Resolved once, here: a session is rooted at the process on the other
+    // end of this socket, and asking the kernel who that is at accept time
+    // is what makes the root unclaimable. This also reads that process's
+    // start time immediately, because `SO_PEERCRED` is stamped when the
+    // socket is connected and never refreshed - see
+    // `SessionRegistry::register` for the recycled-pid attack that
+    // comparison closes. `pid()` is None when the peer lives in a pid
+    // namespace this daemon cannot name a process in.
+    let peer_process =
+        crate::session::PeerProcess::resolve(peer.as_ref().and_then(|c| c.pid()).map(|p| p as u32));
     let (mut reader, mut writer) = stream.into_split();
 
     // All outbound traffic goes through one channel so the prompt table
@@ -181,8 +195,29 @@ async fn handle_conn(stream: UnixStream, deps: Arc<IpcDeps>) -> Result<(), wire:
         }
     });
 
-    let result = message_loop(&mut reader, &out_tx, peer_uid, &deps).await;
+    // A session opened on this connection, released by `Drop` so that every
+    // way this function can stop ends it: a clean disconnect, a protocol
+    // error, the wrapper being SIGKILLed, or this task unwinding on a panic
+    // somewhere below. A grant that outlives its connection keeps allowing
+    // traffic while the wrapper tells the operator the opposite, so ending
+    // it must not depend on reaching a statement.
+    let mut session = SessionGuard {
+        sessions: Arc::clone(&deps.sessions),
+        id: None,
+    };
+    let result = message_loop(
+        &mut reader,
+        &out_tx,
+        PeerCreds {
+            uid: peer_uid,
+            process: peer_process,
+        },
+        &deps,
+        &mut session,
+    )
+    .await;
 
+    drop(session);
     deps.prompts.clear_handler(&out_tx);
     drop(out_tx);
     let _ = writer_task.await;
@@ -231,12 +266,40 @@ async fn send(out_tx: &mpsc::Sender<DaemonMsg>, msg: DaemonMsg) {
     let _ = out_tx.send(msg).await;
 }
 
+/// Who is on the other end of a client connection, as the kernel reports
+/// it. Both halves are best effort; what each absence costs is decided at
+/// the point that reads it.
+#[derive(Debug, Clone, Copy)]
+struct PeerCreds {
+    uid: Option<u32>,
+    process: crate::session::PeerProcess,
+}
+
+/// The session grant opened on one connection, ended when this drops.
+///
+/// Not a convenience: this is the only thing that guarantees a grant cannot
+/// outlive its connection, including when the task holding it unwinds.
+struct SessionGuard {
+    sessions: Arc<crate::session::SessionRegistry>,
+    id: Option<u64>,
+}
+
+impl Drop for SessionGuard {
+    fn drop(&mut self) {
+        if let Some(id) = self.id.take() {
+            self.sessions.unregister(id);
+        }
+    }
+}
+
 async fn message_loop(
     reader: &mut (impl tokio::io::AsyncRead + Unpin),
     out_tx: &mpsc::Sender<DaemonMsg>,
-    peer_uid: Option<u32>,
+    peer: PeerCreds,
     deps: &IpcDeps,
+    session: &mut SessionGuard,
 ) -> Result<(), wire::WireError> {
+    let peer_uid = peer.uid;
     match wire::read_msg::<ClientMsg, _>(reader).await? {
         ClientMsg::Hello { version } if version == PROTOCOL_VERSION => {
             send(
@@ -422,6 +485,33 @@ async fn message_loop(
                     Err(message) => DaemonMsg::Err { message },
                 }
             }
+            ClientMsg::RunSessionStart { label } => {
+                // One session per connection. A second request is refused
+                // rather than replacing the first, because the first is
+                // what the wrapper's child is already running under and
+                // nothing here can tell which one the client meant to keep.
+                if session.id.is_some() {
+                    DaemonMsg::Err {
+                        message: "this connection already has a session".into(),
+                    }
+                } else {
+                    match peer.uid {
+                        // The grant is scoped to a user, so a peer whose
+                        // uid the kernel did not report cannot have one.
+                        None => DaemonMsg::Err {
+                            message: "the daemon cannot see this client's user".into(),
+                        },
+                        Some(uid) => match deps.sessions.register(peer.process, uid, label) {
+                            Ok(id) => {
+                                session.id = Some(id);
+                                DaemonMsg::RunSessionStarted { id }
+                            }
+                            Err(message) => DaemonMsg::Err { message },
+                        },
+                    }
+                }
+            }
+            ClientMsg::RunSessionList => DaemonMsg::RunSessions(deps.sessions.list()),
         };
         send(out_tx, reply).await;
     }
@@ -502,6 +592,7 @@ mod tests {
                 // No queues bound in tests; the reply must carry None for
                 // every kernel queue counter, not another process's row.
                 queues: None,
+                sessions: Arc::new(crate::session::SessionRegistry::default()),
             }),
             dir,
         )
@@ -510,6 +601,68 @@ mod tests {
     async fn client(path: &Path) -> UnixStream {
         let s = UnixStream::connect(path).await.unwrap();
         s
+    }
+
+    /// A session lives exactly as long as the connection that opened it,
+    /// which is what makes a SIGKILLed wrapper leave nothing behind.
+    #[tokio::test]
+    async fn a_session_opens_on_a_connection_and_dies_with_it() {
+        let (deps, dir) = test_deps("session");
+        let sock = dir.path().join("test.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        let server_deps = Arc::clone(&deps);
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let _ = handle_conn(stream, server_deps).await;
+        });
+
+        let mut c = client(&sock).await;
+        wire::write_msg(&mut c, &ClientMsg::Hello { version: PROTOCOL_VERSION })
+            .await
+            .unwrap();
+        let ack: DaemonMsg = wire::read_msg(&mut c).await.unwrap();
+        assert_eq!(ack, DaemonMsg::HelloAck { version: PROTOCOL_VERSION });
+
+        wire::write_msg(&mut c, &ClientMsg::RunSessionStart { label: "curl".into() })
+            .await
+            .unwrap();
+        let id = match wire::read_msg::<DaemonMsg, _>(&mut c).await.unwrap() {
+            DaemonMsg::RunSessionStarted { id } => id,
+            other => panic!("expected the session to open, got {other:?}"),
+        };
+        // Rooted at this test process, which is what is on the other end.
+        let listed = deps.sessions.list();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, id);
+        assert_eq!(listed[0].root_pid, std::process::id());
+        assert_eq!(listed[0].label, "curl");
+
+        // A second request is refused rather than replacing the first: the
+        // wrapper's child is already running under the first one.
+        wire::write_msg(&mut c, &ClientMsg::RunSessionStart { label: "again".into() })
+            .await
+            .unwrap();
+        assert!(matches!(
+            wire::read_msg::<DaemonMsg, _>(&mut c).await.unwrap(),
+            DaemonMsg::Err { .. }
+        ));
+
+        wire::write_msg(&mut c, &ClientMsg::RunSessionList).await.unwrap();
+        match wire::read_msg::<DaemonMsg, _>(&mut c).await.unwrap() {
+            DaemonMsg::RunSessions(v) => assert_eq!(v.len(), 1),
+            other => panic!("expected the session list, got {other:?}"),
+        }
+
+        // Dropping the socket is every way a wrapper can end, including the
+        // one that runs no cleanup code.
+        drop(c);
+        for _ in 0..100 {
+            if deps.sessions.list().is_empty() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("the session outlived the connection that opened it");
     }
 
     #[tokio::test]

@@ -124,8 +124,18 @@ pub struct Proposal {
 
 /// Whether a decision represents traffic an allow rule would have to
 /// cover. See the module doc for why unenforced, rule-less denies count.
+///
+/// A connection a session grant allowed is not such traffic, and this is
+/// the one exclusion that is about intent rather than about coverage: the
+/// operator asked for that connection to be allowed *once*, for one command.
+/// Folding it in would turn every `hallpass run` into a permanent rule
+/// proposal, which is the ruleset pollution the wrapper exists to avoid.
 fn needs_a_rule(ev: &ConnEvent) -> bool {
-    ev.verdict == Verdict::Allow || (!ev.enforced && ev.rule_name.is_none())
+    let session_grant = ev
+        .rule_name
+        .as_deref()
+        .is_some_and(|n| n.starts_with(hallpass_types::RUN_SESSION_RULE_PREFIX));
+    !session_grant && (ev.verdict == Verdict::Allow || (!ev.enforced && ev.rule_name.is_none()))
 }
 
 /// Fold `events` into proposed allow rules.
@@ -406,6 +416,24 @@ mod tests {
             unix_ms: 1_720_000_000_000,
             enforced: true,
         }
+    }
+
+    /// A connection a session grant allowed was a one-off by construction,
+    /// so folding it into a permanent rule proposal would turn every
+    /// `hallpass run` into ruleset growth.
+    #[test]
+    fn session_grants_are_not_folded_into_proposals() {
+        let mut granted = event(Some("/usr/bin/curl"), None, "1.1.1.1:443", Verdict::Allow);
+        granted.rule_name = Some(format!("{}7", hallpass_types::RUN_SESSION_RULE_PREFIX));
+        let proposal = suggest(&[granted.clone()], &Filters::default());
+        assert!(proposal.rules.is_empty(), "a grant must not become a rule");
+        assert_eq!(proposal.folded, 0);
+
+        // The same connection decided any other way still folds, so this
+        // excludes the grant rather than the traffic.
+        let mut by_rule = granted;
+        by_rule.rule_name = Some("allow-curl".into());
+        assert_eq!(suggest(&[by_rule], &Filters::default()).rules.len(), 1);
     }
 
     fn exe_filter(sub: &str) -> Filters {

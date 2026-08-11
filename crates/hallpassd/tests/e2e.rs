@@ -685,6 +685,26 @@ impl TestEnv {
         count_path
     }
 
+    /// Run the CLI inside the cli namespace, pointed at this daemon.
+    ///
+    /// Nothing here needs it to be on PATH: the binary sits beside the
+    /// daemon this test built. See [`cli_binary`] for why it can be absent.
+    fn run_cli(&self, args: &[&str]) -> Output {
+        let cli = cli_binary().expect("caller checked the CLI exists");
+        let socket = self.socket_path.to_string_lossy().into_owned();
+        let mut full: Vec<String> = vec![
+            "netns".into(),
+            "exec".into(),
+            self.ns_cli.clone(),
+            cli.to_string_lossy().into_owned(),
+            "--socket".into(),
+            socket,
+        ];
+        full.extend(args.iter().map(|a| a.to_string()));
+        let refs: Vec<&str> = full.iter().map(String::as_str).collect();
+        run("ip", &refs)
+    }
+
     /// Delete the root-only export exemption from the *live* output chain,
     /// the negative control for the export loop. The watchdog only checks
     /// that the table exists, so an edited chain stays edited.
@@ -718,6 +738,17 @@ impl TestEnv {
             "nft delete rule",
         );
     }
+}
+
+/// The `hallpass-cli` binary built alongside this test's daemon.
+///
+/// The CLI is not a dependency of the daemon, so `cargo test -p hallpassd`
+/// does not build it and there is no `CARGO_BIN_EXE_hallpass-cli` to ask.
+/// A missing binary is a skip rather than a failure locally, and CI builds
+/// it explicitly so the skip guard turns a missing one into a failed job.
+fn cli_binary() -> Option<PathBuf> {
+    let path = Path::new(env!("CARGO_BIN_EXE_hallpassd")).parent()?.join("hallpass-cli");
+    path.exists().then_some(path)
 }
 
 /// Running total published by [`TestEnv::start_syslog_sink`]. Zero until
@@ -2042,4 +2073,179 @@ fn udp_syslog_export_is_exempt_from_its_own_verdict_queue() {
         loop_after - loop_before,
         after - before
     );
+}
+
+/// A session grant covers the wrapped command while it runs, and stops
+/// covering the moment it exits.
+///
+/// Under `default_verdict = "deny"` with no prompt handler, an unmatched
+/// connection is denied once its prompt times out. That makes the grant's
+/// effect the difference between a connection that works and one that does
+/// not, rather than something only the event stream can see.
+#[test]
+#[ignore = "requires root and network namespaces"]
+fn a_wrapped_command_is_covered_only_while_the_wrapper_runs() {
+    const PORT: u16 = 19026;
+    const PORT_AFTER: u16 = 19027;
+    let Some(mut env) = TestEnv::setup("runsession") else {
+        return;
+    };
+    if cli_binary().is_none() {
+        eprintln!("SKIP e2e runsession: hallpass-cli is not built (cargo build -p hallpass-cli)");
+        return;
+    }
+    env.start_listener(PORT);
+    env.start_listener(PORT_AFTER);
+    env.start_daemon("deny", &[]);
+
+    let wrapped = env.run_cli(&["run", "--", "nc", "-z", "-w", "3", SRV_IP, &PORT.to_string()]);
+    assert!(
+        wrapped.status.success(),
+        "the wrapped command should connect and exit 0; stderr: {}\ndaemon log:\n{}",
+        String::from_utf8_lossy(&wrapped.stderr).trim(),
+        env.daemon_log()
+    );
+    // The grant is what allowed it, not the default verdict, and it says so
+    // in the field every client already renders.
+    assert!(
+        env.daemon_log().contains("session grant opened"),
+        "the daemon should have opened a session; daemon log:\n{}",
+        env.daemon_log()
+    );
+    assert!(
+        env.wait_for_log("session grant closed", Duration::from_secs(10)),
+        "the session should end with the wrapper; daemon log:\n{}",
+        env.daemon_log()
+    );
+
+    // Same binary, same host, no wrapper: back to the default verdict.
+    assert!(
+        !env.connect(PORT_AFTER),
+        "an unwrapped connection must still be denied; daemon log:\n{}",
+        env.daemon_log()
+    );
+}
+
+/// A grant suppresses a prompt; it never overrides a rule.
+#[test]
+#[ignore = "requires root and network namespaces"]
+fn an_explicit_deny_still_blocks_inside_a_session() {
+    const PORT: u16 = 19028;
+    let Some(mut env) = TestEnv::setup("runsessiondeny") else {
+        return;
+    };
+    if cli_binary().is_none() {
+        eprintln!("SKIP e2e runsessiondeny: hallpass-cli is not built");
+        return;
+    }
+    env.start_listener(PORT);
+    env.start_daemon("allow", &[&rule("e2e-session-deny", Action::Deny, PORT)]);
+
+    let wrapped = env.run_cli(&["run", "--", "nc", "-z", "-w", "3", SRV_IP, &PORT.to_string()]);
+    assert!(
+        !wrapped.status.success(),
+        "a deny rule must still deny inside a session; daemon log:\n{}",
+        env.daemon_log()
+    );
+}
+
+/// A descendant that daemonizes stays covered, which is what
+/// `PR_SET_CHILD_SUBREAPER` in the wrapper buys.
+///
+/// `setsid --fork` exits as soon as it has forked, so the `nc` beneath it
+/// is orphaned before it connects. Without the subreaper flag it would
+/// reparent past the wrapper (to pid 1, or to whichever subreaper the login
+/// session already installed) and the ancestry walk would never reach the
+/// session root. The assertion is on the rule name the event carries, so it
+/// names the grant rather than inferring it from a connection succeeding.
+///
+/// `--fork` is what makes this a test rather than a coincidence: bare
+/// `setsid(1)` forks only when it is already a process-group leader, which
+/// it is not when spawned this way, so it would `exec` in place and leave
+/// `nc` an ordinary two-hop descendant that plain ancestry reaches. The
+/// test would then pass with `PR_SET_CHILD_SUBREAPER` deleted from the
+/// wrapper, which is the one thing it exists to catch.
+#[test]
+#[ignore = "requires root and network namespaces"]
+fn a_reparented_descendant_stays_covered() {
+    const PORT: u16 = 19029;
+    let Some(mut env) = TestEnv::setup("runsessionorphan") else {
+        return;
+    };
+    if cli_binary().is_none() {
+        eprintln!("SKIP e2e runsessionorphan: hallpass-cli is not built");
+        return;
+    }
+    if !tool_available("setsid", "--version") {
+        eprintln!("SKIP e2e runsessionorphan: `setsid` not found in PATH");
+        return;
+    }
+    // Not every setsid takes --fork (busybox's does not), and without it
+    // this test silently stops testing the subreaper.
+    if !run("setsid", &["--fork", "true"]).status.success() {
+        eprintln!("SKIP e2e runsessionorphan: this `setsid` has no --fork");
+        return;
+    }
+    env.start_listener(PORT);
+    env.start_daemon("allow", &[]);
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    let event = rt.block_on(async {
+        let mut sock = tokio::net::UnixStream::connect(&env.socket_path)
+            .await
+            .expect("connect IPC socket");
+        wire::write_msg(&mut sock, &ClientMsg::Hello { version: PROTOCOL_VERSION })
+            .await
+            .expect("send hello");
+        let ack: DaemonMsg = wire::read_msg(&mut sock).await.expect("read ack");
+        assert_eq!(ack, DaemonMsg::HelloAck { version: PROTOCOL_VERSION });
+        wire::write_msg(&mut sock, &ClientMsg::Subscribe { events: true, prompts: false })
+            .await
+            .expect("send subscribe");
+        let ok: DaemonMsg = wire::read_msg(&mut sock).await.expect("read subscribe ack");
+        assert_eq!(ok, DaemonMsg::Ok);
+
+        // The wrapper outlives the orphan's connection: `sleep` keeps the
+        // session open while the detached `nc` runs.
+        let script = format!("setsid --fork nc -z -w 3 {SRV_IP} {PORT}; sleep 3");
+        let socket = env.socket_path.to_string_lossy().into_owned();
+        let ns = env.ns_cli.clone();
+        let cli = cli_binary().expect("checked above");
+        tokio::task::spawn_blocking(move || {
+            run(
+                "ip",
+                &[
+                    "netns",
+                    "exec",
+                    &ns,
+                    &cli.to_string_lossy(),
+                    "--socket",
+                    &socket,
+                    "run",
+                    "--",
+                    "sh",
+                    "-c",
+                    &script,
+                ],
+            )
+        });
+
+        next_event_on_port(&mut sock, PORT).await
+    });
+
+    let name = event.rule_name.unwrap_or_else(|| {
+        panic!(
+            "the orphan's connection was decided by no rule at all; daemon log:\n{}",
+            env.daemon_log()
+        )
+    });
+    assert!(
+        name.starts_with(hallpass_types::RUN_SESSION_RULE_PREFIX),
+        "a reparented descendant must still be covered, got rule {name}; daemon log:\n{}",
+        env.daemon_log()
+    );
+    assert_eq!(event.verdict, hallpass_types::Verdict::Allow);
 }

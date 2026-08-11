@@ -108,8 +108,11 @@ _hallpass_cli() {
 
     opts=""
     case $cmd in
-    "") opts="status rules events top watch explain" ;;
-    status | watch) ;;
+    "") opts="status doctor sessions run config rules suggest events top watch explain" ;;
+    status | doctor | sessions | watch) ;;
+    # Everything after `run` belongs to the wrapped command, so completing
+    # this CLI's own words there would be wrong.
+    run) ;;
     events) opts="--last --no-follow --exe --domain --verdict" ;;
     top) opts="--group-by --interval --top" ;;
     explain)

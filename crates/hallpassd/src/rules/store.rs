@@ -444,9 +444,11 @@ fn load_dir(dir: &Path) -> LoadResult {
                 continue;
             }
         };
-        // The same validation add() applies: a rule that cannot compile
-        // would otherwise sit inert in the set and crash clients that
-        // render it (e.g. a malformed exe_sha256).
+        // The same validation add() applies, because both go through
+        // `CompiledRule::compile`: a rule that cannot compile would
+        // otherwise sit inert in the set and crash clients that render it
+        // (e.g. a malformed exe_sha256), and a rule naming itself after a
+        // session grant would be indistinguishable from one.
         if let Err(e) = CompiledRule::compile(&rule) {
             tracing::warn!(file = %path.display(), "skipping invalid rule file: {e}");
             skipped += 1;
@@ -593,6 +595,7 @@ impl RuleStore {
                 rule.name.len()
             ));
         }
+
         // Measured with the codec that will echo the rule back, so the size
         // being bounded is exactly the size RuleList pays; see
         // MAX_RULE_WIRE_BYTES for why the bound exists.
@@ -1292,6 +1295,42 @@ mod tests {
         let mut ok = rule("x", RuleDuration::Session);
         ok.name = "n".repeat(MAX_RULE_NAME_BYTES);
         assert!(store.add(ok).is_ok(), "the limit itself is accepted");
+    }
+
+    /// A session grant reports itself through the rule-name field, so a
+    /// disk or IPC rule must not be able to answer to that name: an
+    /// operator reading events could not otherwise tell a permanent allow
+    /// from a grant that ends with a command.
+    #[test]
+    fn the_session_grant_prefix_is_reserved() {
+        let (_td, dir) = tmpdir("reserved");
+        let store = RuleStore::new(dir.clone());
+        let mut r = rule("x", RuleDuration::Session);
+        r.name = format!("{}42", hallpass_types::RUN_SESSION_RULE_PREFIX);
+        let err = store.add(r).expect_err("the reserved prefix must be refused");
+        assert!(err.contains("reserved"), "{err}");
+
+        // Only the prefix is reserved, not the word.
+        let mut ok = rule("x", RuleDuration::Session);
+        ok.name = "my-run-session:42".into();
+        assert!(store.add(ok).is_ok(), "the prefix is only reserved at the start");
+    }
+
+    /// The disk path never calls `add`, so a rule file is the way in that a
+    /// check living only in `add` would miss.
+    #[test]
+    fn a_rule_file_cannot_take_a_session_grants_name() {
+        let (_td, dir) = tmpdir("reserved-disk");
+        let mut r = rule("impostor", RuleDuration::Forever);
+        r.name = format!("{}7", hallpass_types::RUN_SESSION_RULE_PREFIX);
+        std::fs::write(dir.join("impostor.toml"), toml::to_string(&r).unwrap()).unwrap();
+
+        let store = RuleStore::new(dir);
+        assert!(
+            store.list().is_empty(),
+            "a disk rule named after a grant must be skipped, not loaded"
+        );
+        assert_eq!(store.rules_skipped(), 1, "and counted as skipped");
     }
 
     /// Counters for rules that are gone are never reported, so keeping them

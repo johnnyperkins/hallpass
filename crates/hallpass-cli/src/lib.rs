@@ -1,6 +1,6 @@
 //! Hallpass CLI - client library for the hallpass application firewall.
 //!
-//! The binary in `main.rs` is a thin wrapper around [`run`]. Everything is
+//! The binary in `main.rs` is a thin wrapper around [`run()`]. Everything is
 //! kept in the library so integration tests can drive commands against a
 //! mock daemon.
 
@@ -12,6 +12,7 @@ pub mod doctor;
 pub mod fmt;
 pub mod json;
 pub mod rules_file;
+pub mod run;
 pub mod suggest;
 pub mod top;
 pub mod watch;
@@ -67,6 +68,14 @@ pub async fn run(argv: &[String]) -> i32 {
         return doctor::run(&cli.socket, out).await;
     }
 
+    // Like doctor, `run` owns its exit code rather than reporting success
+    // or failure: it exits with the wrapped command's status, and it owns
+    // its connection because a daemon it cannot reach means the command is
+    // not run at all.
+    if let Cmd::Run { argv } = &cli.cmd {
+        return run::run(&cli.socket, argv).await;
+    }
+
     let mut client = match Client::connect(&cli.socket).await {
         Ok(c) => c,
         Err(e) => return report(e),
@@ -74,7 +83,9 @@ pub async fn run(argv: &[String]) -> i32 {
 
     let result = match cli.cmd {
         Cmd::Doctor => unreachable!("dispatched before connecting"),
+        Cmd::Run { .. } => unreachable!("dispatched before connecting"),
         Cmd::Status => status(&mut client, out).await,
+        Cmd::Sessions => run::sessions(&mut client, out).await,
         Cmd::ConfigShow => config_show(&mut client, out).await,
         Cmd::ConfigSet(opts) => config_set(&mut client, opts, out).await,
         Cmd::RulesList { stats } => rules_list(&mut client, stats, out).await,

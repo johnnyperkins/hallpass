@@ -277,7 +277,18 @@ hallpass-cli rules export > policy.toml    # the whole ruleset as one document
 hallpass-cli rules import policy.toml      # add every rule in a document
 hallpass-cli explain --exe /usr/bin/curl --dest 1.1.1.1 --port 443
 hallpass-cli suggest --exe firefox > proposed.toml   # propose rules from history
+hallpass-cli run -- ./build.sh             # one-off grant for a command and its children
+hallpass-cli sessions                      # grants open right now
 ```
+
+`run` is for the command you are about to run once: while it runs,
+connections from it and everything it spawns that no rule matches are
+allowed instead of prompting, and the grant disappears when it exits. It is
+the alternative to writing a permanent allow rule for a build, an installer,
+or a test suite - and to answering forty prompts for one of them. Events
+allowed this way name the grant (`run-session:7`) instead of a rule, so they
+are visible in `events`, `top`, syslog and the GUI like any other decision,
+and `suggest` leaves them out of the rules it proposes.
 
 `explain` asks what policy would do with a connection without sending a
 packet. It answers with the verdict, then every rule in evaluation order and
@@ -456,6 +467,39 @@ attacker with root, who can delete the nftables table outright.
   and the rules directory, so it is the most security-relevant file on disk.
   A `--config` path that does not exist is fatal rather than silently
   replaced by the (fail-open) built-in defaults.
+- **Session grants (`hallpass-cli run`) cover a process tree, one user, and
+  only what would have prompted.** The daemon roots the grant at the wrapper
+  process using the IPC socket's peer credentials, so a client cannot open
+  one over someone else's processes, and membership is the connecting
+  process's `(pid, start time)`-guarded ancestry up to that root. What this
+  means in practice:
+  - **An explicit rule always wins.** The grant is consulted only where a
+    connection would otherwise raise a prompt, so a deny rule still denies
+    inside a session.
+  - **Same user only.** A `sudo` step inside a session runs as another user
+    and prompts as usual.
+  - **Anything the session spawns is covered**, including a descendant that
+    daemonizes: the wrapper sets `PR_SET_CHILD_SUBREAPER`, so an orphan
+    reparents onto it rather than past it. That is the grant's definition,
+    not a gap - if you would not trust the command's children, do not wrap
+    it. What a session cannot do is widen itself: every failure direction
+    (no pid, uid mismatch, an ancestry chain that cannot be walked, a depth
+    past 32 hops, a session that has ended) resolves to a prompt.
+  - **The grant ends with the wrapper**, because the daemon ties it to the
+    IPC connection - `kill -9` on the wrapper ends it too. Connections
+    *already established* under a grant survive it, since only `ct state
+    new` is judged.
+  - **`run-session:` is a reserved rule-name prefix**, refused when a rule
+    is compiled - which covers both the control socket and rule files on
+    disk - so a rule cannot impersonate a grant in the event stream.
+  - **Sessions are capped per user** (8) as well as host-wide (64), so one
+    member of the `hallpass` group cannot hold every slot and stop everyone
+    else's `run` from starting.
+  - **A grant-allowed connection still counts as a sighting** for
+    first-seen highlighting, exactly as an allow *rule* would: the event it
+    emits carries the `first_seen` flag, so a later prompt for the same
+    application will not repeat it. If you want a program's first contact to
+    reach a prompt, do not introduce it inside a session.
 - **No unsafe code** in the userspace crates (`#![deny(unsafe_code)]`
   workspace-wide; the eBPF crate is the exception by nature).
 

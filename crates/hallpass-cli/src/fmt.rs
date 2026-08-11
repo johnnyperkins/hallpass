@@ -5,7 +5,8 @@ use std::fmt::Write;
 
 use hallpass_types::{
     format_ts, human_bytes, sanitize_for_display, ConnEvent, Connection, Explanation,
-    PromptScope, Rule, RuleHit, RuleTrace, RuntimeConfig, Stats, TraceOutcome, Verdict,
+    PromptScope, Rule, RuleHit, RuleTrace, RunSessionInfo, RuntimeConfig, Stats, TraceOutcome,
+    Verdict,
 };
 
 use crate::args::ColorChoice;
@@ -384,6 +385,45 @@ fn render_table(pal: Palette, header: &[&str], rows: &[TableRow]) -> String {
         }
         out.push('\n');
     }
+    out
+}
+
+/// Format the live session grants as a table.
+///
+/// The label is a command basename the wrapper read off a path, so it is
+/// sanitized like every other daemon-carried string before it is printed.
+pub fn format_sessions(sessions: &[RunSessionInfo], pal: Palette) -> String {
+    let mut out = String::new();
+    if sessions.is_empty() {
+        let _ = writeln!(out, "no session grants are open");
+        return out;
+    }
+    let _ = writeln!(
+        out,
+        "{:<6} {:<8} {:<8} {:<10} {:<8} COMMAND",
+        "ID", "PID", "UID", "AGE", "ALLOWED"
+    );
+    for s in sessions {
+        let _ = writeln!(
+            out,
+            "{:<6} {:<8} {:<8} {:<10} {:<8} {}",
+            s.id,
+            s.root_pid,
+            s.uid,
+            format_uptime(s.age_secs),
+            s.allowed,
+            sanitize_for_display(&s.label)
+        );
+    }
+    let _ = writeln!(
+        out,
+        "{}",
+        pal.paint(
+            Style::Warn,
+            "while a grant is open, unmatched connections from its process tree are \
+             allowed without a prompt"
+        )
+    );
     out
 }
 

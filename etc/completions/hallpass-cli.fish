@@ -68,6 +68,13 @@ complete -c hallpass-cli -n '__hallpass_cli_is' -a events -d 'Stream connection 
 complete -c hallpass-cli -n '__hallpass_cli_is' -a top -d 'Live aggregate view of connection activity'
 complete -c hallpass-cli -n '__hallpass_cli_is' -a watch -d 'Interactively answer connection prompts'
 complete -c hallpass-cli -n '__hallpass_cli_is' -a explain -d 'Say what policy would do with a hypothetical connection'
+complete -c hallpass-cli -n '__hallpass_cli_is' -a doctor -d 'Check the install; exits non-zero if anything failed'
+complete -c hallpass-cli -n '__hallpass_cli_is' -a suggest -d 'Propose allow rules from recent decisions'
+complete -c hallpass-cli -n '__hallpass_cli_is' -a run -d 'Run a command under a one-off session grant'
+complete -c hallpass-cli -n '__hallpass_cli_is' -a sessions -d 'List the session grants open right now'
+# After `run` the words are the wrapped command's: complete commands there,
+# not this CLI's own flags.
+complete -c hallpass-cli -n '__hallpass_cli_is run' -a '(__fish_complete_command)'
 
 # Global options. The parser strips these wherever they appear, so they are
 # offered inside every command rather than only before the command word.

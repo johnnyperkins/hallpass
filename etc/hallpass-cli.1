@@ -88,6 +88,36 @@ Live aggregate view of connection activity, redrawn periodically. See
 .B TOP OPTIONS
 below.
 .TP
+.BR run " \-\- " "CMD " [ ARGS ...]
+Run
+.I CMD
+under a session grant. While it runs, connections from it and from every
+process it spawns that no rule matches are allowed instead of raising a
+prompt, and are reported under the synthetic rule name
+.BR run\-session: <id>.
+The grant ends when the wrapped command exits, and it also ends if this
+wrapper is killed: the daemon ties the session to the wrapper's control
+connection rather than to a message. The wrapper exits with the command's
+exit status (128 plus the signal number if it was signalled), and forwards
+.B SIGINT
+and
+.B SIGTERM
+to it.
+.IP
+Everything after
+.B run
+belongs to the wrapped command, including options this CLI also has. An
+explicit rule still decides: a deny rule denies inside a session. Coverage
+is limited to the user that opened the session, so
+.BR sudo (8)
+inside one prompts as usual, and anything the daemon cannot resolve
+(an unattributable connection, an ancestry chain it cannot walk) prompts too.
+.TP
+.B sessions
+List the session grants that are open right now: id, the wrapper's pid, its
+user, how long it has been open, how many connections it has allowed, and
+what it is running.
+.TP
 .B watch
 Interactively answer connection prompts as the daemon raises them. This is the
 terminal equivalent of the desktop prompt window. A prompt for an application

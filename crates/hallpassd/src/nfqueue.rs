@@ -82,6 +82,11 @@ pub struct QueueDeps {
     /// tracking is off, and then every connection carries `first_seen:
     /// None`.
     pub first_seen: Option<crate::firstseen::Tracker>,
+    /// Live session grants, written by IPC tasks and read here. Empty
+    /// unless someone is running `hallpass run`, which is the state this
+    /// costs nothing in: the registry is consulted only for a connection
+    /// that would otherwise prompt, and an empty one answers immediately.
+    pub sessions: Arc<crate::session::SessionRegistry>,
 }
 
 /// Apply `verdict` to a held packet and hand it back to the kernel.
@@ -195,6 +200,7 @@ struct DecideCtx<'a> {
     rules: &'a RuleStore,
     dns_cache: &'a IpDomainCache,
     exe_hash: &'a ExeHashCache,
+    sessions: &'a crate::session::SessionRegistry,
 }
 
 /// Decision logic, separated from nfq plumbing for testability. Reads
@@ -245,8 +251,31 @@ fn decide(
     };
     match set.match_conn(&conn, exe_sha256.as_deref()) {
         Some((rule, verdict)) => Decision::Verdict(verdict, rule.name.clone(), conn),
-        None => Decision::Prompt(conn, exe_sha256),
+        // Only here, where the answer would otherwise be a prompt. A session
+        // grant suppresses the question; it never overrides a rule, so an
+        // explicit deny inside a session still denies and an explicit allow
+        // still reports its own rule name.
+        //
+        // Nothing above this line changes while no session is open: the
+        // snapshot is loaded per unmatched connection, not per packet, and an
+        // empty one costs a length check. Everything that can go wrong on the
+        // way to coverage - no pid, no session, a uid that is not the
+        // session's, an unwalkable chain - leaves the prompt exactly as it
+        // would have been.
+        None => match session_grant(&conn, ctx) {
+            Some(id) => Decision::Verdict(Verdict::Allow, crate::session::rule_name(id), conn),
+            None => Decision::Prompt(conn, exe_sha256),
+        },
     }
+}
+
+/// Id of the session grant covering `conn`, if one does.
+fn session_grant(conn: &Connection, ctx: &DecideCtx) -> Option<u64> {
+    let live = ctx.sessions.snapshot();
+    if live.is_empty() {
+        return None;
+    }
+    crate::session::covering(&live, std::path::Path::new("/proc"), conn.pid?, conn.uid)
 }
 
 /// Run the queue loop until `shutdown` is set. Blocking; call from a
@@ -496,6 +525,7 @@ pub fn run(mut queue: Queue, queue_num: u16, mut deps: QueueDeps) -> std::io::Re
                     rules: &deps.rules,
                     dns_cache: &deps.dns_cache,
                     exe_hash: &deps.exe_hash,
+                    sessions: &deps.sessions,
                 };
                 match decide(tuple, iface, &ctx, seen.as_mut()) {
                     Decision::Verdict(verdict, rule_name, conn) => {
@@ -629,6 +659,24 @@ mod tests {
         }
     }
 
+    /// Attributes every flow to this test process, so a session rooted at
+    /// it covers what it decides.
+    struct SelfProc;
+    impl crate::attribution::Attributor for SelfProc {
+        fn attribute(&self, _t: &hallpass_types::FlowTuple) -> Option<crate::attribution::ProcInfo> {
+            Some(crate::attribution::ProcInfo {
+                pid: Some(std::process::id()),
+                uid: crate::testutil::own_uid(),
+                exe_path: Some(std::path::PathBuf::from("/usr/bin/curl")),
+                cmdline: None,
+                parent_exe: None,
+                app_id: None,
+                starttime: None,
+                socket_inode: None,
+            })
+        }
+    }
+
     fn setup(
         tag: &str,
         rules: Vec<Rule>,
@@ -647,8 +695,9 @@ mod tests {
         rules: &'a Arc<RuleStore>,
         dns_cache: &'a IpDomainCache,
         exe_hash: &'a ExeHashCache,
+        sessions: &'a crate::session::SessionRegistry,
     ) -> DecideCtx<'a> {
-        DecideCtx { attribution, rules, dns_cache, exe_hash }
+        DecideCtx { attribution, rules, dns_cache, exe_hash, sessions }
     }
 
     fn tcp_packet(dst: [u8; 4], dport: u16) -> Vec<u8> {
@@ -686,8 +735,9 @@ mod tests {
                 ..Default::default()
             },
         };
+        let sessions = crate::session::SessionRegistry::default();
         let (chain, store, dns, hash, _dir) = setup("rule", vec![deny]);
-        match decide(tuple_of(&tcp_packet([1, 1, 1, 1], 443)).unwrap(), None, &ctx(&chain, &store, &dns, &hash), None) {
+        match decide(tuple_of(&tcp_packet([1, 1, 1, 1], 443)).unwrap(), None, &ctx(&chain, &store, &dns, &hash, &sessions), None) {
             Decision::Verdict(Verdict::Deny, name, conn) => {
                 assert_eq!(name, "deny-443");
                 assert_eq!(conn.tuple.dst.port(), 443);
@@ -698,8 +748,9 @@ mod tests {
 
     #[test]
     fn unmatched_goes_to_prompt() {
+        let sessions = crate::session::SessionRegistry::default();
         let (chain, store, dns, hash, _dir) = setup("prompt", vec![]);
-        match decide(tuple_of(&tcp_packet([1, 1, 1, 1], 8443)).unwrap(), None, &ctx(&chain, &store, &dns, &hash), None) {
+        match decide(tuple_of(&tcp_packet([1, 1, 1, 1], 8443)).unwrap(), None, &ctx(&chain, &store, &dns, &hash, &sessions), None) {
             Decision::Prompt(conn, _) => {
                 assert_eq!(conn.tuple.dst.port(), 8443);
                 assert_eq!(conn.exe_path, None);
@@ -739,11 +790,112 @@ mod tests {
         );
     }
 
+    /// A session grant answers exactly the connections that would have
+    /// prompted, and reports itself through the rule-name field.
+    #[test]
+    fn a_session_grant_allows_what_would_otherwise_prompt() {
+        let sessions = crate::session::SessionRegistry::default();
+        let (_chain, store, dns, hash, _dir) = setup("session-allow", vec![]);
+        let chain = AttributionChain::new(vec![Box::new(SelfProc)]);
+        let tuple = tuple_of(&tcp_packet([1, 1, 1, 1], 443)).unwrap();
+
+        // Without a session, this is the prompt the grant exists to remove.
+        match decide(tuple, None, &ctx(&chain, &store, &dns, &hash, &sessions), None) {
+            Decision::Prompt(_, _) => {}
+            other => panic!("expected a prompt with no session open, got {other:?}"),
+        }
+
+        let id = sessions
+            .register(
+                crate::session::PeerProcess::resolve(Some(std::process::id())),
+                crate::testutil::own_uid(),
+                "curl".into(),
+            )
+            .expect("register");
+        match decide(tuple, None, &ctx(&chain, &store, &dns, &hash, &sessions), None) {
+            Decision::Verdict(Verdict::Allow, name, _) => {
+                assert_eq!(name, format!("run-session:{id}"));
+            }
+            other => panic!("expected the session grant to allow, got {other:?}"),
+        }
+
+        // And it stops the moment the session does, even though the cache
+        // has an answer for this process.
+        sessions.unregister(id);
+        match decide(tuple, None, &ctx(&chain, &store, &dns, &hash, &sessions), None) {
+            Decision::Prompt(_, _) => {}
+            other => panic!("expected a prompt once the session ended, got {other:?}"),
+        }
+    }
+
+    /// A grant suppresses a question; it never overrules an answer.
+    #[test]
+    fn an_explicit_rule_still_decides_inside_a_session() {
+        let deny = Rule {
+            name: "deny-443".into(),
+            action: Action::Deny,
+            duration: RuleDuration::Session,
+            priority: 1,
+            enabled: true,
+            matcher: RuleMatch {
+                port: Some(443),
+                ..Default::default()
+            },
+        };
+        let sessions = crate::session::SessionRegistry::default();
+        let (_chain, store, dns, hash, _dir) = setup("session-deny", vec![deny]);
+        let chain = AttributionChain::new(vec![Box::new(SelfProc)]);
+        sessions
+            .register(
+                crate::session::PeerProcess::resolve(Some(std::process::id())),
+                crate::testutil::own_uid(),
+                "curl".into(),
+            )
+            .expect("register");
+
+        match decide(
+            tuple_of(&tcp_packet([1, 1, 1, 1], 443)).unwrap(),
+            None,
+            &ctx(&chain, &store, &dns, &hash, &sessions),
+            None,
+        ) {
+            Decision::Verdict(Verdict::Deny, name, _) => assert_eq!(name, "deny-443"),
+            other => panic!("a deny rule must still deny inside a session, got {other:?}"),
+        }
+    }
+
+    /// The grant covers one user's processes. A step to another user inside
+    /// the tree (sudo) leaves it.
+    #[test]
+    fn a_session_does_not_cover_another_user() {
+        let sessions = crate::session::SessionRegistry::default();
+        let (_chain, store, dns, hash, _dir) = setup("session-uid", vec![]);
+        let chain = AttributionChain::new(vec![Box::new(SelfProc)]);
+        sessions
+            .register(
+                crate::session::PeerProcess::resolve(Some(std::process::id())),
+                crate::testutil::own_uid().wrapping_add(1),
+                "curl".into(),
+            )
+            .expect("register");
+
+        match decide(
+            tuple_of(&tcp_packet([1, 1, 1, 1], 443)).unwrap(),
+            None,
+            &ctx(&chain, &store, &dns, &hash, &sessions),
+            None,
+        ) {
+            Decision::Prompt(_, _) => {}
+            other => panic!("another user's connection must still prompt, got {other:?}"),
+        }
+    }
+
     /// The annotation is stamped on the connection the event and the prompt
     /// both carry, and the second packet of the same flow is no longer new:
     /// recording happens where the decision does, not where the display is.
     #[tokio::test]
     async fn first_seen_is_stamped_and_then_settles() {
+        let sessions = crate::session::SessionRegistry::default();
         let dir = TestDir::new("nfq-firstseen");
         let store = Arc::new(RuleStore::new(dir.path().to_path_buf()));
         let chain = AttributionChain::new(vec![Box::new(FixedExe("/usr/bin/curl"))]);
@@ -752,20 +904,20 @@ mod tests {
         let (mut seen, _writer) = crate::firstseen::start(dir.path().join("seen.toml"));
 
         let tuple = tuple_of(&tcp_packet([1, 1, 1, 1], 443)).unwrap();
-        let first = match decide(tuple, None, &ctx(&chain, &store, &dns, &hash), Some(&mut seen)) {
+        let first = match decide(tuple, None, &ctx(&chain, &store, &dns, &hash, &sessions), Some(&mut seen)) {
             Decision::Prompt(conn, _) => conn.first_seen,
             other => panic!("expected a prompt, got {other:?}"),
         };
         assert_eq!(first, Some(hallpass_types::FirstSeen { app: true, dest: true }));
 
-        let again = match decide(tuple, None, &ctx(&chain, &store, &dns, &hash), Some(&mut seen)) {
+        let again = match decide(tuple, None, &ctx(&chain, &store, &dns, &hash, &sessions), Some(&mut seen)) {
             Decision::Prompt(conn, _) => conn.first_seen,
             other => panic!("expected a prompt, got {other:?}"),
         };
         assert_eq!(again, Some(hallpass_types::FirstSeen { app: false, dest: false }));
 
         // Tracking off is not "seen before": the daemon has nothing to say.
-        match decide(tuple, None, &ctx(&chain, &store, &dns, &hash), None) {
+        match decide(tuple, None, &ctx(&chain, &store, &dns, &hash, &sessions), None) {
             Decision::Prompt(conn, _) => assert_eq!(conn.first_seen, None),
             other => panic!("expected a prompt, got {other:?}"),
         }
@@ -787,7 +939,8 @@ mod tests {
         let dns = IpDomainCache::new(16);
         let hash = ExeHashCache::default();
         let (mut seen, _writer) = crate::firstseen::start(dir.path().join("seen.toml"));
-        let ctx = ctx(&chain, &store, &dns, &hash);
+        let sessions = crate::session::SessionRegistry::default();
+        let ctx = ctx(&chain, &store, &dns, &hash, &sessions);
 
         // The program resolves a name first, the way a real one does.
         let query = tuple_of(&udp_packet([127, 0, 0, 53], 53)).unwrap();
@@ -809,13 +962,14 @@ mod tests {
 
     #[test]
     fn domain_enrichment_from_dns_cache() {
+        let sessions = crate::session::SessionRegistry::default();
         let (chain, store, dns, hash, _dir) = setup("domain", vec![]);
         dns.absorb(&crate::dns::SnoopedResponse {
             id: 1,
             query_name: "example.com".into(),
             addrs: vec![("1.1.1.1".parse().unwrap(), 300)],
         });
-        match decide(tuple_of(&tcp_packet([1, 1, 1, 1], 443)).unwrap(), None, &ctx(&chain, &store, &dns, &hash), None) {
+        match decide(tuple_of(&tcp_packet([1, 1, 1, 1], 443)).unwrap(), None, &ctx(&chain, &store, &dns, &hash, &sessions), None) {
             Decision::Prompt(conn, _) => assert_eq!(conn.domain.as_deref(), Some("example.com")),
             _ => panic!("expected prompt"),
         }
