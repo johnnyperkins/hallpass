@@ -262,11 +262,51 @@ fn decide(
         // way to coverage - no pid, no session, a uid that is not the
         // session's, an unwalkable chain - leaves the prompt exactly as it
         // would have been.
+        // A lockdown posture answers before a session grant does. The grant
+        // is a prompt suppressor that allows, so consulting it first would
+        // let anything started under `hallpass run` walk straight through
+        // the posture - and a build script is exactly the sort of thing
+        // running when someone reaches for one.
+        //
+        // Read off the same snapshot that just failed to match, so a posture
+        // lifted between the two cannot deny a connection against a rule set
+        // that would have allowed it.
+        None if set.locked_down() => match stays_on_host(&conn) {
+            // Loopback never leaves the host, so refusing it buys nothing
+            // and costs the local resolver stub, every 127.0.0.1 service,
+            // and with them most of the desktop. Deny rules are not
+            // suppressed, so an operator who does want loopback blocked
+            // still has it blocked here.
+            true => Decision::Verdict(
+                Verdict::Allow,
+                hallpass_types::LOCKDOWN_LOOPBACK_RULE.to_string(),
+                conn,
+            ),
+            // No prompt, deliberately. A dialog would let anyone at the
+            // keyboard answer their way out of the posture, and the rule
+            // that answer writes carries no pinned tag, so it would be
+            // suppressed the moment it was created - an Allow that appears
+            // to do nothing.
+            false => Decision::Verdict(
+                Verdict::Deny,
+                hallpass_types::LOCKDOWN_DENIED_RULE.to_string(),
+                conn,
+            ),
+        },
         None => match session_grant(&conn, ctx) {
             Some(id) => Decision::Verdict(Verdict::Allow, crate::session::rule_name(id), conn),
             None => Decision::Prompt(conn, exe_sha256),
         },
     }
+}
+
+/// Whether this connection stays on the host.
+///
+/// Both halves of the tuple, not just the destination: a packet to a
+/// loopback address from a routable source is not the local traffic this
+/// exemption is about.
+pub fn stays_on_host(conn: &Connection) -> bool {
+    conn.tuple.dst.ip().is_loopback() && conn.tuple.src.ip().is_loopback()
 }
 
 /// Id of the session grant covering `conn`, if one does.
@@ -478,9 +518,21 @@ pub fn run(mut queue: Queue, queue_num: u16, mut deps: QueueDeps) -> std::io::Re
 
                 let packet::Parsed::Flow(tuple) = parsed else {
                     deps.stats.record_other_proto();
+                    // A lockdown posture reaches here too. Nothing on this
+                    // branch goes through the rule engine, so the posture's
+                    // suppression cannot touch it: without this, ICMP, SCTP,
+                    // GRE, ESP and anything unparsable keep leaving a host
+                    // whose operator was told everything unpinned is denied,
+                    // and an ICMP tunnel survives the posture raised to stop
+                    // it. There is no rule to pin these to, so a posture
+                    // denies them outright.
+                    let unhandled = match deps.settings.locked_down() {
+                        true => Verdict::Deny,
+                        false => deps.unhandled_verdict,
+                    };
                     // These carry no Connection, so there is no event to
                     // emit and observe mode can only note it in the log.
-                    if deps.unhandled_verdict == Verdict::Allow {
+                    if unhandled == Verdict::Allow {
                         tracing::debug!(?parsed, "unhandled packet allowed by policy");
                     } else if enforcing {
                         // Blocked traffic must be findable without debug
@@ -502,11 +554,11 @@ pub fn run(mut queue: Queue, queue_num: u16, mut deps: QueueDeps) -> std::io::Re
                         deps.stats.record_observed_only();
                         tracing::info!(
                             ?parsed,
-                            verdict = deps.unhandled_verdict.as_str(),
+                            verdict = unhandled.as_str(),
                             "observe mode: unhandled packet would be blocked by policy"
                         );
                     }
-                    let applied = applied_verdict(deps.unhandled_verdict, enforcing);
+                    let applied = applied_verdict(unhandled, enforcing);
                     apply_verdict(&mut queue, msg, applied);
                     continue;
                 };
@@ -700,6 +752,17 @@ mod tests {
         DecideCtx { attribution, rules, dns_cache, exe_hash, sessions }
     }
 
+    /// A packet that stays on the host: loopback on both ends, which is
+    /// what the posture's exemption is about.
+    fn loopback_packet() -> Vec<u8> {
+        let mut buf = Vec::new();
+        PacketBuilder::ipv4([127, 0, 0, 1], [127, 0, 0, 53], 64)
+            .udp(40000, 53)
+            .write(&mut buf, &[])
+            .unwrap();
+        buf
+    }
+
     fn tcp_packet(dst: [u8; 4], dport: u16) -> Vec<u8> {
         let mut buf = Vec::new();
         PacketBuilder::ipv4([10, 0, 0, 1], dst, 64)
@@ -789,6 +852,102 @@ mod tests {
             want_fail_open(false, false),
             "observe mode must not drop packets even under a fail-closed posture"
         );
+    }
+
+    /// Lockdown answers before a session grant does.
+    ///
+    /// A grant is a prompt suppressor that allows, so consulting it first
+    /// would let anything started under `hallpass run` walk straight through
+    /// the posture - and a build script is exactly what tends to be running
+    /// when someone reaches for one.
+    #[test]
+    fn lockdown_denies_without_a_prompt_and_outranks_a_session_grant() {
+        let sessions = crate::session::SessionRegistry::default();
+        let (_chain, store, dns, hash, _dir) = setup("lockdown", vec![]);
+        let chain = AttributionChain::new(vec![Box::new(SelfProc)]);
+        let tuple = tuple_of(&tcp_packet([1, 1, 1, 1], 443)).unwrap();
+        let id = sessions
+            .register(
+                crate::session::PeerProcess::resolve(Some(std::process::id())),
+                crate::testutil::own_uid(),
+                "curl".into(),
+            )
+            .expect("register");
+
+        // With no posture the grant answers, as it always has.
+        match decide(tuple, None, &ctx(&chain, &store, &dns, &hash, &sessions), None) {
+            Decision::Verdict(Verdict::Allow, name, _) => {
+                assert_eq!(name, format!("run-session:{id}"));
+            }
+            other => panic!("expected the session grant to allow, got {other:?}"),
+        }
+
+        store.rebuild_for_posture(Some(&["work".to_string()]));
+        match decide(tuple, None, &ctx(&chain, &store, &dns, &hash, &sessions), None) {
+            Decision::Verdict(Verdict::Deny, name, _) => {
+                assert_eq!(name, hallpass_types::LOCKDOWN_DENIED_RULE);
+            }
+            // A prompt would be the real failure: anyone at the keyboard
+            // could answer their way out of the posture, and the rule that
+            // answer writes carries no pinned tag, so it would be suppressed
+            // the moment it was created.
+            other => panic!("expected the posture to deny, got {other:?}"),
+        }
+
+        // Loopback is exempt: it never leaves the host, so refusing it costs
+        // the resolver stub and every local service and buys nothing.
+        let local = tuple_of(&loopback_packet()).unwrap();
+        match decide(local, None, &ctx(&chain, &store, &dns, &hash, &sessions), None) {
+            Decision::Verdict(Verdict::Allow, name, _) => {
+                assert_eq!(name, hallpass_types::LOCKDOWN_LOOPBACK_RULE);
+            }
+            other => panic!("expected loopback to be exempt, got {other:?}"),
+        }
+    }
+
+    /// A posture suppresses untagged allows and never a deny, and lifting it
+    /// puts every rule back exactly as the operator left it.
+    #[test]
+    fn a_posture_suppresses_only_untagged_allows_on_the_packet_path() {
+        let sessions = crate::session::SessionRegistry::default();
+        let allow_rule = |name: &str, port: u16, tags: Vec<String>| Rule {
+            name: name.into(),
+            action: Action::Allow,
+            duration: RuleDuration::Session,
+            priority: 1,
+            enabled: true,
+            tags,
+            matcher: RuleMatch {
+                port: Some(port),
+                ..Default::default()
+            },
+        };
+        let allow = allow_rule("allow-any", 443, Vec::new());
+        let tagged = allow_rule("allow-work", 8443, vec!["work".to_string()]);
+        let (_chain, store, dns, hash, _dir) =
+            setup("lockdown-rules", vec![allow, tagged]);
+        let chain = AttributionChain::new(vec![Box::new(SelfProc)]);
+        let untagged_hit = tuple_of(&tcp_packet([1, 1, 1, 1], 443)).unwrap();
+        let tagged_hit = tuple_of(&tcp_packet([1, 1, 1, 1], 8443)).unwrap();
+        let c = |t| decide(t, None, &ctx(&chain, &store, &dns, &hash, &sessions), None);
+
+        store.rebuild_for_posture(Some(&["work".to_string()]));
+        match c(untagged_hit) {
+            Decision::Verdict(Verdict::Deny, name, _) => {
+                assert_eq!(name, hallpass_types::LOCKDOWN_DENIED_RULE);
+            }
+            other => panic!("expected the untagged allow to be suppressed, got {other:?}"),
+        }
+        match c(tagged_hit) {
+            Decision::Verdict(Verdict::Allow, name, _) => assert_eq!(name, "allow-work"),
+            other => panic!("expected the pinned allow to decide, got {other:?}"),
+        }
+
+        store.rebuild_for_posture(None);
+        match c(untagged_hit) {
+            Decision::Verdict(Verdict::Allow, name, _) => assert_eq!(name, "allow-any"),
+            other => panic!("lifting the posture must restore the rule, got {other:?}"),
+        }
     }
 
     /// A session grant answers exactly the connections that would have

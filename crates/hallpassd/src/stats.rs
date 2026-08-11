@@ -264,6 +264,7 @@ impl Counters {
         rules_skipped: u64,
         prompt_handler_connected: bool,
         enforcing: bool,
+        lockdown: Option<hallpass_types::Lockdown>,
         queues: QueueStats,
     ) -> Stats {
         // Acquire pairs with record_nft_flush's Release; loaded once,
@@ -276,6 +277,7 @@ impl Counters {
             denied: self.denied.load(Ordering::Relaxed),
             prompted: self.prompted.load(Ordering::Relaxed),
             rules_loaded,
+            lockdown,
             uptime_secs: self.start.elapsed().as_secs(),
             dns_spoof_rejected: self.dns_spoof_rejected.load(Ordering::Relaxed),
             rules_skipped,
@@ -323,12 +325,12 @@ mod tests {
     #[test]
     fn nft_flush_count_and_timestamp_agree() {
         let c = Counters::default();
-        let before = c.snapshot(0, 0, false, true, QueueStats::default());
+        let before = c.snapshot(0, 0, false, true, None, QueueStats::default());
         assert_eq!(before.nft_flushes, 0);
         assert_eq!(before.nft_last_flush_ms, None);
 
         c.record_nft_flush();
-        let after = c.snapshot(0, 0, false, true, QueueStats::default());
+        let after = c.snapshot(0, 0, false, true, None, QueueStats::default());
         assert_eq!(after.nft_flushes, 1);
         let ms = after.nft_last_flush_ms.expect("a flush carries its time");
         assert!(ms >= 1);
@@ -346,7 +348,7 @@ mod tests {
         c.record_prompt_overflow();
         c.record_prompt_unanswered();
         c.record_prompt_handler_evicted();
-        let s = c.snapshot(5, 4, true, true, QueueStats::default());
+        let s = c.snapshot(5, 4, true, true, None, QueueStats::default());
         assert_eq!(s.connections_total, 3);
         assert_eq!(s.allowed, 1);
         assert_eq!(s.denied, 2);
@@ -367,8 +369,8 @@ mod tests {
     #[test]
     fn prompt_handler_flag_is_passed_through() {
         let c = Counters::default();
-        assert!(!c.snapshot(0, 0, false, true, QueueStats::default()).prompt_handler_connected);
-        assert!(c.snapshot(0, 0, true, true, QueueStats::default()).prompt_handler_connected);
+        assert!(!c.snapshot(0, 0, false, true, None, QueueStats::default()).prompt_handler_connected);
+        assert!(c.snapshot(0, 0, true, true, None, QueueStats::default()).prompt_handler_connected);
     }
 
     /// Observe mode has to be visible in the snapshot: `denied` counts what
@@ -380,7 +382,7 @@ mod tests {
         c.record_verdict(Verdict::Deny);
         c.record_observed_only();
         c.record_dns_snoop_dropped();
-        let s = c.snapshot(0, 0, true, false, QueueStats::default());
+        let s = c.snapshot(0, 0, true, false, None, QueueStats::default());
         assert!(!s.enforcing);
         assert_eq!(s.denied, 1);
         assert_eq!(s.observed_only, 1);
@@ -456,6 +458,7 @@ mod tests {
             0,
             true,
             true,
+            None,
             QueueStats {
                 verdict_fail_open: Some(true),
                 snoop_fail_open: Some(false),

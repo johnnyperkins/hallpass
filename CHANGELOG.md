@@ -7,6 +7,27 @@ carries what an upgrade changes on a running host.
 
 ### Added
 
+- **`hallpass-cli lockdown on --tag core`: a whole-host posture (wire
+  protocol v15).** While it is on, only allow rules carrying a pinned tag
+  decide connections, everything else is denied without a prompt, and the
+  daemon enforces regardless of the mode it was in. Deny rules are never
+  suppressed - a posture exists to permit less, and suppressing a block would
+  permit more. Loopback is exempt, because it never leaves the host and
+  refusing it would cost the resolver stub and every local service.
+
+  It is a posture, not a rule edit: nothing on disk changes, so lifting it
+  restores every rule exactly as you left it, including any you disabled
+  while it was on. It is persisted at `/var/lib/hallpass/posture.toml` and
+  re-read at startup, so a package upgrade's restart does not silently lift
+  it, and it is reported by `lockdown`, `status`, `doctor` and a GUI banner.
+  `explain` reports a stopped rule as suppressed rather than disabled.
+
+  Two limits worth knowing: only new connections are judged, so flows already
+  open keep running; and unless something pinned covers DNS the host cannot
+  resolve names, which also stops `domain` rules matching. `lockdown on`
+  prints what survives, warns when nothing covers DNS, and refuses when
+  nothing survives at all unless you pass `--force`.
+
 - **Rule tags and bulk toggle (wire protocol v14).** A rule can carry
   `tags = ["work", "vpn"]`, and `hallpass-cli rules toggle --tag work off`
   enables or disables the whole set as one change - one lock, one recompile,

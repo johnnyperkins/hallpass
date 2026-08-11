@@ -206,6 +206,28 @@ fn stats_checks(s: &Stats, checks: &mut Vec<Check>) {
         ));
     }
 
+    // A warning rather than a failure: a posture is a state someone chose,
+    // and doctor's job is to make sure nobody is surprised by it. A host
+    // that has been locked down since before the operator's shift started
+    // looks exactly like a broken network otherwise.
+    if let Some(l) = &s.lockdown {
+        checks.push(Check::warn(
+            "lockdown",
+            format!(
+                "on since {}: only the allow rules tagged {} decide connections, \
+                 {} suppressed",
+                hallpass_types::format_ts(l.since_ms),
+                if l.tags.is_empty() {
+                    "nothing".to_string()
+                } else {
+                    l.tags.join(",")
+                },
+                l.rules_suppressed
+            ),
+            Some("lift it with `hallpass-cli lockdown off`".into()),
+        ));
+    }
+
     if s.prompt_handler_connected {
         checks.push(Check::ok("prompts", "a prompt handler is connected".into()));
     } else {

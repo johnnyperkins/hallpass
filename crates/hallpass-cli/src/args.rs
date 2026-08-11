@@ -62,6 +62,10 @@ COMMANDS:
                                  no rule matches are allowed instead of
                                  prompting. The grant ends when it exits
     sessions                     List the session grants open right now
+    lockdown [on|off] [OPTIONS]  Show, enter or leave the lockdown posture:
+                                 while it is on, only the allow rules
+                                 carrying a pinned tag decide connections,
+                                 everything else is denied without a prompt
     watch                        Interactively answer connection prompts
     explain [OPTIONS]            Say what policy would do with a hypothetical
                                  connection, and which rule decides it
@@ -79,6 +83,14 @@ CONFIG SET OPTIONS:
     Settings not named keep the daemon's current values: the whole set is
     written back in one request, so when two clients change settings at
     once the last write wins, exactly as it does between two GUI windows.
+
+LOCKDOWN OPTIONS:
+    --tag TAG                    Pin a tag: its allow rules keep deciding
+                                 while the posture is on (repeatable). Deny
+                                 rules are never suppressed
+    --force                      Enter the posture even when no rule at all
+                                 survives it, which leaves this host reaching
+                                 nothing but loopback
 
 SUGGEST OPTIONS:
     --exe SUBSTR                 Only executables whose path contains SUBSTR
@@ -307,6 +319,18 @@ pub enum Cmd {
     },
     /// `sessions`
     Sessions,
+    /// `lockdown` with no arguments: report the posture.
+    LockdownShow,
+    /// `lockdown on|off [--tag TAG]... [--force]`
+    LockdownSet {
+        /// Tags to pin. Empty and `on` is a posture that keeps only the
+        /// deny rules, which is legal and needs `--force`.
+        tags: Vec<String>,
+        /// True to enter the posture.
+        on: bool,
+        /// Proceed when nothing survives.
+        force: bool,
+    },
     /// `config`
     ConfigShow,
     /// `config set ...`
@@ -488,6 +512,7 @@ pub fn parse(argv: &[String]) -> Result<Parsed, String> {
         Some((&"top", flags)) => Cmd::Top(parse_top(flags)?),
         Some((&"explain", flags)) => Cmd::Explain(parse_explain(flags)?),
         Some((&"rules", sub)) => parse_rules(sub)?,
+        Some((&"lockdown", sub)) => parse_lockdown(sub)?,
         Some((&cmd, extra)) => {
             return Err(if matches!(cmd, "status" | "watch" | "doctor" | "sessions") {
                 format!("unexpected arguments after '{cmd}': {extra:?}")
@@ -820,6 +845,38 @@ fn parse_sha256(value: &str) -> Result<String, String> {
         return Err(format!("invalid exe-sha256 '{value}': expected 64 hex digits"));
     }
     Ok(value.to_string())
+}
+
+/// `lockdown [on|off] [--tag TAG]... [--force]`
+fn parse_lockdown(sub: &[&str]) -> Result<Cmd, String> {
+    let (on, flags) = match sub.split_first() {
+        None => return Ok(Cmd::LockdownShow),
+        Some((&"on", flags)) => (true, flags),
+        Some((&"off", flags)) => (false, flags),
+        Some((&other, _)) => {
+            return Err(format!("expected 'on' or 'off', got '{other}'"));
+        }
+    };
+    let mut tags: Vec<String> = Vec::new();
+    let mut force = false;
+    let mut rest = flags.iter();
+    while let Some(flag) = rest.next() {
+        match *flag {
+            "--tag" => {
+                let value = rest.next().ok_or("--tag requires a value")?;
+                tags.push((*value).to_string());
+            }
+            "--force" => force = true,
+            other => return Err(format!("unknown flag '{other}'")),
+        }
+    }
+    hallpass_types::validate_tags(&tags)?;
+    // Leaving takes no tags, and quietly ignoring them would let `lockdown
+    // off --tag work` read as "unpin this one", which is not a thing.
+    if !on && (!tags.is_empty() || force) {
+        return Err("lockdown off takes no options".into());
+    }
+    Ok(Cmd::LockdownSet { tags, on, force })
 }
 
 fn parse_rules(sub: &[&str]) -> Result<Cmd, String> {
@@ -1433,6 +1490,41 @@ mod tests {
         let mut argv: Vec<&str> = base.to_vec();
         argv.extend_from_slice(&["--enabled", "maybe"]);
         assert!(parse_err(&argv).contains("expected true or false"));
+    }
+
+    #[test]
+    fn lockdown_parsing() {
+        assert_eq!(parse_ok(&["lockdown"]).cmd, Cmd::LockdownShow);
+        assert_eq!(
+            parse_ok(&["lockdown", "on", "--tag", "core", "--tag", "vpn"]).cmd,
+            Cmd::LockdownSet {
+                tags: vec!["core".into(), "vpn".into()],
+                on: true,
+                force: false
+            }
+        );
+        assert_eq!(
+            parse_ok(&["lockdown", "on", "--force"]).cmd,
+            Cmd::LockdownSet {
+                tags: Vec::new(),
+                on: true,
+                force: true
+            }
+        );
+        assert_eq!(
+            parse_ok(&["lockdown", "off"]).cmd,
+            Cmd::LockdownSet {
+                tags: Vec::new(),
+                on: false,
+                force: false
+            }
+        );
+        // Lifting takes no options: `lockdown off --tag work` would read as
+        // "unpin this one", which is not a thing this has.
+        assert!(parse_err(&["lockdown", "off", "--tag", "work"]).contains("no options"));
+        assert!(parse_err(&["lockdown", "maybe"]).contains("on"));
+        assert!(parse_err(&["lockdown", "on", "--tag", "Core"]).contains("bad tag"));
+        assert!(parse_err(&["lockdown", "on", "--tag"]).contains("requires a value"));
     }
 
     #[test]

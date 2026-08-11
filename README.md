@@ -247,6 +247,44 @@ picker that narrows the table, and Enable all / Disable all buttons that act
 on the picked tag. The buttons appear only once a tag is picked, because they
 act on the set rather than on whatever the table is showing.
 
+### Lockdown
+
+`hallpass-cli lockdown on --tag core` narrows the whole host to one set of
+rules. While it is on:
+
+- only allow rules carrying a pinned tag decide connections;
+- **deny rules are never suppressed**, tagged or not, because a posture
+  exists to permit less and suppressing a block would permit more;
+- everything no surviving rule permits is denied **without a prompt**, since
+  a dialog would let anyone at the keyboard answer their way out of the
+  posture, and the rule that answer writes would carry no pinned tag;
+- the daemon enforces regardless of the mode it was in, and the default
+  verdict is deny, both restored exactly as you had them when it lifts;
+- **loopback is exempt.** It never leaves the host, so refusing it would cost
+  the resolver stub and every local service and buy nothing. A deny rule that
+  covers loopback still applies, since denies are not suppressed.
+
+The posture is persisted (`/var/lib/hallpass/posture.toml`, 0600) and re-read
+at startup, so a package upgrade's restart does not silently lift it. It is
+reported by `hallpass-cli lockdown`, in `status`, in `doctor`, and as a
+banner in the GUI. Any member of the socket group can lift it, exactly as any
+of them can delete a deny rule; both transitions are logged with the peer's
+uid and pid.
+
+Three things to know before relying on it. **Only new connections are
+judged**, so everything already established keeps running - lockdown is not a
+kill switch for open flows. **The verdict queue's fail-open flag is fixed at
+startup**, so on the shipped `queue_bypass = true` default a kernel-side
+queue overflow still accepts packets the posture would have denied; the flag
+cannot be changed on a live queue without losing the packets already on it,
+and `status` and `doctor` both report it. And **a locked-down host usually cannot resolve
+names**: unless something pinned covers DNS, the resolver's own upstream
+query is denied like anything else, and rules written against a `domain` then
+stop matching, because a connection only carries a domain when the daemon saw
+its lookup. `lockdown on` prints what survives and warns when nothing pinned
+covers DNS; it also refuses outright when *no* rule survives, unless you pass
+`--force` to say you mean it.
+
 The one rule the installer drops in, `example-allow-dns.toml`, ships with
 `enabled = false`. Matching on port and protocol alone would let every local
 process send arbitrary UDP to port 53 on any host, which is a standard

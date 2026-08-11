@@ -227,6 +227,7 @@ mod tests {
                 denied: 15,
                 prompted: 5,
                 rules_loaded: 3,
+                lockdown: None,
                 uptime_secs: 3600,
                 dns_spoof_rejected: 2,
                 rules_skipped: 1,
@@ -392,6 +393,30 @@ mod tests {
         rule.tags = vec!["work".into(), "vpn".into()];
         let back = roundtrip(&ClientMsg::RuleAdd(rule.clone())).await;
         assert_eq!(back, ClientMsg::RuleAdd(rule));
+    }
+
+    /// The posture frames, in both directions.
+    #[tokio::test]
+    async fn lockdown_messages_roundtrip() {
+        assert_eq!(
+            roundtrip(&ClientMsg::LockdownGet).await,
+            ClientMsg::LockdownGet
+        );
+        let set = ClientMsg::LockdownSet {
+            tags: vec!["core".into()],
+            on: true,
+            force: false,
+        };
+        assert_eq!(roundtrip(&set).await, set);
+
+        let on = DaemonMsg::LockdownState(Some(Lockdown {
+            tags: vec!["core".into()],
+            since_ms: 1_720_000_000_123,
+            rules_suppressed: 4,
+        }));
+        assert_eq!(roundtrip(&on).await, on);
+        let off = DaemonMsg::LockdownState(None);
+        assert_eq!(roundtrip(&off).await, off);
     }
 
     #[test]

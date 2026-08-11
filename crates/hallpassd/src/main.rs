@@ -23,6 +23,7 @@ mod events;
 mod firstseen;
 mod iface;
 mod ipc;
+mod lockdown;
 mod nfqueue;
 mod nft;
 mod packet;
@@ -179,6 +180,12 @@ async fn main() {
     // Shared by the verdict thread (reader) and the IPC tasks (writers).
     // Empty until someone runs `hallpass run`, which costs nothing to have.
     let sessions = Arc::new(session::SessionRegistry::default());
+    // Before the watcher and before anything installs: a posture that was
+    // in force when this host last shut down is in force again from the
+    // first packet, not from whenever a client happens to ask.
+    let lockdown = Arc::new(lockdown::Posture::load(&cfg.lockdown_state));
+    settings.set_locked_down(lockdown.is_on());
+    store.rebuild_for_posture(lockdown.tags().as_deref());
     if let Err(e) = rules::store::spawn_watcher(Arc::clone(&store)) {
         tracing::warn!("rules dir watcher unavailable: {e}");
     }
@@ -388,6 +395,7 @@ async fn main() {
 
     // IPC server.
     let ipc_deps = Arc::new(ipc::server::IpcDeps {
+        lockdown: Arc::clone(&lockdown),
         store,
         prompts,
         events,

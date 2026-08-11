@@ -86,6 +86,10 @@ pub async fn run(argv: &[String]) -> i32 {
         Cmd::Run { .. } => unreachable!("dispatched before connecting"),
         Cmd::Status => status(&mut client, out).await,
         Cmd::Sessions => run::sessions(&mut client, out).await,
+        Cmd::LockdownShow => lockdown_show(&mut client, out).await,
+        Cmd::LockdownSet { tags, on, force } => {
+            lockdown_set(&mut client, tags, on, force, out).await
+        }
         Cmd::ConfigShow => config_show(&mut client, out).await,
         Cmd::ConfigSet(opts) => config_set(&mut client, opts, out).await,
         Cmd::RulesList { stats, tag } => rules_list(&mut client, stats, tag, out).await,
@@ -132,10 +136,34 @@ async fn status(client: &mut Client, out: Output) -> Result<(), CliError> {
 }
 
 async fn config_show(client: &mut Client, out: Output) -> Result<(), CliError> {
-    match client.request(ClientMsg::ConfigGet).await? {
-        DaemonMsg::Config(cfg) => print_config(&cfg, out),
-        other => Err(CliError::unexpected(&other)),
+    let cfg = match client.request(ClientMsg::ConfigGet).await? {
+        DaemonMsg::Config(cfg) => cfg,
+        other => return Err(CliError::unexpected(&other)),
+    };
+    // Always asked for, in both output modes. `ConfigGet` reports what the
+    // operator set, not what a lockdown posture is forcing, so that a
+    // client's read-modify-write cannot persist the posture's values as the
+    // operator's own - which makes this the only thing that says the two
+    // fields it owns are not the ones in force. A script reading
+    // `enforce: false` on a locked-down host would otherwise record it as
+    // not filtering.
+    let lockdown = match client.request(ClientMsg::LockdownGet).await? {
+        DaemonMsg::LockdownState(state) => state,
+        other => return Err(CliError::unexpected(&other)),
+    };
+    print_config(&cfg, &lockdown, out)?;
+    if let (false, Some(l)) = (out.json, &lockdown) {
+        println!(
+            "note: lockdown is on (pinned {}), so the mode is enforce and \
+             the default verdict is deny until it is lifted",
+            if l.tags.is_empty() {
+                "nothing".to_string()
+            } else {
+                l.tags.join(",")
+            }
+        );
     }
+    Ok(())
 }
 
 /// Change the runtime settings, carrying the unnamed ones forward.
@@ -163,15 +191,24 @@ async fn config_set(
         DaemonMsg::Ok => {}
         other => return Err(CliError::unexpected(&other)),
     }
-    match client.request(ClientMsg::ConfigGet).await? {
-        DaemonMsg::Config(cfg) => print_config(&cfg, out),
-        other => Err(CliError::unexpected(&other)),
-    }
+    let refetched = match client.request(ClientMsg::ConfigGet).await? {
+        DaemonMsg::Config(cfg) => cfg,
+        other => return Err(CliError::unexpected(&other)),
+    };
+    let lockdown = match client.request(ClientMsg::LockdownGet).await? {
+        DaemonMsg::LockdownState(state) => state,
+        other => return Err(CliError::unexpected(&other)),
+    };
+    print_config(&refetched, &lockdown, out)
 }
 
-fn print_config(cfg: &RuntimeConfig, out: Output) -> Result<(), CliError> {
+fn print_config(
+    cfg: &RuntimeConfig,
+    lockdown: &Option<hallpass_types::Lockdown>,
+    out: Output,
+) -> Result<(), CliError> {
     if out.json {
-        println!("{}", json::config(cfg)?);
+        println!("{}", json::config(cfg, lockdown)?);
     } else {
         print!("{}", fmt::format_config(cfg, out.palette));
     }
@@ -219,11 +256,144 @@ async fn rules_list(
     } else {
         None
     };
-    match (&hits, out.json) {
-        (Some(hits), true) => println!("{}", json::rules_with_hits(&rules, hits)?),
-        (Some(hits), false) => print!("{}", fmt::format_rules_with_hits(&rules, hits)),
-        (None, true) => println!("{}", json::rules(&rules)?),
-        (None, false) => print!("{}", fmt::format_rules(&rules)),
+    // A posture changes what this table means: an enabled allow it
+    // suppresses decides nothing, and the column an operator reads to answer
+    // "what is in force" would otherwise say `yes` for every one of them.
+    // Asked for only on the human path; the JSON carries the tags on each
+    // rule, so a consumer can apply the same predicate itself.
+    let lockdown = match out.json {
+        true => None,
+        false => match client.request(ClientMsg::LockdownGet).await? {
+            DaemonMsg::LockdownState(state) => state,
+            other => return Err(CliError::unexpected(&other)),
+        },
+    };
+    match (&hits, out.json, &lockdown) {
+        (Some(hits), true, _) => println!("{}", json::rules_with_hits(&rules, hits)?),
+        (Some(hits), false, Some(l)) => print!(
+            "{}",
+            fmt::format_rules_with_hits_under_lockdown(&rules, hits, &l.tags)
+        ),
+        (Some(hits), false, None) => print!("{}", fmt::format_rules_with_hits(&rules, hits)),
+        (None, true, _) => println!("{}", json::rules(&rules)?),
+        (None, false, Some(l)) => {
+            print!("{}", fmt::format_rules_under_lockdown(&rules, &l.tags))
+        }
+        (None, false, None) => print!("{}", fmt::format_rules(&rules)),
+    }
+    Ok(())
+}
+
+/// Report the lockdown posture.
+async fn lockdown_show(client: &mut Client, out: Output) -> Result<(), CliError> {
+    let state = match client.request(ClientMsg::LockdownGet).await? {
+        DaemonMsg::LockdownState(state) => state,
+        other => return Err(CliError::unexpected(&other)),
+    };
+    print_lockdown(client, &state, out).await
+}
+
+/// Enter or leave the lockdown posture.
+///
+/// Entering prints what the posture keeps, because "which rules still decide
+/// connections" is the question an operator has immediately after running
+/// this and the only way to answer it otherwise is to reason about tags by
+/// hand across the whole ruleset.
+async fn lockdown_set(
+    client: &mut Client,
+    tags: Vec<String>,
+    on: bool,
+    force: bool,
+    out: Output,
+) -> Result<(), CliError> {
+    let state = match client
+        .request(ClientMsg::LockdownSet { tags, on, force })
+        .await?
+    {
+        DaemonMsg::LockdownState(state) => state,
+        other => return Err(CliError::unexpected(&other)),
+    };
+    print_lockdown(client, &state, out).await
+}
+
+/// Render a posture, and under it the rules that still decide connections.
+async fn print_lockdown(
+    client: &mut Client,
+    state: &Option<hallpass_types::Lockdown>,
+    out: Output,
+) -> Result<(), CliError> {
+    if out.json {
+        println!("{}", json::to_json(state)?);
+        return Ok(());
+    }
+    let Some(state) = state else {
+        println!("lockdown is off");
+        return Ok(());
+    };
+    println!(
+        "lockdown is ON since {} (pinned {}, {} rule(s) suppressed)",
+        hallpass_types::format_ts(state.since_ms),
+        if state.tags.is_empty() {
+            "nothing".to_string()
+        } else {
+            state.tags.join(",")
+        },
+        state.rules_suppressed
+    );
+    // The kept set is computed from the rule list with the daemon's own
+    // predicate, so this cannot describe a set other than the one enforcing.
+    let rules = match client.request(ClientMsg::RuleList).await? {
+        DaemonMsg::Rules(rules) => rules,
+        other => return Err(CliError::unexpected(&other)),
+    };
+    let kept: Vec<&hallpass_types::Rule> = rules
+        .iter()
+        .filter(|r| r.enabled && r.active_under_lockdown(&state.tags))
+        .collect();
+    // Split by action rather than listed together: every deny survives every
+    // posture, so a combined list reads as though the host can still reach
+    // things when the only survivors are blocks.
+    let permitting: Vec<&&hallpass_types::Rule> = kept
+        .iter()
+        .filter(|r| r.action == hallpass_types::Action::Allow)
+        .collect();
+    match permitting.is_empty() {
+        true => println!("nothing still permits connections: only loopback is reachable"),
+        false => {
+            println!("still permitting:");
+            for rule in &permitting {
+                println!("  {}", sanitize_for_display(&rule.name));
+            }
+        }
+    }
+    let blocking = kept.len() - permitting.len();
+    if blocking > 0 {
+        println!("{blocking} deny rule(s) still apply: a posture never suppresses one");
+    }
+    // Said whenever the posture cannot resolve names, because a pinned rule
+    // written against a domain silently stops matching when it cannot: the
+    // daemon annotates a connection with a domain only when it saw the
+    // lookup, and under lockdown the lookup itself is what gets denied.
+    // Allows only. A deny rule on port 53 survives the posture like every
+    // other deny, and counting it as "something covers DNS" would silence
+    // this warning on exactly the hosts that block plaintext DNS.
+    let resolves = kept.iter().filter(|r| r.action == hallpass_types::Action::Allow).any(|r| {
+        r.matcher.port == Some(53)
+            || r.matcher.port_range.is_some_and(|(lo, hi)| lo <= 53 && 53 <= hi)
+    });
+    if !resolves {
+        let pinned_domains = rules
+            .iter()
+            .any(|r| r.enabled && r.active_under_lockdown(&state.tags) && r.matcher.domain.is_some());
+        println!(
+            "warning: nothing pinned covers DNS, so this host cannot resolve names{}",
+            if pinned_domains {
+                " - and the rules pinned by domain will stop matching, since a \
+                 connection only carries a domain when the daemon saw its lookup"
+            } else {
+                ""
+            }
+        );
     }
     Ok(())
 }

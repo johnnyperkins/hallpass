@@ -38,10 +38,32 @@ pub fn stats(s: &Stats) -> Result<String, CliError> {
     to_json(s)
 }
 
-/// The runtime settings as one JSON object. Plain numbers, an enum, and a
-/// bool, so nothing to sanitize.
-pub fn config(c: &RuntimeConfig) -> Result<String, CliError> {
-    to_json(c)
+/// The runtime settings as one JSON object, carrying the lockdown posture
+/// alongside them.
+///
+/// The posture is in the same document rather than a second command,
+/// because the settings reply reports what the operator *set* and the
+/// posture is what overrides two of those values right now. A consumer that
+/// read `enforce: false` here on a locked-down host and concluded the host
+/// was not filtering would be wrong in the direction that matters, and
+/// nothing in a settings-only document could have told it otherwise.
+#[derive(Debug, Serialize)]
+struct ConfigWithLockdown<'a> {
+    #[serde(flatten)]
+    config: &'a RuntimeConfig,
+    /// Null when no posture is in force. While one is, the mode is enforce
+    /// and the default verdict is deny whatever the fields above say.
+    lockdown: &'a Option<hallpass_types::Lockdown>,
+}
+
+pub fn config(
+    c: &RuntimeConfig,
+    lockdown: &Option<hallpass_types::Lockdown>,
+) -> Result<String, CliError> {
+    to_json(&ConfigWithLockdown {
+        config: c,
+        lockdown,
+    })
 }
 
 /// The live session grants as a JSON array. The label came from a client,

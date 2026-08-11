@@ -97,7 +97,13 @@ use serde::{Deserialize, Serialize};
 /// [`DaemonMsg::RulesToggled`], so a set of rules can be enabled or disabled
 /// as one operation instead of one round trip per name. The struct field
 /// forces the bump, as in v2.
-pub const PROTOCOL_VERSION: u32 = 14;
+///
+/// v15: the lockdown posture. [`Stats::lockdown`], [`TraceOutcome::Suppressed`]
+/// and the [`ClientMsg::LockdownGet`] / [`ClientMsg::LockdownSet`] pair with
+/// [`DaemonMsg::LockdownState`]. The struct field forces the bump, as in v2,
+/// and the new trace outcome would otherwise be a variant older clients
+/// cannot decode in a reply they already ask for.
+pub const PROTOCOL_VERSION: u32 = 15;
 
 /// Prefix reserved for the synthetic rule name a session grant reports.
 ///
@@ -108,6 +114,26 @@ pub const PROTOCOL_VERSION: u32 = 14;
 /// rule is added, and the CLI's policy generator drops events carrying it
 /// rather than folding one-off grants into permanent allow rules.
 pub const RUN_SESSION_RULE_PREFIX: &str = "run-session:";
+
+/// Prefix reserved for the synthetic rule names a lockdown posture reports.
+///
+/// Same reservation as [`RUN_SESSION_RULE_PREFIX`] and for the same reason:
+/// a posture is not a rule, but it names itself in the field every client
+/// renders, and a rule able to call itself `lockdown:denied` would be
+/// indistinguishable from the posture in every event, listing and export.
+pub const LOCKDOWN_RULE_PREFIX: &str = "lockdown:";
+
+/// Rule name reported for a connection the posture refused.
+pub const LOCKDOWN_DENIED_RULE: &str = "lockdown:denied";
+
+/// Rule name reported for the loopback traffic a posture deliberately does
+/// not refuse. See [`Rule::active_under_lockdown`] for the other half.
+pub const LOCKDOWN_LOOPBACK_RULE: &str = "lockdown:loopback";
+
+/// Every prefix a rule may not be named after, because the daemon reports
+/// decisions of its own under them.
+pub const RESERVED_RULE_PREFIXES: [&str; 2] =
+    [RUN_SESSION_RULE_PREFIX, LOCKDOWN_RULE_PREFIX];
 
 /// One live session grant, for [`ClientMsg::RunSessionList`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -535,6 +561,35 @@ impl Rule {
     pub fn has_tag(&self, tag: &str) -> bool {
         self.tags.iter().any(|t| t == tag)
     }
+
+    /// Whether this rule still decides connections while a lockdown posture
+    /// pinned to `tags` is active.
+    ///
+    /// **Only allow rules are ever suppressed.** A posture exists to permit
+    /// less, and suppressing a deny would permit more: an operator's block
+    /// on a tracker or an exfiltration port would come off exactly when the
+    /// host was put into its most restrictive state. Untagged denies
+    /// therefore keep matching, which also keeps a deny that covers loopback
+    /// working under the loopback exemption.
+    ///
+    /// One definition, because the daemon compiles the suppression into its
+    /// ruleset and a client has to tell an operator which rules a lockdown
+    /// would keep. Written twice, `lockdown on` would preview a set that is
+    /// not the one that ends up enforcing.
+    pub fn active_under_lockdown(&self, tags: &[String]) -> bool {
+        self.action != Action::Allow || tags.iter().any(|t| self.has_tag(t))
+    }
+}
+
+/// A lockdown posture as reported to clients.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Lockdown {
+    /// Tags whose allow rules keep deciding connections.
+    pub tags: Vec<String>,
+    /// When the posture was entered, Unix milliseconds.
+    pub since_ms: u64,
+    /// How many loaded allow rules it is currently suppressing.
+    pub rules_suppressed: u32,
 }
 
 /// Final decision for a connection.
@@ -1282,7 +1337,7 @@ impl ConnEvent {
 }
 
 /// Daemon runtime statistics.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Stats {
     /// Total connections seen since start.
     pub connections_total: u64,
@@ -1325,6 +1380,12 @@ pub struct Stats {
     /// nothing is blocked. A status display that omits this shows a healthy
     /// firewall that is not filtering.
     pub enforcing: bool,
+    /// The lockdown posture in force, None when there is none.
+    ///
+    /// In `Stats` rather than only in a reply of its own because a status
+    /// display that omits it shows a host denying almost everything with
+    /// nothing saying why - the same reason `enforcing` is here.
+    pub lockdown: Option<Lockdown>,
     /// Whether a client currently holds the prompt-handler slot.
     ///
     /// False means every connection no rule matches is resolved with the
@@ -1483,6 +1544,9 @@ pub enum TraceOutcome {
     Matched,
     /// Skipped without evaluating: the rule is disabled.
     Disabled,
+    /// Skipped without evaluating: an allow rule carrying none of the
+    /// lockdown posture's pinned tags.
+    Suppressed,
     /// Evaluated and did not match; `field` names the first operand that
     /// failed, which is the one to edit.
     NoMatch {
@@ -1654,6 +1718,26 @@ pub enum ClientMsg {
         /// New enabled state for all of them.
         enabled: bool,
     },
+    /// Request the lockdown posture. Answered with
+    /// [`DaemonMsg::LockdownState`].
+    LockdownGet,
+    /// Enter or leave the lockdown posture. Answered with
+    /// [`DaemonMsg::LockdownState`] carrying the state now in force, or Err.
+    ///
+    /// While it is on, only rules [`Rule::active_under_lockdown`] accepts
+    /// decide connections, everything else is denied without a prompt, and
+    /// the daemon enforces regardless of the mode it was in.
+    LockdownSet {
+        /// Tags whose allow rules keep deciding. Ignored when `on` is false.
+        tags: Vec<String>,
+        /// True to enter the posture, false to leave it.
+        on: bool,
+        /// Proceed even when no rule at all survives the posture, which
+        /// leaves the host reaching nothing but loopback. Without it the
+        /// daemon refuses, because that is far more often a mistyped tag
+        /// than an intent.
+        force: bool,
+    },
 }
 
 /// Messages sent from the daemon to a client.
@@ -1741,4 +1825,8 @@ pub enum DaemonMsg {
         /// this is a list the operator has to go and look at.
         failed: Vec<String>,
     },
+    /// Response to [`ClientMsg::LockdownGet`] and
+    /// [`ClientMsg::LockdownSet`]: the posture now in force, None when there
+    /// is none.
+    LockdownState(Option<Lockdown>),
 }

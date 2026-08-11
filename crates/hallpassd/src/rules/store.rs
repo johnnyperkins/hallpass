@@ -65,6 +65,14 @@ pub struct RuleStore {
     /// bulk toggle's fsyncs are far wider than the watcher's debounce, so
     /// this is reachable rather than theoretical.
     mutations: AtomicU64,
+    /// The lockdown posture's pinned tags, if one is in force.
+    ///
+    /// Held here because this is what compiles the rule set, and the packet
+    /// path must read the posture and the rules from one snapshot. The
+    /// authority on the posture is `lockdown::Posture`, which persists it
+    /// and calls [`RuleStore::rebuild_for_posture`]; nothing else writes
+    /// this.
+    lockdown_tags: Mutex<Option<Vec<String>>>,
 }
 
 /// Hit accounting for one rule name.
@@ -527,6 +535,7 @@ impl RuleStore {
             hits: RwLock::new(HashMap::new()),
             changed: tokio::sync::watch::channel(()).0,
             mutations: AtomicU64::new(0),
+            lockdown_tags: Mutex::new(None),
         };
         store.rebuild();
         store
@@ -872,10 +881,33 @@ impl RuleStore {
         true
     }
 
-    fn rebuild(&self) {
+    /// Whether the lockdown posture currently stops `rule` from deciding.
+    ///
+    /// For the paths that hold a `Rule` rather than a compiled one - the
+    /// prompt sweep in particular, which resolves live prompts with a rule a
+    /// client just added and must not resolve one the packet path would skip.
+    pub fn suppresses(&self, rule: &Rule) -> bool {
+        match self.lockdown_tags.lock().unwrap().as_deref() {
+            Some(tags) => !rule.active_under_lockdown(tags),
+            None => false,
+        }
+    }
+
+    /// Recompile under a new lockdown posture. `None` lifts it.
+    ///
+    /// Only `lockdown::apply` calls this: the posture on disk, the compiled
+    /// set and the runtime settings have to move together.
+    pub fn rebuild_for_posture(&self, tags: Option<&[String]>) {
+        *self.lockdown_tags.lock().unwrap() = tags.map(|t| t.to_vec());
+        self.rebuild();
+    }
+
+    pub(crate) fn rebuild(&self) {
         let rules: Vec<Rule> = self.list();
         self.prune_hits(&rules);
-        self.active.store(Arc::new(RuleSet::compile(&rules)));
+        let posture = self.lockdown_tags.lock().unwrap().clone();
+        self.active
+            .store(Arc::new(RuleSet::compile_with_lockdown(&rules, posture.as_deref())));
         // After the swap, so a woken subscriber always sees the new set.
         // send_replace, not send: this must not depend on a receiver being
         // subscribed yet, and the startup rebuild has none.

@@ -54,6 +54,15 @@ pub struct CompiledRule {
     pub action: Action,
     pub priority: u32,
     pub enabled: bool,
+    /// Set at compile time when a lockdown posture is in force and this is
+    /// an allow rule carrying none of its pinned tags.
+    ///
+    /// Separate from `enabled` rather than folded into it, even though the
+    /// packet path treats them the same: `enabled` is what the operator
+    /// wrote and what a listing shows, and collapsing the two would have a
+    /// posture silently rewrite policy that outlives it. `explain` reports
+    /// the difference for the same reason.
+    pub suppressed: bool,
     exe: Option<PathBuf>,
     exe_glob: Option<GlobMatcher>,
     /// Lowercase hex; validated at compile time.
@@ -85,7 +94,7 @@ fn parse_net(field: &str, raw: &str) -> Result<IpNet, String> {
 impl CompiledRule {
     /// Compile a rule, validating cidr/glob/range fields.
     ///
-    /// Also where the session-grant name prefix is reserved, rather than in
+    /// Also where the daemon's own rule-name prefixes are reserved, rather than in
     /// `RuleStore::add`: `add` is only the IPC and prompt path, and a rule
     /// file on disk reaches the ruleset through `load_dir`, which compiles
     /// but never calls `add`. A rule named after a live grant is exactly the
@@ -93,10 +102,13 @@ impl CompiledRule {
     /// indistinguishable from one in every event, listing and export - so
     /// the check belongs on the one path both entrances share.
     pub fn compile(rule: &Rule) -> Result<CompiledRule, String> {
-        if rule.name.starts_with(hallpass_types::RUN_SESSION_RULE_PREFIX) {
+        if let Some(prefix) = hallpass_types::RESERVED_RULE_PREFIXES
+            .iter()
+            .find(|p| rule.name.starts_with(**p))
+        {
             return Err(format!(
-                "rule names starting with `{}` are reserved for session grants",
-                hallpass_types::RUN_SESSION_RULE_PREFIX
+                "rule names starting with `{prefix}` are reserved for decisions \
+                 the daemon makes itself"
             ));
         }
         // Deliberately not where tags are validated, unlike every other
@@ -195,6 +207,10 @@ impl CompiledRule {
             action: rule.action,
             priority: rule.priority,
             enabled: rule.enabled,
+            // Never here: a posture is not a property of the rule, and this
+            // function is called from paths that have no posture to consult.
+            // `RuleSet::compile_with_lockdown` sets it.
+            suppressed: false,
             exe: m.exe.clone(),
             exe_glob,
             exe_sha256,
@@ -214,6 +230,16 @@ impl CompiledRule {
             iface: m.iface.clone(),
             app_id: m.app_id.clone(),
         })
+    }
+
+    /// Whether this rule decides connections right now: the operator has it
+    /// enabled and no lockdown posture is holding it back.
+    ///
+    /// One predicate for the packet path and the explainer, so a rule that
+    /// enforcement skipped cannot be reported as evaluated.
+    #[inline]
+    pub fn deciding(&self) -> bool {
+        self.enabled && !self.suppressed
     }
 
     /// True when this rule matches on the executable hash. The packet path

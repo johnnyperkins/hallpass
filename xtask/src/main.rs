@@ -290,7 +290,8 @@ fn dev_config(dir: &Path) -> String {
          # other setting is the daemon's built-in default.\n\
          socket_path = \"{dir}/hallpass.sock\"\n\
          rules_dir = \"{dir}/rules.d\"\n\
-         first_seen_state = \"{dir}/seen.toml\"\n"
+         first_seen_state = \"{dir}/seen.toml\"\n\
+         lockdown_state = \"{dir}/posture.toml\"\n"
     )
 }
 
@@ -508,7 +509,10 @@ mod tests {
             .filter(|l| !l.trim_start().starts_with('#') && !l.trim().is_empty())
             .map(|l| l.split('=').next().unwrap_or("").trim())
             .collect();
-        assert_eq!(keys, vec!["socket_path", "rules_dir", "first_seen_state"]);
+        assert_eq!(
+            keys,
+            vec!["socket_path", "rules_dir", "first_seen_state", "lockdown_state"]
+        );
     }
 
     /// Nothing under /etc: a dev run must not be able to write, or point the

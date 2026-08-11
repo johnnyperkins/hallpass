@@ -63,6 +63,7 @@ async fn handshake_and_stats_roundtrip() {
         denied: 1,
         prompted: 1,
         rules_loaded: 5,
+        lockdown: None,
         uptime_secs: 61,
         dns_spoof_rejected: 0,
         rules_skipped: 0,
@@ -88,6 +89,7 @@ async fn handshake_and_stats_roundtrip() {
         flow_bytes: 0,
         flow_packets: 0,
     };
+    let expected = stats.clone();
     let daemon = tokio::spawn(mock_daemon(listener, move |mut stream| async move {
         let req: ClientMsg = wire::read_msg(&mut stream).await.expect("read req");
         assert_eq!(req, ClientMsg::Stats);
@@ -98,7 +100,7 @@ async fn handshake_and_stats_roundtrip() {
 
     let mut client = Client::connect(&path).await.expect("connect + handshake");
     match client.request(ClientMsg::Stats).await.expect("request") {
-        DaemonMsg::Stats(got) => assert_eq!(got, stats),
+        DaemonMsg::Stats(got) => assert_eq!(got, expected),
         other => panic!("unexpected reply: {other:?}"),
     }
 
@@ -121,6 +123,14 @@ async fn config_show_roundtrip() {
             enforce: true,
         });
         wire::write_msg(&mut stream, &reply).await.expect("write config");
+        // `config` asks about the posture too: the settings reply carries
+        // what the operator set, so a locked-down host needs the extra line
+        // to explain why it is not what is in force.
+        let req: ClientMsg = wire::read_msg(&mut stream).await.expect("read posture req");
+        assert_eq!(req, ClientMsg::LockdownGet);
+        wire::write_msg(&mut stream, &DaemonMsg::LockdownState(None))
+            .await
+            .expect("write posture");
     }));
 
     let args = argv(&path, &["config"]);
@@ -170,6 +180,14 @@ async fn config_set_carries_unnamed_settings_forward() {
         wire::write_msg(&mut stream, &DaemonMsg::Config(new))
             .await
             .expect("write refetch");
+
+        // And the posture, which is what says whether the two settings it
+        // owns are the ones in force.
+        let req: ClientMsg = wire::read_msg(&mut stream).await.expect("read posture req");
+        assert_eq!(req, ClientMsg::LockdownGet);
+        wire::write_msg(&mut stream, &DaemonMsg::LockdownState(None))
+            .await
+            .expect("write posture");
     }));
 
     let args = argv(&path, &["config", "set", "--timeout", "60"]);
@@ -378,6 +396,7 @@ fn healthy_stats() -> Stats {
         denied: 0,
         prompted: 0,
         rules_loaded: 3,
+        lockdown: None,
         uptime_secs: 5,
         dns_spoof_rejected: 0,
         rules_skipped: 0,

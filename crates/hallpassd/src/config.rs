@@ -16,6 +16,10 @@ pub const DEFAULT_CONFIG_PATH: &str = "/etc/hallpass/config.toml";
 /// directory and makes it writable under `ProtectSystem=strict`.
 pub const DEFAULT_STATE_PATH: &str = "/var/lib/hallpass/seen.toml";
 
+/// Default location of the lockdown posture file, beside the first-seen
+/// state and for the same reasons.
+pub const DEFAULT_LOCKDOWN_PATH: &str = "/var/lib/hallpass/posture.toml";
+
 /// Read the config only if it is as trustworthy as a rule file.
 ///
 /// Rule files and match-list files are refused unless owned by root (or the
@@ -140,6 +144,10 @@ pub struct Config {
     /// minute, and never read by anything but the daemon; deleting it makes
     /// every application read as new once more.
     pub first_seen_state: PathBuf,
+    /// Where the lockdown posture is kept. Written by the daemon when a
+    /// client enters or leaves the posture, and read once at startup so a
+    /// locked-down host comes back locked down.
+    pub lockdown_state: PathBuf,
 }
 
 impl Default for Config {
@@ -159,6 +167,7 @@ impl Default for Config {
             flow_accounting: false,
             first_seen: true,
             first_seen_state: PathBuf::from(DEFAULT_STATE_PATH),
+            lockdown_state: PathBuf::from(DEFAULT_LOCKDOWN_PATH),
         }
     }
 }
@@ -201,6 +210,14 @@ pub struct RuntimeSettings {
     /// enforcement stops. See the struct comment on why this channel does
     /// not breach the atomics-only design.
     now_enforcing: tokio::sync::watch::Sender<()>,
+    /// True while a lockdown posture is in force.
+    ///
+    /// Read by [`RuntimeSettings::default_verdict`] and
+    /// [`RuntimeSettings::enforcing`] rather than overwriting either, so
+    /// lifting the posture restores exactly what the operator had set. A
+    /// posture that assigned into them would have to remember the previous
+    /// values and would lose any change made while it was on.
+    locked_down: AtomicBool,
 }
 
 fn verdict_to_u8(v: Verdict) -> u8 {
@@ -228,6 +245,7 @@ impl RuntimeSettings {
             default_verdict: AtomicU8::new(verdict_to_u8(initial.default_verdict)),
             enforcing: AtomicBool::new(initial.enforce),
             now_enforcing: tokio::sync::watch::channel(()).0,
+            locked_down: AtomicBool::new(false),
         }
     }
 
@@ -243,21 +261,64 @@ impl RuntimeSettings {
     }
 
     /// Verdict for a connection nobody decided, read at decision time.
+    ///
+    /// Deny while a lockdown posture is on, whatever the configured default:
+    /// a posture whose unmatched connections resolved to `allow` would deny
+    /// nothing at all on the hosts that ship the default, which is most of
+    /// them. This covers the paths that do not go through the rule engine
+    /// too - a prompt that was already open when the posture began, and the
+    /// `unhandled_proto_verdict` fallback.
     pub fn default_verdict(&self) -> Verdict {
+        if self.locked_down.load(Ordering::Relaxed) {
+            return Verdict::Deny;
+        }
         verdict_from_u8(self.default_verdict.load(Ordering::Relaxed))
     }
 
     /// Whether verdicts are applied to packets. False in observe mode.
+    ///
+    /// A lockdown posture enforces regardless: observe mode records what
+    /// policy would have done and blocks nothing, which is the exact
+    /// opposite of what someone reaching for a lockdown is asking for.
     pub fn enforcing(&self) -> bool {
-        self.enforcing.load(Ordering::Relaxed)
+        self.locked_down.load(Ordering::Relaxed) || self.enforcing.load(Ordering::Relaxed)
     }
 
-    /// The settings, for [`hallpass_types::ClientMsg::ConfigGet`].
+    /// Whether a lockdown posture is in force. Set only by
+    /// [`crate::lockdown::apply`].
+    /// Deliberately does not wake the flow-kill sweeper, unlike an
+    /// observe-to-enforce flip. That sweeper kills flows an explicit *deny
+    /// rule* matches, and a posture denies by suppressing allows rather than
+    /// by adding a deny, so waking it would find nothing to kill and the
+    /// wake would read as a promise the code does not keep. Flows already
+    /// established when a posture engages keep running; the README says so,
+    /// and integrating the two is a recorded follow-up.
+    pub fn set_locked_down(&self, on: bool) {
+        self.locked_down.store(on, Ordering::Relaxed);
+    }
+
+    /// Whether the mode and default verdict are currently the posture's
+    /// rather than the operator's.
+    pub fn locked_down(&self) -> bool {
+        self.locked_down.load(Ordering::Relaxed)
+    }
+
+    /// The settings as the operator set them, for
+    /// [`hallpass_types::ClientMsg::ConfigGet`].
+    ///
+    /// **The stored values, not the ones a lockdown posture is forcing.**
+    /// Every client changes settings by reading this, editing one field and
+    /// writing the whole struct back, so reporting the posture's `deny` and
+    /// `enforce` here would have `config set --timeout 45` quietly persist
+    /// them as the operator's own - and lifting the posture would then leave
+    /// the host denying by default forever, with nothing that ever said so.
+    /// What is actually in force is reported by `Stats::lockdown` and said
+    /// by every client that shows it.
     pub fn snapshot(&self) -> RuntimeConfig {
         RuntimeConfig {
             prompt_timeout_secs: self.prompt_timeout_secs(),
-            default_verdict: self.default_verdict(),
-            enforce: self.enforcing(),
+            default_verdict: verdict_from_u8(self.default_verdict.load(Ordering::Relaxed)),
+            enforce: self.enforcing.load(Ordering::Relaxed),
         }
     }
 
@@ -266,6 +327,20 @@ impl RuntimeSettings {
     /// changed by a rejected set.
     pub fn apply(&self, new: &RuntimeConfig) -> Result<(), String> {
         validate_prompt_timeout(new.prompt_timeout_secs)?;
+        // Refused rather than accepted-and-ignored: while a posture is on it
+        // owns both of these, so a client that set them would be told the
+        // change succeeded and then watch `config` report something else.
+        // The timeout is still settable, since the posture does not use it.
+        if self.locked_down() {
+            let current = self.snapshot();
+            if new.default_verdict != current.default_verdict || new.enforce != current.enforce {
+                return Err(
+                    "the host is in lockdown, which sets the mode and the default \
+                     verdict; lift it first with `hallpass-cli lockdown off`"
+                        .to_string(),
+                );
+            }
+        }
         self.prompt_timeout_secs
             .store(new.prompt_timeout_secs, Ordering::Relaxed);
         self.default_verdict

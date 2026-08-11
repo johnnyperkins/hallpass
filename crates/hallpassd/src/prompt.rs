@@ -427,6 +427,29 @@ impl PromptTable {
     ) -> Result<(), String> {
         let pending = self.take_as_handler(tx, id)?;
 
+        // A posture engaged after this prompt was raised. `decide` stops
+        // raising new ones, but the ones already on screen outlive it by up
+        // to `prompt_timeout_secs`, and answering one Allow would put a
+        // connection through the posture from the keyboard - the exact thing
+        // suppressing prompts exists to prevent. The rule such an answer
+        // would write carries no pinned tag, so it would be suppressed the
+        // moment it was created; nothing is written, and the operator is
+        // told through the journal why their answer did not take.
+        if self.settings.locked_down() && verdict == Verdict::Allow {
+            tracing::warn!(
+                id,
+                "an allow answered while the host is in lockdown; the posture \
+                 decides and the connection is denied"
+            );
+            self.finish(
+                pending.conn,
+                pending.packets,
+                Verdict::Deny,
+                Some(hallpass_types::LOCKDOWN_DENIED_RULE.to_string()),
+            );
+            return Ok(());
+        }
+
         let mut rule_name = None;
         let mut added_rule = None;
         if duration != RuleDuration::Once {
@@ -473,6 +496,18 @@ impl PromptTable {
         // `enabled = false`, and sweeping with it resolved live prompts with
         // a verdict no packet would ever have been given.
         if !rule.enabled {
+            return;
+        }
+        // Same argument for a rule a lockdown posture suppresses. Rule adds
+        // are not refused while a posture is on, so an untagged allow can
+        // arrive at any moment; sweeping with it would resolve live prompts
+        // with Allow and release their held packets, while the packet path
+        // denies the identical connection as `lockdown:denied`.
+        if self.store.suppresses(rule) {
+            tracing::info!(
+                rule = %rule.name,
+                "not sweeping prompts with a rule the lockdown posture suppresses"
+            );
             return;
         }
         let compiled = match crate::rules::model::CompiledRule::compile(rule) {
@@ -795,7 +830,7 @@ mod tests {
         /// handler state in it.
         fn snapshot(&self) -> hallpass_types::Stats {
             self.stats
-                .snapshot(0, 0, self.table.has_handler(), true, Default::default())
+                .snapshot(0, 0, self.table.has_handler(), true, None, Default::default())
         }
     }
 
@@ -894,6 +929,75 @@ mod tests {
         // And the slot is really free, for the evicted client or any other.
         let (other, _other_rx) = mpsc::channel(16);
         assert!(h.table.set_handler(other));
+    }
+
+    /// **A prompt already on screen cannot be answered through a posture.**
+    /// `decide` stops raising new ones the moment a lockdown engages, but
+    /// the ones already open outlive it by up to the prompt timeout, and an
+    /// Allow answered on one of those would put a connection through the
+    /// posture from the keyboard.
+    #[tokio::test]
+    async fn an_allow_answered_under_lockdown_is_denied() {
+        let mut h = harness("lockdown-reply", 8, Verdict::Allow);
+        let (tx, mut prompt_rx) = mpsc::channel(64);
+        assert!(h.table.set_handler(tx.clone()));
+        h.table.handle_new(conn("/bin/curl", "1.1.1.1:443"), 1, None);
+        let DaemonMsg::PromptRequest { id, .. } = prompt_rx.recv().await.unwrap() else {
+            panic!("expected PromptRequest");
+        };
+
+        h.settings.set_locked_down(true);
+        h.table
+            .reply(&tx, id, Verdict::Allow, RuleDuration::Forever, PromptScope::ThisPort)
+            .expect("the reply is accepted, the answer is not");
+        assert_eq!(h.verdict_rx.recv().await, Some((1, Verdict::Deny)));
+        // And no rule is written: it would carry no pinned tag, so it would
+        // be suppressed the instant it existed, leaving an allow rule in the
+        // listing that permits nothing.
+        assert!(h.store.list().is_empty(), "an answer wrote policy through the posture");
+    }
+
+    /// A rule the posture suppresses must not sweep live prompts either.
+    /// Rule adds are not refused under a posture, so an untagged allow can
+    /// arrive at any moment; sweeping with it would resolve prompts with
+    /// Allow and release their held packets while the packet path denies the
+    /// identical connection.
+    #[tokio::test]
+    async fn a_suppressed_rule_does_not_sweep_prompts() {
+        let mut h = harness("lockdown-sweep", 8, Verdict::Deny);
+        let (tx, mut prompt_rx) = mpsc::channel(64);
+        assert!(h.table.set_handler(tx.clone()));
+        h.table.handle_new(conn("/bin/curl", "1.1.1.1:443"), 1, None);
+        let DaemonMsg::PromptRequest { .. } = prompt_rx.recv().await.unwrap() else {
+            panic!("expected PromptRequest");
+        };
+
+        h.settings.set_locked_down(true);
+        h.store.rebuild_for_posture(Some(&["core".to_string()]));
+        let untagged = Rule {
+            name: "allow-curl".into(),
+            action: hallpass_types::Action::Allow,
+            duration: RuleDuration::Session,
+            priority: 1,
+            enabled: true,
+            tags: Vec::new(),
+            matcher: hallpass_types::RuleMatch {
+                port: Some(443),
+                ..Default::default()
+            },
+        };
+        h.store.add(untagged.clone()).expect("adds are not refused under a posture");
+        h.table.resolve_covered_by(&untagged);
+        assert!(
+            h.verdict_rx.try_recv().is_err(),
+            "a suppressed rule resolved a live prompt with its own verdict"
+        );
+
+        // And once the posture lifts, the same rule sweeps as it always has.
+        h.settings.set_locked_down(false);
+        h.store.rebuild_for_posture(None);
+        h.table.resolve_covered_by(&untagged);
+        assert_eq!(h.verdict_rx.recv().await, Some((1, Verdict::Allow)));
     }
 
     /// The strikes count consecutive timeouts, so a handler that is deciding

@@ -171,6 +171,29 @@ pub fn format_stats(s: &Stats, pal: Palette) -> String {
         ),
         ("prompts unanswered", s.prompts_unanswered.to_string()),
         ("handlers evicted", s.prompt_handlers_evicted.to_string()),
+        (
+            "lockdown",
+            match &s.lockdown {
+                // Painted like observe mode and for the mirror-image reason:
+                // a table of counters looks the same whether this host is
+                // denying almost everything or filtering normally, and an
+                // operator reading one has to be told which.
+                Some(l) => pal.paint(
+                    Style::Warn,
+                    &format!(
+                        "ON since {} (pinned {}, {} rule(s) suppressed)",
+                        format_ts(l.since_ms),
+                        if l.tags.is_empty() {
+                            "nothing".to_string()
+                        } else {
+                            l.tags.join(",")
+                        },
+                        l.rules_suppressed
+                    ),
+                ),
+                None => "off".to_string(),
+            },
+        ),
         ("rules loaded", s.rules_loaded.to_string()),
         ("rules skipped", s.rules_skipped.to_string()),
         ("dns spoofed", s.dns_spoof_rejected.to_string()),
@@ -429,7 +452,17 @@ pub fn format_sessions(sessions: &[RunSessionInfo], pal: Palette) -> String {
 
 /// Format the rule list as an aligned table with a header row.
 pub fn format_rules(rules: &[Rule]) -> String {
-    format_rule_table(rules, None)
+    format_rule_table(rules, None, None)
+}
+
+/// The rule list, with the rules a lockdown posture pinned to `tags` is
+/// stopping marked as suppressed rather than enabled.
+///
+/// The ENABLED column is what an operator reads to answer "what is in
+/// force", and under a posture a plain `yes` on a rule that decides nothing
+/// is the wrong answer to that question.
+pub fn format_rules_under_lockdown(rules: &[Rule], tags: &[String]) -> String {
+    format_rule_table(rules, None, Some(tags))
 }
 
 /// Format the rule list with the `HITS` and `LAST HIT` columns from
@@ -439,10 +472,23 @@ pub fn format_rules(rules: &[Rule]) -> String {
 /// blank: the question this table answers is "which rules never match", and a
 /// gap where the answer should be is the one rendering that fails to answer it.
 pub fn format_rules_with_hits(rules: &[Rule], hits: &[RuleHit]) -> String {
-    format_rule_table(rules, Some(hits))
+    format_rule_table(rules, Some(hits), None)
 }
 
-fn format_rule_table(rules: &[Rule], hits: Option<&[RuleHit]>) -> String {
+/// [`format_rules_with_hits`] under a lockdown posture pinned to `tags`.
+pub fn format_rules_with_hits_under_lockdown(
+    rules: &[Rule],
+    hits: &[RuleHit],
+    tags: &[String],
+) -> String {
+    format_rule_table(rules, Some(hits), Some(tags))
+}
+
+fn format_rule_table(
+    rules: &[Rule],
+    hits: Option<&[RuleHit]>,
+    lockdown: Option<&[String]>,
+) -> String {
     if rules.is_empty() {
         return "no rules\n".to_string();
     }
@@ -457,7 +503,14 @@ fn format_rule_table(rules: &[Rule], hits: Option<&[RuleHit]>) -> String {
     // Only once some rule carries one: a column of empty cells costs width
     // on a table that already has seven of them, and tags are opt-in.
     let tagged = rules.iter().any(|r| !r.tags.is_empty());
-    let mut header: Vec<&str> = vec!["NAME", "ACTION", "DURATION", "PRIO", "ENABLED"];
+    // "ENABLED" would be a lie for a rule a posture is stopping, which is
+    // enabled and deciding nothing; "DECIDING" is the question this column
+    // is actually being read for.
+    let enabled_header = match lockdown {
+        Some(_) => "DECIDING",
+        None => "ENABLED",
+    };
+    let mut header: Vec<&str> = vec!["NAME", "ACTION", "DURATION", "PRIO", enabled_header];
     if tagged {
         header.push("TAGS");
     }
@@ -479,7 +532,13 @@ fn format_rule_table(rules: &[Rule], hits: Option<&[RuleHit]>) -> String {
                 r.action.as_str().to_string(),
                 r.duration.describe(),
                 r.priority.to_string(),
-                if r.enabled { "yes" } else { "no" }.to_string(),
+                match (r.enabled, lockdown) {
+                    (false, _) => "no".to_string(),
+                    (true, Some(tags)) if !r.active_under_lockdown(tags) => {
+                        "lockdown".to_string()
+                    }
+                    (true, _) => "yes".to_string(),
+                },
             ];
             if tagged {
                 // Sanitized like the neighbouring cells: `valid_tag` should
@@ -628,6 +687,9 @@ fn outcome_str(outcome: &TraceOutcome) -> String {
     match outcome {
         TraceOutcome::Matched => "matched".to_string(),
         TraceOutcome::Disabled => "disabled".to_string(),
+        // Not "disabled": the rule is exactly as the operator left it, and
+        // what stopped it is a posture they can lift.
+        TraceOutcome::Suppressed => "suppressed by lockdown".to_string(),
         TraceOutcome::NoMatch { field } => {
             format!("no match ({})", sanitize_for_display(field))
         }
@@ -898,6 +960,7 @@ mod tests {
             denied: 15,
             prompted: 5,
             rules_loaded: 3,
+            lockdown: None,
             uptime_secs: 3600,
             dns_spoof_rejected: 7,
             rules_skipped: 2,

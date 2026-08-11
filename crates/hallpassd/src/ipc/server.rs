@@ -34,6 +34,8 @@ pub struct IpcDeps {
     /// Live session grants. A client opens one over its own connection and
     /// it ends with that connection, whatever ends it.
     pub sessions: Arc<crate::session::SessionRegistry>,
+    /// The lockdown posture, and the file it is persisted in.
+    pub lockdown: Arc<crate::lockdown::Posture>,
 }
 
 /// Look up a group's GID in /etc/group.
@@ -244,15 +246,34 @@ fn explain(req: &hallpass_types::ExplainRequest, deps: &IpcDeps) -> hallpass_typ
     // exe_sha256 as the criterion that did not hold.
     let result = set.explain(&req.conn, req.exe_sha256.as_deref());
     let default_verdict = deps.prompts.default_verdict();
-    let (verdict, rule_name) = match result.matched {
-        Some((name, verdict)) => (verdict, Some(name)),
+    // The no-match arm has to answer the way `decide` does, or the tool an
+    // operator uses to predict policy contradicts the thing enforcing it.
+    // Under a posture that means no prompt at all, deny for anything leaving
+    // the host, and the loopback exemption spelled out - reporting
+    // `would_prompt` here would promise a dialog for a connection that is
+    // refused in silence, and reporting deny for loopback would describe a
+    // block the packet path does not apply.
+    let (verdict, rule_name, would_prompt) = match result.matched {
+        Some((name, verdict)) => (verdict, Some(name), false),
+        None if set.locked_down() => match crate::nfqueue::stays_on_host(&req.conn) {
+            true => (
+                hallpass_types::Verdict::Allow,
+                Some(hallpass_types::LOCKDOWN_LOOPBACK_RULE.to_string()),
+                false,
+            ),
+            false => (
+                hallpass_types::Verdict::Deny,
+                Some(hallpass_types::LOCKDOWN_DENIED_RULE.to_string()),
+                false,
+            ),
+        },
         // No rule matched, so the connection would raise a prompt and the
         // configured default is what applies if nobody answers in time.
-        None => (default_verdict, None),
+        None => (default_verdict, None, true),
     };
     hallpass_types::Explanation {
         verdict,
-        would_prompt: rule_name.is_none(),
+        would_prompt,
         rule_name,
         enforced: deps.settings.enforcing(),
         trace: result.trace,
@@ -434,6 +455,36 @@ async fn message_loop(
                     Err(message) => DaemonMsg::Err { message },
                 }
             }
+            ClientMsg::LockdownGet => {
+                DaemonMsg::LockdownState(deps.lockdown.snapshot(&deps.store))
+            }
+            ClientMsg::LockdownSet { tags, on, force } => {
+                // Warn, not info, and with the peer on it: this is the one
+                // change that decides every unmatched connection on the
+                // host, and the journal is where an operator reconstructs
+                // when it happened and who asked. Any socket-group member
+                // can lift it, exactly as any of them can delete a deny
+                // rule; that is the existing trust boundary, not a new one.
+                tracing::warn!(
+                    ?peer_uid,
+                    peer_pid = ?peer.process.pid,
+                    ?tags,
+                    on,
+                    force,
+                    "lockdown set"
+                );
+                match crate::lockdown::apply(
+                    &deps.lockdown,
+                    &deps.store,
+                    &deps.settings,
+                    tags,
+                    on,
+                    force,
+                ) {
+                    Ok(state) => DaemonMsg::LockdownState(state),
+                    Err(message) => DaemonMsg::Err { message },
+                }
+            }
             ClientMsg::RuleToggleTag { tag, enabled } => {
                 tracing::info!(?peer_uid, tag = %tag, enabled, "rule toggle by tag");
                 match deps.store.toggle_tag(&tag, enabled) {
@@ -464,6 +515,7 @@ async fn message_loop(
                     skipped,
                     deps.prompts.has_handler(),
                     deps.settings.enforcing(),
+                    deps.lockdown.snapshot(&deps.store),
                     queues,
                 ))
             }
@@ -591,6 +643,9 @@ mod tests {
         ));
         (
             Arc::new(IpcDeps {
+                lockdown: Arc::new(crate::lockdown::Posture::load(
+                    &dir.path().join("posture.toml"),
+                )),
                 store,
                 prompts,
                 events,

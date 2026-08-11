@@ -275,6 +275,7 @@ impl TestEnv {
                  max_pending_prompts = 16\n\
                  rules_dir = \"{}\"\n\
                  first_seen_state = \"{}\"\n\
+                 lockdown_state = \"{}\"\n\
                  {extra_config}",
                 self.socket_path.display(),
                 rules_dir.display(),
@@ -282,7 +283,11 @@ impl TestEnv {
                 // /var/lib/hallpass, and a root test run would otherwise
                 // rewrite the state of the daemon actually installed on the
                 // machine running the suite.
-                self.tmp.join("seen.toml").display()
+                self.tmp.join("seen.toml").display(),
+                // The posture especially: a test that ran `lockdown on`
+                // against the real path would leave the installed daemon
+                // locked down at its next start, with tags from a test.
+                self.tmp.join("posture.toml").display()
             ),
         )
         .expect("write config");
@@ -838,6 +843,24 @@ fn rule_toml(r: &Rule) -> String {
 /// A plain TCP rule on `port`.
 fn rule(name: &str, action: Action, port: u16) -> String {
     rule_with(name, action, port, |m| m.proto = Some(Proto::Tcp))
+}
+
+/// A plain TCP rule on `port`, carrying `tags`.
+fn tagged_rule(name: &str, action: Action, port: u16, tags: &[&str]) -> String {
+    let mut matcher = RuleMatch {
+        port: Some(port),
+        ..Default::default()
+    };
+    matcher.proto = Some(Proto::Tcp);
+    rule_toml(&Rule {
+        name: name.to_string(),
+        action,
+        duration: RuleDuration::Forever,
+        priority: 10,
+        enabled: true,
+        tags: tags.iter().map(|t| (*t).to_string()).collect(),
+        matcher,
+    })
 }
 
 /// SHA-256 of a file as lowercase hex, the form `exe_sha256` expects.
@@ -2251,4 +2274,70 @@ fn a_reparented_descendant_stays_covered() {
         env.daemon_log()
     );
     assert_eq!(event.verdict, hallpass_types::Verdict::Allow);
+}
+
+/// The posture against a real kernel queue: an untagged allow stops
+/// permitting, a pinned one keeps permitting, and lifting it puts the first
+/// one back.
+///
+/// The unit tests cover the decision; only this proves it against packets,
+/// and getting it wrong is the difference between a host that is locked down
+/// and one that only reports that it is. Both ports are allowed by rules
+/// before the posture, so the posture is the sole difference between a
+/// connection that works and one that does not.
+#[test]
+#[ignore = "requires root and network namespaces"]
+fn lockdown_suppresses_untagged_allows_against_a_real_queue() {
+    const PINNED: u16 = 19040;
+    const UNPINNED: u16 = 19041;
+    let Some(mut env) = TestEnv::setup("lockdown") else {
+        return;
+    };
+    if cli_binary().is_none() {
+        eprintln!("SKIP e2e lockdown: hallpass-cli is not built (cargo build -p hallpass-cli)");
+        return;
+    }
+    env.start_listener(PINNED);
+    env.start_listener(UNPINNED);
+    env.start_daemon(
+        "deny",
+        &[
+            &tagged_rule("e2e-lockdown-core", Action::Allow, PINNED, &["core"]),
+            &tagged_rule("e2e-lockdown-other", Action::Allow, UNPINNED, &[]),
+        ],
+    );
+    env.assert_daemon_alive();
+    assert!(env.connect(PINNED), "the pinned rule must work before the posture");
+    assert!(
+        env.connect(UNPINNED),
+        "the untagged rule must work before the posture; daemon log:\n{}",
+        env.daemon_log()
+    );
+
+    let on = env.run_cli(&["lockdown", "on", "--tag", "core"]);
+    assert!(
+        on.status.success(),
+        "lockdown on failed: {}\ndaemon log:\n{}",
+        String::from_utf8_lossy(&on.stderr).trim(),
+        env.daemon_log()
+    );
+    assert!(
+        env.connect(PINNED),
+        "a pinned allow must keep deciding under the posture; daemon log:\n{}",
+        env.daemon_log()
+    );
+    assert!(
+        !env.connect(UNPINNED),
+        "an untagged allow must stop deciding under the posture; daemon log:\n{}",
+        env.daemon_log()
+    );
+
+    // And the posture is a state, not a one-way door.
+    let off = env.run_cli(&["lockdown", "off"]);
+    assert!(off.status.success(), "lockdown off failed");
+    assert!(
+        env.connect(UNPINNED),
+        "lifting the posture must restore the rule the operator wrote; daemon log:\n{}",
+        env.daemon_log()
+    );
 }

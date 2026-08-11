@@ -21,6 +21,15 @@ use crate::traffic;
 use crate::tray::TrayMsg;
 
 /// Maximum number of events kept in the scrollback.
+/// How often the window refetches `Stats`.
+///
+/// The mode and the lockdown posture are whole-host facts that another
+/// client can change at any moment, and both are rendered as banners on
+/// every tab, so they cannot depend on the operator standing on the Stats
+/// tab. A few seconds is far below how long anyone reads a screen for, and
+/// the request is a handful of counters over a unix socket.
+const STATS_POLL: Duration = Duration::from_secs(3);
+
 const MAX_EVENTS: usize = 1000;
 
 /// Events requested from the daemon's history when a connection comes up.
@@ -203,6 +212,9 @@ pub struct HallpassApp {
     editor: Option<RuleEditor>,
     /// Free-text filter applied to the event feed and the traffic view.
     filter: String,
+    /// When stats were last requested, for the poll that keeps whole-host
+    /// state (the mode, the lockdown posture) visible from every tab.
+    stats_asked: std::time::Instant,
     /// What the last bulk toggle actually did, shown in the rules tab.
     ///
     /// The daemon acts on its own live set, which is not necessarily the one
@@ -301,6 +313,8 @@ impl HallpassApp {
             last_error: None,
             editor: None,
             filter: String::new(),
+            // In the past, so the first frame asks immediately.
+            stats_asked: std::time::Instant::now() - STATS_POLL,
             rules_notice: None,
             rule_tag_filter: None,
             group_by: traffic::GroupBy::default(),
@@ -606,7 +620,10 @@ impl HallpassApp {
                     self.send(refetch);
                 }
             }
-            DaemonMsg::RuleHits(_)
+            // Never requested by this client: the posture reaches the
+            // window through `Stats`, which the tab already refetches.
+            DaemonMsg::LockdownState(_)
+            | DaemonMsg::RuleHits(_)
             | DaemonMsg::Explanation(_)
             | DaemonMsg::RunSessionStarted { .. }
             | DaemonMsg::RunSessions(_) => {}
@@ -642,7 +659,47 @@ impl HallpassApp {
     /// nothing to report, and reporting it anyway would announce that
     /// nothing is being blocked on a daemon that is blocking.
     fn observe_banner(&self) -> bool {
-        self.enforcing == Some(false)
+        // Never under a posture. `enforcing` is fed by both the Stats reply
+        // (the effective mode) and the Config reply (the operator's stored
+        // one, which a posture deliberately overrides), and the Config reply
+        // is the later of the two at connect - so on a locked-down host with
+        // a stored observe mode this said "nothing is blocked" directly
+        // above the banner saying everything is. The posture's banner is the
+        // true statement of the two.
+        self.enforcing == Some(false) && self.lockdown_banner().is_none()
+    }
+
+    /// Ask for stats again when the last answer is old enough, whatever tab
+    /// is open, and keep the frame ticking so the next poll happens without
+    /// an event to wake it.
+    fn poll_stats(&mut self, ctx: &egui::Context) {
+        if !matches!(self.status, ConnStatus::Connected) {
+            return;
+        }
+        let now = std::time::Instant::now();
+        if now.duration_since(self.stats_asked) >= STATS_POLL {
+            self.stats_asked = now;
+            self.send(ClientMsg::Stats);
+        }
+        ctx.request_repaint_after(STATS_POLL);
+    }
+
+    /// The lockdown banner's text, when a posture is in force.
+    ///
+    /// From `Stats`, which is the daemon's own statement about the posture,
+    /// so this cannot claim one that has been lifted.
+    fn lockdown_banner(&self) -> Option<String> {
+        let l = self.stats.as_ref()?.lockdown.as_ref()?;
+        Some(format!(
+            "LOCKDOWN: only the allow rules tagged {} decide connections; \
+             everything else is denied without a prompt ({} rule(s) suppressed)",
+            if l.tags.is_empty() {
+                "nothing".to_string()
+            } else {
+                l.tags.join(", ")
+            },
+            l.rules_suppressed
+        ))
     }
 
     /// The enforce/observe switch, in the tab bar so the mode is visible
@@ -659,14 +716,26 @@ impl HallpassApp {
         let Some(current) = self.daemon_config else {
             return;
         };
-        let mut enforce = current.enforce;
-        let response = ui.checkbox(&mut enforce, "Enforce").on_hover_text(
-            "On: rules and prompts decide what connects (active). \
-             Off: observe mode, everything is recorded and nothing is \
-             blocked or prompted (passive). Lasts until the daemon \
-             restarts; the config file decides the mode it starts in.",
-        );
-        if response.changed() {
+        // A posture owns the mode while it is on, and the daemon refuses a
+        // change to it, so the switch is shown ticked (what is in force) and
+        // disabled rather than left offering a change that would come back
+        // as an error - and rather than showing the stored `false` on a host
+        // that is enforcing everything.
+        let locked = self.lockdown_banner().is_some();
+        let mut enforce = current.enforce || locked;
+        let response = ui
+            .add_enabled(!locked, egui::Checkbox::new(&mut enforce, "Enforce"))
+            .on_hover_text(
+                "On: rules and prompts decide what connects (active). \
+                 Off: observe mode, everything is recorded and nothing is \
+                 blocked or prompted (passive). Lasts until the daemon \
+                 restarts; the config file decides the mode it starts in.",
+            )
+            .on_disabled_hover_text(
+                "Lockdown is on, and it enforces regardless of this setting. \
+                 Lift it to choose the mode again.",
+            );
+        if response.changed() && !locked {
             self.send(ClientMsg::ConfigSet(RuntimeConfig { enforce, ..current }));
         }
     }
@@ -813,6 +882,16 @@ impl HallpassApp {
                     REJECT_COLOR,
                     "OBSERVE MODE: policy is evaluated and recorded, nothing is blocked",
                 );
+                ui.separator();
+            }
+            // The mirror image of the observe banner, and it belongs on
+            // screen for the same reason: almost everything is being denied,
+            // and every other signal for it (a DENY in the feed, a row in
+            // Stats) is only visible to someone already looking at the right
+            // pane. An operator debugging "nothing can connect" must not
+            // have to go looking for the reason.
+            if let Some(l) = self.lockdown_banner() {
+                ui.colored_label(REJECT_COLOR, l);
                 ui.separator();
             }
             match self.tab {
@@ -1029,6 +1108,18 @@ impl HallpassApp {
         let mut toggle: Option<(String, bool)> = None;
         let mut delete: Option<String> = None;
         let mut edit: Option<RuleEditor> = None;
+        // Computed with the daemon's own predicate, from the posture the
+        // daemon reported, so the table cannot mark a different set than the
+        // one the packet path is skipping.
+        let suppressed: Vec<String> = match self.stats.as_ref().and_then(|s| s.lockdown.as_ref()) {
+            Some(l) => self
+                .rules
+                .iter()
+                .filter(|r| r.enabled && !r.active_under_lockdown(&l.tags))
+                .map(|r| r.name.clone())
+                .collect(),
+            None => Vec::new(),
+        };
         let (header_h, row_h) = table_heights(ui);
         let shown: Vec<&Rule> = match &self.rule_tag_filter {
             Some(tag) => self.rules.iter().filter(|r| r.has_tag(tag)).collect(),
@@ -1072,7 +1163,17 @@ impl HallpassApp {
                     let rule = shown[row.index()];
                     row.col(|ui| {
                         let mut enabled = rule.enabled;
-                        if ui.checkbox(&mut enabled, "").changed() {
+                        let changed = ui.checkbox(&mut enabled, "").changed();
+                        // A rule the posture stops decides nothing, and the
+                        // checkbox alone says the opposite: this is the view
+                        // an operator opens to see what is in force, so the
+                        // difference between "on" and "on but not deciding"
+                        // has to be on the row.
+                        if suppressed.iter().any(|n| n == &rule.name) {
+                            ui.colored_label(REJECT_COLOR, "!")
+                                .on_hover_text("suppressed by lockdown");
+                        }
+                        if changed {
                             toggle = Some((rule.name.clone(), enabled));
                         }
                     });
@@ -1210,7 +1311,7 @@ impl HallpassApp {
             self.send(ClientMsg::Stats);
         }
         ui.separator();
-        let Some(s) = self.stats else {
+        let Some(s) = self.stats.clone() else {
             ui.label("Waiting for the daemon...");
             return;
         };
@@ -1942,6 +2043,13 @@ impl eframe::App for HallpassApp {
         let ctx = ui.ctx().clone();
         self.drain_net();
         self.drain_tray(&ctx);
+        // The posture banner and the mode both come from `Stats`, which
+        // until now only the Stats tab refetched: a lockdown entered by
+        // another client never appeared while the operator sat on Events,
+        // and one that was lifted left its banner claiming the host was
+        // denying everything. One small request every few seconds is what
+        // makes a whole-host state visible from whatever tab is open.
+        self.poll_stats(&ctx);
         self.main_window(ui);
         self.editor_window(&ctx);
         self.prompt_windows(&ctx);

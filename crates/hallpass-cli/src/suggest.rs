@@ -131,11 +131,15 @@ pub struct Proposal {
 /// Folding it in would turn every `hallpass run` into a permanent rule
 /// proposal, which is the ruleset pollution the wrapper exists to avoid.
 fn needs_a_rule(ev: &ConnEvent) -> bool {
-    let session_grant = ev
-        .rule_name
-        .as_deref()
-        .is_some_and(|n| n.starts_with(hallpass_types::RUN_SESSION_RULE_PREFIX));
-    !session_grant && (ev.verdict == Verdict::Allow || (!ev.enforced && ev.rule_name.is_none()))
+    // The same argument covers the loopback a lockdown posture exempts: that
+    // allow is the posture's, granted for as long as it lasts, and folding
+    // it into a permanent rule would outlive the reason for it.
+    let daemons_own = ev.rule_name.as_deref().is_some_and(|n| {
+        hallpass_types::RESERVED_RULE_PREFIXES
+            .iter()
+            .any(|p| n.starts_with(p))
+    });
+    !daemons_own && (ev.verdict == Verdict::Allow || (!ev.enforced && ev.rule_name.is_none()))
 }
 
 /// Fold `events` into proposed allow rules.

@@ -17,18 +17,37 @@ pub struct ExplainResult {
 /// higher priority first, ties broken by name for determinism.
 pub struct RuleSet {
     rules: Vec<CompiledRule>,
-    /// Whether any enabled rule pins an executable hash; precomputed so
+    /// Whether any deciding rule pins an executable hash; precomputed so
     /// the per-packet check is free when the feature is unused.
     has_hash_rules: bool,
+    /// Whether a lockdown posture was in force when this was compiled.
+    locked_down: bool,
 }
 
 impl RuleSet {
-    /// Compile `rules`, skipping (with a warning) any that fail validation.
+    /// Compile `rules` with no lockdown posture in force.
     pub fn compile(rules: &[Rule]) -> RuleSet {
+        RuleSet::compile_with_lockdown(rules, None)
+    }
+
+    /// Compile `rules`, skipping (with a warning) any that fail validation.
+    ///
+    /// `lockdown` is the posture's pinned tags, if one is in force. The
+    /// suppression is resolved here, once per rebuild, rather than consulted
+    /// per packet: the packet path's filter stays one bool test, and the
+    /// snapshot a connection is judged against carries its own answer about
+    /// whether the posture was on, so a posture change mid-decision cannot
+    /// split enrichment from matching.
+    pub fn compile_with_lockdown(rules: &[Rule], lockdown: Option<&[String]>) -> RuleSet {
         let mut compiled: Vec<CompiledRule> = rules
             .iter()
             .filter_map(|r| match CompiledRule::compile(r) {
-                Ok(c) => Some(c),
+                Ok(mut c) => {
+                    if let Some(tags) = lockdown {
+                        c.suppressed = !r.active_under_lockdown(tags);
+                    }
+                    Some(c)
+                }
                 Err(e) => {
                     tracing::warn!(rule = %r.name, "skipping invalid rule: {e}");
                     None
@@ -40,11 +59,31 @@ impl RuleSet {
                 .cmp(&a.priority)
                 .then_with(|| a.name.cmp(&b.name))
         });
-        let has_hash_rules = compiled.iter().any(|r| r.enabled && r.wants_exe_hash());
+        let has_hash_rules = compiled.iter().any(|r| r.deciding() && r.wants_exe_hash());
         RuleSet {
             rules: compiled,
             has_hash_rules,
+            locked_down: lockdown.is_some(),
         }
+    }
+
+    /// Whether a lockdown posture was in force when this set was compiled.
+    ///
+    /// Read from the snapshot the connection is being judged against, not
+    /// from the posture itself, so the answer cannot change between deciding
+    /// that no rule matched and deciding what to do about it.
+    pub fn locked_down(&self) -> bool {
+        self.locked_down
+    }
+
+    /// How many rules the posture is currently stopping from deciding.
+    ///
+    /// Enabled ones only: a rule the operator had already disabled decides
+    /// nothing either way, and counting it would have a host with a drawer
+    /// full of old disabled rules report a posture far wider than the one it
+    /// actually applied.
+    pub fn suppressed_count(&self) -> u32 {
+        self.rules.iter().filter(|r| r.enabled && r.suppressed).count() as u32
     }
 
     /// First enabled rule matching `conn`, with its verdict. `exe_sha256`
@@ -57,7 +96,7 @@ impl RuleSet {
     ) -> Option<(&CompiledRule, Verdict)> {
         self.rules
             .iter()
-            .filter(|r| r.enabled)
+            .filter(|r| r.deciding())
             .find(|r| r.matches(conn, exe_sha256))
             .map(|r| (r, Verdict::from(r.action)))
     }
@@ -91,6 +130,12 @@ impl RuleSet {
                 TraceOutcome::NotReached
             } else if !rule.enabled {
                 TraceOutcome::Disabled
+            } else if rule.suppressed {
+                // Distinct from Disabled on purpose: the rule is exactly as
+                // the operator left it, and what stopped it is a posture
+                // they can lift. Reporting it as disabled would send them
+                // looking for an `enabled = false` that is not there.
+                TraceOutcome::Suppressed
             } else {
                 match rule.first_failing_field(conn, exe_sha256) {
                     Some(field) => TraceOutcome::NoMatch {
