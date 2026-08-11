@@ -7,8 +7,8 @@
 //! destroy notification carrying its original tuple and those counters.
 //! This module listens on that multicast group, joins each teardown back to
 //! the connection the daemon attributed at its start, and records the
-//! volume: aggregate totals in [`Stats`], and a per-flow line naming the
-//! executable and how much it moved.
+//! volume: aggregate totals in [`hallpass_types::Stats`], and a per-flow
+//! line naming the executable and how much it moved.
 //!
 //! It is observe-only and additive: it reads notifications the kernel sends
 //! anyway and never influences a verdict. The destroy group carries every

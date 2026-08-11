@@ -106,7 +106,7 @@ enum Target {
 /// report its coverage honestly.
 pub struct Proposal {
     pub rules: Vec<Rule>,
-    /// Proposals dropped to [`MAX_RULES`]; zero means complete.
+    /// Proposals dropped to the `MAX_RULES` cap; zero means complete.
     pub dropped: usize,
     /// Decisions that contributed to the rules.
     pub folded: usize,
