@@ -765,6 +765,11 @@ fn rule_from_reply(
         duration,
         priority: PROMPT_RULE_PRIORITY,
         enabled: true,
+        // Untagged, and not a default worth inventing: a tag is a set an
+        // operator chose to put a rule in, and answering one dialog is not
+        // choosing. A rule that arrived here can be tagged afterwards by
+        // saving it again under the same name.
+        tags: Vec::new(),
         matcher,
     })
 }
@@ -1462,6 +1467,7 @@ mod tests {
             duration: RuleDuration::Session,
             priority: 1,
             enabled: false,
+            tags: Vec::new(),
             matcher: RuleMatch {
                 exe: Some(PathBuf::from("/bin/a")),
                 ..Default::default()

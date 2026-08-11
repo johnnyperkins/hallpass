@@ -434,6 +434,13 @@ async fn message_loop(
                     Err(message) => DaemonMsg::Err { message },
                 }
             }
+            ClientMsg::RuleToggleTag { tag, enabled } => {
+                tracing::info!(?peer_uid, tag = %tag, enabled, "rule toggle by tag");
+                match deps.store.toggle_tag(&tag, enabled) {
+                    Ok((changed, failed)) => DaemonMsg::RulesToggled { changed, failed },
+                    Err(message) => DaemonMsg::Err { message },
+                }
+            }
             ClientMsg::Stats => {
                 let rules = deps.store.ruleset().rule_count() as u32;
                 let skipped = deps.store.rules_skipped();
@@ -665,6 +672,23 @@ mod tests {
         panic!("the session outlived the connection that opened it");
     }
 
+    /// A rule the tests add over the socket. Session-scoped, so nothing
+    /// touches disk.
+    fn ipc_rule(name: &str, tags: Vec<String>) -> Rule {
+        Rule {
+            name: name.into(),
+            action: Action::Deny,
+            duration: RuleDuration::Session,
+            priority: 3,
+            enabled: true,
+            tags,
+            matcher: RuleMatch {
+                port: Some(25),
+                ..Default::default()
+            },
+        }
+    }
+
     #[tokio::test]
     async fn hello_rules_and_stats_roundtrip() {
         let (deps, dir) = test_deps("roundtrip");
@@ -683,17 +707,7 @@ mod tests {
         let ack: DaemonMsg = wire::read_msg(&mut c).await.unwrap();
         assert_eq!(ack, DaemonMsg::HelloAck { version: PROTOCOL_VERSION });
 
-        let rule = Rule {
-            name: "via-ipc".into(),
-            action: Action::Deny,
-            duration: RuleDuration::Session,
-            priority: 3,
-            enabled: true,
-            matcher: RuleMatch {
-                port: Some(25),
-                ..Default::default()
-            },
-        };
+        let rule = ipc_rule("via-ipc", Vec::new());
         wire::write_msg(&mut c, &ClientMsg::RuleAdd(rule.clone())).await.unwrap();
         assert_eq!(wire::read_msg::<DaemonMsg, _>(&mut c).await.unwrap(), DaemonMsg::Ok);
 
@@ -713,6 +727,75 @@ mod tests {
         match wire::read_msg::<DaemonMsg, _>(&mut c).await.unwrap() {
             DaemonMsg::Stats(s) => assert_eq!(s.rules_loaded, 1),
             other => panic!("expected stats, got {other:?}"),
+        }
+    }
+
+    /// The bulk toggle over IPC: the reply carries what changed, a tag no
+    /// rule carries is refused, and the rules a client lists afterwards show
+    /// the new state.
+    #[tokio::test]
+    async fn rule_toggle_tag_roundtrip() {
+        let (deps, dir) = test_deps("toggle-tag");
+        let sock = dir.path().join("test.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        let server_deps = Arc::clone(&deps);
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let _ = handle_conn(stream, server_deps).await;
+        });
+
+        let mut c = client(&sock).await;
+        wire::write_msg(&mut c, &ClientMsg::Hello { version: PROTOCOL_VERSION })
+            .await
+            .unwrap();
+        let _: DaemonMsg = wire::read_msg(&mut c).await.unwrap();
+
+        for (name, tags) in [("t1", vec!["work".to_string()]), ("t2", Vec::new())] {
+            wire::write_msg(&mut c, &ClientMsg::RuleAdd(ipc_rule(name, tags)))
+                .await
+                .unwrap();
+            assert_eq!(wire::read_msg::<DaemonMsg, _>(&mut c).await.unwrap(), DaemonMsg::Ok);
+        }
+
+        wire::write_msg(
+            &mut c,
+            &ClientMsg::RuleToggleTag {
+                tag: "work".into(),
+                enabled: false,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            wire::read_msg::<DaemonMsg, _>(&mut c).await.unwrap(),
+            DaemonMsg::RulesToggled {
+                changed: 1,
+                failed: Vec::new()
+            }
+        );
+
+        wire::write_msg(
+            &mut c,
+            &ClientMsg::RuleToggleTag {
+                tag: "absent".into(),
+                enabled: false,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            wire::read_msg::<DaemonMsg, _>(&mut c).await.unwrap(),
+            DaemonMsg::Err { .. }
+        ));
+
+        wire::write_msg(&mut c, &ClientMsg::RuleList).await.unwrap();
+        match wire::read_msg::<DaemonMsg, _>(&mut c).await.unwrap() {
+            DaemonMsg::Rules(rules) => {
+                let by_name = |n: &str| rules.iter().find(|r| r.name == n).unwrap().enabled;
+                assert!(!by_name("t1"), "the tagged rule is off");
+                assert!(by_name("t2"), "the untagged rule is untouched");
+            }
+            other => panic!("expected rules, got {other:?}"),
         }
     }
 

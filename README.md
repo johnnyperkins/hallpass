@@ -192,6 +192,9 @@ duration = "forever"    # once | session | forever; the CLI also takes a
                         # timespan (30s, 5m, 2h, 1d) for a rule that expires
 priority = 100
 enabled = true
+tags = ["core"]         # optional labels for selecting this rule in bulk;
+                        # lowercase letters, digits, "-" and "_", starting
+                        # with a letter or digit
 
 [match]                 # all present fields must match (AND)
 port = 53
@@ -216,6 +219,33 @@ proto = "udp"
 The directory is watched; edits apply without a restart. Unknown keys are
 rejected: a file with a misspelled operand is skipped with a warning rather
 than loaded with a wider match than you wrote.
+
+Tags label a rule; they never match a connection. `hallpass-cli rules --tag
+work` lists the set, and `hallpass-cli rules toggle --tag work off` disables
+all of it as one change, so no connection is ever judged against half of it.
+A rule already in the requested state is left alone, and a tag no rule
+carries is an error from both - a typo fails loudly rather than reporting an
+empty set. Tags are set when the rule is written: `rules add --tag work`, the
+`tags` key in the file, or the Tags field in the GUI editor.
+
+Because a tag cannot change what a rule matches, an unusable one never costs
+a rule its enforcement: a rules.d file whose `tags` are misspelled, repeated
+or over the cap still loads and enforces, with the unusable entries dropped
+and named in the journal. The stricter entrances refuse instead, because
+there the cost is an error message rather than a rule that stopped filtering:
+`rules add`, an IPC add, and the GUI editor all reject a bad tag outright.
+
+**Adding a rule under an existing name replaces it wholesale**, which is how
+a rule's tags are changed from the CLI - and also means everything else must
+be restated. In particular a rule that was toggled off comes back enabled
+unless the add passes `--enabled false`, and a `rules import` of a document
+exported before tags existed strips the tags off every rule it restores. The
+GUI editor loads the whole rule first, so saving from it preserves both.
+
+The GUI's Rules tab has the same three operations: a TAGS column, a tag
+picker that narrows the table, and Enable all / Disable all buttons that act
+on the picked tag. The buttons appear only once a tag is picked, because they
+act on the set rather than on whatever the table is showing.
 
 The one rule the installer drops in, `example-allow-dns.toml`, ships with
 `enabled = false`. Matching on port and protocol alone would let every local

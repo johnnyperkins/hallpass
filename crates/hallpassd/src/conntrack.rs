@@ -449,6 +449,7 @@ mod tests {
             duration: RuleDuration::Forever,
             priority: 0,
             enabled: true,
+            tags: Vec::new(),
             matcher: RuleMatch {
                 exe: Some(exe.into()),
                 ..Default::default()
@@ -500,6 +501,7 @@ mod tests {
             duration: RuleDuration::Forever,
             priority: 10,
             enabled: true,
+            tags: Vec::new(),
             matcher: RuleMatch {
                 exe_sha256: Some(
                     "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".into(),

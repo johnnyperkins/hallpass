@@ -224,6 +224,7 @@ fn rules_can_be_managed_without_privileges() {
         duration: hallpass_types::RuleDuration::Session,
         priority: 7,
         enabled: true,
+        tags: Vec::new(),
         matcher: hallpass_types::RuleMatch {
             port: Some(25),
             ..Default::default()

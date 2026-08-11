@@ -106,6 +106,7 @@ fn rule(name: &str, enabled: bool) -> Rule {
         duration: RuleDuration::Forever,
         priority: 10,
         enabled,
+        tags: Vec::new(),
         matcher: RuleMatch {
             port: Some(443),
             ..RuleMatch::default()
@@ -214,6 +215,13 @@ fn ack_kinds_are_distinct_per_request() {
     let toggle = ClientMsg::RuleToggle { name: "r".into(), enabled: false };
     let delete = ClientMsg::RuleDelete { name: "r".into() };
     assert_eq!(ack_kind(&toggle), Some(AckKind::RuleToggle));
+    // The bulk toggle is answered with `RulesToggled`, but a refusal is the
+    // same `Err` as everyone else's: left out of the FIFO, an unknown tag
+    // would pop somebody else's slot and reconcile the wrong request.
+    assert_eq!(
+        ack_kind(&ClientMsg::RuleToggleTag { tag: "work".into(), enabled: false }),
+        Some(AckKind::RuleToggle)
+    );
     assert_eq!(ack_kind(&delete), Some(AckKind::RuleDelete));
     assert_eq!(
         ack_kind(&ClientMsg::ConfigSet(runtime_config(30, Verdict::Deny))),
@@ -305,6 +313,63 @@ fn every_ack_kind_crossed_with_ok_and_err() {
     }
 }
 
+/// The bulk toggle's reply takes its slot in the FIFO and reconciles the
+/// screen, and the rules it could not write are said out loud - the refetch
+/// that follows would otherwise show them enabled with nothing said why.
+#[test]
+fn a_bulk_toggle_reply_reconciles_and_reports_failures() {
+    let mut t = TestApp::new();
+    t.app.send(ClientMsg::RuleToggleTag { tag: "work".into(), enabled: false });
+    t.sent();
+    assert_eq!(t.app.pending_ack_kinds(), vec![AckKind::RuleToggle]);
+
+    t.daemon(DaemonMsg::RulesToggled { changed: 2, failed: Vec::new() });
+    assert_eq!(t.sent(), vec![ClientMsg::RuleList], "the screen is refetched");
+    assert!(t.app.pending_ack_kinds().is_empty(), "the slot is freed");
+    assert!(t.app.last_error.is_none(), "a clean batch raises no error");
+    // The count is always reported: the daemon acts on its own live tag
+    // set, so a batch can be wider than the table the operator judged it
+    // from, and the refetch alone says nothing about how much moved.
+    assert_eq!(t.app.rules_notice.as_deref(), Some("2 rule(s) changed"));
+
+    t.app.send(ClientMsg::RuleToggleTag { tag: "work".into(), enabled: false });
+    t.sent();
+    t.daemon(DaemonMsg::RulesToggled {
+        changed: 1,
+        failed: vec!["stuck".into()],
+    });
+    assert_eq!(t.sent(), vec![ClientMsg::RuleList]);
+    let shown = t.app.last_error.clone().expect("failures are surfaced");
+    assert!(shown.contains("stuck"), "{shown}");
+
+    // And the banner is cleared by a batch that succeeds. Left standing, it
+    // keeps naming a rule as still enforcing after the retry that fixed it,
+    // and the next real failure cannot be told from the stale one.
+    t.app.send(ClientMsg::RuleToggleTag { tag: "work".into(), enabled: false });
+    t.sent();
+    t.daemon(DaemonMsg::RulesToggled { changed: 1, failed: Vec::new() });
+    assert!(t.app.last_error.is_none(), "a fixed failure kept its banner");
+}
+
+/// A refused bulk toggle is an ordinary `Err`, so it must consume exactly
+/// its own slot: the alternative is the next reply reconciling this one's
+/// request and this one's error being blamed on a rule save.
+#[test]
+fn a_refused_bulk_toggle_consumes_one_slot() {
+    let mut t = TestApp::new();
+    t.app.send(ClientMsg::RuleToggleTag { tag: "wrok".into(), enabled: false });
+    t.editor_awaiting_ack();
+    assert_eq!(
+        t.app.pending_ack_kinds(),
+        vec![AckKind::RuleToggle, AckKind::RuleSave]
+    );
+
+    t.daemon(err("no rule carries tag `wrok`"));
+    assert_eq!(t.sent(), vec![ClientMsg::RuleList], "the toggle's ack");
+    assert!(t.app.editor.is_some(), "the save is still in flight");
+    assert_eq!(t.app.pending_ack_kinds(), vec![AckKind::RuleSave]);
+}
+
 /// Replies arrive in request order on the one IPC stream, so the FIFO is
 /// the only thing that says which request an Ok belongs to. Answer them out
 /// of order and a save's ack would close a form the daemon never took.
@@ -374,6 +439,32 @@ fn a_dropped_message_keeps_the_queue_aligned() {
     t.sent();
     t.daemon(DaemonMsg::Ok);
     assert!(t.sent().is_empty(), "an Other ack refetched the rule list");
+}
+
+/// A bulk toggle dropped on reconnect is a whole set still enforcing, so it
+/// is named as one - and its slot has to leave the FIFO with it. The
+/// message must also be in net.rs's reported-drop list, or nothing emits
+/// this event and the slot is orphaned for the rest of the session.
+#[test]
+fn a_dropped_bulk_toggle_names_the_set_and_keeps_the_queue_aligned() {
+    let msg = ClientMsg::RuleToggleTag {
+        tag: "work".to_string(),
+        enabled: false,
+    };
+    assert!(
+        crate::net::reports_send_failure(&msg),
+        "net.rs drops this without telling anyone"
+    );
+
+    let mut t = TestApp::new();
+    t.app.send(msg.clone());
+    t.sent();
+    assert_eq!(t.app.pending_ack_kinds().len(), 1);
+
+    t.feed(UiEvent::SendFailed { msg });
+    assert!(t.app.pending_ack_kinds().is_empty(), "the dead ack was left queued");
+    let shown = t.app.last_error.clone().expect("a lost bulk toggle is visible");
+    assert!(shown.contains("work"), "the set is named: {shown}");
 }
 
 /// A settings change that never reached the daemon is not in force, and

@@ -196,6 +196,11 @@ pub fn sanitized_rule(r: &Rule) -> Rule {
         duration: r.duration,
         priority: r.priority,
         enabled: r.enabled,
+        // Sanitized like every other field, even though `valid_tag` should
+        // make a hazardous tag impossible. This function's stated property is
+        // that it has no exemptions, and an exemption resting on a validator
+        // being correct is the argument it exists so nobody has to make.
+        tags: r.tags.iter().map(|t| clean(t)).collect(),
         matcher: RuleMatch {
             exe: clean_path(&m.exe),
             exe_glob: clean_opt(&m.exe_glob),
@@ -294,6 +299,7 @@ mod tests {
             duration: RuleDuration::Forever,
             priority: 3,
             enabled: true,
+            tags: Vec::new(),
             matcher: RuleMatch {
                 exe: Some(PathBuf::from("/bin/sh\r")),
                 domain: Some("a\nb.example.org".into()),
@@ -343,6 +349,7 @@ mod tests {
             duration: RuleDuration::Forever,
             priority: 1,
             enabled: true,
+            tags: Vec::new(),
             matcher: RuleMatch::default(),
         };
         let out = rules_with_hits(

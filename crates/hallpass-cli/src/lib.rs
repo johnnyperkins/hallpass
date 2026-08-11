@@ -88,11 +88,14 @@ pub async fn run(argv: &[String]) -> i32 {
         Cmd::Sessions => run::sessions(&mut client, out).await,
         Cmd::ConfigShow => config_show(&mut client, out).await,
         Cmd::ConfigSet(opts) => config_set(&mut client, opts, out).await,
-        Cmd::RulesList { stats } => rules_list(&mut client, stats, out).await,
+        Cmd::RulesList { stats, tag } => rules_list(&mut client, stats, tag, out).await,
         Cmd::RulesAdd(rule) => expect_ok(&mut client, ClientMsg::RuleAdd(rule)).await,
         Cmd::RulesRm { name } => expect_ok(&mut client, ClientMsg::RuleDelete { name }).await,
         Cmd::RulesToggle { name, enabled } => {
             expect_ok(&mut client, ClientMsg::RuleToggle { name, enabled }).await
+        }
+        Cmd::RulesToggleTag { tag, enabled } => {
+            rules_toggle_tag(&mut client, tag, enabled).await
         }
         Cmd::RulesExport => rules_export(&mut client).await,
         Cmd::RulesImport { path } => rules_import(&mut client, &path).await,
@@ -175,11 +178,36 @@ fn print_config(cfg: &RuntimeConfig, out: Output) -> Result<(), CliError> {
     Ok(())
 }
 
-async fn rules_list(client: &mut Client, stats: bool, out: Output) -> Result<(), CliError> {
-    let rules = match client.request(ClientMsg::RuleList).await? {
+async fn rules_list(
+    client: &mut Client,
+    stats: bool,
+    tag: Option<String>,
+    out: Output,
+) -> Result<(), CliError> {
+    let mut rules = match client.request(ClientMsg::RuleList).await? {
         DaemonMsg::Rules(rules) => rules,
         other => return Err(CliError::unexpected(&other)),
     };
+    // Filtered here rather than by the daemon: `RuleList` answers with the
+    // whole set, and a listing filter is a display concern that no other
+    // client has to agree with. The predicate is the daemon's, so a listing
+    // and a bulk toggle cannot disagree about what a set contains.
+    if let Some(tag) = &tag {
+        rules.retain(|r| r.has_tag(tag));
+        // Before the counters are fetched: an empty listing has nothing to
+        // count, and asking anyway costs a whole round trip thrown away.
+        //
+        // An error rather than an empty listing, in both output modes, and
+        // worded exactly as `rules toggle --tag` words it. A tag no rule
+        // carries is nearly always a typo, and the two entrances must not
+        // disagree about that: `--json rules --tag wrok` printing `[]` and
+        // exiting 0 tells a script "this set is empty, nothing to review"
+        // about a set it never actually queried, while the same typo
+        // through the toggle fails loudly.
+        if rules.is_empty() {
+            return Err(CliError::Input(format!("no rule carries tag `{tag}`")));
+        }
+    }
     // Two requests rather than one: the counters are the daemon's runtime
     // accounting and are deliberately not part of a rule. An error here is
     // not degraded into a plain listing - the counts are what was asked for.
@@ -198,6 +226,44 @@ async fn rules_list(client: &mut Client, stats: bool, out: Output) -> Result<(),
         (None, false) => print!("{}", fmt::format_rules(&rules)),
     }
     Ok(())
+}
+
+/// Enable or disable every rule carrying a tag.
+///
+/// Exits non-zero when any rule's new state could not be written: the change
+/// the operator asked for is not the change the daemon made, and a bulk
+/// operation that reports success while part of it did not happen is how a
+/// disabled-everything posture ends up with a rule still enforcing.
+async fn rules_toggle_tag(
+    client: &mut Client,
+    tag: String,
+    enabled: bool,
+) -> Result<(), CliError> {
+    let (changed, failed) = match client
+        .request(ClientMsg::RuleToggleTag {
+            tag: tag.clone(),
+            enabled,
+        })
+        .await?
+    {
+        DaemonMsg::RulesToggled { changed, failed } => (changed, failed),
+        other => return Err(CliError::unexpected(&other)),
+    };
+    let state = if enabled { "enabled" } else { "disabled" };
+    if changed == 0 && failed.is_empty() {
+        println!("no change: every rule tagged `{tag}` was already {state}");
+    } else {
+        let noun = if changed == 1 { "rule" } else { "rules" };
+        println!("{changed} {noun} tagged `{tag}` {state}");
+    }
+    if failed.is_empty() {
+        return Ok(());
+    }
+    Err(CliError::Daemon(format!(
+        "{} could not be written and kept their previous state: {}",
+        failed.len(),
+        failed.join(", ")
+    )))
 }
 
 /// Write the whole ruleset to stdout as one TOML document.

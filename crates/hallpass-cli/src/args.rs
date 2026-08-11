@@ -40,10 +40,14 @@ COMMANDS:
     config set [OPTIONS]         Change runtime settings. Runtime only: a
                                  change lasts until the daemon restarts, and
                                  config.toml stays the operator's file
-    rules [--stats]              List rules; --stats adds hit counts
+    rules [OPTIONS]              List rules; --stats adds hit counts,
+                                 --tag TAG lists only rules carrying TAG
     rules add [OPTIONS]          Add a rule
     rules rm NAME                Delete a rule
     rules toggle NAME on|off     Enable or disable a rule
+    rules toggle --tag TAG on|off
+                                 Enable or disable every rule carrying TAG,
+                                 as one change
     rules export                 Write the ruleset to stdout as one TOML
                                  document (always TOML, never JSON)
     rules import PATH            Add every rule in such a document, reporting
@@ -149,6 +153,13 @@ RULES ADD OPTIONS:
                                  Rule lifetime (default: forever); TIMESPAN
                                  like 30s, 5m, 2h, 1d expires the rule
     --priority N                 Priority, higher wins (default: 0)
+    --tag TAG                    Label for selecting this rule in bulk;
+                                 repeatable. Lowercase letters, digits, '-'
+                                 and '_', starting with a letter or digit
+    --enabled true|false         Whether the rule is active (default: true).
+                                 An add replaces any rule of the same name
+                                 outright, so pass false to keep a disabled
+                                 rule disabled
 
 GLOBAL OPTIONS:
     --socket PATH                Daemon socket (default: /run/hallpass/hallpass.sock)
@@ -300,10 +311,12 @@ pub enum Cmd {
     ConfigShow,
     /// `config set ...`
     ConfigSet(ConfigSetOpts),
-    /// `rules [--stats]`
+    /// `rules [--stats] [--tag TAG]`
     RulesList {
         /// Whether to fetch and show per-rule hit counts.
         stats: bool,
+        /// Show only rules carrying this tag.
+        tag: Option<String>,
     },
     /// `rules add ...`
     RulesAdd(Rule),
@@ -316,6 +329,13 @@ pub enum Cmd {
     RulesToggle {
         /// Rule name.
         name: String,
+        /// New enabled state.
+        enabled: bool,
+    },
+    /// `rules toggle --tag TAG on|off`
+    RulesToggleTag {
+        /// Tag selecting the rules to toggle.
+        tag: String,
         /// New enabled state.
         enabled: bool,
     },
@@ -804,11 +824,8 @@ fn parse_sha256(value: &str) -> Result<String, String> {
 
 fn parse_rules(sub: &[&str]) -> Result<Cmd, String> {
     match sub.split_first() {
-        None => Ok(Cmd::RulesList { stats: false }),
-        Some((&"--stats", [])) => Ok(Cmd::RulesList { stats: true }),
-        Some((&"--stats", extra)) => {
-            Err(format!("unexpected arguments after '--stats': {extra:?}"))
-        }
+        None => parse_rules_list(&[]),
+        Some((flag, _)) if flag.starts_with("--") => parse_rules_list(sub),
         Some((&"add", flags)) => Ok(Cmd::RulesAdd(parse_rule_add(flags)?)),
         Some((&"export", [])) => Ok(Cmd::RulesExport),
         Some((&"export", _)) => Err("usage: rules export".into()),
@@ -820,17 +837,66 @@ fn parse_rules(sub: &[&str]) -> Result<Cmd, String> {
             name: (*name).to_string(),
         }),
         Some((&"rm", _)) => Err("usage: rules rm NAME".into()),
-        Some((&"toggle", [name, state])) => Ok(Cmd::RulesToggle {
-            name: (*name).to_string(),
-            enabled: match *state {
-                "on" => true,
-                "off" => false,
-                other => return Err(format!("expected 'on' or 'off', got '{other}'")),
-            },
+        Some((&"toggle", ["--tag", tag, state])) => Ok(Cmd::RulesToggleTag {
+            tag: validate_tag(tag)?,
+            enabled: parse_on_off(state)?,
         }),
-        Some((&"toggle", _)) => Err("usage: rules toggle NAME on|off".into()),
+        // Only `--tag` is reserved here. Guarding on `--` as a whole would
+        // have made every rule whose name starts with one untoggleable,
+        // while `rules add --name --legacy-allow` and a hand-written rules.d
+        // file both still create them and `rules rm` still deletes them.
+        Some((&"toggle", [name, state])) if *name != "--tag" => Ok(Cmd::RulesToggle {
+            name: (*name).to_string(),
+            enabled: parse_on_off(state)?,
+        }),
+        Some((&"toggle", _)) => {
+            Err("usage: rules toggle NAME on|off, or rules toggle --tag TAG on|off".into())
+        }
         Some((&other, _)) => Err(format!("unknown rules subcommand '{other}'")),
     }
+}
+
+/// `rules [--stats] [--tag TAG]`, in either order.
+fn parse_rules_list(flags: &[&str]) -> Result<Cmd, String> {
+    let mut stats = false;
+    let mut tag: Option<String> = None;
+    let mut rest = flags.iter();
+    while let Some(flag) = rest.next() {
+        match *flag {
+            "--stats" => stats = true,
+            "--tag" => {
+                // A second one is an error rather than an overwrite: the old
+                // parser refused everything it did not recognize, and
+                // `--tag work --tag vpn` printing only the `vpn` rules reads
+                // as "the work rules are gone from the daemon".
+                if tag.is_some() {
+                    return Err("--tag may only be given once".into());
+                }
+                let value = rest.next().ok_or("--tag requires a value")?;
+                tag = Some(validate_tag(value)?);
+            }
+            other => return Err(format!("unknown flag '{other}'")),
+        }
+    }
+    Ok(Cmd::RulesList { stats, tag })
+}
+
+fn parse_on_off(state: &str) -> Result<bool, String> {
+    match state {
+        "on" => Ok(true),
+        "off" => Ok(false),
+        other => Err(format!("expected 'on' or 'off', got '{other}'")),
+    }
+}
+
+/// Check a `--tag` selector through the daemon's own gate, so a tag that
+/// could never name a rule fails here rather than looking like a set that
+/// happens to be empty - and says the same thing about it that a rejected
+/// rule does.
+fn validate_tag(tag: &str) -> Result<String, String> {
+    let tag = tag.to_string();
+    hallpass_types::validate_tags(std::slice::from_ref(&tag))?;
+    Ok(tag)
 }
 
 fn parse_rule_add(flags: &[&str]) -> Result<Rule, String> {
@@ -838,6 +904,11 @@ fn parse_rule_add(flags: &[&str]) -> Result<Rule, String> {
     let mut action: Option<Action> = None;
     let mut duration = RuleDuration::Forever;
     let mut priority: u32 = 0;
+    let mut tags: Vec<String> = Vec::new();
+    // An add replaces any rule of the same name outright, so re-adding a
+    // rule that was toggled off would silently start enforcing it again -
+    // and re-adding is how tags are changed from here.
+    let mut enabled = true;
     let mut matcher = RuleMatch::default();
 
     let mut it = flags.iter();
@@ -877,6 +948,9 @@ fn parse_rule_add(flags: &[&str]) -> Result<Rule, String> {
                 matcher.src_port =
                     Some(value.parse::<u16>().map_err(|_| format!("invalid src-port '{value}'"))?);
             }
+            // Repeatable; the list as a whole is checked below, through the
+            // same gate the daemon applies.
+            "--tag" => tags.push(value.to_string()),
             "--iface" => matcher.iface = Some(value.to_string()),
             "--app-id" => matcher.app_id = Some(parse_app_id(value)?),
             "--domains-file" => matcher.domains_file = Some(PathBuf::from(value)),
@@ -906,16 +980,28 @@ fn parse_rule_add(flags: &[&str]) -> Result<Rule, String> {
                     .parse::<u32>()
                     .map_err(|_| format!("invalid priority '{value}'"))?;
             }
+            "--enabled" => {
+                enabled = match value {
+                    "true" => true,
+                    "false" => false,
+                    other => return Err(format!("invalid enabled '{other}': expected true or false")),
+                };
+            }
             other => return Err(format!("unknown flag '{other}'")),
         }
     }
+    // The daemon's own gate, so the count cap, the charset and the repeat
+    // check are one definition rather than whichever subset this parser
+    // remembered.
+    hallpass_types::validate_tags(&tags)?;
 
     Ok(Rule {
         name: name.ok_or_else(|| "--name is required".to_string())?,
         action: action.ok_or_else(|| "--action is required".to_string())?,
         duration,
         priority,
-        enabled: true,
+        enabled,
+        tags,
         matcher,
     })
 }
@@ -1028,7 +1114,10 @@ mod tests {
         assert_eq!(parse_ok(&["doctor"]).cmd, Cmd::Doctor);
         parse_err(&["doctor", "extra"]);
         assert_eq!(parse_ok(&["watch"]).cmd, Cmd::Watch);
-        assert_eq!(parse_ok(&["rules"]).cmd, Cmd::RulesList { stats: false });
+        assert_eq!(
+            parse_ok(&["rules"]).cmd,
+            Cmd::RulesList { stats: false, tag: None }
+        );
         assert_eq!(
             parse_ok(&["events"]).cmd,
             Cmd::Events(EventsOpts {
@@ -1273,10 +1362,112 @@ mod tests {
     }
 
     #[test]
+    fn rules_tag_selectors() {
+        assert_eq!(
+            parse_ok(&["rules", "--tag", "work"]).cmd,
+            Cmd::RulesList {
+                stats: false,
+                tag: Some("work".into())
+            }
+        );
+        assert_eq!(
+            parse_ok(&["rules", "--tag", "work", "--stats"]).cmd,
+            Cmd::RulesList {
+                stats: true,
+                tag: Some("work".into())
+            }
+        );
+        assert_eq!(
+            parse_ok(&["rules", "toggle", "--tag", "work", "off"]).cmd,
+            Cmd::RulesToggleTag {
+                tag: "work".into(),
+                enabled: false
+            }
+        );
+        // A selector that could never name a rule is refused here rather
+        // than sent and reported as an empty set.
+        assert!(parse_err(&["rules", "--tag", "Work"]).contains("bad tag"));
+        assert!(parse_err(&["rules", "toggle", "--tag", "Work", "off"]).contains("bad tag"));
+        assert!(parse_err(&["rules", "--tag"]).contains("requires a value"));
+        // `--tag off` is two arguments, which is the shape of `NAME on|off`:
+        // it must not read as toggling a rule literally named `--tag`.
+        assert!(parse_err(&["rules", "toggle", "--tag", "off"]).contains("--tag TAG"));
+        // Only `--tag` is reserved. `rules add --name --legacy-allow` and a
+        // hand-written rules.d file both create names like this, and `rules
+        // rm` still takes them, so refusing them here would leave deletion
+        // as the only way to stop such a rule enforcing.
+        assert_eq!(
+            parse_ok(&["rules", "toggle", "--legacy-allow", "off"]).cmd,
+            Cmd::RulesToggle {
+                name: "--legacy-allow".into(),
+                enabled: false
+            }
+        );
+        // A tag cannot begin with a dash, so a flag after `--tag` is refused
+        // rather than swallowed as the selector - which would have listed an
+        // empty set and exited 0 for `rules --tag --stats`.
+        assert!(parse_err(&["rules", "--tag", "--stats"]).contains("bad tag"));
+        // And a second `--tag` is an error, not an overwrite: printing only
+        // the last one's rules reads as the first set being gone.
+        assert!(parse_err(&["rules", "--tag", "work", "--tag", "vpn"]).contains("only be given once"));
+    }
+
+    /// An add replaces any rule of the same name outright, so the flag that
+    /// keeps a disabled rule disabled has to exist: re-adding is how tags
+    /// are changed, and without it that silently re-enables the rule.
+    #[test]
+    fn rules_add_enabled_flag() {
+        let base = ["rules", "add", "--name", "r", "--action", "deny", "--port", "443"];
+        let rule_of = |extra: &[&str]| {
+            let mut argv: Vec<&str> = base.to_vec();
+            argv.extend_from_slice(extra);
+            match parse_ok(&argv).cmd {
+                Cmd::RulesAdd(rule) => rule,
+                other => panic!("expected RulesAdd, got {other:?}"),
+            }
+        };
+        assert!(rule_of(&[]).enabled, "an add still defaults to enabled");
+        assert!(!rule_of(&["--enabled", "false"]).enabled);
+        assert!(rule_of(&["--enabled", "true"]).enabled);
+
+        let mut argv: Vec<&str> = base.to_vec();
+        argv.extend_from_slice(&["--enabled", "maybe"]);
+        assert!(parse_err(&argv).contains("expected true or false"));
+    }
+
+    #[test]
+    fn rules_add_tags() {
+        let cli = parse_ok(&[
+            "rules", "add", "--name", "r", "--action", "deny", "--port", "443", "--tag", "work",
+            "--tag", "vpn",
+        ]);
+        let Cmd::RulesAdd(rule) = cli.cmd else {
+            panic!("expected RulesAdd");
+        };
+        assert_eq!(rule.tags, vec!["work".to_string(), "vpn".to_string()]);
+
+        let base = ["rules", "add", "--name", "r", "--action", "deny", "--port", "443"];
+        let with = |extra: &[&str]| {
+            let mut argv: Vec<&str> = base.to_vec();
+            argv.extend_from_slice(extra);
+            parse_err(&argv)
+        };
+        assert!(with(&["--tag", "Work"]).contains("bad tag"));
+        assert!(with(&["--tag", "work", "--tag", "work"]).contains("duplicate tag"));
+        // The count cap is the check this parser used to be missing, so a
+        // rule the daemon would refuse was only refused after a round trip.
+        let many: Vec<String> = (0..=hallpass_types::MAX_TAGS_PER_RULE)
+            .flat_map(|i| ["--tag".to_string(), format!("t{i}")])
+            .collect();
+        let many: Vec<&str> = many.iter().map(String::as_str).collect();
+        assert!(with(&many).contains("at most"));
+    }
+
+    #[test]
     fn rules_list_stats_export_import() {
         assert_eq!(
             parse_ok(&["rules", "--stats"]).cmd,
-            Cmd::RulesList { stats: true }
+            Cmd::RulesList { stats: true, tag: None }
         );
         assert_eq!(parse_ok(&["rules", "export"]).cmd, Cmd::RulesExport);
         assert_eq!(
@@ -1288,7 +1479,7 @@ mod tests {
         assert!(parse_err(&["rules", "import"]).contains("rules import PATH"));
         assert!(parse_err(&["rules", "import", "a", "b"]).contains("rules import PATH"));
         assert!(parse_err(&["rules", "export", "now"]).contains("rules export"));
-        assert!(parse_err(&["rules", "--stats", "x"]).contains("unexpected arguments"));
+        assert!(parse_err(&["rules", "--stats", "x"]).contains("unknown flag"));
     }
 
     #[test]

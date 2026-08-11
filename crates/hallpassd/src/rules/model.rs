@@ -99,6 +99,15 @@ impl CompiledRule {
                 hallpass_types::RUN_SESSION_RULE_PREFIX
             ));
         }
+        // Deliberately not where tags are validated, unlike every other
+        // field here. Compiling is what decides whether a rule is enforced,
+        // and a tag cannot change what a rule matches: refusing one would
+        // mean an operator who mistyped a label on a deny rule silently
+        // stops blocking the traffic that file exists to block. Rule files
+        // have their tags normalized on the way in (`load_dir`), and the
+        // interactive entrances refuse a bad list outright (`RuleStore::add`
+        // and both clients), where the cost of being strict is an error
+        // message rather than an unenforced rule.
         let m = &rule.matcher;
         // A criteria-free matcher matches every connection. That is a valid
         // thing to want (a final catch-all), but it is never a thing to want
@@ -371,12 +380,17 @@ mod tests {
     use hallpass_types::{RuleDuration, RuleMatch};
 
     fn rule_with(matcher: RuleMatch) -> Rule {
+        tagged_rule_with(Vec::new(), matcher)
+    }
+
+    fn tagged_rule_with(tags: Vec<String>, matcher: RuleMatch) -> Rule {
         Rule {
             name: "t".into(),
             action: Action::Allow,
             duration: RuleDuration::Session,
             priority: 0,
             enabled: true,
+            tags,
             matcher,
         }
     }
@@ -832,6 +846,34 @@ mod tests {
             ..Default::default()
         });
         assert!(CompiledRule::compile(&r).is_ok());
+    }
+
+    /// **A bad tag must never cost a rule its enforcement.** Compiling is
+    /// what decides whether a rule is in the enforced set, and a tag cannot
+    /// change what a rule matches, so refusing one here would mean a
+    /// mistyped label on a deny rule silently passes the traffic that rule
+    /// exists to stop. The strictness lives where a refusal is only an error
+    /// message: `RuleStore::add` for the interactive path, and `load_dir`
+    /// normalizes what is already on disk.
+    #[test]
+    fn a_malformed_tag_never_stops_a_rule_compiling() {
+        let matcher = RuleMatch {
+            port: Some(443),
+            ..Default::default()
+        };
+        let one = |tag: &str| tagged_rule_with(vec![tag.to_string()], matcher.clone());
+        for bad in ["Work", "work lab", "", "-", &"a".repeat(33)] {
+            assert!(
+                CompiledRule::compile(&one(bad)).is_ok(),
+                "tag {bad:?} cost the rule its enforcement"
+            );
+        }
+        let dup = tagged_rule_with(vec!["work".into(), "work".into()], matcher.clone());
+        assert!(CompiledRule::compile(&dup).is_ok());
+        let many: Vec<String> = (0..=hallpass_types::MAX_TAGS_PER_RULE)
+            .map(|i| format!("t{i}"))
+            .collect();
+        assert!(CompiledRule::compile(&tagged_rule_with(many, matcher)).is_ok());
     }
 
     #[test]

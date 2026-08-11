@@ -454,7 +454,13 @@ fn format_rule_table(rules: &[Rule], hits: Option<&[RuleHit]>) -> String {
         .map(|h| (h.name.as_str(), h))
         .collect();
 
+    // Only once some rule carries one: a column of empty cells costs width
+    // on a table that already has seven of them, and tags are opt-in.
+    let tagged = rules.iter().any(|r| !r.tags.is_empty());
     let mut header: Vec<&str> = vec!["NAME", "ACTION", "DURATION", "PRIO", "ENABLED"];
+    if tagged {
+        header.push("TAGS");
+    }
     if hits.is_some() {
         header.extend(["HITS", "LAST HIT"]);
     }
@@ -475,6 +481,17 @@ fn format_rule_table(rules: &[Rule], hits: Option<&[RuleHit]>) -> String {
                 r.priority.to_string(),
                 if r.enabled { "yes" } else { "no" }.to_string(),
             ];
+            if tagged {
+                // Sanitized like the neighbouring cells: `valid_tag` should
+                // make it impossible for a tag to reshape this row, and this
+                // table is exactly where relying on that would cost the
+                // operator the audit they are reading it for.
+                cells.push(if r.tags.is_empty() {
+                    "-".to_string()
+                } else {
+                    sanitize_for_display(&r.tags.join(",")).into_owned()
+                });
+            }
             if hits.is_some() {
                 let hit = by_name.get(r.name.as_str());
                 cells.push(hit.map_or(0, |h| h.hits).to_string());
@@ -1097,6 +1114,7 @@ mod tests {
             duration: RuleDuration::Forever,
             priority: 100,
             enabled: true,
+            tags: Vec::new(),
             matcher: RuleMatch {
                 domain: Some("a\r\nb.example.org".into()),
                 cmdline_contains: Some("x\x1b[2Ky".into()),
@@ -1120,6 +1138,7 @@ mod tests {
             duration: RuleDuration::Forever,
             priority: 1,
             enabled: true,
+            tags: Vec::new(),
             matcher: RuleMatch {
                 port: Some(25),
                 ..Default::default()
@@ -1150,6 +1169,7 @@ mod tests {
                 duration: RuleDuration::Session,
                 priority: 1,
                 enabled: true,
+                tags: Vec::new(),
                 matcher: RuleMatch {
                     port: Some(443),
                     domain: Some("*.example.org".into()),
@@ -1162,6 +1182,7 @@ mod tests {
                 duration: RuleDuration::Forever,
                 priority: 0,
                 enabled: false,
+                tags: Vec::new(),
                 matcher: RuleMatch::default(),
             },
         ];
@@ -1183,6 +1204,19 @@ mod tests {
         assert_eq!(format_rules_with_hits(&[], &[]), "no rules\n");
     }
 
+    #[test]
+    fn tags_column_appears_only_when_a_rule_has_tags() {
+        let mut rules = vec![counted("a"), counted("b")];
+        assert!(!format_rules(&rules).contains("TAGS"));
+
+        rules[1].tags = vec!["work".into(), "vpn".into()];
+        let out = format_rules(&rules);
+        assert!(out.contains("TAGS"), "{out}");
+        let lines: Vec<&str> = out.lines().collect();
+        assert!(lines[1].contains(" -  "), "untagged rule reads as a dash:\n{out}");
+        assert!(lines[2].contains("work,vpn"), "{out}");
+    }
+
     fn counted(name: &str) -> Rule {
         Rule {
             name: name.into(),
@@ -1190,6 +1224,7 @@ mod tests {
             duration: RuleDuration::Forever,
             priority: 1,
             enabled: true,
+            tags: Vec::new(),
             matcher: RuleMatch {
                 port: Some(25),
                 ..Default::default()

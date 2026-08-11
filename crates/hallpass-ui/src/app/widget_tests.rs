@@ -514,6 +514,7 @@ fn toggling_a_rule_asks_the_daemon_instead_of_editing_the_row() {
         duration: RuleDuration::Forever,
         priority: 10,
         enabled: true,
+        tags: Vec::new(),
         matcher: hallpass_types::RuleMatch {
             port: Some(443),
             ..Default::default()
@@ -539,4 +540,87 @@ fn toggling_a_rule_asks_the_daemon_instead_of_editing_the_row() {
         harness.state().rules[0].enabled,
         "the row was edited before the daemon agreed to it"
     );
+}
+
+/// The bulk buttons act on the selected tag, not on what the table happens
+/// to be showing, and like the per-row checkbox they ask rather than edit.
+/// They also only exist under a chosen tag: an "enable all" whose scope is
+/// whatever is on screen is the kind of button that disables a host.
+#[test]
+fn the_bulk_buttons_act_on_the_selected_tag() {
+    let (to_daemon, mut from_ui) = tokio::sync::mpsc::unbounded_channel();
+    let (_to_ui, from_net) = std::sync::mpsc::channel();
+    let mut app = HallpassApp::with_channels(to_daemon, from_net);
+    app.tab = Tab::Rules;
+    let tagged = |name: &str, tags: &[&str]| hallpass_types::Rule {
+        name: name.to_string(),
+        action: hallpass_types::Action::Deny,
+        duration: RuleDuration::Forever,
+        priority: 10,
+        enabled: true,
+        tags: tags.iter().map(|t| (*t).to_string()).collect(),
+        matcher: hallpass_types::RuleMatch {
+            port: Some(443),
+            ..Default::default()
+        },
+    };
+    app.rules = vec![tagged("w", &["work"]), tagged("plain", &[])];
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(820.0, 520.0))
+        .build_ui_state(|ui, app: &mut HallpassApp| app.main_window(ui), app);
+    harness.run();
+
+    // No tag chosen: nothing that could act on a set is on screen.
+    assert!(
+        harness.query_by_label("Disable all").is_none(),
+        "a bulk button with no set selected"
+    );
+
+    harness.state_mut().rule_tag_filter = Some("work".to_string());
+    harness.run();
+    harness.get_by_label("Disable all").click();
+    harness.run();
+
+    assert_eq!(
+        drain(&mut from_ui),
+        vec![ClientMsg::RuleToggleTag {
+            tag: "work".to_string(),
+            enabled: false,
+        }]
+    );
+    assert!(
+        harness.state().rules.iter().all(|r| r.enabled),
+        "the rows were edited before the daemon agreed to it"
+    );
+}
+
+/// A filter naming a tag no rule carries any more (its last rule was
+/// deleted or retagged) must fall back to the whole list: an empty table
+/// with no way back to it reads as a ruleset that lost its rules.
+#[test]
+fn a_filter_whose_tag_stopped_existing_resets() {
+    let (to_daemon, mut from_ui) = tokio::sync::mpsc::unbounded_channel();
+    let (_to_ui, from_net) = std::sync::mpsc::channel();
+    let mut app = HallpassApp::with_channels(to_daemon, from_net);
+    app.tab = Tab::Rules;
+    app.rules = vec![hallpass_types::Rule {
+        name: "w".to_string(),
+        action: hallpass_types::Action::Deny,
+        duration: RuleDuration::Forever,
+        priority: 10,
+        enabled: true,
+        tags: vec!["work".to_string()],
+        matcher: hallpass_types::RuleMatch {
+            port: Some(443),
+            ..Default::default()
+        },
+    }];
+    app.rule_tag_filter = Some("gone".to_string());
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(820.0, 520.0))
+        .build_ui_state(|ui, app: &mut HallpassApp| app.main_window(ui), app);
+    harness.run();
+
+    assert_eq!(harness.state().rule_tag_filter, None);
+    assert!(drain(&mut from_ui).is_empty(), "resetting a filter asks nothing");
 }

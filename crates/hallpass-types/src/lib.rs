@@ -92,7 +92,12 @@ use serde::{Deserialize, Serialize};
 /// which frames exist is exactly what v5 was bumped to avoid - a wrapper
 /// sending a frame the daemon cannot decode tears down the connection the
 /// session lives on, mid-session, instead of being refused at connect.
-pub const PROTOCOL_VERSION: u32 = 13;
+///
+/// v14: rule tags. [`Rule::tags`] plus [`ClientMsg::RuleToggleTag`] and
+/// [`DaemonMsg::RulesToggled`], so a set of rules can be enabled or disabled
+/// as one operation instead of one round trip per name. The struct field
+/// forces the bump, as in v2.
+pub const PROTOCOL_VERSION: u32 = 14;
 
 /// Prefix reserved for the synthetic rule name a session grant reports.
 ///
@@ -501,9 +506,35 @@ pub struct Rule {
     pub priority: u32,
     /// Whether the rule is currently active.
     pub enabled: bool,
+    /// Labels selecting this rule in bulk, as `rules toggle --tag` does.
+    /// Validated by [`valid_tag`]; not match criteria, so nothing here
+    /// reaches the packet path.
+    ///
+    /// `serde(default)` because this arrived after rules were being written
+    /// to disk. Without it, `deny_unknown_fields` plus a required field means
+    /// every rule file an operator already has fails to parse on the upgrade
+    /// that adds it, and the daemon starts with an empty ruleset it reports
+    /// only as skip warnings. Never `skip_serializing_if`: postcard writes
+    /// fields positionally and has no concept of an absent one, so omitting
+    /// this on serialize would misalign every field after it.
+    #[serde(default)]
+    pub tags: Vec<String>,
     /// Match criteria. Serialized as "match" in TOML/JSON.
+    ///
+    /// Last, and every plain value above it: TOML ends the top-level keys at
+    /// the first table header, so a field serialized after `matcher` would
+    /// either fail to encode or land inside `[match]`.
     #[serde(rename = "match")]
     pub matcher: RuleMatch,
+}
+
+impl Rule {
+    /// Whether this rule carries `tag`. One definition of the predicate the
+    /// whole feature selects on, so the daemon's bulk toggle and a client's
+    /// listing filter cannot disagree about what a set contains.
+    pub fn has_tag(&self, tag: &str) -> bool {
+        self.tags.iter().any(|t| t == tag)
+    }
 }
 
 /// Final decision for a connection.
@@ -746,6 +777,103 @@ pub fn valid_app_id(id: &str) -> bool {
         // is not an application.
         && name.bytes().any(|b| b.is_ascii_alphanumeric())
         && name.bytes().all(allowed)
+}
+
+/// Maximum bytes in one [`Rule::tags`] entry.
+pub const MAX_TAG_BYTES: usize = 32;
+
+/// Maximum tags one rule may carry.
+///
+/// A tag exists to select a rule in bulk, and a rule that belongs to eight
+/// different sets is no longer being selected by any of them. The bound is
+/// also what keeps `tags` from being a place to store text: the rule's wire
+/// size is already capped, but a cap reached by one field is a cap the
+/// operator meets as "rule too large" with nothing pointing at the cause.
+pub const MAX_TAGS_PER_RULE: usize = 8;
+
+/// Whether `tag` is a well-formed [`Rule::tags`] entry: 1 to
+/// [`MAX_TAG_BYTES`] of lowercase ASCII alphanumerics, `-` and `_`, starting
+/// with a letter or digit.
+///
+/// Uppercase is refused rather than folded, for the reason the `snap:` half
+/// of [`valid_app_id`] is: a tag names a set, and two spellings that select
+/// the same set mean `rules toggle --tag Work` silently misses every rule
+/// tagged `work` - a bulk operation that reports success while leaving rules
+/// enforcing. An error naming the fix is the cheaper failure.
+///
+/// The leading character is constrained for two separate reasons, both about
+/// a tag being mistaken for something else. Every rule listing renders "this
+/// rule has no tags" as `-`, so a rule tagged `-` (or `_`, or `--`) displays
+/// exactly like an untagged one and the GUI's tag picker offers it directly
+/// under `(all)`: an operator auditing the table would read a rule as being
+/// in no set at all, and then a bulk toggle would disable it as part of one.
+/// And a `--tag` selector takes the next argument, so admitting a leading
+/// dash lets `rules --tag --stats` swallow the flag after it and report an
+/// empty set with a success exit code.
+pub fn valid_tag(tag: &str) -> bool {
+    tag.len() <= MAX_TAG_BYTES
+        && tag.bytes().next().is_some_and(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+        && tag
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'-' | b'_'))
+}
+
+/// Drop everything [`validate_tags`] would refuse, returning what was
+/// dropped so the caller can say so.
+///
+/// For rules that already exist. A tag cannot change what a rule matches, so
+/// refusing a rule over one is refusing to enforce policy the operator wrote
+/// because they mistyped a label - and for a deny rule that means letting
+/// through exactly the traffic the file exists to stop. Interactive
+/// entrances still call [`validate_tags`] and refuse, because there the cost
+/// of being strict is an error message rather than an unenforced rule.
+pub fn retain_valid_tags(tags: &mut Vec<String>) -> Vec<String> {
+    let mut dropped = Vec::new();
+    let mut kept: Vec<String> = Vec::new();
+    for tag in tags.drain(..) {
+        if kept.len() < MAX_TAGS_PER_RULE && valid_tag(&tag) && !kept.contains(&tag) {
+            kept.push(tag);
+        } else {
+            dropped.push(tag);
+        }
+    }
+    *tags = kept;
+    dropped
+}
+
+/// Check a whole [`Rule::tags`] list: every tag well-formed, no repeats, at
+/// most [`MAX_TAGS_PER_RULE`] of them. `Err` is a message for the operator.
+///
+/// The list rules live here, not only the per-tag grammar, because each
+/// entrance would otherwise implement its own subset: the first cut had the
+/// CLI checking repeats but not the count, so nine `--tag` flags passed local
+/// validation and were refused only by the daemon - which is the round trip
+/// the client-side check exists to avoid.
+///
+/// For an interactive entrance, where refusing costs an error message.
+/// [`retain_valid_tags`] is the one for a rule that is already policy.
+pub fn validate_tags(tags: &[String]) -> Result<(), String> {
+    if tags.len() > MAX_TAGS_PER_RULE {
+        return Err(format!(
+            "rule carries {} tags, at most {MAX_TAGS_PER_RULE} are allowed",
+            tags.len()
+        ));
+    }
+    for (i, tag) in tags.iter().enumerate() {
+        if !valid_tag(tag) {
+            return Err(format!(
+                "bad tag {tag:?}: expected 1 to {MAX_TAG_BYTES} bytes of lowercase \
+                 letters, digits, `-` or `_`, starting with a letter or digit"
+            ));
+        }
+        // Refused rather than folded, like the case rule: a repeat is a typo
+        // (`["work", "work"]` for `["work", "home"]`), and silently collapsing
+        // it hides the tag the operator meant to write.
+        if tags[..i].contains(tag) {
+            return Err(format!("duplicate tag {tag:?}"));
+        }
+    }
+    Ok(())
 }
 
 /// True for characters that let text reshape how it renders.
@@ -1013,6 +1141,47 @@ mod app_id_tests {
         let long = "a".repeat(MAX_APP_ID_NAME_BYTES);
         assert!(valid_app_id(&format!("snap:{long}")));
         assert!(!valid_app_id(&format!("snap:{long}a")));
+    }
+}
+
+#[cfg(test)]
+mod tag_tests {
+    use super::*;
+
+    #[test]
+    fn well_formed_tags_are_accepted() {
+        for tag in ["work", "vpn2", "home-lab", "ci_runner", "a", "0"] {
+            assert!(valid_tag(tag), "{tag:?}");
+        }
+        let long = "a".repeat(MAX_TAG_BYTES);
+        assert!(valid_tag(&long));
+        assert!(!valid_tag(&format!("{long}a")));
+    }
+
+    #[test]
+    fn malformed_tags_are_rejected() {
+        for tag in [
+            "",             // a tag names a set; nothing names nothing
+            "Work",         // case is refused, not folded
+            "work lab",     // whitespace would split one selector into two
+            "work,lab",     // the CLI's own separator
+            "work.lab",     // reserved for nothing, so not admitted for now
+            "work\u{1b}[2K", // terminal escape
+            "wörk",         // non-ASCII: two spellings of one word
+            // Every rule listing prints `-` for "no tags", so these render
+            // as untagged and the GUI picker offers them as "(all)"'s twin.
+            "-",
+            "--",
+            "_",
+            "___",
+            // A `--tag` selector eats the next argument: a tag that can look
+            // like a flag lets `rules --tag --stats` swallow the flag.
+            "--stats",
+            "-work",
+            "_work",
+        ] {
+            assert!(!valid_tag(tag), "{tag:?}");
+        }
     }
 }
 
@@ -1473,6 +1642,18 @@ pub enum ClientMsg {
     /// Request the live session grants. Answered with
     /// [`DaemonMsg::RunSessions`].
     RunSessionList,
+    /// Enable or disable every rule carrying `tag`, as one change. Answered
+    /// with [`DaemonMsg::RulesToggled`], or Err when no rule carries it.
+    ///
+    /// One message rather than a `RuleToggle` per name: the daemon applies
+    /// the whole set under a single lock and recompiles once, so no packet is
+    /// ever judged against half of the operator's intent.
+    RuleToggleTag {
+        /// Tag selecting the rules to toggle; see [`valid_tag`].
+        tag: String,
+        /// New enabled state for all of them.
+        enabled: bool,
+    },
 }
 
 /// Messages sent from the daemon to a client.
@@ -1551,4 +1732,13 @@ pub enum DaemonMsg {
     },
     /// Response to [`ClientMsg::RunSessionList`].
     RunSessions(Vec<RunSessionInfo>),
+    /// Response to [`ClientMsg::RuleToggleTag`].
+    RulesToggled {
+        /// How many rules the change reached.
+        changed: u32,
+        /// Rules whose new state could not be written to disk, and which
+        /// therefore kept the state they had. Named rather than counted:
+        /// this is a list the operator has to go and look at.
+        failed: Vec<String>,
+    },
 }

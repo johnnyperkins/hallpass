@@ -7,6 +7,33 @@ carries what an upgrade changes on a running host.
 
 ### Added
 
+- **Rule tags and bulk toggle (wire protocol v14).** A rule can carry
+  `tags = ["work", "vpn"]`, and `hallpass-cli rules toggle --tag work off`
+  enables or disables the whole set as one change - one lock, one recompile,
+  so no connection is judged against half of it. `hallpass-cli rules --tag
+  work` lists a set, `rules add --tag` and the GUI editor's Tags field write
+  them, and the rule table grows a TAGS column only once some rule carries
+  one. The GUI's Rules tab gets the same three: the column, a tag picker that
+  narrows the table, and Enable all / Disable all for the picked tag (shown
+  only once one is picked, since they act on the set rather than on what is
+  displayed). Tags label rules; they never match connections. A rule already in the
+  requested state is left alone, a tag no rule carries is an error from both
+  the listing and the toggle, and a rule whose file cannot be written keeps
+  the state it had and is named in the CLI's non-zero exit. An unusable tag
+  in a rules.d file never costs that rule its enforcement - the tag is
+  dropped with a journal warning and the rule still filters - while `rules
+  add`, an IPC add and the GUI editor refuse one outright.
+
+  Two things to know before using it. Rule files written before this keep
+  loading unchanged (`tags` defaults to empty), but a file this version
+  *writes* carries `tags = []` and an older daemon refuses unknown keys, so
+  **downgrading after any rule has been added, toggled or approved needs
+  those lines removed** or those rules are skipped on the older build. And
+  adding a rule under an existing name still replaces it wholesale, so
+  re-adding to change tags restates everything: pass the new `--enabled
+  true|false` to keep a disabled rule disabled, and note that importing a
+  document exported before this version strips tags off the rules it
+  restores.
 - **`hallpass-cli run -- <cmd>`: one-off network grants (wire protocol
   v13).** A build, an installer or a test suite either meant answering a
   prompt per connection or writing a permanent allow rule for a one-off.

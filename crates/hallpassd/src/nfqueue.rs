@@ -730,6 +730,7 @@ mod tests {
             duration: RuleDuration::Session,
             priority: 1,
             enabled: true,
+            tags: Vec::new(),
             matcher: RuleMatch {
                 port: Some(443),
                 ..Default::default()
@@ -837,6 +838,7 @@ mod tests {
             duration: RuleDuration::Session,
             priority: 1,
             enabled: true,
+            tags: Vec::new(),
             matcher: RuleMatch {
                 port: Some(443),
                 ..Default::default()

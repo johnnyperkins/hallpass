@@ -39,6 +39,8 @@ pub struct RuleEditor {
     timespan: String,
     priority: String,
     enabled: bool,
+    /// Comma-separated tags, parsed on save. Not a match criterion.
+    tags: String,
     // Match criteria, blank = unset.
     exe: String,
     exe_glob: String,
@@ -67,6 +69,29 @@ pub struct RuleEditor {
     awaiting: bool,
 }
 
+/// Parse the tags field: separated by commas or whitespace, in whichever
+/// combination the operator typed.
+///
+/// Validated here so the form says what is wrong next to the field, but the
+/// daemon checks the same thing on the way in - this is feedback, not a gate.
+fn parse_tags(text: &str) -> Result<Vec<String>, String> {
+    let mut tags: Vec<String> = Vec::new();
+    for tag in text.split([',', ' ', '\t']).filter(|t| !t.is_empty()) {
+        // Bailing inside the loop rather than checking the length after it:
+        // a pasted field is unbounded, and the check that would catch it is
+        // otherwise reached only after allocating every entry in it.
+        if tags.len() == hallpass_types::MAX_TAGS_PER_RULE {
+            return Err(format!(
+                "at most {} tags per rule",
+                hallpass_types::MAX_TAGS_PER_RULE
+            ));
+        }
+        tags.push(tag.to_string());
+    }
+    hallpass_types::validate_tags(&tags)?;
+    Ok(tags)
+}
+
 impl RuleEditor {
     /// An empty form for a new rule.
     pub fn add() -> Self {
@@ -78,6 +103,7 @@ impl RuleEditor {
             timespan: "1h".to_string(),
             priority: "10".to_string(),
             enabled: true,
+            tags: String::new(),
             exe: String::new(),
             exe_glob: String::new(),
             exe_sha256: String::new(),
@@ -179,6 +205,7 @@ impl RuleEditor {
             e.timespan = format!("{left_secs}s");
         }
         e.priority = rule.priority.to_string();
+        e.tags = rule.tags.join(", ");
         e.exe = path(&m.exe);
         e.exe_glob = text(&m.exe_glob);
         e.exe_sha256 = text(&m.exe_sha256);
@@ -276,6 +303,7 @@ impl RuleEditor {
             duration,
             priority,
             enabled: self.enabled,
+            tags: parse_tags(&self.tags)?,
             matcher,
         })
     }
@@ -441,6 +469,18 @@ impl RuleEditor {
 
                 ui.label("Enabled");
                 ui.checkbox(&mut self.enabled, "");
+                ui.end_row();
+
+                // Above the separator, with the rest of the rule's own
+                // properties: a tag selects the rule, it does not select
+                // connections, and putting it under "Match criteria" would
+                // read as an operand that narrows what the rule catches.
+                ui.label("Tags");
+                ui.add(
+                    TextEdit::singleline(&mut self.tags)
+                        .hint_text("work, vpn")
+                        .desired_width(200.0),
+                );
                 ui.end_row();
             });
 
@@ -646,6 +686,10 @@ mod tests {
             duration: RuleDuration::Forever,
             priority: 42,
             enabled: true,
+            // Tagged, because saving is an add by the same name: an editor
+            // that dropped tags would quietly remove a rule from every set
+            // it belonged to.
+            tags: vec!["work".into(), "vpn".into()],
             matcher: RuleMatch {
                 exe: Some("/usr/bin/curl".into()),
                 dest: Some("10.0.0.0/8".into()),
@@ -660,6 +704,22 @@ mod tests {
         assert_eq!(back, rule);
     }
 
+    #[test]
+    fn tags_field_accepts_commas_and_spaces_and_refuses_the_rest() {
+        assert_eq!(parse_tags(""), Ok(Vec::new()));
+        assert_eq!(
+            parse_tags("work, vpn home-lab"),
+            Ok(vec!["work".to_string(), "vpn".into(), "home-lab".into()])
+        );
+        assert!(parse_tags("Work").is_err(), "case is refused, not folded");
+        assert!(parse_tags("work, work").is_err(), "a repeat is a typo");
+        let many = (0..=hallpass_types::MAX_TAGS_PER_RULE)
+            .map(|i| format!("t{i}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        assert!(parse_tags(&many).is_err());
+    }
+
     /// Editing a disabled rule must not re-enable it: the enabled flag
     /// rides through the form like every other field.
     #[test]
@@ -670,6 +730,7 @@ mod tests {
             duration: RuleDuration::Forever,
             priority: 1,
             enabled: false,
+            tags: Vec::new(),
             matcher: RuleMatch {
                 port: Some(80),
                 ..Default::default()
@@ -690,6 +751,7 @@ mod tests {
             },
             priority: 1,
             enabled: true,
+            tags: Vec::new(),
             matcher: RuleMatch {
                 port: Some(80),
                 ..Default::default()

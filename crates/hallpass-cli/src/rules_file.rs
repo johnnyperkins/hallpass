@@ -63,6 +63,11 @@ mod tests {
                 duration: RuleDuration::Forever,
                 priority: 50,
                 enabled: true,
+                // Tagged deliberately: `tags` is a plain value and `[match]`
+                // is a table, and TOML refuses a value emitted after a table.
+                // An export that puts them the other way round fails to
+                // encode, which would take the whole backup with it.
+                tags: vec!["work".into(), "vpn".into()],
                 matcher: RuleMatch {
                     exe: Some(PathBuf::from("/usr/bin/curl")),
                     exe_sha256: Some("ab".repeat(32)),
@@ -82,6 +87,7 @@ mod tests {
                 },
                 priority: 10,
                 enabled: false,
+                tags: Vec::new(),
                 matcher: RuleMatch {
                     port_range: Some((1024, 65535)),
                     cmdline_contains: Some("--upload".into()),
@@ -100,6 +106,7 @@ mod tests {
                 duration: RuleDuration::Session,
                 priority: 0,
                 enabled: true,
+                tags: Vec::new(),
                 matcher: RuleMatch {
                     exe_glob: Some("/opt/*".into()),
                     ips_file: Some(PathBuf::from("/etc/hallpass/rules.d/bad.ips")),
@@ -131,6 +138,7 @@ mod tests {
             "duration = \"forever\"",
             "priority = 50",
             "enabled = true",
+            "\"work\",",
             "[rule.match]",
             "port = 443",
             "domain = \"*.example.org\"",

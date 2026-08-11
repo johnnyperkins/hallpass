@@ -63,6 +63,29 @@ pub fn spawn(
 
 /// Deliver an event to the UI thread and wake egui. Returns false if the UI
 /// side is gone (app shutting down).
+/// Whether a message dropped on reconnect is reported to the operator
+/// through [`UiEvent::SendFailed`].
+///
+/// Everything that changes what the daemon enforces, plus a prompt reply
+/// (which the daemon backstops with its default verdict). A refresh request
+/// is not here: it is re-sent on `Connected`.
+///
+/// Named rather than inline because it has to stay in step with
+/// `app::ack_kind`: a message that takes a slot in the pending-ack FIFO and
+/// is then dropped without this event leaves that slot orphaned, and from
+/// then on every daemon reply is matched to the previous request.
+pub(crate) fn reports_send_failure(msg: &ClientMsg) -> bool {
+    matches!(
+        msg,
+        ClientMsg::PromptReply { .. }
+            | ClientMsg::RuleAdd(_)
+            | ClientMsg::RuleDelete { .. }
+            | ClientMsg::RuleToggle { .. }
+            | ClientMsg::RuleToggleTag { .. }
+            | ClientMsg::ConfigSet(_)
+    )
+}
+
 fn send_ui(to_ui: &Sender<UiEvent>, ctx: &egui::Context, ev: UiEvent) -> bool {
     let ok = to_ui.send(ev).is_ok();
     if ok {
@@ -170,17 +193,9 @@ async fn connect_and_serve(
     // prompt replies for dead ids would draw spurious daemon errors, and
     // list/stat refreshes are re-requested on Connected anyway. Rule
     // changes, settings changes and prompt replies are reported so their
-    // loss is not silent.
+    // loss is not silent; see [`reports_send_failure`].
     while let Ok(msg) = from_ui.try_recv() {
-        if matches!(
-            msg,
-            ClientMsg::PromptReply { .. }
-                | ClientMsg::RuleAdd(_)
-                | ClientMsg::RuleDelete { .. }
-                | ClientMsg::RuleToggle { .. }
-                | ClientMsg::ConfigSet(_)
-        ) && !send_ui(to_ui, ctx, UiEvent::SendFailed { msg })
-        {
+        if reports_send_failure(&msg) && !send_ui(to_ui, ctx, UiEvent::SendFailed { msg }) {
             return Ok(());
         }
     }

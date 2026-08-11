@@ -204,6 +204,7 @@ pub fn suggest(events: &[ConnEvent], filters: &Filters) -> Proposal {
                 duration: RuleDuration::Forever,
                 priority: 0,
                 enabled: true,
+                tags: Vec::new(),
                 matcher: RuleMatch {
                     exe: Some(exe.into()),
                     app_id,

@@ -119,6 +119,7 @@ mod tests {
             duration: RuleDuration::Forever,
             priority: 10,
             enabled: true,
+            tags: Vec::new(),
             matcher: RuleMatch {
                 exe: Some(PathBuf::from("/usr/bin/curl")),
                 exe_glob: Some("/usr/bin/*".to_string()),
@@ -365,6 +366,32 @@ mod tests {
             age_secs: 12,
         }]);
         assert_eq!(roundtrip(&listed).await, listed);
+    }
+
+    /// The tag frames, in both directions, and a rule carrying tags: postcard
+    /// writes struct fields positionally, so a `Vec<String>` field that is
+    /// serialized differently from how it is read misaligns everything after
+    /// it rather than failing outright.
+    #[tokio::test]
+    async fn tag_messages_roundtrip() {
+        let toggle = ClientMsg::RuleToggleTag {
+            tag: "work".into(),
+            enabled: false,
+        };
+        assert_eq!(roundtrip(&toggle).await, toggle);
+
+        let toggled = DaemonMsg::RulesToggled {
+            changed: 3,
+            failed: vec!["locked-rule".into()],
+        };
+        assert_eq!(roundtrip(&toggled).await, toggled);
+
+        // The empty case rides through `sample_rule` in the round trips
+        // above this one, so only the populated field is new here.
+        let mut rule = sample_rule();
+        rule.tags = vec!["work".into(), "vpn".into()];
+        let back = roundtrip(&ClientMsg::RuleAdd(rule.clone())).await;
+        assert_eq!(back, ClientMsg::RuleAdd(rule));
     }
 
     #[test]

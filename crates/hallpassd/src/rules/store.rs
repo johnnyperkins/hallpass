@@ -52,6 +52,19 @@ pub struct RuleStore {
     /// watch channel rather than a notify so a subscriber that was busy
     /// during two changes still wakes once for the latest.
     changed: tokio::sync::watch::Sender<()>,
+    /// Bumped, under the entries lock, by every mutation that writes a rule
+    /// file. [`RuleStore::reload_disk`] reads it before scanning and again
+    /// once it holds the lock, and abandons a scan that straddled a write.
+    ///
+    /// `load_dir` runs outside the lock deliberately (a directory of file
+    /// reads is not something to hold the packet path's rule set behind), so
+    /// a scan can be taken mid-write and describe a directory that never
+    /// existed at any instant: some files carrying the new `enabled` and the
+    /// rest the old. Applied, that snapshot re-enables rules the operator
+    /// just disabled, after the CLI has already reported success. One
+    /// bulk toggle's fsyncs are far wider than the watcher's debounce, so
+    /// this is reachable rather than theoretical.
+    mutations: AtomicU64,
 }
 
 /// Hit accounting for one rule name.
@@ -436,7 +449,7 @@ fn load_dir(dir: &Path) -> LoadResult {
             skipped += 1;
             continue;
         }
-        let rule: Rule = match toml::from_str(&text) {
+        let mut rule: Rule = match toml::from_str(&text) {
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!(file = %path.display(), "skipping unparsable rule file: {e}");
@@ -444,6 +457,21 @@ fn load_dir(dir: &Path) -> LoadResult {
                 continue;
             }
         };
+        // Normalized, not refused: a tag is a label, and no selector could
+        // ever have named a malformed one, so dropping it costs nothing that
+        // worked. Skipping the rule instead would stop enforcing policy the
+        // operator wrote over a mistyped label - on a deny rule, that means
+        // passing exactly the traffic the file exists to stop.
+        let dropped = hallpass_types::retain_valid_tags(&mut rule.tags);
+        if !dropped.is_empty() {
+            tracing::warn!(
+                file = %path.display(),
+                rule = %rule.name,
+                "ignoring unusable tags {dropped:?}; the rule is still enforced. \
+                 Tags are lowercase letters, digits, `-` and `_`, start with a \
+                 letter or digit, and are unique"
+            );
+        }
         // The same validation add() applies, because both go through
         // `CompiledRule::compile`: a rule that cannot compile would
         // otherwise sit inert in the set and crash clients that render it
@@ -498,6 +526,7 @@ impl RuleStore {
             rules_skipped: AtomicU64::new(loaded.skipped),
             hits: RwLock::new(HashMap::new()),
             changed: tokio::sync::watch::channel(()).0,
+            mutations: AtomicU64::new(0),
         };
         store.rebuild();
         store
@@ -608,6 +637,11 @@ impl RuleStore {
                 "rule encodes to {wire_bytes} bytes, must be at most {MAX_RULE_WIRE_BYTES}"
             ));
         }
+        // Strict here, where a refusal is an error message the caller reads,
+        // rather than in `CompiledRule::compile`, where it would cost an
+        // existing rule its enforcement (see the note there, and `load_dir`,
+        // which normalizes instead).
+        hallpass_types::validate_tags(&rule.tags)?;
         // Before compile: compiling opens the list files as root.
         list_paths_within(&rule, &self.rules_dir)?;
         CompiledRule::compile(&rule)?;
@@ -663,6 +697,7 @@ impl RuleStore {
         // Remove the file under the lock so a concurrent reload_disk()
         // cannot resurrect the rule from a file whose entry is gone.
         if let Origin::Disk(path) = &old.origin {
+            self.mutations.fetch_add(1, Ordering::Relaxed);
             if let Err(e) = std::fs::remove_file(path) {
                 tracing::warn!(file = %path.display(), "failed to remove rule file: {e}");
             }
@@ -672,29 +707,91 @@ impl RuleStore {
         Ok(())
     }
 
-    /// Enable or disable a rule, updating its file if persisted.
-    pub fn toggle(&self, name: &str, enabled: bool) -> Result<(), String> {
+    /// Set `enabled` on every rule `select` accepts, persisting each to its
+    /// own file. Returns how many rules were selected, how many the change
+    /// actually moved, and `(name, error)` for each whose file could not be
+    /// written.
+    ///
+    /// The one mechanism behind [`RuleStore::toggle`] and
+    /// [`RuleStore::toggle_tag`], which differ only in what they select and
+    /// how they report. Written twice, the two verbs immediately disagreed
+    /// about whether an already-correct rule is rewritten and whether a
+    /// no-op change recompiles the ruleset.
+    ///
+    /// One lock and one rebuild for the whole selection: toggling name by
+    /// name would recompile once per rule, so a packet arriving mid-sequence
+    /// would be judged against half of the operator's intent, and half of
+    /// "disable everything tagged `work`" is a policy nobody wrote.
+    ///
+    /// A rule whose file cannot be written keeps the state it had, and the
+    /// rest of the selection still applies. The batch is deliberately not
+    /// all-or-nothing: undoing the writes that already landed needs the same
+    /// disk that just refused one.
+    fn set_enabled(
+        &self,
+        enabled: bool,
+        select: impl Fn(&Rule) -> bool,
+    ) -> (usize, u32, Vec<(String, String)>) {
         let mut entries = self.entries.lock().unwrap();
-        let entry = entries
-            .iter_mut()
-            .find(|e| e.rule.name == name)
-            .ok_or_else(|| format!("no such rule: {name}"))?;
-        entry.rule.enabled = enabled;
-        // Persist under the lock; see add() for the watcher race this
-        // avoids. Write to the entry's own file: a hand-written rule can
-        // live in a file whose name differs from the rule name, and a
-        // name-derived path would orphan it (the stale file would revert
-        // or resurrect the rule on the next reload).
-        if let Origin::Disk(path) = entry.origin.clone() {
-            let rule = entry.rule.clone();
-            if let Err(e) = self.persist_to(&rule, &path) {
-                entry.rule.enabled = !enabled;
-                return Err(e);
+        let mut matched = 0usize;
+        let mut changed = 0u32;
+        let mut failed = Vec::new();
+        for entry in entries.iter_mut().filter(|e| select(&e.rule)) {
+            matched += 1;
+            // Nothing to write, and nothing to recompile: `changed` counts
+            // what actually moved.
+            if entry.rule.enabled == enabled {
+                continue;
             }
+            entry.rule.enabled = enabled;
+            // Persist under the lock; see add() for the watcher race this
+            // avoids. Write to the entry's own file: a hand-written rule can
+            // live in a file whose name differs from the rule name, and a
+            // name-derived path would orphan it (the stale file would revert
+            // or resurrect the rule on the next reload).
+            if let Origin::Disk(path) = &entry.origin {
+                if let Err(e) = self.persist_to(&entry.rule, path) {
+                    tracing::warn!(rule = %entry.rule.name, "failed to persist toggle: {e}");
+                    entry.rule.enabled = !enabled;
+                    failed.push((entry.rule.name.clone(), e));
+                    continue;
+                }
+            }
+            changed += 1;
         }
         drop(entries);
-        self.rebuild();
-        Ok(())
+        if changed > 0 {
+            self.rebuild();
+        }
+        (matched, changed, failed)
+    }
+
+    /// Enable or disable a rule, updating its file if persisted.
+    pub fn toggle(&self, name: &str, enabled: bool) -> Result<(), String> {
+        let (matched, _, mut failed) = self.set_enabled(enabled, |r| r.name == name);
+        if matched == 0 {
+            return Err(format!("no such rule: {name}"));
+        }
+        // One rule selected, so at most one failure, and it is this call's
+        // whole outcome rather than part of a batch.
+        match failed.pop() {
+            Some((_, e)) => Err(e),
+            None => Ok(()),
+        }
+    }
+
+    /// Enable or disable every rule carrying `tag`, as one change. Returns
+    /// how many rules the change moved, and the names of any whose new state
+    /// could not be written to disk.
+    pub fn toggle_tag(&self, tag: &str, enabled: bool) -> Result<(u32, Vec<String>), String> {
+        let (matched, changed, failed) = self.set_enabled(enabled, |r| r.has_tag(tag));
+        // A tag no rule carries is nearly always a typo, and a quiet zero
+        // reads as "done" - the wrong answer to give someone who believes
+        // they just disabled their work rules.
+        if matched == 0 {
+            return Err(format!("no rule carries tag `{tag}`"));
+        }
+        Ok((changed, failed.into_iter().map(|(name, _)| name).collect()))
     }
 
     /// Remove rules whose `Until` deadline has passed, deleting persisted
@@ -713,6 +810,7 @@ impl RuleStore {
             }
             tracing::info!(rule = %e.rule.name, "timed rule expired");
             if let Origin::Disk(path) = &e.origin {
+                self.mutations.fetch_add(1, Ordering::Relaxed);
                 if let Err(err) = std::fs::remove_file(path) {
                     tracing::warn!(file = %path.display(), "failed to remove expired rule file: {err}");
                 }
@@ -731,6 +829,7 @@ impl RuleStore {
     /// whether a complete scan was applied; after `false` nothing changed
     /// and the caller should retry.
     pub fn reload_disk(&self) -> bool {
+        let generation = self.mutations.load(Ordering::Relaxed);
         let fresh = load_dir(&self.rules_dir);
         // An incomplete scan fails toward staleness: the loaded set stays as
         // it is and this reload changes nothing, the skip counter included
@@ -749,8 +848,18 @@ impl RuleStore {
             );
             return false;
         }
-        self.rules_skipped.fetch_add(fresh.skipped, Ordering::Relaxed);
         let mut entries = self.entries.lock().unwrap();
+        // Taken under the lock, so no further write can start before this
+        // decision. A scan that straddled one describes a directory that
+        // never existed at any instant - half a bulk toggle written, half
+        // not - and applying it would re-enable rules the operator was told
+        // were disabled. Same failure direction as an incomplete scan, same
+        // answer: keep what is loaded and let the watcher retry.
+        if self.mutations.load(Ordering::Relaxed) != generation {
+            tracing::debug!("rules reload aborted: the rule files changed under the scan");
+            return false;
+        }
+        self.rules_skipped.fetch_add(fresh.skipped, Ordering::Relaxed);
         entries.retain(|e| e.origin == Origin::Session);
         for f in fresh.entries {
             if !entries.iter().any(|e| e.rule.name == f.rule.name) {
@@ -843,6 +952,10 @@ impl RuleStore {
     /// reads, and `unique_path` has already refused to reuse a path this
     /// store does not own.
     fn persist_to(&self, rule: &Rule, path: &Path) -> Result<(), String> {
+        // Before the write, not after: a scan that starts while this is in
+        // flight must see a generation it cannot match later. See
+        // `mutations`.
+        self.mutations.fetch_add(1, Ordering::Relaxed);
         let text = toml::to_string_pretty(rule).map_err(|e| format!("serialize rule: {e}"))?;
         write_atomic(path, text.as_bytes(), 0o644)
             .map_err(|e| format!("write {}: {e}", path.display()))
@@ -940,6 +1053,7 @@ mod tests {
             duration,
             priority: 1,
             enabled: true,
+            tags: Vec::new(),
             matcher: RuleMatch {
                 port: Some(443),
                 ..Default::default()
@@ -1110,6 +1224,139 @@ mod tests {
         assert!(!on_disk.enabled, "the original file carries the toggle");
         store.reload_disk();
         assert!(!store.list()[0].enabled, "reload does not revert the toggle");
+    }
+
+    fn tagged(name: &str, tags: &[&str], duration: RuleDuration) -> Rule {
+        let mut r = rule(name, duration);
+        r.tags = tags.iter().map(|t| (*t).to_string()).collect();
+        r
+    }
+
+    /// The bulk toggle reaches exactly the tagged rules, on disk and in
+    /// memory, and leaves everything else where it was.
+    #[test]
+    fn toggle_tag_changes_only_tagged_rules() {
+        let (_td, dir) = tmpdir("toggle-tag");
+        let store = RuleStore::new(dir.clone());
+        store
+            .add(tagged("w1", &["work", "vpn"], RuleDuration::Forever))
+            .unwrap();
+        store
+            .add(tagged("w2", &["work"], RuleDuration::Session))
+            .unwrap();
+        store.add(rule("other", RuleDuration::Forever)).unwrap();
+
+        let (changed, failed) = store.toggle_tag("work", false).unwrap();
+        assert_eq!((changed, failed.len()), (2, 0));
+        let by_name = |n: &str| store.list().into_iter().find(|r| r.name == n).unwrap();
+        assert!(!by_name("w1").enabled);
+        assert!(!by_name("w2").enabled, "a session rule toggles too");
+        assert!(by_name("other").enabled, "an untagged rule is untouched");
+
+        // The disk rule's file carries it, so a reload does not revert.
+        let on_disk: Rule =
+            toml::from_str(&std::fs::read_to_string(dir.join("w1.toml")).unwrap()).unwrap();
+        assert!(!on_disk.enabled);
+        assert_eq!(on_disk.tags, vec!["work".to_string(), "vpn".to_string()]);
+
+        // Already in the requested state: nothing to change, and no error.
+        let (changed, failed) = store.toggle_tag("work", false).unwrap();
+        assert_eq!((changed, failed.len()), (0, 0));
+
+        // A tag no rule carries is an error, not an empty success: it is a
+        // typo, and a quiet zero reads as "your rules are disabled".
+        assert!(store.toggle_tag("wrok", false).is_err());
+    }
+
+    /// **A mistyped label must not cost a rule its enforcement.** A tag
+    /// cannot change what a rule matches, so a rule file carrying an
+    /// unusable one loads and enforces exactly as written, with the tag
+    /// dropped. Refusing the file instead would mean `tags = ["Prod"]` on a
+    /// deny rule silently passes the traffic that rule exists to stop.
+    #[test]
+    fn a_rule_file_with_an_unusable_tag_still_enforces() {
+        let (_td, dir) = tmpdir("bad-tag-file");
+        let text = "name = \"deny-telemetry\"\naction = \"deny\"\nduration = \"forever\"\n\
+                    priority = 1\nenabled = true\ntags = [\"Prod\", \"work\", \"work\", \"-\"]\n\
+                    [match]\nport = 25\n";
+        std::fs::write(dir.join("00-deny.toml"), text).unwrap();
+        let store = RuleStore::new(dir.clone());
+        let loaded = store.list();
+        assert_eq!(loaded.len(), 1, "an unusable tag skipped the whole rule");
+        assert_eq!(store.rules_skipped(), 0);
+        assert!(loaded[0].enabled);
+        // Only the usable one survives, and only once: nothing that got
+        // through could have been named by a selector anyway.
+        assert_eq!(loaded[0].tags, vec!["work".to_string()]);
+        // And it is in the set it can be selected by.
+        assert_eq!(store.toggle_tag("work", false).unwrap(), (1, Vec::new()));
+    }
+
+    /// The interactive path stays strict: there a refusal costs an error
+    /// message, not an unenforced rule, so the operator finds out before the
+    /// rule is in a set it does not belong to.
+    #[test]
+    fn add_refuses_an_unusable_tag() {
+        let (_td, dir) = tmpdir("bad-tag-add");
+        let store = RuleStore::new(dir);
+        for bad in ["Work", "work lab", "-", &"a".repeat(33)] {
+            let err = store
+                .add(tagged("r", &[bad], RuleDuration::Session))
+                .expect_err("accepted {bad:?}");
+            assert!(err.contains("tag"), "{err}");
+        }
+        assert!(store
+            .add(tagged("dup", &["work", "work"], RuleDuration::Session))
+            .is_err());
+        assert!(store.list().is_empty(), "a refused add left a rule behind");
+        assert!(store.add(tagged("ok", &["work"], RuleDuration::Session)).is_ok());
+    }
+
+    /// The three claims [`RuleStore::set_enabled`] makes about a rule whose
+    /// file cannot be written: it keeps the state it had, the rest of the
+    /// selection still applies, and it is named back. Untested, a lost
+    /// revert would have `RuleList` reporting a rule disabled while its file
+    /// and the next reload bring it back enforcing.
+    #[test]
+    fn a_rule_whose_file_cannot_be_written_keeps_its_state() {
+        let (_td, dir) = tmpdir("toggle-fail");
+        let store = RuleStore::new(dir.clone());
+        store.add(tagged("ok", &["work"], RuleDuration::Forever)).unwrap();
+        store.add(tagged("stuck", &["work"], RuleDuration::Forever)).unwrap();
+
+        // Unwritable in the one way `write_atomic` cannot work around: its
+        // final rename lands on a directory. Read-only permissions would not
+        // do it, since the rename replaces the file rather than opening it.
+        let stuck = dir.join("stuck.toml");
+        std::fs::remove_file(&stuck).unwrap();
+        std::fs::create_dir(&stuck).unwrap();
+
+        let (changed, failed) = store.toggle_tag("work", false).unwrap();
+        assert_eq!(changed, 1, "the rest of the selection must still apply");
+        assert_eq!(failed, vec!["stuck".to_string()], "the name is reported");
+        let by_name = |n: &str| store.list().into_iter().find(|r| r.name == n).unwrap();
+        assert!(!by_name("ok").enabled);
+        assert!(
+            by_name("stuck").enabled,
+            "a rule that could not be written was reported as disabled while its \
+             file still enables it"
+        );
+    }
+
+    /// A rule file written before tags existed must keep loading, tags or
+    /// no tags. Without `serde(default)` on the field this scan skips every
+    /// rule an operator already had, and reports it only as warnings.
+    #[test]
+    fn a_rule_file_without_tags_still_loads() {
+        let (_td, dir) = tmpdir("pre-tags");
+        let text = "name = \"old\"\naction = \"deny\"\nduration = \"forever\"\n\
+                    priority = 1\nenabled = true\n[match]\nport = 25\n";
+        std::fs::write(dir.join("00-old.toml"), text).unwrap();
+        let store = RuleStore::new(dir.clone());
+        let loaded = store.list();
+        assert_eq!(loaded.len(), 1, "pre-tags rule file must load");
+        assert!(loaded[0].tags.is_empty());
+        assert_eq!(store.rules_skipped(), 0);
     }
 
     /// Distinct rule names that sanitize to the same file stem must not

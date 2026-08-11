@@ -826,6 +826,7 @@ fn rule_with(
         duration: RuleDuration::Forever,
         priority: 10,
         enabled: true,
+        tags: Vec::new(),
         matcher,
     })
 }
@@ -870,6 +871,7 @@ fn timed_rule_serializes_to_loadable_toml() {
         },
         priority: 10,
         enabled: true,
+        tags: Vec::new(),
         matcher: RuleMatch {
             port: Some(19014),
             proto: Some(Proto::Tcp),
@@ -1515,6 +1517,7 @@ fn timed_rule_stops_applying_after_its_deadline() {
             },
             priority: 10,
             enabled: true,
+            tags: Vec::new(),
             matcher: RuleMatch {
                 port: Some(PORT),
                 proto: Some(Proto::Tcp),

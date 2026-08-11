@@ -111,7 +111,14 @@ fn event_key(ev: &ConnEvent) -> EventKey {
 fn ack_kind(msg: &ClientMsg) -> Option<AckKind> {
     match msg {
         ClientMsg::RuleAdd(_) => Some(AckKind::RuleSave),
-        ClientMsg::RuleToggle { .. } => Some(AckKind::RuleToggle),
+        // Both toggles, because both are answered - the bulk one with
+        // `RulesToggled` rather than `Ok`, but a refusal comes back as the
+        // same `Err` every other request's does. Left out of this table, an
+        // unknown tag would pop the queue against somebody else's request
+        // and blame the wrong one.
+        ClientMsg::RuleToggle { .. } | ClientMsg::RuleToggleTag { .. } => {
+            Some(AckKind::RuleToggle)
+        }
         ClientMsg::RuleDelete { .. } => Some(AckKind::RuleDelete),
         ClientMsg::ConfigSet(_) => Some(AckKind::ConfigSet),
         ClientMsg::Subscribe { .. } | ClientMsg::PromptReply { .. } => Some(AckKind::Other),
@@ -196,6 +203,20 @@ pub struct HallpassApp {
     editor: Option<RuleEditor>,
     /// Free-text filter applied to the event feed and the traffic view.
     filter: String,
+    /// What the last bulk toggle actually did, shown in the rules tab.
+    ///
+    /// The daemon acts on its own live set, which is not necessarily the one
+    /// this table was showing: rules tagged since the last refetch are in it
+    /// too. Without the count, an operator who saw three rows and disabled
+    /// twelve rules is told nothing at all.
+    rules_notice: Option<String>,
+    /// Tag the rules tab is narrowed to, and what the bulk enable/disable
+    /// buttons act on. None is every rule.
+    ///
+    /// Chosen from the tags the daemon's own rules carry rather than typed:
+    /// a selector naming nothing renders as an empty table, which reads the
+    /// same as a set whose rules were all deleted.
+    rule_tag_filter: Option<String>,
     /// What the traffic view groups by.
     group_by: traffic::GroupBy,
     /// Runtime settings as the daemon last reported them. None until it
@@ -280,6 +301,8 @@ impl HallpassApp {
             last_error: None,
             editor: None,
             filter: String::new(),
+            rules_notice: None,
+            rule_tag_filter: None,
             group_by: traffic::GroupBy::default(),
             daemon_config: None,
             enforcing: None,
@@ -357,6 +380,9 @@ impl HallpassApp {
                 UiEvent::Connected => {
                     self.status = ConnStatus::Connected;
                     self.last_error = None;
+                    // A count from before the reconnect describes a daemon
+                    // this one has not spoken to.
+                    self.rules_notice = None;
                     // Register as prompt handler + event subscriber and prime
                     // the rule/stat views (net.rs only does the handshake).
                     self.send(ClientMsg::Subscribe {
@@ -405,15 +431,22 @@ impl HallpassApp {
                     // The message is gone; for a prompt reply the daemon
                     // falls back to its default verdict, so tell the user
                     // instead of failing silently.
-                    let what = match msg {
+                    let what = match &msg {
                         ClientMsg::PromptReply { .. } => {
                             "your prompt answer; the daemon applies its default action"
+                                .to_string()
                         }
-                        ClientMsg::RuleAdd(_) => "a rule change",
-                        ClientMsg::RuleDelete { .. } => "a rule deletion",
-                        ClientMsg::RuleToggle { .. } => "a rule toggle",
-                        ClientMsg::ConfigSet(_) => "a settings change",
-                        _ => "a request",
+                        ClientMsg::RuleAdd(_) => "a rule change".to_string(),
+                        ClientMsg::RuleDelete { .. } => "a rule deletion".to_string(),
+                        ClientMsg::RuleToggle { .. } => "a rule toggle".to_string(),
+                        // Named, because this one is a whole set: "a rule
+                        // toggle" would leave the operator unsure whether the
+                        // rules they meant to disable are enforcing.
+                        ClientMsg::RuleToggleTag { tag, .. } => {
+                            format!("the change to every rule tagged `{}`", prompt::ui_text(tag))
+                        }
+                        ClientMsg::ConfigSet(_) => "a settings change".to_string(),
+                        _ => "a request".to_string(),
                     };
                     self.last_error =
                         Some(format!("connection lost before delivering {what}"));
@@ -542,6 +575,37 @@ impl HallpassApp {
             // reply would be tearing down the stream that carries prompts.
             // Session grants surface here anyway, through the rule name on
             // the events they allow, so nothing is hidden by not asking.
+            // The bulk toggle's own ack: it occupies a slot in the queue like
+            // any other answered request, and the rules it did not manage to
+            // write are the operator's to see - the screen is about to be
+            // refetched, so those rules will quietly reappear enabled with
+            // nothing said about why.
+            DaemonMsg::RulesToggled { changed, failed } => {
+                let kind = self.link.pending_acks.lock().unwrap().pop_front();
+                // Always said, not only on failure: the daemon acted on its
+                // own live tag set, which may hold rules this table never
+                // showed, and the refetch that follows renders the result
+                // with nothing to say how much of it the operator caused.
+                self.rules_notice = Some(format!("{changed} rule(s) changed"));
+                match failed.is_empty() {
+                    // Cleared on a clean batch, or the banner naming rules as
+                    // still enforcing outlives the retry that fixed them, and
+                    // the next real failure is indistinguishable from it.
+                    true => self.last_error = None,
+                    false => {
+                        self.last_error = Some(prompt::ui_text(&format!(
+                            "{} rule(s) changed; {} could not be written and kept \
+                             their previous state: {}",
+                            changed,
+                            failed.len(),
+                            failed.join(", ")
+                        )));
+                    }
+                }
+                if let Some(refetch) = reconcile_msg(kind) {
+                    self.send(refetch);
+                }
+            }
             DaemonMsg::RuleHits(_)
             | DaemonMsg::Explanation(_)
             | DaemonMsg::RunSessionStarted { .. }
@@ -936,6 +1000,7 @@ impl HallpassApp {
     }
 
     fn rules_tab(&mut self, ui: &mut egui::Ui) {
+        let mut bulk: Option<(String, bool)> = None;
         ui.horizontal(|ui| {
             if ui.button("Add rule").clicked() {
                 self.editor = Some(RuleEditor::add());
@@ -944,8 +1009,18 @@ impl HallpassApp {
                 self.send(ClientMsg::RuleList);
             }
             ui.label(format!("{} rule(s)", self.rules.len()));
+            bulk = self.tag_filter_controls(ui);
         });
+        if let Some(notice) = &self.rules_notice {
+            ui.label(prompt::ui_text(notice));
+        }
         ui.separator();
+        if let Some((tag, enabled)) = bulk {
+            // The previous batch's count would otherwise sit there looking
+            // like this one's answer until the reply lands.
+            self.rules_notice = None;
+            self.send(ClientMsg::RuleToggleTag { tag, enabled });
+        }
         if self.rules.is_empty() {
             ui.label("No rules loaded.");
             return;
@@ -955,25 +1030,46 @@ impl HallpassApp {
         let mut delete: Option<String> = None;
         let mut edit: Option<RuleEditor> = None;
         let (header_h, row_h) = table_heights(ui);
-        let rules = &self.rules;
-        data_table(ui, "rules_table")
+        let shown: Vec<&Rule> = match &self.rule_tag_filter {
+            Some(tag) => self.rules.iter().filter(|r| r.has_tag(tag)).collect(),
+            None => self.rules.iter().collect(),
+        };
+        if shown.is_empty() {
+            // Only reachable through the filter, since an empty ruleset
+            // returned above.
+            ui.label("No rules carry that tag.");
+            return;
+        }
+        // Only once some rule carries one, as in the CLI listing: a column
+        // of dashes costs width on a table that already has seven.
+        let tagged = self.rules.iter().any(|r| !r.tags.is_empty());
+        let mut table = data_table(ui, "rules_table")
             .column(Column::auto()) // On
             .column(Column::auto().clip(true).at_least(60.0)) // Name
-            .column(Column::auto()) // Action
+            .column(Column::auto()); // Action
+        if tagged {
+            table = table.column(Column::auto().clip(true).at_least(50.0)); // Tags
+        }
+        let titles: &[&str] = if tagged {
+            &["On", "Name", "Action", "Tags", "Match", "Priority", "", ""]
+        } else {
+            &["On", "Name", "Action", "Match", "Priority", "", ""]
+        };
+        table
             .column(Column::remainder().clip(true).at_least(80.0)) // Match
             .column(Column::auto()) // Priority
             .column(Column::auto()) // Edit
             .column(Column::auto()) // Delete
             .header(header_h, |mut header| {
-                for title in ["On", "Name", "Action", "Match", "Priority", "", ""] {
+                for title in titles {
                     header.col(|ui| {
-                        ui.strong(title);
+                        ui.strong(*title);
                     });
                 }
             })
             .body(|body| {
-                body.rows(row_h, rules.len(), |mut row| {
-                    let rule = &rules[row.index()];
+                body.rows(row_h, shown.len(), |mut row| {
+                    let rule = shown[row.index()];
                     row.col(|ui| {
                         let mut enabled = rule.enabled;
                         if ui.checkbox(&mut enabled, "").changed() {
@@ -987,6 +1083,18 @@ impl HallpassApp {
                         let v = Verdict::from(rule.action);
                         ui.colored_label(verdict_color(v), verdict_label(v));
                     });
+                    if tagged {
+                        row.col(|ui| {
+                            // Through ui_text like every other daemon-supplied
+                            // string here, though `valid_tag` should have made
+                            // a hazardous tag impossible.
+                            ui.label(prompt::ui_text(&if rule.tags.is_empty() {
+                                "-".to_string()
+                            } else {
+                                rule.tags.join(",")
+                            }));
+                        });
+                    }
                     row.col(|ui| {
                         ui.monospace(prompt::ui_text(&rule.matcher.summary()));
                     });
@@ -1019,6 +1127,64 @@ impl HallpassApp {
         if let Some(name) = delete {
             self.send(ClientMsg::RuleDelete { name });
         }
+    }
+
+    /// The tag picker and, once a tag is picked, the two buttons that
+    /// enable or disable that whole set. Returns the bulk change asked for.
+    ///
+    /// The buttons only exist under a chosen tag: they act on the set, not
+    /// on what the table happens to be showing, and an "enable all" whose
+    /// scope is "whatever is on screen" is the kind of button that disables
+    /// a host.
+    fn tag_filter_controls(&mut self, ui: &mut egui::Ui) -> Option<(String, bool)> {
+        let mut tags: Vec<&str> = self
+            .rules
+            .iter()
+            .flat_map(|r| r.tags.iter().map(String::as_str))
+            .collect();
+        tags.sort_unstable();
+        tags.dedup();
+        // A ruleset with no tags in it gets no picker rather than an empty
+        // one: the feature is opt-in and this tab is read at a glance.
+        if tags.is_empty() {
+            self.rule_tag_filter = None;
+            return None;
+        }
+        // A tag can stop existing while it is selected (its last rule was
+        // deleted or retagged elsewhere), and a filter naming nothing shows
+        // an empty table with no way back to the full list.
+        if self
+            .rule_tag_filter
+            .as_ref()
+            .is_some_and(|t| !tags.contains(&t.as_str()))
+        {
+            self.rule_tag_filter = None;
+        }
+
+        let mut bulk = None;
+        ui.separator();
+        ui.label("Tag:");
+        egui::ComboBox::from_id_salt("rules-tag-filter")
+            .selected_text(self.rule_tag_filter.as_deref().unwrap_or("(all)"))
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut self.rule_tag_filter, None, "(all)");
+                for tag in tags {
+                    ui.selectable_value(
+                        &mut self.rule_tag_filter,
+                        Some(tag.to_string()),
+                        tag,
+                    );
+                }
+            });
+        if let Some(tag) = self.rule_tag_filter.clone() {
+            if ui.button("Enable all").clicked() {
+                bulk = Some((tag.clone(), true));
+            }
+            if ui.button("Disable all").clicked() {
+                bulk = Some((tag, false));
+            }
+        }
+        bulk
     }
 
     /// Render the rule editor window, sending the rule when saved. The

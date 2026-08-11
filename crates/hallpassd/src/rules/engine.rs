@@ -219,6 +219,7 @@ mod tests {
             duration: RuleDuration::Session,
             priority,
             enabled,
+            tags: Vec::new(),
             matcher: m,
         }
     }
