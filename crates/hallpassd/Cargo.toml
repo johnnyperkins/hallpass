@@ -38,7 +38,7 @@ ipnet = "2"
 globset = "0.4"
 notify = "8"
 arc-swap = "1"
-lru = "0.16"
+lru = "0.18"
 sha2 = { workspace = true }
 # AF_NETLINK socket for the sock_diag attribution path; the daemon denies
 # unsafe_code and std has no netlink socket. Chosen over neli (proc-macro
