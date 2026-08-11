@@ -101,6 +101,45 @@ fn buttons_survive_worst_case_content() {
     );
 }
 
+/// A prompt for something never seen here has to say so where the operator
+/// is already looking, and a routine one must not.
+///
+/// A property of the laid-out tree rather than of the state: the flag is on
+/// the connection either way, and what this proves is that it reaches the
+/// window at all. The badge is deliberately not the only carrier - keyboard
+/// traversal never passes through it, so the details grid states it in words
+/// too, and both are asserted here.
+#[test]
+fn a_new_application_is_announced_in_the_prompt_window() {
+    let mut fixture = PromptFixture {
+        prompt: PromptState::new(1, conn(EXE, "93.184.216.34:443"), NOW_MS + 30_000, NOW_MS),
+        answered: Vec::new(),
+    };
+    fixture.prompt.conn.first_seen = Some(hallpass_types::FirstSeen { app: true, dest: true });
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(440.0, 330.0))
+        .build_ui_state(
+            |ui, state: &mut PromptFixture| {
+                prompt_ui(ui, &mut state.prompt, NOW_MS, &[], &mut state.answered);
+            },
+            fixture,
+        );
+    harness.get_by_label("NEW");
+    harness.get_by_label("this application has not connected before");
+
+    // Nothing new, and tracking off, both render as an ordinary prompt: a
+    // window that said "seen before" would be making a claim the daemon may
+    // have no basis for.
+    for quiet in [Some(hallpass_types::FirstSeen { app: false, dest: false }), None] {
+        harness.state_mut().prompt.conn.first_seen = quiet;
+        harness.run();
+        assert!(
+            harness.query_by_label("NEW").is_none(),
+            "an unremarkable connection was announced as new ({quiet:?})"
+        );
+    }
+}
+
 /// Deny has to be what keyboard traversal reaches first.
 ///
 /// This window steals focus from whatever the operator was doing, and the

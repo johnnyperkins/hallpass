@@ -295,6 +295,7 @@ mod tests {
             domain: None,
             iface: None,
             app_id: None,
+            first_seen: None,
         };
         let cache = ExeHashCache::default();
         let hash = cache.for_connection(&conn).unwrap();

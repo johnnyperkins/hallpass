@@ -707,6 +707,11 @@ fn parse_explain(flags: &[&str]) -> Result<ExplainRequest, String> {
             domain,
             iface,
             app_id,
+            // Explain answers for the connection stated on the command line,
+            // which no process ever made, so there is nothing the daemon
+            // could have seen before. None, not false: false would claim
+            // this destination is familiar.
+            first_seen: None,
         },
         exe_sha256,
     })
@@ -1064,6 +1069,7 @@ mod tests {
                 domain: domain.map(String::from),
                 iface: None,
                 app_id: None,
+                first_seen: None,
             },
             verdict,
             rule_name: None,

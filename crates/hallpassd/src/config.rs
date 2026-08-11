@@ -10,6 +10,12 @@ use serde::Deserialize;
 /// Default location of the daemon config file.
 pub const DEFAULT_CONFIG_PATH: &str = "/etc/hallpass/config.toml";
 
+/// Default location of the first-seen state file. Under `/var/lib` rather
+/// than `/etc`: this is state the daemon writes, not policy an operator
+/// edits, and the unit's `StateDirectory=hallpass` is what creates the
+/// directory and makes it writable under `ProtectSystem=strict`.
+pub const DEFAULT_STATE_PATH: &str = "/var/lib/hallpass/seen.toml";
+
 /// Read the config only if it is as trustworthy as a rule file.
 ///
 /// Rule files and match-list files are refused unless owned by root (or the
@@ -19,10 +25,10 @@ pub const DEFAULT_CONFIG_PATH: &str = "/etc/hallpass/config.toml";
 /// path, and the rules directory, so anyone who can write it can disable
 /// enforcement outright rather than adjust one rule.
 ///
-/// [`Links::Follow`](crate::rules::store::Links::Follow), unlike the files
-/// the daemon writes itself: this path is named by the operator, and a config
-/// symlinked to `config.hardened.toml` or into a dotfile tree is a way people
-/// keep these. The ownership check still applies to whatever the link
+/// [`Links::Follow`](crate::rules::store::Links::Follow), unlike the
+/// daemon's own state file: this path is named by the operator, and a config
+/// symlinked to `config.hardened.toml` or into a dotfile tree is a way
+/// people keep these. The ownership check still applies to whatever the link
 /// resolves to, so following one cannot reach a file an unprivileged user
 /// wrote.
 fn read_trusted(path: &Path) -> std::io::Result<String> {
@@ -122,6 +128,18 @@ pub struct Config {
     /// `nf_conntrack_acct` and joins the conntrack destroy multicast group,
     /// and a host that does not want volume accounting should not subscribe.
     pub flow_accounting: bool,
+    /// Whether connections carry whether the application, and this
+    /// destination for it, have been seen before. `true` by default: it
+    /// costs one small state file and no kernel feature, and the fact it
+    /// adds is the one an operator answering a prompt most wants.
+    ///
+    /// Off means [`hallpass_types::Connection::first_seen`] is `None`
+    /// everywhere and nothing is written to disk.
+    pub first_seen: bool,
+    /// Where the first-seen state is kept. Rewritten whole, at most once a
+    /// minute, and never read by anything but the daemon; deleting it makes
+    /// every application read as new once more.
+    pub first_seen_state: PathBuf,
 }
 
 impl Default for Config {
@@ -139,6 +157,8 @@ impl Default for Config {
             mode: Mode::Enforce,
             kill_established: true,
             flow_accounting: false,
+            first_seen: true,
+            first_seen_state: PathBuf::from(DEFAULT_STATE_PATH),
         }
     }
 }
@@ -396,6 +416,12 @@ mod tests {
         assert_eq!(c.max_pending_prompts, 64);
         assert_eq!(c.rules_dir, PathBuf::from("/etc/hallpass/rules.d"));
         assert!(c.queue_bypass);
+        // On by default, and pointed at the state directory the unit
+        // creates: a default that landed anywhere else would be a root
+        // daemon writing outside the paths its hardening allows.
+        assert!(c.first_seen);
+        assert_eq!(c.first_seen_state, PathBuf::from(DEFAULT_STATE_PATH));
+        assert!(c.first_seen_state.starts_with("/var/lib/"));
     }
 
     #[test]

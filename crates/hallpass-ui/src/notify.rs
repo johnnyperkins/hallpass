@@ -119,7 +119,26 @@ fn banner_text(entries: &[Entry]) -> (String, String) {
     let front = &entries[0];
     let name = escape_markup(&prompt::exe_name(&front.conn));
     let dest = escape_markup(&prompt::format_dest(&front.conn));
-    let summary = "Connection request".to_string();
+    // The summary is the line a banner shows when nothing else fits, and it
+    // is the same six words for every prompt. Saying that this one is from
+    // an application (or to a destination) never seen here is the one thing
+    // that distinguishes a prompt worth walking back to the keyboard for.
+    //
+    // Across the whole group, not just the front entry: a group is keyed on
+    // the executable alone, so a prompt for a destination this program has
+    // never reached coalesces behind a routine one from the same program.
+    // Reading only the front would drop the marker for exactly the prompt
+    // that earned it, in the one situation the banner exists for - the
+    // operator is not looking at the screen.
+    let anything_new = entries
+        .iter()
+        .any(|e| e.conn.first_seen.and_then(|f| f.tag()).is_some());
+    let summary = if anything_new {
+        "Connection request (NEW)"
+    } else {
+        "Connection request"
+    }
+    .to_string();
     let body = if entries.len() == 1 {
         format!("{name} wants to connect to {dest}")
     } else {
@@ -333,6 +352,7 @@ mod tests {
             domain: domain.map(String::from),
             iface: None,
             app_id: None,
+            first_seen: None,
         }
     }
 
@@ -346,6 +366,39 @@ mod tests {
 
     fn tracker() -> Tracker<FakeSink> {
         Tracker::new(FakeSink::default())
+    }
+
+    /// The banner exists for the operator who is not looking at the screen,
+    /// so the NEW marker has to survive coalescing. Groups are keyed on the
+    /// executable alone: a prompt for a destination this program has never
+    /// reached lands behind a routine one from the same program, and reading
+    /// only the front entry dropped the marker for exactly the prompt that
+    /// earned it.
+    #[test]
+    fn a_new_prompt_behind_a_routine_one_still_marks_the_banner() {
+        let routine = Entry {
+            id: 1,
+            conn: conn(Some("/usr/bin/curl"), None),
+            deadline_ms: 40_000,
+        };
+        let mut fresh = routine.conn.clone();
+        fresh.first_seen = Some(hallpass_types::FirstSeen { app: false, dest: true });
+        let fresh = Entry { id: 2, conn: fresh, deadline_ms: 40_000 };
+
+        let (summary, _) = banner_text(&[routine, fresh]);
+        assert_eq!(summary, "Connection request (NEW)");
+    }
+
+    /// Nothing new, and tracking off, both read as an ordinary request: a
+    /// banner claiming NEW for a feature that is off would be a lie.
+    #[test]
+    fn an_ordinary_group_is_not_marked() {
+        for quiet in [Some(hallpass_types::FirstSeen { app: false, dest: false }), None] {
+            let mut c = conn(Some("/usr/bin/curl"), None);
+            c.first_seen = quiet;
+            let (summary, _) = banner_text(&[Entry { id: 1, conn: c, deadline_ms: 40_000 }]);
+            assert_eq!(summary, "Connection request", "{quiet:?}");
+        }
     }
 
     #[test]

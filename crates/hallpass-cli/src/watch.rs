@@ -98,6 +98,15 @@ fn format_prompt(p: &Pending, now_ms: u64) -> String {
         c.tuple.dst,
         c.tuple.proto
     ));
+    // Below the destination, because that is what the sentence about a new
+    // destination refers to, and above the countdown so it is inside the
+    // block being read rather than after it. Absent when nothing is new, or
+    // when the daemon is not tracking: a line claiming a connection is
+    // familiar on the strength of a feature being off would be worse than
+    // no line.
+    if let Some(what) = c.first_seen.and_then(|f| f.describe()) {
+        out.push_str(&format!("  new:     {what}\n"));
+    }
     out.push_str(&format!("  respond within {remaining}s\n"));
     out
 }
@@ -337,6 +346,7 @@ mod tests {
                 domain: None,
                 iface: None,
                 app_id: None,
+                first_seen: None,
             },
             deadline_ms,
         }
@@ -418,6 +428,7 @@ mod tests {
                 domain: Some("bank.example\u{202e}moc.reknatta".into()),
                 iface: None,
                 app_id: None,
+                first_seen: None,
             },
             deadline_ms: 30_000,
         };
@@ -453,6 +464,7 @@ mod tests {
                 domain: Some("example.org".into()),
                 iface: None,
                 app_id: None,
+                first_seen: None,
             },
             deadline_ms: 30_000,
         };
@@ -466,5 +478,46 @@ mod tests {
         );
         // Past deadline saturates to zero.
         assert!(format_prompt(&p, 99_000).contains("within 0s"));
+    }
+
+    /// The block says what is new about the connection, and says nothing at
+    /// all when nothing is (or when the daemon is not tracking): a "seen
+    /// before" line the daemon has no basis for is worse than no line.
+    #[test]
+    fn prompt_block_says_what_is_new() {
+        let mut p = Pending {
+            id: 7,
+            conn: Connection {
+                tuple: FlowTuple {
+                    proto: Proto::Tcp,
+                    src: "127.0.0.1:50000".parse::<SocketAddr>().unwrap(),
+                    dst: "93.184.216.34:443".parse::<SocketAddr>().unwrap(),
+                },
+                uid: Some(1000),
+                pid: Some(4242),
+                exe_path: Some(PathBuf::from("/usr/bin/curl")),
+                cmdline: None,
+                parent_exe: None,
+                domain: Some("example.org".into()),
+                iface: None,
+                app_id: None,
+                first_seen: Some(hallpass_types::FirstSeen { app: true, dest: true }),
+            },
+            deadline_ms: 30_000,
+        };
+        assert!(
+            format_prompt(&p, 5_000).contains("new:     this application has not connected before"),
+            "{}",
+            format_prompt(&p, 5_000)
+        );
+
+        p.conn.first_seen = Some(hallpass_types::FirstSeen { app: false, dest: true });
+        assert!(format_prompt(&p, 5_000).contains("has not reached this destination before"));
+
+        for quiet in [Some(hallpass_types::FirstSeen { app: false, dest: false }), None] {
+            p.conn.first_seen = quiet;
+            let out = format_prompt(&p, 5_000);
+            assert!(!out.contains("new:"), "{out:?}");
+        }
     }
 }

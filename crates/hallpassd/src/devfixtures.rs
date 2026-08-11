@@ -91,6 +91,12 @@ pub fn spawn(
     );
     tokio::spawn(async move {
         let mut n: u64 = 0;
+        // The real store, in memory and never persisted: a client developer
+        // needs the "NEW" annotation to appear and then stop appearing the
+        // way it does on a real host, and reproducing that by hand here
+        // would be a second implementation to keep in step. This build has
+        // no packets, so nothing else is recording.
+        let mut seen = crate::firstseen::Seen::new();
         loop {
             tokio::time::sleep(INTERVAL).await;
             let s = &SCENARIOS[(n as usize) % SCENARIOS.len()];
@@ -98,7 +104,7 @@ pub fn spawn(
             // keyed on the tuple sees distinct connections.
             let src_port = 40_000 + (n % 20_000) as u16;
             let last_octet = (n % 250 + 1) as u8;
-            let conn = Connection {
+            let mut conn = Connection {
                 tuple: FlowTuple {
                     proto: Proto::Tcp,
                     src: format!("10.0.0.2:{src_port}").parse().expect("static src addr"),
@@ -114,7 +120,9 @@ pub fn spawn(
                 domain: (!s.domain.is_empty()).then(|| s.domain.to_string()),
                 iface: Some("eth0".to_string()),
                 app_id: (!s.app_id.is_empty()).then(|| s.app_id.to_string()),
+                first_seen: None,
             };
+            conn.first_seen = seen.observe(&conn, &hallpass_types::unix_ms_now);
             // The same sequence the verdict path runs, minus the packet:
             // one ruleset snapshot, match, count the hit, emit. The hash
             // operand is deliberately never computed - these executables do

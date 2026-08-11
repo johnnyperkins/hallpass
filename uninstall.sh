@@ -52,6 +52,12 @@ systemctl daemon-reload
 if [ "$purge" = "1" ]; then
 	rm -rf /etc/hallpass
 	echo "   removed /etc/hallpass"
+	# Daemon state, not policy: which applications and destinations this
+	# host has already seen. Kept on a plain uninstall like the config, so
+	# a reinstall does not report every application as new again, and
+	# removed here because it is a record of what this host talked to.
+	rm -rf /var/lib/hallpass
+	echo "   removed /var/lib/hallpass"
 fi
 # The 'hallpass' group is left in place; delete it with: groupdel hallpass
 REMOVE

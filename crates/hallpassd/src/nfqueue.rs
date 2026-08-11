@@ -71,6 +71,11 @@ pub struct QueueDeps {
     /// shuts down (and tears nftables down) instead of running on looking
     /// healthy while every queued packet blackholes.
     pub fatal_tx: UnboundedSender<()>,
+    /// What this daemon has seen before, stamped onto every connection it
+    /// decides. Owned by this thread and shared with nothing; None when
+    /// tracking is off, and then every connection carries `first_seen:
+    /// None`.
+    pub first_seen: Option<crate::firstseen::Tracker>,
 }
 
 /// Apply `verdict` to a held packet and hand it back to the kernel.
@@ -166,6 +171,9 @@ fn commit(
 }
 
 /// What to do with one received flow packet.
+// Debug only under test: it is there for an assertion message, and deriving
+// it in a release build pulls a formatter for the whole Connection in.
+#[cfg_attr(test, derive(Debug))]
 enum Decision {
     /// A rule decided; the connection is carried for the event.
     Verdict(Verdict, String, Connection),
@@ -185,10 +193,40 @@ struct DecideCtx<'a> {
 /// Decision logic, separated from nfq plumbing for testability. Reads
 /// attribution and rules but has no channel or verdict side effects;
 /// `run` commits the decision.
-fn decide(tuple: FlowTuple, iface: Option<String>, ctx: &DecideCtx) -> Decision {
+///
+/// `seen` is the one thing here that mutates: it records the connection as
+/// it reports what was new about it, so the annotation cannot claim a first
+/// sighting twice for one connection. It is `&mut` rather than part of
+/// [`DecideCtx`] because the store is owned by this thread alone.
+fn decide(
+    tuple: FlowTuple,
+    iface: Option<String>,
+    ctx: &DecideCtx,
+    seen: Option<&mut crate::firstseen::Tracker>,
+) -> Decision {
     let mut conn = ctx.attribution.connection(tuple);
     conn.domain = ctx.dns_cache.lookup(&conn.tuple.dst.ip());
     conn.iface = iface;
+    // After the domain and the interface: the destination half is keyed on
+    // the domain when one is known, so recording before enrichment would
+    // remember the address instead and report the name as new later.
+    //
+    // Never for a resolver query, which is the subtle half. A DNS query is
+    // `ct state new` and is judged like any other connection, so for a
+    // program that has never run here it is almost always the *first* packet
+    // to arrive: recording it spent that program's one first sighting on a
+    // packet to 127.0.0.53, and the prompt the operator actually answers -
+    // for the connection that follows the lookup - then reported only a new
+    // destination, never "this application has not connected before". The
+    // resolver is also not a destination anyone judges: every program on the
+    // host reaches it, so it is new exactly once per program and says
+    // nothing. Cost of skipping: a program whose *only* traffic is DNS (a
+    // tunnel, a resolver test) carries no annotation at all rather than a
+    // new one; its prompt still appears, and `None` is the honest answer for
+    // a connection the daemon deliberately did not record.
+    if let Some(seen) = seen.filter(|_| !packet::is_dns_query(&conn.tuple)) {
+        conn.first_seen = seen.observe(&conn);
+    }
     // One snapshot for both the enrichment decision and the match, so a
     // concurrent rule reload cannot split them. Hashing reads the binary
     // off disk; only pay for it when a hash-pinning rule could apply.
@@ -337,9 +375,20 @@ pub fn run(mut queue: Queue, queue_num: u16, mut deps: QueueDeps) -> std::io::Re
     let mut next_seq: u64 = 0;
     let mut recv_errors: u32 = 0;
     let mut fatal: Option<std::io::Error> = None;
+    // Out of `deps` so `decide` can take it mutably while the rest of the
+    // deps are borrowed for the context it reads. Dropped when this function
+    // returns, which flushes what the run recorded and closes the channel
+    // the writer task ends on.
+    let mut seen = deps.first_seen.take();
 
     while fatal.is_none() && !deps.shutdown.load(Ordering::Relaxed) {
         let mut busy = false;
+        // A clock read and a bool on all but one iteration a minute, and
+        // only a channel send on that one: the file itself is written by
+        // another thread, because an fsync here is a packet waiting.
+        if let Some(seen) = seen.as_mut() {
+            seen.maybe_flush();
+        }
 
         // Apply verdicts decided by the async side.
         while let Ok((seq, verdict)) = deps.verdict_rx.try_recv() {
@@ -441,7 +490,7 @@ pub fn run(mut queue: Queue, queue_num: u16, mut deps: QueueDeps) -> std::io::Re
                     dns_cache: &deps.dns_cache,
                     exe_hash: &deps.exe_hash,
                 };
-                match decide(tuple, iface, &ctx) {
+                match decide(tuple, iface, &ctx, seen.as_mut()) {
                     Decision::Verdict(verdict, rule_name, conn) => {
                         commit(&mut queue, msg, verdict, Some(rule_name), conn, &deps, enforcing);
                     }
@@ -551,6 +600,24 @@ mod tests {
         }
     }
 
+    /// Attributes every flow to one executable, for the paths that need a
+    /// connection with an identity on it.
+    struct FixedExe(&'static str);
+    impl crate::attribution::Attributor for FixedExe {
+        fn attribute(&self, _t: &hallpass_types::FlowTuple) -> Option<crate::attribution::ProcInfo> {
+            Some(crate::attribution::ProcInfo {
+                pid: Some(1),
+                uid: 1000,
+                exe_path: Some(std::path::PathBuf::from(self.0)),
+                cmdline: None,
+                parent_exe: None,
+                app_id: None,
+                starttime: None,
+                socket_inode: None,
+            })
+        }
+    }
+
     fn setup(
         tag: &str,
         rules: Vec<Rule>,
@@ -582,6 +649,15 @@ mod tests {
         buf
     }
 
+    fn udp_packet(dst: [u8; 4], dport: u16) -> Vec<u8> {
+        let mut buf = Vec::new();
+        PacketBuilder::ipv4([10, 0, 0, 1], dst, 64)
+            .udp(40000, dport)
+            .write(&mut buf, &[])
+            .unwrap();
+        buf
+    }
+
     fn tuple_of(buf: &[u8]) -> Option<FlowTuple> {
         packet::parse_tuple(buf)
     }
@@ -600,7 +676,7 @@ mod tests {
             },
         };
         let (chain, store, dns, hash, _dir) = setup("rule", vec![deny]);
-        match decide(tuple_of(&tcp_packet([1, 1, 1, 1], 443)).unwrap(), None, &ctx(&chain, &store, &dns, &hash)) {
+        match decide(tuple_of(&tcp_packet([1, 1, 1, 1], 443)).unwrap(), None, &ctx(&chain, &store, &dns, &hash), None) {
             Decision::Verdict(Verdict::Deny, name, conn) => {
                 assert_eq!(name, "deny-443");
                 assert_eq!(conn.tuple.dst.port(), 443);
@@ -612,7 +688,7 @@ mod tests {
     #[test]
     fn unmatched_goes_to_prompt() {
         let (chain, store, dns, hash, _dir) = setup("prompt", vec![]);
-        match decide(tuple_of(&tcp_packet([1, 1, 1, 1], 8443)).unwrap(), None, &ctx(&chain, &store, &dns, &hash)) {
+        match decide(tuple_of(&tcp_packet([1, 1, 1, 1], 8443)).unwrap(), None, &ctx(&chain, &store, &dns, &hash), None) {
             Decision::Prompt(conn) => {
                 assert_eq!(conn.tuple.dst.port(), 8443);
                 assert_eq!(conn.exe_path, None);
@@ -652,6 +728,74 @@ mod tests {
         );
     }
 
+    /// The annotation is stamped on the connection the event and the prompt
+    /// both carry, and the second packet of the same flow is no longer new:
+    /// recording happens where the decision does, not where the display is.
+    #[tokio::test]
+    async fn first_seen_is_stamped_and_then_settles() {
+        let dir = TestDir::new("nfq-firstseen");
+        let store = Arc::new(RuleStore::new(dir.path().to_path_buf()));
+        let chain = AttributionChain::new(vec![Box::new(FixedExe("/usr/bin/curl"))]);
+        let dns = IpDomainCache::new(16);
+        let hash = ExeHashCache::default();
+        let (mut seen, _writer) = crate::firstseen::start(dir.path().join("seen.toml"));
+
+        let tuple = tuple_of(&tcp_packet([1, 1, 1, 1], 443)).unwrap();
+        let first = match decide(tuple, None, &ctx(&chain, &store, &dns, &hash), Some(&mut seen)) {
+            Decision::Prompt(conn) => conn.first_seen,
+            other => panic!("expected a prompt, got {other:?}"),
+        };
+        assert_eq!(first, Some(hallpass_types::FirstSeen { app: true, dest: true }));
+
+        let again = match decide(tuple, None, &ctx(&chain, &store, &dns, &hash), Some(&mut seen)) {
+            Decision::Prompt(conn) => conn.first_seen,
+            other => panic!("expected a prompt, got {other:?}"),
+        };
+        assert_eq!(again, Some(hallpass_types::FirstSeen { app: false, dest: false }));
+
+        // Tracking off is not "seen before": the daemon has nothing to say.
+        match decide(tuple, None, &ctx(&chain, &store, &dns, &hash), None) {
+            Decision::Prompt(conn) => assert_eq!(conn.first_seen, None),
+            other => panic!("expected a prompt, got {other:?}"),
+        }
+    }
+
+    /// A resolver query must not consume a program's first sighting.
+    ///
+    /// A DNS query is `ct state new` and is judged like anything else, so for
+    /// a program that has never run here it is usually the first packet to
+    /// arrive. Recording it meant the prompt the operator actually answers,
+    /// for the connection that follows the lookup, no longer said "this
+    /// application has not connected before" - the one sentence the feature
+    /// exists to show.
+    #[tokio::test]
+    async fn a_resolver_query_does_not_consume_the_first_sighting() {
+        let dir = TestDir::new("nfq-firstseen-dns");
+        let store = Arc::new(RuleStore::new(dir.path().to_path_buf()));
+        let chain = AttributionChain::new(vec![Box::new(FixedExe("/usr/bin/curl"))]);
+        let dns = IpDomainCache::new(16);
+        let hash = ExeHashCache::default();
+        let (mut seen, _writer) = crate::firstseen::start(dir.path().join("seen.toml"));
+        let ctx = ctx(&chain, &store, &dns, &hash);
+
+        // The program resolves a name first, the way a real one does.
+        let query = tuple_of(&udp_packet([127, 0, 0, 53], 53)).unwrap();
+        let Decision::Prompt(conn) = decide(query, None, &ctx, Some(&mut seen)) else {
+            panic!("expected a prompt for the query");
+        };
+        assert_eq!(conn.first_seen, None, "a resolver query is not recorded at all");
+
+        // Then connects, and *that* is where the annotation belongs.
+        let real = tuple_of(&tcp_packet([1, 1, 1, 1], 443)).unwrap();
+        let Decision::Prompt(conn) = decide(real, None, &ctx, Some(&mut seen)) else {
+            panic!("expected a prompt for the connection");
+        };
+        assert_eq!(
+            conn.first_seen,
+            Some(hallpass_types::FirstSeen { app: true, dest: true })
+        );
+    }
+
     #[test]
     fn domain_enrichment_from_dns_cache() {
         let (chain, store, dns, hash, _dir) = setup("domain", vec![]);
@@ -660,7 +804,7 @@ mod tests {
             query_name: "example.com".into(),
             addrs: vec![("1.1.1.1".parse().unwrap(), 300)],
         });
-        match decide(tuple_of(&tcp_packet([1, 1, 1, 1], 443)).unwrap(), None, &ctx(&chain, &store, &dns, &hash)) {
+        match decide(tuple_of(&tcp_packet([1, 1, 1, 1], 443)).unwrap(), None, &ctx(&chain, &store, &dns, &hash), None) {
             Decision::Prompt(conn) => assert_eq!(conn.domain.as_deref(), Some("example.com")),
             _ => panic!("expected prompt"),
         }

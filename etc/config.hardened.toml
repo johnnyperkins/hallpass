@@ -39,6 +39,14 @@ max_pending_prompts = 128
 # ("allow") keeps ping and friends working, "deny" closes the channel.
 unhandled_proto_verdict = "deny"
 
+# Flag applications and destinations this host has not seen before, on
+# every event and every prompt. Stated rather than defaulted because this
+# posture denies what nobody answers: "NEW" on a prompt is the difference
+# between an operator approving a familiar program and approving one that
+# has never run here. See config.toml for what the state file records; set
+# to false on a host that wants no such record on disk.
+first_seen = true
+
 # Drop the NFQUEUE `bypass` flag from the verdict queue, and with it the
 # queue's fail-open flag: new connections are dropped, not allowed, when
 # the daemon is dead or the queue is full.

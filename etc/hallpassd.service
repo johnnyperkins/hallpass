@@ -20,6 +20,15 @@ RestartSec=2
 RuntimeDirectory=hallpass
 RuntimeDirectoryMode=0750
 
+# /var/lib/hallpass, for the first-seen state (which applications, and which
+# destinations for them, this host has already seen). systemd creates it and
+# adds it to ReadWritePaths, which ProtectSystem=strict otherwise denies.
+# 0700: the file inside is a record of what this host talks to, and only the
+# daemon reads it. Without this the daemon warns once and keeps the state in
+# memory, which costs the annotation across a restart and nothing else.
+StateDirectory=hallpass
+StateDirectoryMode=0700
+
 # Hardening
 ProtectSystem=strict
 ReadWritePaths=/etc/hallpass /run/hallpass

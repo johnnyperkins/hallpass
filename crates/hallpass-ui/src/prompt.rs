@@ -177,6 +177,7 @@ mod tests {
             domain: domain.map(String::from),
             iface: None,
             app_id: None,
+            first_seen: None,
         }
     }
 

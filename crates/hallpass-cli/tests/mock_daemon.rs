@@ -505,6 +505,7 @@ async fn suggest_folds_history_into_rules() {
                 domain: Some("example.org".into()),
                 iface: None,
                 app_id: None,
+                first_seen: None,
             },
             verdict: Verdict::Allow,
             rule_name: None,

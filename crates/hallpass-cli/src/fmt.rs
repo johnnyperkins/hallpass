@@ -500,14 +500,24 @@ pub fn verdict_style(verdict: Verdict, enforced: bool) -> Style {
 pub fn format_event(ev: &ConnEvent, pal: Palette) -> String {
     let rule = ev.rule_name.as_deref().unwrap_or("-");
     let label = ev.verdict_label().to_uppercase();
-    format!(
+    let mut line = format!(
         "{} {} {} -> {} rule={}",
         format_ts(ev.unix_ms),
         cell(pal, verdict_style(ev.verdict, ev.enforced), &label, VERDICT_WIDTH),
         exe_display(&ev.conn),
         dst_display(&ev.conn),
         sanitize_for_display(rule)
-    )
+    );
+    // Appended, and only when there is something to say. Every column before
+    // this one is fixed, so a filter or a script reading the existing fields
+    // by position keeps working, and a line without it is a line where
+    // nothing was new (or where the daemon is not tracking, which
+    // `--json`'s null distinguishes and a text line cannot).
+    if let Some(tag) = ev.conn.first_seen.and_then(|f| f.tag()) {
+        line.push(' ');
+        line.push_str(&pal.paint(Style::Warn, &format!("new={tag}")));
+    }
+    line
 }
 
 /// Most trace rows [`format_explanation`] renders; the rest are summarized by
@@ -618,7 +628,7 @@ pub fn format_explanation(exp: &Explanation, pal: Palette) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hallpass_types::{Action, FlowTuple, Proto, RuleDuration, RuleMatch};
+    use hallpass_types::{Action, FirstSeen, FlowTuple, Proto, RuleDuration, RuleMatch};
     use std::net::SocketAddr;
     use std::path::PathBuf;
 
@@ -637,6 +647,7 @@ mod tests {
             domain: domain.map(String::from),
             iface: None,
             app_id: None,
+            first_seen: None,
         }
     }
 
@@ -674,6 +685,36 @@ mod tests {
             "2024-07-03 09:46:40 ALLOW        /usr/bin/curl -> example.org:443 \
              rule=allow-curl"
         );
+    }
+
+    /// The marker is appended, so every existing field keeps its position,
+    /// and it is absent both when nothing is new and when the daemon is not
+    /// tracking: a text line cannot say "unknown", and claiming "seen
+    /// before" for a feature that is off would be a lie about policy.
+    #[test]
+    fn event_line_marks_what_is_new() {
+        let mk = |first_seen| {
+            let mut c = conn(Some("example.org"));
+            c.first_seen = first_seen;
+            format_event(
+                &ConnEvent {
+                    conn: c,
+                    verdict: Verdict::Allow,
+                    rule_name: Some("allow-curl".into()),
+                    unix_ms: 1_720_000_000_000,
+                    enforced: true,
+                },
+                plain(),
+            )
+        };
+        assert!(mk(Some(FirstSeen { app: true, dest: true })).ends_with(" new=app,dest"));
+        assert!(mk(Some(FirstSeen { app: false, dest: true })).ends_with(" new=dest"));
+        assert!(mk(Some(FirstSeen { app: true, dest: false })).ends_with(" new=app"));
+        for quiet in [Some(FirstSeen { app: false, dest: false }), None] {
+            let line = mk(quiet);
+            assert!(!line.contains("new="), "{line}");
+            assert!(line.ends_with("rule=allow-curl"), "{line}");
+        }
     }
 
     #[test]

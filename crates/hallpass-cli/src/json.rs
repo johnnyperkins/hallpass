@@ -162,6 +162,8 @@ pub fn sanitized_event(ev: &ConnEvent) -> ConnEvent {
             domain: clean_opt(&ev.conn.domain),
             iface: clean_opt(&ev.conn.iface),
             app_id: clean_opt(&ev.conn.app_id),
+            // Two bools; nothing here can carry an escape or a newline.
+            first_seen: ev.conn.first_seen,
         },
         verdict: ev.verdict,
         rule_name: clean_opt(&ev.rule_name),
@@ -225,6 +227,7 @@ mod tests {
                 domain: Some("bank.example\u{202e}moc.reknatta".into()),
                 iface: Some("eth0\x1b[2K".into()),
                 app_id: None,
+                first_seen: None,
             },
             verdict: Verdict::Deny,
             rule_name: Some("r\rule".into()),
@@ -253,6 +256,21 @@ mod tests {
         assert!(line.contains("firefox"), "{line:?}");
         assert!(line.contains("\"enforced\":false"), "{line:?}");
         assert!(line.contains("\"verdict\":\"deny\""), "{line:?}");
+    }
+
+    /// JSON is the one output that can tell "nothing was new" from "the
+    /// daemon is not tracking", and a consumer alerting on first contact
+    /// needs the difference: null is not `{"app":false,"dest":false}`.
+    #[test]
+    fn first_seen_survives_the_sanitizing_copy() {
+        let mut ev = hostile_event();
+        ev.conn.first_seen = Some(hallpass_types::FirstSeen { app: true, dest: false });
+        let line = event(&ev).expect("encode");
+        assert!(line.contains(r#""first_seen":{"app":true,"dest":false}"#), "{line}");
+
+        ev.conn.first_seen = None;
+        let line = event(&ev).expect("encode");
+        assert!(line.contains(r#""first_seen":null"#), "{line}");
     }
 
     #[test]

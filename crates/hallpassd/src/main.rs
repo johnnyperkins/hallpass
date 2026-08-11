@@ -20,6 +20,7 @@ mod netlink;
 mod devfixtures;
 mod dns;
 mod events;
+mod firstseen;
 mod iface;
 mod ipc;
 mod nfqueue;
@@ -281,6 +282,17 @@ async fn main() {
         }
     });
 
+    // First-seen tracking, loaded before the queue thread starts because the
+    // thread owns the store from then on: it is read and written per packet
+    // on the verdict path and shared with nothing, which is what keeps the
+    // event-history mutex the only lock that thread contends for. Only when
+    // this run has a queue; with no packets there is nothing to observe, and
+    // building it would leave a state file rewritten by a daemon that judged
+    // nothing.
+    let (first_seen, first_seen_writer) = (queue.is_some() && cfg.first_seen)
+        .then(|| firstseen::start(cfg.first_seen_state.clone()))
+        .unzip();
+
     // Blocking nfqueue loop on its own thread, over the queue bound
     // before the nftables install. None means interception is off for
     // this run (no privileges); rule management still works over IPC.
@@ -306,6 +318,7 @@ async fn main() {
                 settings: Arc::clone(&settings),
                 shutdown: Arc::clone(&shutdown),
                 fatal_tx,
+                first_seen,
             },
         )
     });
@@ -452,6 +465,14 @@ async fn main() {
     }
     if let Some(t) = queue_thread {
         let _ = t.join();
+    }
+    // After the join, never before: the queue loop hands over its last
+    // first-seen snapshot as it ends, and dropping its sender is what tells
+    // this task there is nothing more coming. Awaiting it here is what makes
+    // a clean shutdown persist the run rather than losing up to a minute of
+    // it.
+    if let Some(w) = first_seen_writer {
+        let _ = w.await;
     }
     tracing::info!("hallpassd stopped");
     // A clean return is exit status 0, which Restart=on-failure ignores. The

@@ -131,6 +131,9 @@ impl AttributionChain {
             // Interface is packet metadata; the queue loop fills it in.
             iface: None,
             app_id: None,
+            // Needs the domain and the application identity below it, so the
+            // queue loop stamps it once the connection is fully enriched.
+            first_seen: None,
         };
         if let Some(i) = self.attribute(&tuple) {
             conn.uid = Some(i.uid);

@@ -763,6 +763,7 @@ mod tests {
             domain: None,
             iface: None,
             app_id: None,
+            first_seen: None,
         }
     }
 

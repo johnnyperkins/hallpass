@@ -85,6 +85,7 @@ pub(super) fn conn(exe: &str, dst: &str) -> Connection {
         domain: None,
         iface: None,
         app_id: None,
+        first_seen: None,
     }
 }
 

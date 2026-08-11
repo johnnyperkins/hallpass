@@ -399,6 +399,7 @@ mod tests {
                 domain: domain.map(Into::into),
                 iface: None,
                 app_id: None,
+                first_seen: None,
             },
             verdict,
             rule_name: None,

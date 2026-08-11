@@ -64,6 +64,22 @@ kill_established = true
 # multicast group. Observe-only; it never affects a verdict.
 flow_accounting = false
 
+# Flag connections from an application the daemon has never seen, and
+# familiar applications reaching a destination they never have. The flag
+# rides on every event and every prompt: `hallpass-cli events` prints
+# `new=app`, `new=dest` or `new=app,dest`, `watch` and the GUI prompt say
+# which in words, and syslog export carries a `first_seen` field.
+#
+# What this costs is one file: `first_seen_state` below is a record of which
+# applications on this host have connected and which destinations they
+# reached, by name and by address, rewritten whole at most once a minute and
+# root-only (0600). It is not an event log - no timestamps per connection, no
+# ports, no verdicts - but it is a list of what this host contacted, so a
+# host that wants no such record on disk turns this off. Deleting the file is
+# safe: every application reads as new once more. Never affects a verdict.
+first_seen = true
+first_seen_state = "/var/lib/hallpass/seen.toml"
+
 # Optional: export every decided connection to syslog. Omit the whole
 # [syslog] section for no export. Export is a plain event subscriber, so
 # a stalled collector costs events, never verdicts. Facility is auth, so

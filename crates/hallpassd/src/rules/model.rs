@@ -393,6 +393,7 @@ mod tests {
                 domain: None,
                 iface: None,
                 app_id: None,
+                first_seen: None,
             };
             compiled.matches(&c, None)
         };
@@ -465,6 +466,7 @@ mod tests {
             domain: None,
             iface: None,
             app_id: None,
+            first_seen: None,
         };
         assert!(compiled.matches(&conn, Some(&"ab".repeat(32))));
         // Wrong or missing hash: no match, but other criteria still do.
@@ -496,6 +498,7 @@ mod tests {
             domain: domain.map(String::from),
             iface: None,
             app_id: None,
+            first_seen: None,
         };
 
         let r = rule_with(RuleMatch {
@@ -552,6 +555,7 @@ mod tests {
             domain: None,
             iface: Some("wg0".into()),
             app_id: Some("flatpak:org.mozilla.firefox".into()),
+            first_seen: None,
         };
         let check = |m: RuleMatch, expect: bool| {
             let compiled = CompiledRule::compile(&rule_with(m)).unwrap();
@@ -615,6 +619,7 @@ mod tests {
             domain: Some("example.org".into()),
             iface: Some("wg0".into()),
             app_id: Some("snap:firefox".into()),
+            first_seen: None,
         };
 
         struct Case {
@@ -759,6 +764,7 @@ mod tests {
             domain: Some("example.org".into()),
             iface: None,
             app_id: None,
+            first_seen: None,
         };
 
         let compiled = CompiledRule::compile(&rule_with(RuleMatch {

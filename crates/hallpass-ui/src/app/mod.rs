@@ -1537,10 +1537,24 @@ fn prompt_ui(
 /// The scrolling half: everything the operator reads to decide.
 fn prompt_info_ui(ui: &mut egui::Ui, p: &PromptState, rest: &[String]) {
     let conn = &p.conn;
+    // Read once and used by both the badge and the details row below, so
+    // "the badge and the row always say the same thing" is structural rather
+    // than two call sites a later edit could split.
+    let whats_new = conn.first_seen.and_then(|f| f.describe());
 
     ui.horizontal(|ui| {
         ui.label(RichText::new(prompt::exe_name(conn)).strong().size(18.0));
         ui.label(format!("wants to connect ({})", conn.tuple.proto));
+        // In the title line rather than the details grid below, because it
+        // changes what the question is: a first-ever connection from a
+        // program is the one an operator reads the rest of this window for.
+        // Absent when nothing is new *and* when the daemon is not tracking,
+        // which is why there is no "seen before" badge to pair with it: it
+        // would be a claim the daemon may have no basis for.
+        if let Some(what) = whats_new {
+            ui.label(RichText::new("NEW").strong().color(REJECT_COLOR))
+                .on_hover_text(what);
+        }
     });
     if let Some(exe) = &conn.exe_path {
         // Full path, sanitized: this is the line the operator checks to see
@@ -1572,6 +1586,15 @@ fn prompt_info_ui(ui: &mut egui::Ui, p: &PromptState, rest: &[String]) {
             if let Some(app) = &conn.app_id {
                 ui.label("Application");
                 ui.monospace(prompt::ui_text(app));
+                ui.end_row();
+            }
+            // The badge above says something is new; this says what, since
+            // the two cases lead to different answers. A hover tooltip is
+            // not enough on its own: the keyboard path to the buttons never
+            // passes through it.
+            if let Some(what) = whats_new {
+                ui.label("First seen");
+                ui.colored_label(REJECT_COLOR, what);
                 ui.end_row();
             }
         });

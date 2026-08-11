@@ -98,6 +98,7 @@ mod tests {
             domain: Some("example.org".to_string()),
             iface: None,
             app_id: Some("flatpak:org.mozilla.firefox".to_string()),
+            first_seen: None,
         }
     }
 

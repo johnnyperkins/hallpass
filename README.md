@@ -119,7 +119,7 @@ group, and `systemctl enable --now hallpassd`. Log out and back in once so the
 group membership and UI autostart take effect.
 
 Remove it again with `./uninstall.sh` (add `HALLPASS_PURGE=1` to also delete
-`/etc/hallpass`).
+`/etc/hallpass` and `/var/lib/hallpass`).
 
 <details><summary>Manual install (what the script does)</summary>
 
@@ -332,6 +332,18 @@ with `NO_COLOR` unset). A verdict the daemon recorded but did not apply,
 which is what observe mode produces, renders as `WOULD-DENY`: the connection
 went out, and printing `DENY` would say the opposite of what happened.
 
+Connections carry whether they are the first the daemon has seen from an
+application, and the first that application has made to a destination. A
+prompt shows a **NEW** badge and says which of the two it is, `events` marks
+the line `new=app`, `new=dest` or `new=app,dest`, and syslog export carries a
+`first_seen` field. It is an annotation and never a verdict: the record
+behind it is bounded and lossy in one direction only, so an application the
+daemon has forgotten reads as new a second time rather than a familiar one
+being flagged never. What the record holds is a list of applications and the
+destinations they reached, in `/var/lib/hallpass/seen.toml` (root-only,
+rewritten at most once a minute); `first_seen = false` in the config turns the
+whole thing off and writes nothing.
+
 The GUI (`hallpass-ui`) connects to the same socket, pops up a dialog for each
 unmatched connection (allow/deny, scope, duration), and offers a management
 window for rules, live events, and statistics. Deny leads the dialog's
@@ -442,6 +454,22 @@ attacker with root, who can delete the nftables table outright.
   by IP/port/exe only.
 - Only new connections (`ct state new`) are evaluated; established flows are
   never re-checked.
+- **"NEW" is an observation, not a claim about the past.** The first-seen
+  record is capped, so an application or destination that falls out of it is
+  reported new again; it is written at most once a minute, so a hard power
+  loss forgets the last minute of it; and it keys on the same identity a rule
+  would (executable plus `app_id`), which a process can influence for the same
+  reason it can influence that rule. Every one of those errs toward flagging
+  something familiar, which is the harmless direction. The absence of a flag
+  is the weaker signal: it can also mean the daemon is not tracking, which
+  `--json`'s `first_seen: null` distinguishes and a text line does not.
+  Resolver queries are deliberately not annotated at all, since a new
+  program's DNS lookup would otherwise spend its first sighting on a packet
+  nobody judges. And because the record is written as it is reported, exactly
+  one event per application and destination ever carries the field: syslog
+  export is an ordinary event subscriber, so a lagging or unreachable
+  collector can lose that one line, and an alert built on it will miss that
+  first contact.
 - **A process can choose which executable it is attributed to.** Attribution
   resolves the executable from `/proc/<pid>/exe` after the connection is
   observed, and a socket descriptor survives `execve`. So a process can start

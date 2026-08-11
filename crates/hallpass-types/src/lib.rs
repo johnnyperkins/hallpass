@@ -70,7 +70,13 @@ use serde::{Deserialize, Serialize};
 /// itself, so until now those connections could only be scoped by a path
 /// that is neither on this host nor unique. The struct fields force the
 /// bump, as in v2.
-pub const PROTOCOL_VERSION: u32 = 10;
+///
+/// v11: [`Connection::first_seen`]. Whether the daemon has ever seen this
+/// application connect before, and whether it has seen it reach this
+/// destination before, so a prompt can say which of the two is new rather
+/// than presenting a routine connection and a first-ever one identically.
+/// The struct field forces the bump, as in v2.
+pub const PROTOCOL_VERSION: u32 = 11;
 
 /// Transport-layer protocol of a connection.
 // Ord so protocol can be part of a sorted grouping key (the CLI's suggest
@@ -140,6 +146,76 @@ pub struct Connection {
     /// way `cmdline_contains` does, and is not a boundary against a process
     /// evading it.
     pub app_id: Option<String>,
+    /// Whether this application, and this destination for it, are ones the
+    /// daemon has never seen before. See [`FirstSeen`].
+    ///
+    /// `None` means the daemon is not tracking, not that the connection is
+    /// familiar: first-seen tracking is off, the connection could not be
+    /// attributed to any application, or the state could not be kept. A
+    /// display that rendered `None` as "seen before" would make a host with
+    /// tracking off look like one where nothing is ever new, the same
+    /// none-is-not-zero distinction [`RuleHit::last_hit_ms`] makes.
+    pub first_seen: Option<FirstSeen>,
+}
+
+/// What is new about a connection, as of the moment it was decided.
+///
+/// Both flags are annotations and neither reaches a verdict: they say what
+/// the daemon has recorded, and the record is bounded and lossy on purpose
+/// (see the daemon's `firstseen` module). Something the daemon forgot, or
+/// never got to write down before a restart, reads as new a second time,
+/// which is the loud direction: the failure mode is one extra "NEW" on a
+/// familiar connection, never a silent one on a connection nobody has
+/// approved before.
+///
+/// This says what the daemon has *observed*, never what an operator has
+/// approved: a connection that was denied and then retried is no longer new,
+/// because it was seen the first time. "Has this ever happened here" and
+/// "has anyone agreed to this" are different questions, and the rules are
+/// the answer to the second one.
+///
+/// The identity behind [`FirstSeen::app`] is the pair a rule would be
+/// written against, [`Connection::app_id`] together with
+/// [`Connection::exe_path`], so a packaged application that turns up under a
+/// new identity is new here too. That includes an identity a process chose
+/// for itself: `app_id` is spoofable (see [`Connection::app_id`]), and
+/// spoofing one produces a *more* prominent connection, not a quieter one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FirstSeen {
+    /// First connection this daemon has recorded from this application.
+    pub app: bool,
+    /// First time this application has reached this destination, by domain
+    /// when one is known and by address otherwise. True on its own means a
+    /// familiar application going somewhere new.
+    pub dest: bool,
+}
+
+impl FirstSeen {
+    /// Compact form for machine-read output (event lines, JSON, syslog):
+    /// `app`, `dest`, `app,dest`, or `None` when nothing is new.
+    ///
+    /// One vocabulary for every consumer, so a filter written against the
+    /// CLI's output keeps working against the exported one.
+    pub fn tag(self) -> Option<&'static str> {
+        match (self.app, self.dest) {
+            (true, true) => Some("app,dest"),
+            (true, false) => Some("app"),
+            (false, true) => Some("dest"),
+            (false, false) => None,
+        }
+    }
+
+    /// Sentence for an operator deciding a prompt, or `None` when nothing is
+    /// new. Says which of the two facts is new, because the answers differ:
+    /// an application nobody has run before is a different question from a
+    /// familiar one reaching somewhere it never has.
+    pub fn describe(self) -> Option<&'static str> {
+        match (self.app, self.dest) {
+            (true, _) => Some("this application has not connected before"),
+            (false, true) => Some("this application has not reached this destination before"),
+            (false, false) => None,
+        }
+    }
 }
 
 /// What a rule does when it matches.
@@ -698,6 +774,7 @@ mod event_tests {
                 domain: None,
                 iface: None,
                 app_id: None,
+                first_seen: None,
             },
             verdict,
             rule_name: None,

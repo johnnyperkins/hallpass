@@ -245,9 +245,15 @@ impl TestEnv {
                  socket_path = \"{}\"\n\
                  max_pending_prompts = 16\n\
                  rules_dir = \"{}\"\n\
+                 first_seen_state = \"{}\"\n\
                  {extra_config}",
                 self.socket_path.display(),
-                rules_dir.display()
+                rules_dir.display(),
+                // Into the temp dir like everything else: the default is
+                // /var/lib/hallpass, and a root test run would otherwise
+                // rewrite the state of the daemon actually installed on the
+                // machine running the suite.
+                self.tmp.join("seen.toml").display()
             ),
         )
         .expect("write config");
@@ -960,6 +966,98 @@ fn attribution_event_reports_exe_path() {
         name.contains("nc"),
         "expected the nc binary in the exe path, got {}",
         exe.display()
+    );
+}
+
+/// Read events from a subscribed socket until one for `port` arrives.
+async fn next_event_on_port(
+    sock: &mut tokio::net::UnixStream,
+    port: u16,
+) -> hallpass_types::ConnEvent {
+    loop {
+        let msg = tokio::time::timeout(Duration::from_secs(10), async {
+            wire::read_msg::<DaemonMsg, _>(sock).await
+        })
+        .await
+        .expect("timed out waiting for connection event")
+        .expect("read event");
+        if let DaemonMsg::Event(ev) = msg {
+            if ev.conn.tuple.dst.port() == port {
+                return ev;
+            }
+        }
+    }
+}
+
+/// The first connection an application makes is flagged new on the event
+/// the daemon emits, and a second one to the same host is not.
+///
+/// Worth a privileged test rather than only a unit one: the flag is computed
+/// on the verdict thread from an attribution that only exists against a real
+/// process, and it has to survive being encoded, sent over the socket, and
+/// decoded by a client. The unit tests prove the store; this proves the wire.
+///
+/// The second probe uses a different port on purpose. `nc -l` serves one
+/// connection and exits, so reusing the port would need a fresh listener
+/// between the probes, and a destination is the host rather than the port -
+/// so this asserts that property live at the same time.
+#[test]
+#[ignore = "requires root and network namespaces"]
+fn first_connection_is_flagged_new_on_the_event_stream() {
+    const PORT: u16 = 19012;
+    const PORT_AGAIN: u16 = 19013;
+    let Some(mut env) = TestEnv::setup("firstseen") else { return };
+    // Listeners so the probes complete rather than being refused: an nc that
+    // exits the moment it gets an RST can be gone before procfs attribution
+    // reads /proc, and an unattributed connection is deliberately not
+    // tracked at all.
+    env.start_listener(PORT);
+    env.start_listener(PORT_AGAIN);
+    env.start_daemon("allow", &[]);
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    let (first, second) = rt.block_on(async {
+        let mut sock = tokio::net::UnixStream::connect(&env.socket_path)
+            .await
+            .expect("connect IPC socket");
+        wire::write_msg(&mut sock, &ClientMsg::Hello { version: PROTOCOL_VERSION })
+            .await
+            .expect("send hello");
+        let ack: DaemonMsg = wire::read_msg(&mut sock).await.expect("read ack");
+        assert_eq!(ack, DaemonMsg::HelloAck { version: PROTOCOL_VERSION });
+        wire::write_msg(&mut sock, &ClientMsg::Subscribe { events: true, prompts: false })
+            .await
+            .expect("send subscribe");
+        let ok: DaemonMsg = wire::read_msg(&mut sock).await.expect("read subscribe ack");
+        assert_eq!(ok, DaemonMsg::Ok);
+
+        // Two connections from the same binary to the same host.
+        let probe = |port: u16| {
+            let ns = env.ns_cli.clone();
+            tokio::task::spawn_blocking(move || {
+                let _ = ns_run(&ns, &["nc", "-z", "-w", "3", SRV_IP, &port.to_string()]);
+            });
+        };
+        probe(PORT);
+        let first = next_event_on_port(&mut sock, PORT).await;
+        probe(PORT_AGAIN);
+        let second = next_event_on_port(&mut sock, PORT_AGAIN).await;
+        (first, second)
+    });
+
+    let log = env.daemon_log();
+    assert_eq!(
+        first.conn.first_seen,
+        Some(hallpass_types::FirstSeen { app: true, dest: true }),
+        "the first connection from this binary must be flagged new; log:\n{log}"
+    );
+    assert_eq!(
+        second.conn.first_seen,
+        Some(hallpass_types::FirstSeen { app: false, dest: false }),
+        "a repeat of the same connection must not be flagged; log:\n{log}"
     );
 }
 

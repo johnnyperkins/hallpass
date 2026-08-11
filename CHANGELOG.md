@@ -7,6 +7,26 @@ carries what an upgrade changes on a running host.
 
 ### Added
 
+- **First-seen highlighting (wire protocol v11).** Every prompt looked the
+  same whether the program asking had been running here for a year or had
+  never connected before, which is the single fact most likely to change the
+  answer. Connections now carry `first_seen`: whether this is the first
+  connection the daemon has recorded from this application, and whether it
+  is the first time that application has reached this destination (by domain
+  when one is known, by address otherwise). The GUI prompt shows a NEW badge
+  and a line saying which, `hallpass-cli watch` prints the same sentence,
+  `events` appends `new=app`, `new=dest` or `new=app,dest` to the line,
+  `--json` carries the pair, and syslog export gains a `first_seen` field.
+  Never a verdict, and never a claim about the past: the record is capped
+  and rewritten at most once a minute, so everything it forgets reads as new
+  a second time rather than a first-ever connection reading as routine.
+  On by default; the state lives in `/var/lib/hallpass/seen.toml`
+  (root-only, created by the unit's `StateDirectory`) and `first_seen =
+  false` turns it off and writes nothing. Existing installs should re-run
+  `install.sh` so the unit picks up the state directory: without it the
+  daemon warns once and keeps the record in memory, losing it on restart.
+  The protocol bump means daemon, CLI and UI must be upgraded together.
+
 - **Packaged applications are named, and matchable (wire protocol v10).**
   A Flatpak or Snap application's executable path resolves inside its own
   sandbox, so `/proc/<pid>/exe` reads as a path that is not on this host and

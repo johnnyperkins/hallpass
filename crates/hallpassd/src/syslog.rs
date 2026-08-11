@@ -191,6 +191,22 @@ fn for_each_field(ev: &ConnEvent, mut visit: impl FnMut(&'static str, &dyn std::
     if let Some(app_id) = &c.app_id {
         visit("app_id", app_id);
     }
+    // Same vocabulary as the CLI's `new=` field, and absent for the same two
+    // different reasons a line can lack any other field here: nothing was
+    // new, or the daemon is not tracking. A collector cannot tell those
+    // apart, which is why "first_seen" is worth alerting on and its absence
+    // is worth nothing.
+    //
+    // Alert on it, but do not treat it as a complete record of first
+    // contacts. Exactly one event per (application, destination) ever
+    // carries it - the store records while it reports - and export is an
+    // ordinary event subscriber: a lagging broadcast, an unreachable
+    // collector or a send timeout drops that event like any other, and
+    // nothing re-sends it, because by then the pair is no longer new. What
+    // is lost is the annotation, never the event's verdict.
+    if let Some(tag) = c.first_seen.and_then(|f| f.tag()) {
+        visit("first_seen", &tag);
+    }
     if let Some(pid) = c.pid {
         visit("pid", &pid);
     }
@@ -408,6 +424,7 @@ mod tests {
                 domain: Some("example.org".into()),
                 iface: Some("eth0".into()),
                 app_id: None,
+                first_seen: None,
             },
             verdict: Verdict::Deny,
             rule_name: Some("block-example".into()),

@@ -101,6 +101,22 @@ A new outbound connection then travels like this:
    libc resolver entry points feed the same cache, which catches names
    resolved through a stub resolver or an encrypted upstream.
 
+5b. **Flagged, if it is new.** The application (executable path plus
+   application identity) and the destination (the domain when one is known,
+   the address otherwise) are looked up in the first-seen store and recorded.
+   This happens after the domain lookup above, because a destination the
+   daemon can name is a different fact from the address behind it; a
+   destination reached by name records the address alongside it, so the
+   annotation does not come back once the name expires from the domain cache.
+   Resolver queries are skipped entirely: a DNS query is `ct state new` and
+   is judged like anything else, so for a program that has never run here it
+   is usually the first packet to arrive, and recording it would spend that
+   program's one first sighting on a packet the operator is not asked about.
+   The store is owned by this thread and shared with nothing, which is why it
+   adds no lock; persistence is a snapshot handed to a writer task at most
+   once a minute. Everything about it is bounded and lossy in the same
+   direction: a forgotten identity reads as new again, never the reverse.
+
 6. **Matched.** One `RuleSet` snapshot is taken and used for both the
    enrichment decision and the match, so a concurrent rules reload cannot
    split them. The executable is hashed only if a hash-pinning rule could
@@ -176,11 +192,20 @@ The daemon is one multi-threaded tokio runtime plus one std thread.
 - **The syslog exporter** (task, optional) is an ordinary event subscriber. A
   stalled or unreachable collector makes the broadcast lag, which costs
   events and never verdicts.
+- **The first-seen writer** (task, optional) receives whole snapshots of the
+  store from the verdict thread and writes them to the state file inside
+  `spawn_blocking`, so neither the fsync nor a slow disk lands on a runtime
+  worker. Shutdown awaits it after joining the queue thread: the tracker is
+  dropped when the loop ends, which flushes the run and closes the channel
+  the task exits on.
 
 Who can block whom: nothing on the tokio side can stall the verdict thread
 through a channel, by construction. The one shared lock between them is the
 event bus history mutex, which the verdict thread takes on every decision and
-an IPC handler takes to answer a history request. That is why the history
+an IPC handler takes to answer a history request. Anything else the verdict
+thread reads and writes per packet is owned by it outright (the first-seen
+store) or reached through a channel, deliberately: a second shared lock would
+be a second thing an operator request can make a packet wait for. That is why the history
 reply is capped by both count and bytes: the verdict thread waits for exactly
 one bounded copy.
 
@@ -287,7 +312,9 @@ encodes struct fields positionally, again with no names. An old peer decoding
 a new layout produces garbage rather than an error. This is why v2 exists
 (`RuleMatch::exe_sha256`) and why v3 exists (`ConnEvent::enforced` plus three
 `Stats` fields); the request/reply pairs added alongside v3 would not have
-needed a bump on their own, being appended variants.
+needed a bump on their own, being appended variants. The current version is
+v11 (`Connection::first_seen`); every bump is documented at
+`PROTOCOL_VERSION` with what forced it.
 
 ## Startup ordering invariants
 

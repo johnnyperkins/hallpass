@@ -73,7 +73,13 @@ rather than only the first, but the command exits non-zero if any rule failed.
 .TP
 .BR events " [" OPTIONS ]
 Stream connection events until interrupted with Ctrl\-C, optionally replaying
-recent history first. See
+recent history first. A line ends with
+.BI new= app ", " new= dest " or " new= app,dest
+when the daemon has not seen that application, or that destination for it,
+before; a line without it means nothing was new, or that the daemon is not
+tracking, which only
+.B \-\-json
+tells apart. See
 .B EVENTS OPTIONS
 below.
 .TP
@@ -84,7 +90,11 @@ below.
 .TP
 .B watch
 Interactively answer connection prompts as the daemon raises them. This is the
-terminal equivalent of the desktop prompt window.
+terminal equivalent of the desktop prompt window. A prompt for an application
+the daemon has not seen before, or for a destination that application has not
+reached before, carries a
+.B new:
+line saying which.
 .TP
 .BR explain " [" OPTIONS ]
 Say what policy would do with a hypothetical connection, and which rule
@@ -336,6 +346,16 @@ Rule files loaded by the daemon, where
 writes a
 .B \-\-duration forever
 rule, and the only directory the match-list options may name a file in.
+.TP
+.I /var/lib/hallpass/seen.toml
+The applications and destinations the daemon has already seen, which is what
+the
+.B new=
+marker and the prompt's
+.B new:
+line are read from. Written by
+.BR hallpassd ;
+deleting it makes everything read as new once more.
 .TP
 .I /run/hallpass/hallpass.sock
 The daemon socket this client connects to. Override it with
