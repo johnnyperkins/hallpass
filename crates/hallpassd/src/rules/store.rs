@@ -178,6 +178,113 @@ fn list_paths_within(rule: &Rule, dir: &Path) -> Result<(), String> {
 /// stable ABI on every Linux architecture.
 const O_NOFOLLOW: i32 = 0o400_000;
 
+/// `O_NONBLOCK` on Linux, spelled out for the same reason as [`O_NOFOLLOW`].
+const O_NONBLOCK: i32 = 0o4_000;
+
+/// Whether [`read_trusted`] may open a path that is a symbolic link.
+///
+/// Stated per call site rather than defaulted, because the two files the
+/// daemon reads this way answer it differently and neither answer is
+/// obviously right for the other. A path the operator named may legitimately
+/// be a link (a config symlinked to `config.hardened.toml`, or into a
+/// dotfile tree); a path the daemon writes itself never is, and following
+/// one there would aim a root open at a file chosen by whoever planted it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Links {
+    /// Follow a symlink at the path.
+    Follow,
+    /// Refuse a symlink at the path (`O_NOFOLLOW`).
+    Refuse,
+}
+
+/// Read a file only if it is as trustworthy as a rule file: owned by root
+/// (or by the daemon's own euid) and not group- or world-writable.
+///
+/// Ownership and content come from the same descriptor, so the file that was
+/// checked is the file that is read: a path checked by name and then opened
+/// separately can be swapped in between. A `NotFound` error is passed
+/// through unchanged, because callers distinguish it.
+///
+/// One implementation for every file the daemon trusts by ownership. Two
+/// copies of this drifted on exactly the question [`Links`] now asks, and a
+/// reader could not tell which position was deliberate.
+pub(crate) fn read_trusted(path: &Path, links: Links) -> std::io::Result<String> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut opts = std::fs::OpenOptions::new();
+    // O_NONBLOCK, and the regular-file check below, because these paths come
+    // from a config file. Opening a FIFO blocks until a writer appears and
+    // reading a character device may never end, so a mistyped or malicious
+    // path would hang the daemon inside startup - alive, before the nftables
+    // install, with the host unfiltered and nothing in the log to say why.
+    // On a regular file the flag does nothing.
+    opts.read(true).custom_flags(O_NONBLOCK);
+    if links == Links::Refuse {
+        opts.custom_flags(O_NONBLOCK | O_NOFOLLOW);
+    }
+    let mut file = opts.open(path)?;
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        return Err(std::io::Error::other("must be a regular file"));
+    }
+    let self_uid = effective_uid().unwrap_or(u32::MAX);
+    if !file_perms_ok(meta.uid(), meta.mode(), self_uid) {
+        return Err(std::io::Error::other(
+            "must be owned by root and not group/world-writable",
+        ));
+    }
+    let mut text = String::new();
+    file.read_to_string(&mut text)?;
+    Ok(text)
+}
+
+/// Write `bytes` to `path` so that a reader sees either the old file or the
+/// new one, never half of either.
+///
+/// Writing in place truncates first, so a crash or a full disk mid-write
+/// leaves a partial file, which for a rule file means a rule that stops
+/// applying and for the first-seen state means everything reads as new. The
+/// temp file is dot-prefixed and not `.toml`, so a directory scan skips it
+/// if it catches one mid-write, and the rename is atomic within the
+/// directory.
+///
+/// `create_new` plus `O_NOFOLLOW` plus an explicit `mode`, not `fs::write`:
+/// `fs::write` follows a symlink at the target and creates with
+/// `0666 & ~umask`, so a planted link would aim a root write anywhere, and
+/// under a permissive umask there is a window where the file about to become
+/// live policy is world-writable.
+pub(crate) fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let dir = path.parent().unwrap_or(Path::new("."));
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let tmp = dir.join(format!(".{name}.tmp"));
+    // A leftover from an interrupted write, so create_new below does not
+    // refuse. Nothing else owns this name.
+    let _ = std::fs::remove_file(&tmp);
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .custom_flags(O_NOFOLLOW)
+        .mode(mode)
+        .open(&tmp)?;
+    let written = file
+        .write_all(bytes)
+        // The bytes have to be on disk before the rename publishes them, or
+        // a crash can leave the new name pointing at an empty file.
+        .and_then(|()| file.sync_all());
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    drop(file);
+    std::fs::rename(&tmp, path).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })
+}
+
 /// Turn a rule name into a safe file stem.
 fn sanitize_filename(name: &str) -> String {
     let stem: String = name
@@ -728,53 +835,14 @@ impl RuleStore {
     }
 
     /// Write a rule file so that it is either the old rule or the new one,
-    /// never half of either.
-    ///
-    /// Writing in place truncates first, so a crash or a full disk mid-write
-    /// left a partial file, which the next scan refuses as unparsable and
-    /// silently drops from policy: for a deny rule that is a rule that stops
-    /// denying. The temp file is dot-prefixed and not `.toml`, so `load_dir`
-    /// skips it if a scan catches it mid-write, and the rename is atomic
-    /// within the directory.
+    /// never half of either. The atomicity and the mode are
+    /// [`write_atomic`]'s; 0644 because a rule file is policy an operator
+    /// reads, and `unique_path` has already refused to reuse a path this
+    /// store does not own.
     fn persist_to(&self, rule: &Rule, path: &Path) -> Result<(), String> {
-        use std::io::Write;
-
         let text = toml::to_string_pretty(rule).map_err(|e| format!("serialize rule: {e}"))?;
-        let dir = path.parent().unwrap_or(Path::new("."));
-        let name = path.file_name().unwrap_or_default().to_string_lossy();
-        let tmp = dir.join(format!(".{name}.tmp"));
-        // A leftover from an interrupted write, so create_new below does not
-        // refuse. Nothing else owns this name.
-        let _ = std::fs::remove_file(&tmp);
-        // create_new plus O_NOFOLLOW plus an explicit mode, not fs::write:
-        // fs::write follows a symlink at the target and creates with
-        // 0666 & ~umask, so a planted link would aim a root write anywhere,
-        // and under a permissive umask there is a window where the file
-        // about to become live policy is world-writable. unique_path already
-        // refuses to reuse a path it does not own; the temp path needs the
-        // same care.
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .custom_flags(O_NOFOLLOW)
-            .mode(0o644)
-            .open(&tmp)
-            .map_err(|e| format!("write {}: {e}", tmp.display()))?;
-        let written = file
-            .write_all(text.as_bytes())
-            // The bytes have to be on disk before the rename publishes them,
-            // or a crash can leave the new name pointing at an empty file.
-            .and_then(|()| file.sync_all());
-        if let Err(e) = written {
-            let _ = std::fs::remove_file(&tmp);
-            return Err(format!("write {}: {e}", tmp.display()));
-        }
-        drop(file);
-        std::fs::rename(&tmp, path).map_err(|e| {
-            let _ = std::fs::remove_file(&tmp);
-            format!("write {}: {e}", path.display())
-        })?;
-        Ok(())
+        write_atomic(path, text.as_bytes(), 0o644)
+            .map_err(|e| format!("write {}: {e}", path.display()))
     }
 }
 
@@ -1371,6 +1439,7 @@ mod tests {
             domain: None,
             iface: None,
             app_id: None,
+            first_seen: None,
         };
         let iterations = 1000u32;
         let t = Instant::now();

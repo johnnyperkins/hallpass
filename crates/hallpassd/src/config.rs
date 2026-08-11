@@ -19,24 +19,14 @@ pub const DEFAULT_CONFIG_PATH: &str = "/etc/hallpass/config.toml";
 /// path, and the rules directory, so anyone who can write it can disable
 /// enforcement outright rather than adjust one rule.
 ///
-/// Ownership and content come from the same descriptor, so the file that was
-/// checked is the file that is parsed. A `NotFound` error is passed through
-/// unchanged, because the caller distinguishes it.
+/// [`Links::Follow`](crate::rules::store::Links::Follow), unlike the files
+/// the daemon writes itself: this path is named by the operator, and a config
+/// symlinked to `config.hardened.toml` or into a dotfile tree is a way people
+/// keep these. The ownership check still applies to whatever the link
+/// resolves to, so following one cannot reach a file an unprivileged user
+/// wrote.
 fn read_trusted(path: &Path) -> std::io::Result<String> {
-    use std::io::Read;
-    use std::os::unix::fs::MetadataExt;
-
-    let mut file = std::fs::File::open(path)?;
-    let meta = file.metadata()?;
-    let self_uid = crate::rules::store::effective_uid().unwrap_or(u32::MAX);
-    if !crate::rules::store::file_perms_ok(meta.uid(), meta.mode(), self_uid) {
-        return Err(std::io::Error::other(
-            "must be owned by root and not group/world-writable",
-        ));
-    }
-    let mut text = String::new();
-    file.read_to_string(&mut text)?;
-    Ok(text)
+    crate::rules::store::read_trusted(path, crate::rules::store::Links::Follow)
 }
 
 /// Where the config should come from, and whether the operator said so.
