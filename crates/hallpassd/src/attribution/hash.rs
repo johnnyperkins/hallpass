@@ -294,6 +294,7 @@ mod tests {
             parent_exe: None,
             domain: None,
             iface: None,
+            app_id: None,
         };
         let cache = ExeHashCache::default();
         let hash = cache.for_connection(&conn).unwrap();

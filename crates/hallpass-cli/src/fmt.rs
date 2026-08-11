@@ -636,6 +636,7 @@ mod tests {
             parent_exe: None,
             domain: domain.map(String::from),
             iface: None,
+            app_id: None,
         }
     }
 

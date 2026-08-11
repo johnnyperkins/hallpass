@@ -92,6 +92,7 @@ _hallpass-cli() {
             '--src[source IP address]:ip address:' \
             '--src-port[source port]:port:' \
             '--iface[outbound network interface]:interface:_net_interfaces' \
+            '--app-id[packaged application, flatpak:<id> or snap:<name>]:app id:' \
             && ret=0
         ;;
     rules)
@@ -122,6 +123,7 @@ _hallpass-cli() {
                 '--src[source IP address or CIDR block]:ip or cidr:' \
                 '--src-port[source port]:port:' \
                 '--iface[outbound network interface]:interface:_net_interfaces' \
+                '--app-id[packaged application, flatpak:<id> or snap:<name>]:app id:' \
                 '--domains-file[file of domains, hosts format or one per line]:file:_files' \
                 '--ips-file[file of destination IPs or CIDRs, one per line]:file:_files' \
                 '--hashes-file[file of executable SHA-256 hashes, one per line]:file:_files' \

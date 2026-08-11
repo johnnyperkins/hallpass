@@ -26,10 +26,14 @@ use crate::stats::Counters;
 /// Priority given to rules created from prompt replies.
 const PROMPT_RULE_PRIORITY: u32 = 50;
 
-/// Coalescing key: (exe, proto, dst ip, dst port). The protocol is part
-/// of it because a TCP and a UDP flow to the same ip:port (e.g. HTTPS and
-/// QUIC) are different requests; one prompt must not answer both.
-type Key = (Option<PathBuf>, Proto, IpAddr, u16);
+/// Coalescing key: (exe, app id, proto, dst ip, dst port). The protocol is
+/// part of it because a TCP and a UDP flow to the same ip:port (e.g. HTTPS
+/// and QUIC) are different requests; one prompt must not answer both. The
+/// application is part of it for the same reason the generated rule pins it
+/// ([`rule_from_reply`]): a sandboxed application's executable path is
+/// shared by every application of that packaging system, so exe alone would
+/// let one dialog answer for two of them.
+type Key = (Option<PathBuf>, Option<String>, Proto, IpAddr, u16);
 
 struct Pending {
     key: Key,
@@ -219,6 +223,7 @@ impl PromptTable {
         }
         let key: Key = (
             conn.exe_path.clone(),
+            conn.app_id.clone(),
             conn.tuple.proto,
             conn.tuple.dst.ip(),
             conn.tuple.dst.port(),
@@ -226,12 +231,21 @@ impl PromptTable {
         let mut inner = self.inner.lock().unwrap();
 
         // Both budgets, before either path can take a slot: one caps what a
-        // single destination holds, the other what one executable holds
+        // single destination holds, the other what one application holds
         // across all of its destinations.
+        //
+        // Keyed on the same (exe, app id) pair the coalescing key carries,
+        // not on the executable alone. Two packaged applications can run
+        // from one sandbox path, and the coalescing key already tells them
+        // apart; summing their held packets together would let two of them
+        // fill this budget and send the third's first packet down the
+        // over-budget path, which resolves with the default verdict and
+        // never raises a prompt at all - the one thing the per-prompt cap
+        // above promises it will not do.
         let exe_held: usize = inner
             .by_id
             .values()
-            .filter(|p| p.conn.exe_path == conn.exe_path)
+            .filter(|p| p.conn.exe_path == conn.exe_path && p.conn.app_id == conn.app_id)
             .map(|p| p.packets.len())
             .sum();
         let over_budget = exe_held >= MAX_PACKETS_PER_EXE
@@ -642,6 +656,28 @@ fn rule_from_reply(
         exe: Some(exe),
         ..Default::default()
     };
+    // Pinned on an allow, never on a deny, because the operand only ever
+    // narrows and narrowing runs opposite ways for the two.
+    //
+    // On an allow it has to be pinned. A sandboxed application's executable
+    // path resolves inside its sandbox, so `/app/bin/firefox` is a path
+    // every application of that packaging system could present, and an
+    // exe-only allow generated from one of their prompts would answer for
+    // all of them. If that application is later launched somewhere no
+    // recognized scope is created, the allow stops matching and prompts
+    // again: the safe direction for a rule the operator has not seen since.
+    //
+    // On a deny that same silence is the wrong direction. The identity is
+    // absent for reasons that have nothing to do with the operator - a
+    // launcher that makes no per-app scope, a session with no user manager,
+    // a unit name this daemon does not parse - and a deny that quietly stops
+    // matching resolves the connection with `default_verdict` instead, which
+    // ships as allow. A deny stays exe-only and therefore covers every
+    // application sharing that sandbox path, which is the direction a block
+    // should err in.
+    if verdict == Verdict::Allow {
+        matcher.app_id = conn.app_id.clone();
+    }
     match scope {
         PromptScope::ThisPort => {
             matcher.dest = Some(dst.ip().to_string());
@@ -726,6 +762,7 @@ mod tests {
             parent_exe: None,
             domain: None,
             iface: None,
+            app_id: None,
         }
     }
 
@@ -844,6 +881,48 @@ mod tests {
         );
         // The exe criterion keeps the real path: only the name is reduced.
         assert_eq!(rule.matcher.exe, Some(PathBuf::from(hostile)));
+    }
+
+    /// An allow answered for a sandboxed application names the application,
+    /// not only the path inside its sandbox: that path is shared by every
+    /// application of the same packaging system, so an exe-only allow would
+    /// answer for all of them at once.
+    ///
+    /// A deny must not be pinned the same way. The operand only narrows, and
+    /// a deny that stops matching because the application turned up without
+    /// a recognized cgroup scope is resolved by `default_verdict`, which
+    /// ships as allow: the operator's block would silently stop applying.
+    #[test]
+    fn only_an_allow_pins_the_application() {
+        let mut c = conn("/app/bin/firefox", "1.1.1.1:443");
+        c.app_id = Some("flatpak:org.mozilla.firefox".into());
+        let generated = |verdict| {
+            rule_from_reply("abc", 7, &c, verdict, RuleDuration::Forever, PromptScope::AppAnywhere)
+                .expect("a rule is generated")
+        };
+
+        let allow = generated(Verdict::Allow);
+        assert_eq!(allow.matcher.exe, Some(PathBuf::from("/app/bin/firefox")));
+        assert_eq!(allow.matcher.app_id.as_deref(), Some("flatpak:org.mozilla.firefox"));
+
+        for verdict in [Verdict::Deny, Verdict::Reject] {
+            let rule = generated(verdict);
+            assert_eq!(rule.matcher.app_id, None, "{verdict:?} must not be narrowed");
+            assert_eq!(rule.matcher.exe, Some(PathBuf::from("/app/bin/firefox")));
+        }
+
+        // Nothing changes for a connection with no application identity.
+        let plain = conn("/usr/bin/curl", "1.1.1.1:443");
+        let rule = rule_from_reply(
+            "abc",
+            8,
+            &plain,
+            Verdict::Allow,
+            RuleDuration::Forever,
+            PromptScope::AppAnywhere,
+        )
+        .expect("a rule is generated");
+        assert_eq!(rule.matcher.app_id, None);
     }
 
     /// Two executables differing only in stripped characters must not collapse
@@ -1161,6 +1240,42 @@ mod tests {
         assert!(
             h.verdict_rx.try_recv().is_err(),
             "one loud executable must not deny everyone else a prompt"
+        );
+    }
+
+    /// The share is per application, and two packaged applications can run
+    /// from one path inside their sandboxes. Summing their held packets
+    /// together would let one of them spend the other's budget, and the
+    /// over-budget path does not merely drop packets - it resolves them with
+    /// the default verdict without ever raising a prompt, so the second
+    /// application would be decided without anyone being asked.
+    #[tokio::test]
+    async fn applications_sharing_a_sandbox_path_do_not_share_a_budget() {
+        let mut h = harness("appbudget", MAX_PACKETS_PER_EXE * 4, Verdict::Deny);
+        let (tx, _prompt_rx) = mpsc::channel(256);
+        assert!(h.table.set_handler(tx.clone()));
+
+        let from = |app: &str, port: u16| {
+            let mut c = conn("/app/bin/electron", &format!("1.1.1.1:{port}"));
+            c.app_id = Some(app.to_string());
+            c
+        };
+
+        // The first application spends its whole share.
+        let mut seq = 0u64;
+        for port in 0..(MAX_PACKETS_PER_EXE as u16) {
+            h.table.handle_new(from("flatpak:com.example.First", 1000 + port), seq);
+            seq += 1;
+        }
+        h.table.handle_new(from("flatpak:com.example.First", 9999), seq);
+        assert_eq!(h.verdict_rx.recv().await, Some((seq, Verdict::Deny)));
+
+        // The second is still asked about, though it runs from the same path.
+        seq += 1;
+        h.table.handle_new(from("flatpak:com.example.Second", 443), seq);
+        assert!(
+            h.verdict_rx.try_recv().is_err(),
+            "a second application must not inherit the first's spent budget"
         );
     }
 

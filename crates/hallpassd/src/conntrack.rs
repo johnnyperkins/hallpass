@@ -432,6 +432,7 @@ mod tests {
                 parent_exe: None,
                 domain: None,
                 iface: None,
+                app_id: None,
             },
             verdict,
             rule_name: None,

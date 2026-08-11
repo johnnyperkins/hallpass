@@ -1370,6 +1370,7 @@ mod tests {
             parent_exe: None,
             domain: None,
             iface: None,
+            app_id: None,
         };
         let iterations = 1000u32;
         let t = Instant::now();

@@ -27,6 +27,9 @@ pub struct ProcInfo {
     pub cmdline: Option<String>,
     /// Executable path of the parent process, from /proc/ppid/exe.
     pub parent_exe: Option<PathBuf>,
+    /// Packaged application from /proc/pid/cgroup, when the process runs
+    /// under one; see [`hallpass_types::Connection::app_id`].
+    pub app_id: Option<String>,
     /// Start time of `pid` from /proc/pid/stat. The kernel sets it at fork,
     /// so together with the pid it names one process incarnation and a
     /// recycled pid cannot pass for the one this was resolved from.
@@ -114,22 +117,30 @@ impl AttributionChain {
     /// Build a [`Connection`] for `tuple` with whatever attribution is
     /// available. The domain is left unset; DNS snooping fills it in later.
     pub fn connection(&self, tuple: FlowTuple) -> Connection {
-        let info = self.attribute(&tuple);
-        let (uid, pid, exe_path, cmdline, parent_exe) = match info {
-            Some(i) => (Some(i.uid), i.pid, i.exe_path, i.cmdline, i.parent_exe),
-            None => (None, None, None, None, None),
-        };
-        Connection {
+        // Fields move out of the attribution rather than being cloned: this
+        // runs per packet. Assigned by name so a field added to either type
+        // is one line here instead of a positional tuple to keep aligned.
+        let mut conn = Connection {
             tuple,
-            uid,
-            pid,
-            exe_path,
-            cmdline,
-            parent_exe,
+            uid: None,
+            pid: None,
+            exe_path: None,
+            cmdline: None,
+            parent_exe: None,
             domain: None,
             // Interface is packet metadata; the queue loop fills it in.
             iface: None,
+            app_id: None,
+        };
+        if let Some(i) = self.attribute(&tuple) {
+            conn.uid = Some(i.uid);
+            conn.pid = i.pid;
+            conn.exe_path = i.exe_path;
+            conn.cmdline = i.cmdline;
+            conn.parent_exe = i.parent_exe;
+            conn.app_id = i.app_id;
         }
+        conn
     }
 }
 
@@ -245,6 +256,7 @@ mod tests {
             exe_path: Some(PathBuf::from(EXE)),
             cmdline: None,
             parent_exe: None,
+            app_id: None,
             starttime: Some(900),
             socket_inode: Some(INODE),
         }

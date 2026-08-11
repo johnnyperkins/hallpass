@@ -124,8 +124,8 @@ A new outbound connection then travels like this:
 For the prompt path, the packet's `nfq::Message` stays in a map on the
 verdict thread keyed by a local sequence number, and only the sequence number
 and the `Connection` cross to the async side. The prompt table coalesces by
-(executable, protocol, destination IP, destination port), so one dialog can
-cover several held packets. If no client holds the prompt-handler slot, or
+(executable, application id, protocol, destination IP, destination port), so
+one dialog can cover several held packets. If no client holds the prompt-handler slot, or
 the pending table is full, the connection resolves immediately with
 `default_verdict` rather than waiting. Otherwise a request goes to the
 handler and a timer is armed for `prompt_timeout_secs`; the reply or the

@@ -89,6 +89,7 @@ mod tests {
                     src: Some("192.168.0.0/16".into()),
                     src_port: Some(9000),
                     iface: Some("wg0".into()),
+                    app_id: Some("flatpak:org.mozilla.firefox".into()),
                     domains_file: Some(PathBuf::from("/etc/hallpass/rules.d/ads.list")),
                     ..Default::default()
                 },
@@ -135,6 +136,7 @@ mod tests {
             "domain = \"*.example.org\"",
             "cmdline_contains = \"--upload\"",
             "port_range = [",
+            "app_id = \"flatpak:org.mozilla.firefox\"",
         ] {
             assert!(text.contains(want), "missing {want:?} in:\n{text}");
         }

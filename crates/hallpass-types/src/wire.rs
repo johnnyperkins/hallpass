@@ -97,6 +97,7 @@ mod tests {
             parent_exe: None,
             domain: Some("example.org".to_string()),
             iface: None,
+            app_id: Some("flatpak:org.mozilla.firefox".to_string()),
         }
     }
 
@@ -135,6 +136,7 @@ mod tests {
                 src: Some("192.168.1.0/24".to_string()),
                 src_port: Some(40_000),
                 iface: Some("eth0".to_string()),
+                app_id: Some("snap:firefox".to_string()),
             },
         }
     }

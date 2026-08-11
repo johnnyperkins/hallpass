@@ -6,6 +6,7 @@
 //! /proc/pid/{exe,cmdline} give process details.
 
 use std::collections::VecDeque;
+use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
@@ -367,6 +368,7 @@ impl Attributor for ProcfsAttributor {
             exe_path,
             cmdline,
             parent_exe: pid.and_then(|p| parent_exe_of(proc_root, p)),
+            app_id: pid.and_then(|p| app_id_of(proc_root, p)),
             starttime: pid.and_then(|p| starttime_of(proc_root, p)),
             // The row this was resolved from. Whether the pid still holds
             // it is what tells a live cache entry from one whose port has
@@ -527,6 +529,11 @@ pub(super) fn starttime_of(proc_root: &Path, pid: u32) -> Option<u64> {
 /// Exe, cmdline, and parent exe for `pid`, snapshotted together. Used by
 /// the eBPF attributor at exec-event time, while the parent is certainly
 /// alive.
+///
+/// Deliberately not where [`app_id_of`] belongs: a cgroup is assigned to a
+/// process rather than read out of its image, so it is read when a flow is
+/// attributed, like the interface is. Snapshotting it here would also pay
+/// for it on every exec on the host, most of which never open a socket.
 #[cfg_attr(not(feature = "ebpf"), allow(dead_code))]
 pub(super) fn proc_snapshot(
     proc_root: &Path,
@@ -534,6 +541,111 @@ pub(super) fn proc_snapshot(
 ) -> (Option<PathBuf>, Option<String>, Option<PathBuf>) {
     let (exe, cmdline) = read_proc_details(proc_root, pid);
     (exe, cmdline, parent_exe_of(proc_root, pid))
+}
+
+/// Packaged application `pid` belongs to, as `flatpak:<app-id>` or
+/// `snap:<name>`, read from /proc/pid/cgroup. None for everything else,
+/// which is most processes.
+///
+/// One extra small read per attribution that misses the cache, on a path
+/// that already reads exe, cmdline and two stat files.
+pub(super) fn app_id_of(proc_root: &Path, pid: u32) -> Option<String> {
+    let mut raw = Vec::new();
+    let read = std::fs::File::open(proc_root.join(pid.to_string()).join("cgroup"))
+        .ok()?
+        // Bounded because the length is not the kernel's choice alone: a
+        // cgroup path is as deep as whoever owns the subtree nested it, and
+        // names run to NAME_MAX each, so an unbounded read is an allocation
+        // a local process sizes on the thread that decides every packet. A
+        // real path is a couple of hundred bytes.
+        .take(MAX_CGROUP_BYTES as u64)
+        .read_to_end(&mut raw)
+        .ok()?;
+    // A file that filled the cap is not parsed at all. The search walks
+    // segments innermost first, so a cut path's innermost *surviving*
+    // segment is an ancestor's, and answering with it would attribute a
+    // process to the application it is merely nested under - one identity
+    // standing in for another, which is worse than none.
+    if read >= MAX_CGROUP_BYTES {
+        return None;
+    }
+    // Lossy rather than strict, and read as bytes for that reason. A cgroup
+    // directory name may hold any byte but '/' and NUL, so a user with a
+    // delegated subtree can put one that is not UTF-8 in a path - and on a
+    // cgroup v1 host the whole path is repeated on every hierarchy line, so
+    // a strict decode would fail the entire file and cost the identity of
+    // every real application nested under that name. Decoding lossily
+    // confines the damage to the segment that carries the byte: U+FFFD is
+    // outside every name charset, so that one segment is refused and the
+    // rest still parse.
+    app_id_from_cgroup(&String::from_utf8_lossy(&raw))
+}
+
+/// Most of one process's `cgroup` file the identity is looked for in.
+const MAX_CGROUP_BYTES: usize = 8192;
+
+/// Pull an application identity out of the contents of a `cgroup` file.
+///
+/// One line per hierarchy, `id:controllers:path`; cgroup v2 writes the
+/// single line `0::/path`. Both are read the same way because only the path
+/// matters. Segments are examined innermost first *across the whole file*,
+/// not within each line in turn, so the most specific scope a process sits
+/// in is the one that names it however many hierarchies list it. Walking
+/// line by line would let a shallower path in an earlier line outrank a
+/// deeper one in a later, and on a v1 host the kernel picks that order, not
+/// this daemon: a process would be attributed to whatever launched it.
+///
+/// Which way it fails: a layout this does not recognize yields None, the
+/// connection carries no application identity, and rules naming one do not
+/// match it, so it falls through to the prompt or the default verdict. A
+/// launcher that changes how it names units therefore costs matches instead
+/// of handing out somebody else's.
+fn app_id_from_cgroup(contents: &str) -> Option<String> {
+    contents
+        .lines()
+        .filter_map(|line| line.splitn(3, ':').nth(2))
+        // Depth from the root, so the comparison is "how specific is this
+        // scope" rather than "which line was it on". Counted forwards
+        // because a segment's distance from the *end* of its own path says
+        // nothing across lines: the last segment of a shallow path and the
+        // last segment of a deep one are both zero from the end.
+        .flat_map(|path| path.split('/').enumerate())
+        .filter_map(|(depth, segment)| Some((app_id_from_unit(segment)?, depth)))
+        .max_by_key(|(_, depth)| *depth)
+        .map(|(id, _)| id)
+}
+
+/// Application identity from one cgroup path segment, when that segment is
+/// a unit whose name carries one.
+///
+/// Two layouts, each putting the identity in the unit name because the
+/// launcher needed the name to be unique per application:
+/// `app-flatpak-<app-id>-<pid>.scope`, and `snap.<name>.<app>.<uuid>.scope`
+/// for a snap's user units (its system units end `.service` with the name
+/// in the same position).
+fn app_id_from_unit(segment: &str) -> Option<String> {
+    let unit = segment
+        .strip_suffix(".scope")
+        .or_else(|| segment.strip_suffix(".service"))?;
+    let candidate = if let Some(rest) = unit.strip_prefix("app-flatpak-") {
+        // The trailing "-<pid>" is the launcher's uniquifier rather than
+        // part of the identity. Required, not optional: without it any
+        // app-flatpak-* unit name would read as an identity, and the app id
+        // itself may contain '-', so there is no other way to know where it
+        // ends.
+        let (id, uniquifier) = rest.rsplit_once('-')?;
+        if uniquifier.is_empty() || !uniquifier.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        format!("flatpak:{id}")
+    } else {
+        format!("snap:{}", unit.strip_prefix("snap.")?.split_once('.')?.0)
+    };
+    // A cgroup name is chosen by whoever created it, and this string travels
+    // into prompts, event lines and rule files, so what may become an
+    // identity is decided in one place shared with the rule engine and the
+    // CLI. Dropping one costs a match, which is the safe direction.
+    hallpass_types::valid_app_id(&candidate).then_some(candidate)
 }
 
 /// Longest command line kept for a connection.
@@ -1120,5 +1232,171 @@ mod tests {
         assert!(out.len() <= MAX_CMDLINE_BYTES + 16, "kept {} bytes", out.len());
         // Short input is returned untouched, no marker.
         assert_eq!(truncate_cmdline("curl x".to_string()), "curl x");
+    }
+
+    /// The two layouts this reads, in the form a real host produces them.
+    /// The snap line is verbatim from this project's own session
+    /// (probe, 2026-08-10); the flatpak one is what its launcher names the
+    /// transient scope it starts an application in.
+    #[test]
+    fn app_id_from_real_cgroup_layouts() {
+        let v2 = |path: &str| format!("0::{path}\n");
+
+        assert_eq!(
+            app_id_from_cgroup(&v2(
+                "/user.slice/user-1000.slice/user@1000.service/app.slice/\
+                 snap.zellij.zellij-6dccfa72-aaa1-4833-886a-1dde79a4d41d.scope"
+            )),
+            Some("snap:zellij".to_string())
+        );
+        assert_eq!(
+            app_id_from_cgroup(&v2(
+                "/user.slice/user-1000.slice/user@1000.service/app.slice/\
+                 app-flatpak-org.mozilla.firefox-2814.scope"
+            )),
+            Some("flatpak:org.mozilla.firefox".to_string())
+        );
+        // A snap's system units end .service, with the name in the same
+        // position.
+        assert_eq!(
+            app_id_from_cgroup(&v2("/system.slice/snap.lxd.daemon.service")),
+            Some("snap:lxd".to_string())
+        );
+        // cgroup v1 writes one line per hierarchy; only the path matters.
+        assert_eq!(
+            app_id_from_cgroup(
+                "12:pids:/user.slice/app-flatpak-com.example.App-9.scope\n\
+                 1:name=systemd:/user.slice/app-flatpak-com.example.App-9.scope\n"
+            ),
+            Some("flatpak:com.example.App".to_string())
+        );
+        // Everything else has no application identity, which is most
+        // processes and every unrecognized layout.
+        for none in [
+            "0::/user.slice/user-1000.slice/session-2.scope",
+            "0::/system.slice/sshd.service",
+            "0::/",
+            "",
+        ] {
+            assert_eq!(app_id_from_cgroup(none), None, "{none:?}");
+        }
+    }
+
+    /// A cgroup name is chosen by whoever created it, and any user may
+    /// create one under their own delegated subtree. Nothing that could
+    /// reshape a prompt, a rule file, or an event line may come out of here,
+    /// and an over-long name is dropped rather than cut down to a prefix of
+    /// somebody else's identity.
+    #[test]
+    fn a_hostile_cgroup_name_yields_no_identity() {
+        let v2 = |unit: &str| format!("0::/user.slice/{unit}\n");
+        let hostile = [
+            // Terminal escapes and newlines, raw or systemd-escaped.
+            "app-flatpak-org.evil\x1b[2K-1.scope",
+            "app-flatpak-org\u{1b}[2Kevil-1.scope",
+            "snap.ev\u{202e}il.app.x.scope",
+            "snap.a\u{feff}b.app.x.scope",
+            // A '/' cannot appear in one path segment, but a name that
+            // parses as a path prefix must not either.
+            "app-flatpak-..-1.scope",
+            // No numeric uniquifier: not a name the launcher produced.
+            "app-flatpak-org.mozilla.firefox.scope",
+            "app-flatpak-org.mozilla.firefox-.scope",
+            "app-flatpak-org.mozilla.firefox-abc.scope",
+            // Empty identities.
+            "app-flatpak--1.scope",
+            "snap..app.x.scope",
+        ];
+        for unit in hostile {
+            assert_eq!(app_id_from_cgroup(&v2(unit)), None, "{unit:?}");
+        }
+
+        // Over-long is dropped, not truncated: a truncated identity is a
+        // prefix of a real one, and matching an allow rule on a prefix is
+        // the direction that fails open.
+        let long = "a".repeat(hallpass_types::MAX_APP_ID_NAME_BYTES + 1);
+        assert_eq!(app_id_from_cgroup(&v2(&format!("app-flatpak-{long}-1.scope"))), None);
+        let ok = "a".repeat(hallpass_types::MAX_APP_ID_NAME_BYTES);
+        assert_eq!(
+            app_id_from_cgroup(&v2(&format!("app-flatpak-{ok}-1.scope"))),
+            Some(format!("flatpak:{ok}"))
+        );
+    }
+
+    /// The innermost scope names the process: an application launched from
+    /// inside another one's cgroup subtree is that application, not its
+    /// launcher. That has to hold across hierarchy lines too, because on a
+    /// cgroup v1 host the kernel chooses their order.
+    #[test]
+    fn the_innermost_recognized_segment_wins() {
+        assert_eq!(
+            app_id_from_cgroup(
+                "0::/user.slice/app-flatpak-com.example.Outer-1.scope/\
+                 app-flatpak-com.example.Inner-2.scope\n"
+            ),
+            Some("flatpak:com.example.Inner".to_string())
+        );
+        // The launcher's scope is listed first and shallower; the nested
+        // application still wins.
+        assert_eq!(
+            app_id_from_cgroup(
+                "12:pids:/user.slice/app-flatpak-com.example.Outer-1.scope\n\
+                 4:memory:/user.slice/app-flatpak-com.example.Outer-1.scope/\
+                 app-flatpak-com.example.Inner-2.scope\n"
+            ),
+            Some("flatpak:com.example.Inner".to_string())
+        );
+    }
+
+    /// A cgroup directory name may hold any byte but '/' and NUL, and on a
+    /// v1 host the whole path repeats on every hierarchy line. One
+    /// undecodable byte must cost that segment, not every identity beneath
+    /// it.
+    #[test]
+    fn a_non_utf8_segment_does_not_cost_the_whole_file() {
+        let dir = crate::testutil::TestDir::new("procfs-cgroup-utf8");
+        let dir = dir.path();
+        std::fs::create_dir_all(dir.join("4242")).unwrap();
+        let mut raw = b"0::/user.slice/".to_vec();
+        raw.push(0xff);
+        raw.extend_from_slice(b"/app.slice/snap.firefox.firefox-abc.scope\n");
+        std::fs::write(dir.join("4242/cgroup"), &raw).unwrap();
+        assert_eq!(app_id_of(dir, 4242), Some("snap:firefox".to_string()));
+    }
+
+    #[test]
+    fn app_id_reads_the_pid_cgroup_file() {
+        let dir = crate::testutil::TestDir::new("procfs-app-id");
+        let dir = dir.path();
+        std::fs::create_dir_all(dir.join("4242")).unwrap();
+        // No cgroup file at all (a pid that just exited) is not an error.
+        assert_eq!(app_id_of(dir, 4242), None);
+        std::fs::write(
+            dir.join("4242/cgroup"),
+            "0::/user.slice/app.slice/snap.firefox.firefox-abc.scope\n",
+        )
+        .unwrap();
+        assert_eq!(app_id_of(dir, 4242), Some("snap:firefox".to_string()));
+
+        // A cgroup path is as deep as whoever owns the subtree nested it, so
+        // the read is capped, and a file that fills the cap yields nothing.
+        // Not merely because the tail is gone: the surviving prefix here
+        // ends inside another application's scope, and answering with that
+        // would hand one application's identity to a process nested under
+        // it.
+        let deep = "x".repeat(MAX_CGROUP_BYTES);
+        std::fs::write(
+            dir.join("4242/cgroup"),
+            format!("0::/{deep}/snap.firefox.firefox-abc.scope\n"),
+        )
+        .unwrap();
+        assert_eq!(app_id_of(dir, 4242), None);
+        let outer = "app-flatpak-com.other.App-1.scope";
+        std::fs::write(
+            dir.join("4242/cgroup"),
+            format!("0::/{outer}/{deep}/app-flatpak-org.real.App-2.scope\n"),
+        )
+        .unwrap();
+        assert_eq!(app_id_of(dir, 4242), None, "an ancestor must not stand in");
     }
 }

@@ -162,6 +162,7 @@ fn event_cost(ev: &ConnEvent) -> usize {
         + c.cmdline.as_ref().map_or(0, |s| s.len())
         + c.domain.as_ref().map_or(0, |s| s.len())
         + c.iface.as_ref().map_or(0, |s| s.len())
+        + c.app_id.as_ref().map_or(0, |s| s.len())
         + ev.rule_name.as_ref().map_or(0, |s| s.len())
 }
 
@@ -184,6 +185,7 @@ mod tests {
             parent_exe: None,
             domain: None,
             iface: None,
+            app_id: None,
         }
     }
 

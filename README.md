@@ -207,6 +207,7 @@ proto = "udp"
 # src = "192.168.1.0/24"
 # src_port = 40000
 # iface = "wg0"                    # outbound interface name
+# app_id = "flatpak:org.mozilla.firefox"   # packaged app: flatpak:<id> or snap:<name>
 # domains_file = "/etc/hallpass/rules.d/ads.list"   # hosts format or one per line
 # ips_file = "/etc/hallpass/rules.d/bad-ips.list"   # IPs/CIDRs, one per line
 # hashes_file = "/etc/hallpass/rules.d/bad.sha256"  # exe SHA-256s, one per line
@@ -453,6 +454,16 @@ attacker with root, who can delete the nftables table outright.
   ordinary software, not a boundary against a process that is actively
   evading them. The same caveat already applies for a different reason to
   `cmdline_contains` and `parent_exe`, which a process controls outright.
+- **`app_id` names a cgroup, and a user names their own cgroups.** The
+  packaged-application identity comes from `/proc/<pid>/cgroup`, which is
+  whatever the launcher called the scope it started the process in. Any
+  unprivileged user can start a command under a scope of their choosing
+  (`systemd-run --user --scope --unit=app-flatpak-org.mozilla.firefox-99.scope
+  ...`), so `app_id` scopes rules the way `cmdline_contains` does and is not a
+  boundary. It is worth having because a sandboxed application's executable
+  path resolves inside its sandbox: it names neither a file on this host nor
+  the application uniquely, which is what left those connections hard to
+  scope at all.
 - **Only the `output` and `input` hooks are filtered.** Traffic that is
   *forwarded* rather than locally generated, which is what containers, VMs,
   and other network namespaces bridged to the host produce, traverses the

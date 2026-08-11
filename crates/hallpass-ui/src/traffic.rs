@@ -134,11 +134,17 @@ impl Aggregate {
 fn raw_key(ev: &ConnEvent, group_by: GroupBy) -> String {
     let c = &ev.conn;
     match group_by {
-        GroupBy::Exe => c
-            .exe_path
-            .as_ref()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|| "unknown".to_string()),
+        // Keyed on the application when the connection names one, because
+        // the column says Application and a packaged application's
+        // executable path does not name it: two of them can run from one
+        // path inside their sandboxes and would otherwise sum into one row.
+        // The path stays alongside, since that is what a rule keys on.
+        GroupBy::Exe => match (&c.exe_path, &c.app_id) {
+            (Some(exe), Some(app)) => format!("{app} ({})", exe.display()),
+            (Some(exe), None) => exe.display().to_string(),
+            (None, Some(app)) => app.clone(),
+            (None, None) => "unknown".to_string(),
+        },
         // Falling back to the address keeps unresolved traffic visible.
         // Dropping it would hide exactly the connections that went around
         // the system resolver, which are the ones worth looking at.
@@ -193,6 +199,7 @@ mod tests {
                 parent_exe: None,
                 domain: None,
                 iface: None,
+                app_id: None,
             },
             verdict,
             rule_name: None,

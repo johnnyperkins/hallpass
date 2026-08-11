@@ -114,6 +114,8 @@ EXPLAIN OPTIONS:
     --src IP                     Source IP address (default: unspecified)
     --src-port PORT              Source port (default: 0)
     --iface NAME                 Outbound network interface (e.g. eth0)
+    --app-id ID                  Packaged application the process belongs to,
+                                 as flatpak:<app-id> or snap:<name>
 
 RULES ADD OPTIONS:
     --name NAME                  Rule name (required)
@@ -131,6 +133,8 @@ RULES ADD OPTIONS:
     --src IP|CIDR                Source IP address or CIDR block
     --src-port PORT              Source port
     --iface NAME                 Outbound network interface (e.g. eth0)
+    --app-id ID                  Packaged application, as flatpak:<app-id> or
+                                 snap:<name>; matched exactly
     --domains-file PATH          File of domains (hosts format or one per
                                  line) matched against the destination domain
     --ips-file PATH              File of destination IPs/CIDRs, one per line
@@ -630,6 +634,7 @@ fn parse_explain(flags: &[&str]) -> Result<ExplainRequest, String> {
     let mut domain: Option<String> = None;
     let mut user: Option<u32> = None;
     let mut iface: Option<String> = None;
+    let mut app_id: Option<String> = None;
     let mut exe_sha256: Option<String> = None;
 
     let mut it = flags.iter();
@@ -667,6 +672,7 @@ fn parse_explain(flags: &[&str]) -> Result<ExplainRequest, String> {
                 );
             }
             "--iface" => iface = Some(value.to_string()),
+            "--app-id" => app_id = Some(parse_app_id(value)?),
             "--exe-sha256" => exe_sha256 = Some(parse_sha256(value)?),
             other => return Err(format!("unknown flag '{other}'")),
         }
@@ -700,6 +706,7 @@ fn parse_explain(flags: &[&str]) -> Result<ExplainRequest, String> {
             parent_exe,
             domain,
             iface,
+            app_id,
         },
         exe_sha256,
     })
@@ -711,6 +718,25 @@ fn parse_addr(flag: &str, value: &str) -> Result<IpAddr, String> {
     value
         .parse()
         .map_err(|_| format!("invalid {flag} '{value}': expected an IP address"))
+}
+
+/// Validate an application-identity operand and return it unchanged.
+///
+/// Checked here rather than only at the daemon for the same reason
+/// `--exe-sha256` is: a value no connection could ever carry is a typo, and
+/// the answer to a typo should be an error naming it, not an `explain` that
+/// quietly reports the default verdict because nothing matched. `rules add`
+/// would be refused by the daemon anyway; saying so locally names the flag.
+fn parse_app_id(value: &str) -> Result<String, String> {
+    if hallpass_types::valid_app_id(value) {
+        return Ok(value.to_string());
+    }
+    Err(format!(
+        "invalid --app-id '{value}': expected {}, for example \"flatpak:org.mozilla.firefox\"",
+        hallpass_types::APP_ID_SCHEMES
+            .map(|s| format!("{s}:<name>"))
+            .join(" or ")
+    ))
 }
 
 /// Validate a SHA-256 operand and return it unchanged.
@@ -797,6 +823,7 @@ fn parse_rule_add(flags: &[&str]) -> Result<Rule, String> {
                     Some(value.parse::<u16>().map_err(|_| format!("invalid src-port '{value}'"))?);
             }
             "--iface" => matcher.iface = Some(value.to_string()),
+            "--app-id" => matcher.app_id = Some(parse_app_id(value)?),
             "--domains-file" => matcher.domains_file = Some(PathBuf::from(value)),
             "--ips-file" => matcher.ips_file = Some(PathBuf::from(value)),
             "--hashes-file" => matcher.hashes_file = Some(PathBuf::from(value)),
@@ -1036,6 +1063,7 @@ mod tests {
                 parent_exe: None,
                 domain: domain.map(String::from),
                 iface: None,
+                app_id: None,
             },
             verdict,
             rule_name: None,
@@ -1151,7 +1179,8 @@ mod tests {
             "explain", "--exe", "/usr/bin/curl", "--cmdline", "curl https://example.org",
             "--parent-exe", "/bin/bash", "--dest", "93.184.216.34", "--port", "443",
             "--proto", "udp", "--domain", "example.org", "--user", "1000", "--src",
-            "10.0.0.5", "--src-port", "51000", "--iface", "wg0", "--exe-sha256", &hash,
+            "10.0.0.5", "--src-port", "51000", "--iface", "wg0", "--app-id",
+            "flatpak:org.mozilla.firefox", "--exe-sha256", &hash,
         ])
         .cmd
         else {
@@ -1167,6 +1196,13 @@ mod tests {
         assert_eq!(conn.domain.as_deref(), Some("example.org"));
         assert_eq!(conn.uid, Some(1000));
         assert_eq!(conn.iface.as_deref(), Some("wg0"));
+        assert_eq!(conn.app_id.as_deref(), Some("flatpak:org.mozilla.firefox"));
+        // A value no connection could carry is named as the error it is,
+        // not passed through to an explanation that matches nothing.
+        for bad in ["firefox", "snap:Firefox", "docker:nginx"] {
+            let err = parse_err(&["explain", "--dest", "1.2.3.4", "--port", "1", "--app-id", bad]);
+            assert!(err.contains("invalid --app-id"), "{bad}: {err}");
+        }
         // The hash rides beside the connection: it is what the daemon should
         // use for hash operands, not a property of the flow.
         assert_eq!(req.exe_sha256.as_deref(), Some(hash.as_str()));

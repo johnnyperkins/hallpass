@@ -88,6 +88,12 @@ const MAX_RULES: usize = 200;
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct Key {
     exe: String,
+    /// Packaged application the connections came from, when they carried
+    /// one. Part of the key, not decoration: a sandboxed application's
+    /// executable path is shared by every application of that packaging
+    /// system, so folding on the path alone merges two applications into
+    /// one proposed allow rule.
+    app_id: Option<String>,
     proto: Proto,
     port: u16,
     target: Target,
@@ -148,6 +154,7 @@ pub fn suggest(events: &[ConnEvent], filters: &Filters) -> Proposal {
         };
         let key = Key {
             exe: exe.display().to_string(),
+            app_id: ev.conn.app_id.clone(),
             proto: ev.conn.tuple.proto,
             port: ev.conn.tuple.dst.port(),
             target,
@@ -172,6 +179,7 @@ pub fn suggest(events: &[ConnEvent], filters: &Filters) -> Proposal {
             let name = unique_name(&key, &mut used_names);
             let Key {
                 exe,
+                app_id,
                 proto,
                 port,
                 target,
@@ -188,6 +196,7 @@ pub fn suggest(events: &[ConnEvent], filters: &Filters) -> Proposal {
                 enabled: true,
                 matcher: RuleMatch {
                     exe: Some(exe.into()),
+                    app_id,
                     domain,
                     dest,
                     port: Some(port),
@@ -210,14 +219,12 @@ pub fn suggest(events: &[ConnEvent], filters: &Filters) -> Proposal {
 /// itself stays exact: `*.example.org` deliberately does not vouch for
 /// `example.org`.
 fn collapse_wildcards(hits: BTreeMap<Key, u64>) -> BTreeMap<Key, u64> {
-    // Distinct hosts per (exe, proto, port, suffix).
-    let mut sizes: BTreeMap<(String, Proto, u16, String), usize> = BTreeMap::new();
+    // Distinct hosts per group.
+    let mut sizes: BTreeMap<Group, usize> = BTreeMap::new();
     for key in hits.keys() {
         if let Target::Domain(d) = &key.target {
             if let Some(suffix) = wildcard_suffix(d) {
-                *sizes
-                    .entry((key.exe.clone(), key.proto, key.port, suffix))
-                    .or_insert(0) += 1;
+                *sizes.entry(group_of(key, suffix)).or_insert(0) += 1;
             }
         }
     }
@@ -227,15 +234,32 @@ fn collapse_wildcards(hits: BTreeMap<Key, u64>) -> BTreeMap<Key, u64> {
     for (mut key, count) in hits {
         if let Target::Domain(d) = &key.target {
             if let Some(suffix) = wildcard_suffix(d) {
-                let group = (key.exe.clone(), key.proto, key.port, suffix);
+                let group = group_of(&key, suffix.clone());
                 if sizes.get(&group).copied().unwrap_or(0) >= WILDCARD_MIN {
-                    key.target = Target::Domain(format!("*.{}", group.3));
+                    key.target = Target::Domain(format!("*.{suffix}"));
                 }
             }
         }
         *out.entry(key).or_insert(0) += count;
     }
     out
+}
+
+/// Everything except the host that decides whether a set of domains
+/// collapses under one wildcard: the rule the collapse would produce, minus
+/// its target.
+type Group = (String, Option<String>, Proto, u16, String);
+
+/// Build a [`Group`] from a key and the suffix its domain falls under.
+///
+/// One constructor, because both passes of [`collapse_wildcards`] have to
+/// agree exactly. Built twice by hand, a field added to [`Key`] and applied
+/// to only one of them leaves the counting pass coarser than the pass that
+/// consults it, and members of two different groups then collapse onto one
+/// wildcard rule: an allow covering traffic from an application nobody
+/// reviewed.
+fn group_of(key: &Key, suffix: String) -> Group {
+    (key.exe.clone(), key.app_id.clone(), key.proto, key.port, suffix)
 }
 
 /// The suffix a host would collapse under: its last two labels, only when
@@ -255,7 +279,15 @@ fn wildcard_suffix(domain: &str) -> Option<String> {
 
 /// A readable, unique, filesystem-safe rule name for one key.
 fn unique_name(key: &Key, used: &mut HashSet<String>) -> String {
-    let exe_base = key.exe.rsplit('/').next().unwrap_or("app");
+    // The application when there is one, because that is what the rule is
+    // scoped to. Two applications sharing a sandbox executable path would
+    // otherwise produce names differing only by the "-2" the collision
+    // counter appends, and a reviewer reading the emitted document has
+    // every reason to delete the second as an accidental duplicate.
+    let exe_base = match &key.app_id {
+        Some(app) => app.rsplit([':', '.']).next().unwrap_or("app"),
+        None => key.exe.rsplit('/').next().unwrap_or("app"),
+    };
     let target = match &key.target {
         Target::Domain(d) => d.as_str(),
         Target::Dest(ip) => ip.as_str(),
@@ -366,6 +398,7 @@ mod tests {
                 parent_exe: None,
                 domain: domain.map(Into::into),
                 iface: None,
+                app_id: None,
             },
             verdict,
             rule_name: None,
@@ -454,6 +487,58 @@ mod tests {
             domains,
             vec!["*.example.org", "example.org", "x.other.net", "y.other.net"]
         );
+    }
+
+    /// Two packaged applications can run from the same path inside their
+    /// sandboxes, so folding on the executable alone would propose one allow
+    /// rule covering both. They stay separate rules, each pinning its own
+    /// application.
+    #[test]
+    fn packaged_applications_do_not_fold_together() {
+        let app = |id: &str, domain: &str| {
+            let mut ev = event(
+                Some("/app/bin/browser"),
+                Some(domain),
+                "1.1.1.1:443",
+                Verdict::Allow,
+            );
+            ev.conn.app_id = Some(id.to_string());
+            ev
+        };
+        let p = suggest(
+            &[
+                app("flatpak:org.mozilla.firefox", "mozilla.example"),
+                app("flatpak:com.example.Other", "other.example"),
+            ],
+            &Filters::default(),
+        );
+        let mut pairs: Vec<_> = p
+            .rules
+            .iter()
+            .map(|r| (r.matcher.app_id.clone(), r.matcher.domain.clone()))
+            .collect();
+        pairs.sort();
+        assert_eq!(
+            pairs,
+            vec![
+                (Some("flatpak:com.example.Other".into()), Some("other.example".into())),
+                (Some("flatpak:org.mozilla.firefox".into()), Some("mozilla.example".into())),
+            ]
+        );
+        // And they are told apart by name, not by a collision counter: a
+        // reviewer deleting an apparent duplicate would drop one
+        // application's allow.
+        let mut names: Vec<&str> = p.rules.iter().map(|r| r.name.as_str()).collect();
+        names.sort();
+        assert!(names[0].starts_with("suggest-firefox-"), "{names:?}");
+        assert!(names[1].starts_with("suggest-other-"), "{names:?}");
+        // A connection with no application identity proposes what it always
+        // did: an exe rule with no app_id operand.
+        let plain = suggest(
+            &[event(Some("/usr/bin/curl"), Some("example.org"), "1.1.1.1:443", Verdict::Allow)],
+            &Filters::default(),
+        );
+        assert_eq!(plain.rules[0].matcher.app_id, None);
     }
 
     /// Registry and shared-hosting suffixes never collapse, however many

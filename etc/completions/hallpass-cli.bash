@@ -100,7 +100,7 @@ _hallpass_cli() {
         ;;
     --last | --domain | --top | --interval | --name | --exe-glob | --exe-sha256 | \
         --dest | --port | --cmdline | --cmdline-contains | --src | --src-port | \
-        --iface | --user | --priority)
+        --iface | --app-id | --user | --priority)
         # Free-form values with nothing sensible to suggest.
         return
         ;;
@@ -114,7 +114,7 @@ _hallpass_cli() {
     top) opts="--group-by --interval --top" ;;
     explain)
         opts="--dest --port --proto --exe --cmdline --parent-exe --exe-sha256"
-        opts="$opts --domain --user --src --src-port --iface"
+        opts="$opts --domain --user --src --src-port --iface --app-id"
         ;;
     rules)
         case $sub in
@@ -122,7 +122,7 @@ _hallpass_cli() {
         add)
             opts="--name --action --exe --exe-glob --exe-sha256 --dest --port"
             opts="$opts --domain --user --proto --cmdline-contains --parent-exe"
-            opts="$opts --src --src-port --iface --domains-file --ips-file"
+            opts="$opts --src --src-port --iface --app-id --domains-file --ips-file"
             opts="$opts --hashes-file --duration --priority"
             ;;
         import)

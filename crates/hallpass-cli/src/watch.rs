@@ -73,6 +73,17 @@ fn format_prompt(p: &Pending, now_ms: u64) -> String {
     let uid = c.uid.map(|v| v.to_string()).unwrap_or_else(|| "?".into());
     let remaining = p.deadline_ms.saturating_sub(now_ms) / 1000;
     let mut out = format!("prompt #{}: {exe} (pid {pid}, uid {uid})\n", p.id);
+    if let Some(app) = &c.app_id {
+        // The line the exe path cannot carry: a packaged application's
+        // executable resolves inside its sandbox, so two applications can
+        // print the same path here. Answering an allow generates a rule
+        // scoped to this identity, and consent has to be given to something
+        // the operator was shown.
+        out.push_str(&format!(
+            "  app:     {}\n",
+            hallpass_types::sanitize_for_display(app)
+        ));
+    }
     if let Some(cmdline) = &c.cmdline {
         // A process writes its own argv, and this line sits right above the
         // allow/deny question. Raw, it could erase and rewrite the exe line.
@@ -325,6 +336,7 @@ mod tests {
                 parent_exe: None,
                 domain: None,
                 iface: None,
+                app_id: None,
             },
             deadline_ms,
         }
@@ -405,6 +417,7 @@ mod tests {
                 parent_exe: None,
                 domain: Some("bank.example\u{202e}moc.reknatta".into()),
                 iface: None,
+                app_id: None,
             },
             deadline_ms: 30_000,
         };
@@ -439,6 +452,7 @@ mod tests {
                 parent_exe: None,
                 domain: Some("example.org".into()),
                 iface: None,
+                app_id: None,
             },
             deadline_ms: 30_000,
         };

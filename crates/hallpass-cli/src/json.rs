@@ -161,6 +161,7 @@ pub fn sanitized_event(ev: &ConnEvent) -> ConnEvent {
             parent_exe: clean_path(&ev.conn.parent_exe),
             domain: clean_opt(&ev.conn.domain),
             iface: clean_opt(&ev.conn.iface),
+            app_id: clean_opt(&ev.conn.app_id),
         },
         verdict: ev.verdict,
         rule_name: clean_opt(&ev.rule_name),
@@ -198,6 +199,7 @@ pub fn sanitized_rule(r: &Rule) -> Rule {
             src: clean_opt(&m.src),
             src_port: m.src_port,
             iface: clean_opt(&m.iface),
+            app_id: clean_opt(&m.app_id),
         },
     }
 }
@@ -222,6 +224,7 @@ mod tests {
                 parent_exe: None,
                 domain: Some("bank.example\u{202e}moc.reknatta".into()),
                 iface: Some("eth0\x1b[2K".into()),
+                app_id: None,
             },
             verdict: Verdict::Deny,
             rule_name: Some("r\rule".into()),

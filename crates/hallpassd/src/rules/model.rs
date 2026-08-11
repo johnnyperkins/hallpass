@@ -72,6 +72,7 @@ pub struct CompiledRule {
     src: Option<IpNet>,
     src_port: Option<u16>,
     iface: Option<String>,
+    app_id: Option<String>,
 }
 
 /// Parse an IP or CIDR match field (a bare address becomes a host net).
@@ -135,6 +136,20 @@ impl CompiledRule {
                 return Err(format!("bad port_range {lo}-{hi}: start exceeds end"));
             }
         }
+        if let Some(app) = &m.app_id {
+            // Same gate the daemon applies to what it reads out of a cgroup,
+            // so an operand that no connection could ever carry is a loud
+            // skipped rule rather than a rule that lists fine and silently
+            // never matches. `firefox` without a scheme is the likely typo.
+            if !hallpass_types::valid_app_id(app) {
+                return Err(format!(
+                    "bad app_id {app:?}: expected {}, for example \"flatpak:org.mozilla.firefox\"",
+                    hallpass_types::APP_ID_SCHEMES
+                        .map(|s| format!("{s}:<name>"))
+                        .join(" or ")
+                ));
+            }
+        }
         let exe_sha256 = m
             .exe_sha256
             .as_deref()
@@ -174,6 +189,7 @@ impl CompiledRule {
             src,
             src_port: m.src_port,
             iface: m.iface.clone(),
+            app_id: m.app_id.clone(),
         })
     }
 
@@ -323,6 +339,14 @@ impl CompiledRule {
                 _ => return Some("iface"),
             }
         }
+        if let Some(app) = &self.app_id {
+            // Exact, including the scheme prefix: a connection with no
+            // application identity matches nothing here, the way a domain
+            // rule needs a domain.
+            if conn.app_id.as_deref() != Some(app.as_str()) {
+                return Some("app_id");
+            }
+        }
         None
     }
 }
@@ -368,6 +392,7 @@ mod tests {
                 parent_exe: None,
                 domain: None,
                 iface: None,
+                app_id: None,
             };
             compiled.matches(&c, None)
         };
@@ -439,6 +464,7 @@ mod tests {
             parent_exe: None,
             domain: None,
             iface: None,
+            app_id: None,
         };
         assert!(compiled.matches(&conn, Some(&"ab".repeat(32))));
         // Wrong or missing hash: no match, but other criteria still do.
@@ -469,6 +495,7 @@ mod tests {
             parent_exe: None,
             domain: domain.map(String::from),
             iface: None,
+            app_id: None,
         };
 
         let r = rule_with(RuleMatch {
@@ -524,6 +551,7 @@ mod tests {
             parent_exe: Some("/usr/bin/bash".into()),
             domain: None,
             iface: Some("wg0".into()),
+            app_id: Some("flatpak:org.mozilla.firefox".into()),
         };
         let check = |m: RuleMatch, expect: bool| {
             let compiled = CompiledRule::compile(&rule_with(m)).unwrap();
@@ -540,12 +568,18 @@ mod tests {
         check(RuleMatch { src_port: Some(40001), ..Default::default() }, false);
         check(RuleMatch { iface: Some("wg0".into()), ..Default::default() }, true);
         check(RuleMatch { iface: Some("eth0".into()), ..Default::default() }, false);
+        check(RuleMatch { app_id: Some("flatpak:org.mozilla.firefox".into()), ..Default::default() }, true);
+        // The scheme prefix is part of the value: the same application
+        // packaged the other way is a different identity.
+        check(RuleMatch { app_id: Some("snap:firefox".into()), ..Default::default() }, false);
+        check(RuleMatch { app_id: Some("flatpak:org.mozilla".into()), ..Default::default() }, false);
 
         // Absent connection data never matches a present criterion.
         let mut bare = conn.clone();
         bare.cmdline = None;
         bare.parent_exe = None;
         bare.iface = None;
+        bare.app_id = None;
         let m = CompiledRule::compile(&rule_with(RuleMatch {
             cmdline_contains: Some("x".into()),
             ..Default::default()
@@ -580,6 +614,7 @@ mod tests {
             parent_exe: Some("/usr/bin/bash".into()),
             domain: Some("example.org".into()),
             iface: Some("wg0".into()),
+            app_id: Some("snap:firefox".into()),
         };
 
         struct Case {
@@ -661,6 +696,11 @@ mod tests {
                 expect: Some("iface"),
             },
             Case {
+                name: "app_id",
+                matcher: RuleMatch { app_id: Some("snap:chromium".into()), ..m() },
+                expect: Some("app_id"),
+            },
+            Case {
                 name: "earliest failing operand wins over later ones",
                 matcher: RuleMatch {
                     dest: Some("10.0.0.0/8".into()),
@@ -718,6 +758,7 @@ mod tests {
             parent_exe: None,
             domain: Some("example.org".into()),
             iface: None,
+            app_id: None,
         };
 
         let compiled = CompiledRule::compile(&rule_with(RuleMatch {
@@ -751,6 +792,26 @@ mod tests {
         .unwrap();
         assert_eq!(compiled.first_failing_field(&conn, None), Some("hashes_file"));
         assert_eq!(compiled.first_failing_field(&conn, Some(&"ab".repeat(32))), None);
+    }
+
+    /// An app_id no connection could ever carry is refused at compile,
+    /// like a bad hash or a bad CIDR: the rule is skipped with a warning
+    /// instead of loading and matching nothing for a reason the operator
+    /// cannot see.
+    #[test]
+    fn unwritable_app_id_is_rejected() {
+        for bad in ["firefox", "docker:nginx", "flatpak:", "snap:Firefox"] {
+            let r = rule_with(RuleMatch {
+                app_id: Some(bad.into()),
+                ..Default::default()
+            });
+            assert!(CompiledRule::compile(&r).is_err(), "accepted {bad:?}");
+        }
+        let r = rule_with(RuleMatch {
+            app_id: Some("flatpak:org.mozilla.firefox".into()),
+            ..Default::default()
+        });
+        assert!(CompiledRule::compile(&r).is_ok());
     }
 
     #[test]

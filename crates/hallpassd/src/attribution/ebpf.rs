@@ -46,6 +46,17 @@ type ProcDetails = (Option<PathBuf>, Option<String>, Option<PathBuf>);
 /// guard against a stale entry outliving its pid.
 type ProcCache = Arc<Mutex<LruCache<u32, (ProcDetails, Option<u64>)>>>;
 
+/// pid -> application identity, with the starttime it was read at.
+///
+/// Separate from [`ProcCache`] because it is filled at a different moment.
+/// The details there are snapshotted by the exec tracepoint, which sees
+/// every exec on the host; a cgroup is assigned to a process rather than
+/// read out of its image, so reading it there would pay for every exec and
+/// still be read too early. This one fills on first attribution instead,
+/// which is the only time the answer is wanted, and the entry then serves
+/// the rest of the flow.
+type AppIdCache = Mutex<LruCache<u32, (Option<String>, u64)>>;
+
 const PID_CACHE_CAP: usize = 4096;
 
 pub struct EbpfAttributor {
@@ -53,6 +64,7 @@ pub struct EbpfAttributor {
     _ebpf: Ebpf,
     sock_map: FlowMap<MapData, FlowKey, FlowVal>,
     cache: ProcCache,
+    app_ids: AppIdCache,
     /// Stop signal for the ring-buffer readers; the [`Drop`] impl sends on
     /// it, and dropping it alone would also wake them.
     stop: watch::Sender<bool>,
@@ -152,6 +164,9 @@ impl EbpfAttributor {
             _ebpf: ebpf,
             sock_map,
             cache,
+            app_ids: Mutex::new(LruCache::new(
+                NonZeroUsize::new(PID_CACHE_CAP).expect("nonzero capacity"),
+            )),
             stop,
         })
     }
@@ -176,6 +191,49 @@ impl EbpfAttributor {
         self.cache.lock().unwrap().put(pid, (d.clone(), now_start));
         (d, now_start)
     }
+
+    /// Application identity for `pid`, read once per process incarnation.
+    ///
+    /// Cached because this attributor's entries are never served from the
+    /// chain's own cache: it reports no socket inode (see `attribute`), and
+    /// [`super::cached_still_valid`] refuses an entry it cannot check
+    /// against the flow, so the source runs again for every packet the
+    /// kernel queues. A flow that stays `ct state new`, which is every
+    /// one-way UDP flow, is queued per datagram, so an uncached /proc read
+    /// here lands on the thread that decides every connection on the host.
+    ///
+    /// Guarded by the start time exactly as [`Self::details_for`] is: a
+    /// recycled pid is a different process and must not inherit an identity.
+    /// An entry is only stored when there is a start time to guard it with,
+    /// since one without could never be served and would evict a usable
+    /// entry to sit there unreadable.
+    ///
+    /// What is lost when the cache fills: the least recently used pid pays
+    /// the /proc read again. What is lost by caching at all: a process whose
+    /// launcher moves it into an application scope *after* it has already
+    /// been judged keeps the identity it had at that moment for the rest of
+    /// its life. That window is narrow (a launcher creates the scope around
+    /// the process before handing it the network), and being wrong inside it
+    /// costs a rule match and therefore a prompt, never a verdict.
+    fn app_id_for(&self, pid: u32, starttime: Option<u64>) -> Option<String> {
+        // Nothing to check a cached answer against: a pid whose stat cannot
+        // be read is exiting or already gone, so read once and cache
+        // nothing rather than store an entry no lookup can accept.
+        let Some(starttime) = starttime else {
+            return procfs::app_id_of(Path::new("/proc"), pid);
+        };
+        if let Some((cached, at)) = self.app_ids.lock().unwrap().get(&pid) {
+            if *at == starttime {
+                return cached.clone();
+            }
+        }
+        let app_id = procfs::app_id_of(Path::new("/proc"), pid);
+        self.app_ids
+            .lock()
+            .unwrap()
+            .put(pid, (app_id.clone(), starttime));
+        app_id
+    }
 }
 
 impl Drop for EbpfAttributor {
@@ -194,6 +252,12 @@ impl Attributor for EbpfAttributor {
             exe_path,
             cmdline,
             parent_exe,
+            // Resolved here rather than snapshotted at exec like the
+            // fields above: a cgroup is assigned to a process, not read out
+            // of its image, so the current one is the true one, and this
+            // keeps the read off the exec tracepoint, which sees every exec
+            // on the host. Cached per process incarnation; see app_id_for.
+            app_id: self.app_id_for(val.pid, starttime),
             starttime,
             // The kernel side records (pid, uid) against the flow tuple and
             // never sees the socket inode. Leaving it unset means the

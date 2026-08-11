@@ -57,6 +57,7 @@ pub struct RuleEditor {
     src: String,
     src_port: String,
     iface: String,
+    app_id: String,
     /// Parse error from the last save attempt.
     error: Option<String>,
     /// A save was sent and the daemon has not answered yet. The window
@@ -94,6 +95,7 @@ impl RuleEditor {
             src: String::new(),
             src_port: String::new(),
             iface: String::new(),
+            app_id: String::new(),
             error: None,
             awaiting: false,
         }
@@ -126,6 +128,13 @@ impl RuleEditor {
             .unwrap_or_else(|| "connection".to_string());
         e.name = format!("{stem}-{}", conn.tuple.dst.port());
         e.exe = exe;
+        // Carried for the same reason the daemon pins it on a rule made
+        // from a prompt reply: a sandboxed application's executable path is
+        // shared by every application of that packaging system, so exe
+        // alone would write a rule that answers for all of them.
+        if let Some(app) = &conn.app_id {
+            e.app_id = hallpass_types::sanitize_for_display(app).into_owned();
+        }
         e.port = conn.tuple.dst.port().to_string();
         e.proto = Some(conn.tuple.proto);
         // Prefer the domain over the address: an address is one of however
@@ -190,6 +199,7 @@ impl RuleEditor {
         e.src = text(&m.src);
         e.src_port = num(m.src_port);
         e.iface = text(&m.iface);
+        e.app_id = text(&m.app_id);
         e
     }
 
@@ -255,6 +265,7 @@ impl RuleEditor {
             src: opt(&self.src),
             src_port: opt_u16(&self.src_port, "src_port")?,
             iface: opt(&self.iface),
+            app_id: opt(&self.app_id),
         };
         if matcher == RuleMatch::default() {
             return Err("set at least one match criterion, or the rule matches everything".into());
@@ -474,12 +485,31 @@ impl RuleEditor {
                     ("Source", &mut self.src, "IP or CIDR"),
                     ("Source port", &mut self.src_port, ""),
                     ("Interface", &mut self.iface, "wg0"),
+                    ("App id", &mut self.app_id, "flatpak:org.mozilla.firefox"),
                 ] {
                     ui.label(label);
                     ui.add(TextEdit::singleline(field).hint_text(hint));
                     ui.end_row();
                 }
             });
+
+        // Said where the operator can still act on it, because this form is
+        // prefilled from a connection with the action defaulting to deny.
+        // An app id only narrows, and a block that narrows can stop applying
+        // for a reason that has nothing to do with policy: the application
+        // turns up without a recognized cgroup scope, the operand does not
+        // match, and the connection falls through to the default verdict.
+        // The daemon refuses to generate this shape at all (see
+        // `rule_from_reply`); here the operator may want it, so it is a
+        // warning rather than a rule.
+        if self.action != Action::Allow && !self.app_id.trim().is_empty() {
+            ui.colored_label(
+                crate::app::REJECT_COLOR,
+                "\u{26a0} An app id narrows this rule. A deny carrying one stops applying \
+                 whenever the application runs outside its packaging scope; leave it blank \
+                 to block the executable however it is launched.",
+            );
+        }
 
         if self.editing.is_some() && self.duration == DurationChoice::Timed {
             ui.label("Saving a timed rule restarts its clock from now.");
@@ -516,6 +546,7 @@ mod tests {
             parent_exe: None,
             domain: domain.map(String::from),
             iface: None,
+            app_id: None,
         }
     }
 

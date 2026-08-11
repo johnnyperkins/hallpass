@@ -62,7 +62,15 @@ use serde::{Deserialize, Serialize};
 /// packet and never saw its volume; with `flow_accounting` on it now tallies
 /// each flow's bytes and packets from conntrack teardown notifications. The
 /// struct fields force the bump, as in v2.
-pub const PROTOCOL_VERSION: u32 = 9;
+///
+/// v10: packaged-application identity. [`Connection::app_id`] carries which
+/// packaged application a connection belongs to, read from the process's
+/// cgroup, and [`RuleMatch::app_id`] is the operand that matches it. A
+/// sandboxed application's executable path names its sandbox rather than
+/// itself, so until now those connections could only be scoped by a path
+/// that is neither on this host nor unique. The struct fields force the
+/// bump, as in v2.
+pub const PROTOCOL_VERSION: u32 = 10;
 
 /// Transport-layer protocol of a connection.
 // Ord so protocol can be part of a sorted grouping key (the CLI's suggest
@@ -116,6 +124,22 @@ pub struct Connection {
     pub domain: Option<String>,
     /// Name of the network interface the packet leaves through, if known.
     pub iface: Option<String>,
+    /// Packaged application this process belongs to, read from its cgroup:
+    /// `flatpak:<app-id>` or `snap:<name>`. None for everything else.
+    ///
+    /// A sandboxed application's `/proc/<pid>/exe` resolves inside its own
+    /// mount namespace, so it reads as a path that does not exist on this
+    /// host and that other applications of the same packaging system share
+    /// (`/app/bin/...`). The cgroup its launcher placed it in is where the
+    /// identity an operator would recognize actually lives.
+    ///
+    /// Chosen by whoever created the cgroup, which for a user's own
+    /// processes is that user: `systemd-run --user --scope
+    /// --unit=app-flatpak-org.mozilla.firefox-99.scope <cmd>` puts any
+    /// command under that name (probe-confirmed). So this scopes rules the
+    /// way `cmdline_contains` does, and is not a boundary against a process
+    /// evading it.
+    pub app_id: Option<String>,
 }
 
 /// What a rule does when it matches.
@@ -219,6 +243,17 @@ pub struct RuleMatch {
     pub src_port: Option<u16>,
     /// Outbound network interface name (e.g. "eth0", "wg0").
     pub iface: Option<String>,
+    /// Packaged application, matched exactly against [`Connection::app_id`]:
+    /// `flatpak:org.mozilla.firefox`, `snap:firefox`.
+    ///
+    /// The scheme prefix is part of the value, so an application packaged
+    /// one way cannot satisfy a rule written for the other under the same
+    /// name. A connection with no application identity never matches this
+    /// operand, the way a domain rule needs a domain.
+    ///
+    /// See [`Connection::app_id`] for why this scopes rather than enforces:
+    /// pair an allow rule with `exe` or `exe_sha256` where that matters.
+    pub app_id: Option<String>,
 }
 
 /// A firewall rule.
@@ -422,12 +457,69 @@ impl RuleMatch {
         if let Some(i) = &self.iface {
             parts.push(format!("iface={i}"));
         }
+        if let Some(a) = &self.app_id {
+            parts.push(format!("app={a}"));
+        }
         if parts.is_empty() {
             "(any)".to_string()
         } else {
             parts.join(" ")
         }
     }
+}
+
+/// Longest name part of an application identity, after the scheme prefix.
+///
+/// Over-long identities are rejected rather than truncated wherever one is
+/// produced: a truncated identity is a prefix of some other application's,
+/// and matching an allow rule on a prefix is the direction that fails open.
+/// Far above any real one, which are reverse-DNS names and snap names.
+///
+/// Sized so a whole identity, scheme prefix included, still fits the bound
+/// the GUI puts on a label it renders (`hallpass_ui::prompt::UI_TEXT_MAX`,
+/// 120 characters). Otherwise the prompt would show a prefix of the value
+/// the rule it generates pins, and two scopes sharing that prefix would
+/// render identically in the one place the operator gives consent.
+pub const MAX_APP_ID_NAME_BYTES: usize = 96;
+
+/// Packaging systems an application identity can name.
+pub const APP_ID_SCHEMES: [&str; 2] = ["flatpak", "snap"];
+
+/// Whether `id` is a well-formed [`Connection::app_id`]: a scheme from
+/// [`APP_ID_SCHEMES`], a colon, and a name.
+///
+/// One definition, checked in three places, because each of them fails a
+/// different way without it. The daemon checks what it reads out of a cgroup
+/// path, where a name is chosen by whoever created the cgroup and any user
+/// may create one under their own subtree: nothing that could reshape a
+/// prompt, a rule file, or an event line may become an identity, and
+/// systemd's own escaping would arrive here as a literal `\x1b`. The rule
+/// engine and the CLI check what an operator writes, where the failure is
+/// quieter: `app_id = "firefox"` with no scheme, or `snap:Firefox` in a
+/// namespace that has no capital letters in it, is a rule that loads, lists,
+/// and then never matches anything with nothing to say why.
+///
+/// The name charset is per scheme for exactly that reason, and each is the
+/// one its packaging system allows: reverse-DNS application ids, which are
+/// mixed case, against snap names, which are not.
+pub fn valid_app_id(id: &str) -> bool {
+    let Some((scheme, name)) = id.split_once(':') else {
+        return false;
+    };
+    let allowed: fn(u8) -> bool = match scheme {
+        "flatpak" => |b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'),
+        // Lowercase only, and no dots: a snap name is one label. The
+        // instance key of a parallel install (`firefox_beta`) is part of the
+        // name the cgroup carries, hence the underscore.
+        "snap" => |b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'_' | b'-'),
+        _ => return false,
+    };
+    name.len() <= MAX_APP_ID_NAME_BYTES
+        // At least one alphanumeric, so punctuation alone is not a name:
+        // "app-flatpak-..-1.scope" is a cgroup a user may create, and ".."
+        // is not an application.
+        && name.bytes().any(|b| b.is_ascii_alphanumeric())
+        && name.bytes().all(allowed)
 }
 
 /// True for characters that let text reshape how it renders.
@@ -605,6 +697,7 @@ mod event_tests {
                 parent_exe: None,
                 domain: None,
                 iface: None,
+                app_id: None,
             },
             verdict,
             rule_name: None,
@@ -644,6 +737,55 @@ mod time_tests {
         // Just under a unit boundary must roll up, not print "1024.0".
         assert_eq!(human_bytes(1_048_575), "1.0 MiB");
         assert_eq!(human_bytes(1_073_741_823), "1.0 GiB");
+    }
+}
+
+#[cfg(test)]
+mod app_id_tests {
+    use super::*;
+
+    #[test]
+    fn well_formed_identities_are_accepted() {
+        for id in [
+            "flatpak:org.mozilla.firefox",
+            "snap:firefox",
+            "snap:zellij",
+            "flatpak:com.example.App-Name",
+            "flatpak:a",
+            "snap:firefox_beta",
+            "snap:lxd-4",
+        ] {
+            assert!(valid_app_id(id), "{id:?}");
+        }
+    }
+
+    /// Everything an operator can type that would load as a rule and then
+    /// never match, and everything a cgroup name could carry into a display.
+    #[test]
+    fn malformed_identities_are_rejected() {
+        for id in [
+            "firefox",                     // no scheme
+            "docker:nginx",                // not a scheme this reads
+            "flatpak:",                    // no name
+            ":firefox",                    // no scheme
+            "flatpak:..",                  // punctuation is not a name
+            "flatpak:org.mozilla/firefox", // a name is one path segment
+            "flatpak:org\u{1b}[2K.evil",   // terminal escape
+            "flatpak:org\\x1b[2K.evil",    // systemd's escaping of one
+            "snap:ev\u{202e}il",           // bidi override
+            "snap:a\u{feff}b",             // zero width
+            "snap:fire fox",               // whitespace
+            // A namespace's own charset: snap names have no capital letters
+            // and no dots, so the daemon can never produce these and a rule
+            // written with one would be inert.
+            "snap:Firefox",
+            "snap:org.mozilla.firefox",
+        ] {
+            assert!(!valid_app_id(id), "{id:?}");
+        }
+        let long = "a".repeat(MAX_APP_ID_NAME_BYTES);
+        assert!(valid_app_id(&format!("snap:{long}")));
+        assert!(!valid_app_id(&format!("snap:{long}a")));
     }
 }
 

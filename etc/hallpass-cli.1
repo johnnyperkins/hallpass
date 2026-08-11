@@ -187,6 +187,12 @@ Source port. Default: 0.
 .BI \-\-iface " NAME"
 Outbound network interface, for example
 .BR eth0 .
+.TP
+.BI \-\-app\-id " ID"
+Packaged application the hypothetical process belongs to, as
+.BR flatpak: <app\-id>
+or
+.BR snap: <name>.
 .SS RULES ADD OPTIONS
 .TP
 .BI \-\-name " NAME"
@@ -239,6 +245,14 @@ Source port.
 .BI \-\-iface " NAME"
 Outbound network interface, for example
 .BR eth0 .
+.TP
+.BI \-\-app\-id " ID"
+Packaged application, as
+.BR flatpak: <app\-id>
+or
+.BR snap: <name>,
+read from the process's cgroup and matched exactly. A cgroup name is chosen
+by whoever created it, so this scopes a rule rather than enforcing it.
 .TP
 .BI \-\-domains\-file " PATH"
 File of domains, in hosts format or one per line, matched against the

@@ -135,11 +135,17 @@ fn classify(ev: &ConnEvent) -> Class {
 fn raw_key(ev: &ConnEvent, group_by: GroupBy) -> String {
     let c = &ev.conn;
     match group_by {
-        GroupBy::Exe => c
-            .exe_path
-            .as_ref()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|| "?".to_string()),
+        // Keyed on the application when the connection names one: two
+        // packaged applications can run from one path inside their
+        // sandboxes, and summing their rows together would report as one
+        // program what policy treats as two. The path stays alongside,
+        // since that is what a rule keys on.
+        GroupBy::Exe => match (&c.exe_path, &c.app_id) {
+            (Some(exe), Some(app)) => format!("{app} ({})", exe.display()),
+            (Some(exe), None) => exe.display().to_string(),
+            (None, Some(app)) => app.clone(),
+            (None, None) => "?".to_string(),
+        },
         // Falling back to the address keeps unresolved traffic visible.
         // Dropping it would hide exactly the connections that bypassed the
         // system resolver, which are the ones worth looking at.
@@ -349,6 +355,7 @@ mod tests {
                 parent_exe: None,
                 domain: None,
                 iface: None,
+                app_id: None,
             },
             verdict,
             rule_name: None,

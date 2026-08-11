@@ -90,6 +90,7 @@ mod tests {
             exe_path: Some("/usr/bin/curl".into()),
             cmdline: None,
             parent_exe: None,
+            app_id: None,
             starttime: Some(1234),
             socket_inode: Some(99),
         }

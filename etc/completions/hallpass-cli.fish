@@ -106,6 +106,7 @@ complete -c hallpass-cli -n '__hallpass_cli_in rules add' -l parent-exe -r -F -d
 complete -c hallpass-cli -n '__hallpass_cli_in rules add' -l src -x -d 'Source IP address or CIDR block'
 complete -c hallpass-cli -n '__hallpass_cli_in rules add' -l src-port -x -d 'Source port'
 complete -c hallpass-cli -n '__hallpass_cli_in rules add' -l iface -x -a '(__fish_print_interfaces)' -d 'Outbound network interface'
+complete -c hallpass-cli -n '__hallpass_cli_in rules add' -l app-id -x -d 'Packaged application (flatpak:<id> or snap:<name>)'
 complete -c hallpass-cli -n '__hallpass_cli_in rules add' -l domains-file -r -F -d 'File of domains, hosts format or one per line'
 complete -c hallpass-cli -n '__hallpass_cli_in rules add' -l ips-file -r -F -d 'File of destination IPs or CIDRs, one per line'
 complete -c hallpass-cli -n '__hallpass_cli_in rules add' -l hashes-file -r -F -d 'File of executable SHA-256 hashes, one per line'
@@ -139,3 +140,4 @@ complete -c hallpass-cli -n '__hallpass_cli_in explain' -l user -x -a '(__fish_c
 complete -c hallpass-cli -n '__hallpass_cli_in explain' -l src -x -d 'Source IP address'
 complete -c hallpass-cli -n '__hallpass_cli_in explain' -l src-port -x -d 'Source port'
 complete -c hallpass-cli -n '__hallpass_cli_in explain' -l iface -x -a '(__fish_print_interfaces)' -d 'Outbound network interface'
+complete -c hallpass-cli -n '__hallpass_cli_in explain' -l app-id -x -d 'Packaged application (flatpak:<id> or snap:<name>)'

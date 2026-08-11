@@ -188,6 +188,9 @@ fn for_each_field(ev: &ConnEvent, mut visit: impl FnMut(&'static str, &dyn std::
     if let Some(iface) = &c.iface {
         visit("iface", iface);
     }
+    if let Some(app_id) = &c.app_id {
+        visit("app_id", app_id);
+    }
     if let Some(pid) = c.pid {
         visit("pid", &pid);
     }
@@ -404,6 +407,7 @@ mod tests {
                 parent_exe: None,
                 domain: Some("example.org".into()),
                 iface: Some("eth0".into()),
+                app_id: None,
             },
             verdict: Verdict::Deny,
             rule_name: Some("block-example".into()),

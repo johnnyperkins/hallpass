@@ -44,6 +44,10 @@ struct Scenario {
     /// views must render rather than hide.
     domain: &'static str,
     port: u16,
+    /// Empty for a process no packaging system placed in a cgroup, which is
+    /// most of them; the one that is set exists so the prompt's application
+    /// row and the app_id operand are exercised here too.
+    app_id: &'static str,
 }
 
 /// The cast: plausible applications and destinations, chosen so the starter
@@ -52,19 +56,19 @@ struct Scenario {
 /// policy, or adding to it from a client, changes what these are decided by.
 const SCENARIOS: &[Scenario] = &[
     Scenario { exe: "/usr/bin/curl", cmdline: "curl https://example.org",
-        domain: "example.org", port: 443 },
+        domain: "example.org", port: 443, app_id: "" },
+    Scenario { exe: "/app/bin/firefox", cmdline: "firefox",
+        domain: "cdn.example.net", port: 443, app_id: "flatpak:org.mozilla.firefox" },
     Scenario { exe: "/usr/lib/firefox/firefox", cmdline: "firefox",
-        domain: "cdn.example.net", port: 443 },
-    Scenario { exe: "/usr/lib/firefox/firefox", cmdline: "firefox",
-        domain: "telemetry.example.com", port: 443 },
+        domain: "telemetry.example.com", port: 443, app_id: "" },
     Scenario { exe: "/usr/bin/ssh", cmdline: "ssh build@10.0.0.9",
-        domain: "", port: 22 },
+        domain: "", port: 22, app_id: "" },
     Scenario { exe: "/usr/bin/apt", cmdline: "apt update",
-        domain: "deb.example.org", port: 80 },
+        domain: "deb.example.org", port: 80, app_id: "" },
     Scenario { exe: "/tmp/.cache/miner", cmdline: "./miner --pool",
-        domain: "pool.example.biz", port: 3333 },
+        domain: "pool.example.biz", port: 3333, app_id: "" },
     Scenario { exe: "/usr/bin/python3", cmdline: "python3 backup.py",
-        domain: "backup.example.org", port: 8443 },
+        domain: "backup.example.org", port: 8443, app_id: "" },
 ];
 
 /// Start the generator. One task, stopped only by the process exiting.
@@ -109,6 +113,7 @@ pub fn spawn(
                 parent_exe: Some("/usr/bin/bash".into()),
                 domain: (!s.domain.is_empty()).then(|| s.domain.to_string()),
                 iface: Some("eth0".to_string()),
+                app_id: (!s.app_id.is_empty()).then(|| s.app_id.to_string()),
             };
             // The same sequence the verdict path runs, minus the packet:
             // one ruleset snapshot, match, count the hit, emit. The hash

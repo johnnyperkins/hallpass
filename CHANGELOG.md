@@ -7,6 +7,28 @@ carries what an upgrade changes on a running host.
 
 ### Added
 
+- **Packaged applications are named, and matchable (wire protocol v10).**
+  A Flatpak or Snap application's executable path resolves inside its own
+  sandbox, so `/proc/<pid>/exe` reads as a path that is not on this host and
+  that other applications of the same packaging system share: those
+  connections could not be scoped to one application at all. The daemon now
+  reads the process's cgroup at attribution time and carries the identity it
+  finds (`flatpak:org.mozilla.firefox`, `snap:firefox`) on every connection.
+  Rules gain a matching `app_id` operand (`hallpass-cli rules add --app-id`,
+  `explain --app-id`, and a field in the GUI rule editor), both prompt
+  handlers show the application, syslog export carries it, and an *allow*
+  generated from a prompt reply, from a traffic row, or by `suggest` pins it
+  alongside the executable so one answer cannot cover a different
+  application that happens to run from the same sandbox path. A deny stays
+  scoped to the executable alone: the operand only narrows, and a block that
+  quietly stopped applying because an application turned up without a
+  recognized cgroup scope is the wrong way to fail. A cgroup name is chosen
+  by whoever created the cgroup, and any user can start a command under a
+  scope of their choosing,
+  so `app_id` scopes rules the way `cmdline_contains` does and is not a
+  boundary; pair it with `exe` or `exe_sha256` where that matters. The
+  protocol bump means daemon, CLI and UI must be upgraded together.
+
 - **Flow accounting: how much each connection moved (wire protocol v9).**
   The daemon decides a connection from its first packet and never saw its
   volume. With `flow_accounting = true` it joins the conntrack destroy

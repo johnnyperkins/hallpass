@@ -504,6 +504,7 @@ async fn suggest_folds_history_into_rules() {
                 parent_exe: None,
                 domain: Some("example.org".into()),
                 iface: None,
+                app_id: None,
             },
             verdict: Verdict::Allow,
             rule_name: None,

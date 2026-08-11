@@ -1270,7 +1270,7 @@ impl HallpassApp {
             let mut windows = Vec::new();
             for p in board.pending.iter() {
                 let w = match &p.conn.exe_path {
-                    Some(exe) => PromptWindow::App(exe.clone()),
+                    Some(exe) => PromptWindow::App(exe.clone(), p.conn.app_id.clone()),
                     None => PromptWindow::Anon(p.id),
                 };
                 if !windows.contains(&w) {
@@ -1334,28 +1334,38 @@ impl HallpassApp {
 
 /// Which popup one viewport shows: an application's whole queue, or a
 /// single unattributed prompt.
+///
+/// An application is (executable, application id), not the executable
+/// alone. Two packaged applications can run from one path inside their
+/// sandboxes, the daemon already raises them as separate prompts, and the
+/// rule an answer generates is scoped to one of the two: grouping them into
+/// one window would put the other's destinations under "also pending from
+/// this app" and promise that answering settles them, which it cannot.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum PromptWindow {
-    App(PathBuf),
+    App(PathBuf, Option<String>),
     Anon(u64),
 }
 
 impl PromptWindow {
     fn covers(&self, p: &PromptState) -> bool {
         match self {
-            PromptWindow::App(exe) => p.conn.exe_path.as_ref() == Some(exe),
+            PromptWindow::App(exe, app_id) => {
+                p.conn.exe_path.as_ref() == Some(exe) && p.conn.app_id == *app_id
+            }
             PromptWindow::Anon(id) => p.conn.exe_path.is_none() && p.id == *id,
         }
     }
 
-    /// Viewport id for this window at one generation. Keyed by exe rather
-    /// than prompt id, so the window survives its front prompt being
-    /// answered and shows the next one; the generation is in the key so
-    /// an abandoned window's id is never reused (see [`PromptBoard`]).
+    /// Viewport id for this window at one generation. Keyed by the
+    /// application rather than the prompt id, so the window survives its
+    /// front prompt being answered and shows the next one; the generation is
+    /// in the key so an abandoned window's id is never reused (see
+    /// [`PromptBoard`]).
     fn viewport_id(&self, generation: u64) -> egui::ViewportId {
         match self {
-            PromptWindow::App(exe) => {
-                egui::ViewportId::from_hash_of(("hallpass-prompt-app", exe, generation))
+            PromptWindow::App(exe, app_id) => {
+                egui::ViewportId::from_hash_of(("hallpass-prompt-app", exe, app_id, generation))
             }
             PromptWindow::Anon(id) => {
                 egui::ViewportId::from_hash_of(("hallpass-prompt-anon", id, generation))
@@ -1556,6 +1566,14 @@ fn prompt_info_ui(ui: &mut egui::Ui, p: &PromptState, rest: &[String]) {
                 opt_num(conn.pid)
             ));
             ui.end_row();
+            // Only for a packaged application, which is where the executable
+            // path above says little: it resolves inside the sandbox, so it
+            // names neither a file on this host nor the application uniquely.
+            if let Some(app) = &conn.app_id {
+                ui.label("Application");
+                ui.monospace(prompt::ui_text(app));
+                ui.end_row();
+            }
         });
     if !rest.is_empty() {
         ui.add_space(4.0);
@@ -1617,6 +1635,14 @@ fn prompt_actions_ui(
     // TTLs), and an "App anywhere" allow rule is only as strong as the exe
     // match: any process that execs the same binary inherits it. Warn before
     // the reply widens a rule to every destination.
+    //
+    // The text has to hold for whichever button is pressed, and the two
+    // rules differ: an allow for a packaged application is pinned to its
+    // identity, a deny deliberately is not (see `rule_from_reply`). So the
+    // shared sentence states the widest of the two, and the second line
+    // says where the allow is narrower. Stating only the allow's scope
+    // would understate what Deny does, and Deny is the button that leads
+    // keyboard traversal.
     if p.scope == PromptScope::AppAnywhere {
         ui.colored_label(
             REJECT_COLOR,
@@ -1625,6 +1651,16 @@ fn prompt_actions_ui(
                 prompt::exe_name(&p.conn)
             ),
         );
+        if let Some(app) = &p.conn.app_id {
+            ui.colored_label(
+                REJECT_COLOR,
+                format!(
+                    "Allow is scoped to {}; Deny is not, and covers every application \
+                     running from that path.",
+                    prompt::ui_text(app)
+                ),
+            );
+        }
         ui.add_space(6.0);
     }
 

@@ -152,6 +152,7 @@ mod tests {
             parent_exe: None,
             domain: domain.map(String::from),
             iface: None,
+            app_id: None,
         }
     }
 
@@ -377,6 +378,39 @@ mod tests {
                 ],
                 conn: curl(),
                 expect: Some(("ok", Verdict::Allow)),
+            },
+            Case {
+                name: "app id match",
+                rules: vec![rule(
+                    "app",
+                    Action::Allow,
+                    0,
+                    true,
+                    RuleMatch {
+                        app_id: Some("flatpak:org.mozilla.firefox".into()),
+                        ..Default::default()
+                    },
+                )],
+                conn: Connection {
+                    app_id: Some("flatpak:org.mozilla.firefox".into()),
+                    ..curl()
+                },
+                expect: Some(("app", Verdict::Allow)),
+            },
+            Case {
+                name: "app id rule needs an app id on the connection",
+                rules: vec![rule(
+                    "app",
+                    Action::Allow,
+                    0,
+                    true,
+                    RuleMatch {
+                        app_id: Some("flatpak:org.mozilla.firefox".into()),
+                        ..Default::default()
+                    },
+                )],
+                conn: curl(),
+                expect: None,
             },
             Case {
                 name: "hash-pinned rule does not match without a hash",
