@@ -57,11 +57,13 @@ impl FileId {
 
 /// Largest executable this will read.
 ///
-/// The read runs on the verdict thread, where blocking is a stalled packet
-/// for every other connection on the host, and the size of the file is
+/// One of the two callers is the verdict thread, where blocking is a stalled
+/// packet for every other connection on the host, and the size of the file is
 /// chosen by whoever exec'd it. 256 MiB is past any binary this is likely to
 /// meet (the largest commonly shipped ones are well under 200 MiB) and is a
-/// bounded fraction of a second to hash, once per distinct file.
+/// bounded fraction of a second to hash, once per distinct file. (The other
+/// caller builds a prompt's context on a blocking worker, where the cap is
+/// about a bounded wait for the operator rather than a stalled packet.)
 ///
 /// Skipping costs the hash, which costs a match: a rule pinning
 /// `exe_sha256` or listing a `hashes_file` does not match a binary this
@@ -142,8 +144,8 @@ impl ExeHashCache {
             tracing::warn!(
                 bytes = meta.len(),
                 regular = meta.is_file(),
-                "not hashing an executable this large on the verdict thread; \
-                 hash-pinned rules will not match it"
+                "not hashing an executable this large; hash-pinned rules will \
+                 not match it and prompts will not show its hash"
             );
             self.entries.lock().unwrap().put(id, None);
             return None;

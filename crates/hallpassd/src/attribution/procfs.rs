@@ -506,14 +506,78 @@ fn ppid_of(proc_root: &Path, pid: u32) -> Option<u32> {
     after_comm.split_whitespace().nth(1)?.parse().ok()
 }
 
-/// Best-effort executable path of `pid`'s parent process. The ppid is
-/// re-read after the readlink and must be unchanged: if the parent exits
-/// in between, the child is reparented (ppid changes) and a recycled PID's
-/// exe could otherwise be pinned as the parent.
-pub(super) fn parent_exe_of(proc_root: &Path, pid: u32) -> Option<PathBuf> {
+/// One step up the process tree: `pid`'s parent, as (ppid, executable, the
+/// parent's start time).
+///
+/// Two things are re-read after the readlink and must be unchanged. The
+/// ppid, because if the parent exits in between the child is reparented and
+/// a recycled PID's exe could otherwise be pinned as the parent. The
+/// parent's start time, because the pid alone does not name a process: freed
+/// pids are reissued, and without this the returned exe could belong to one
+/// incarnation and the pid to the next. The pair is the same identity
+/// [`super::cached_still_valid`] checks before reusing an attribution, and
+/// it is returned so a caller walking further can keep checking it.
+fn parent_step(proc_root: &Path, pid: u32) -> Option<(u32, PathBuf, u64)> {
     let ppid = ppid_of(proc_root, pid)?;
+    // pid 1's parent, and the answer for a process whose stat could not be
+    // parsed. There is no /proc/0 to read an executable from.
+    if ppid == 0 {
+        return None;
+    }
+    let started = starttime_of(proc_root, ppid)?;
     let exe = std::fs::read_link(proc_root.join(ppid.to_string()).join("exe")).ok()?;
-    (ppid_of(proc_root, pid) == Some(ppid)).then_some(exe)
+    let stable = ppid_of(proc_root, pid) == Some(ppid)
+        && starttime_of(proc_root, ppid) == Some(started);
+    stable.then_some((ppid, exe, started))
+}
+
+/// Best-effort executable path of `pid`'s parent process.
+pub(super) fn parent_exe_of(proc_root: &Path, pid: u32) -> Option<PathBuf> {
+    parent_step(proc_root, pid).map(|(_, exe, _)| exe)
+}
+
+/// Executables of `pid`'s ancestors, nearest parent first, at most `max`.
+///
+/// [`parent_step`] guards one hop. This guards the joins between them, which
+/// is what makes the result a chain rather than a list of unrelated
+/// processes: hop N resolves a ppid, hop N+1 walks from it, and in between
+/// that pid can be freed and reissued. Forcing that is cheap at the default
+/// `pid_max` of 32768 and worth forcing, because the payoff is an innocuous
+/// launcher chain rendered above an allow/deny question. So the start time
+/// [`parent_step`] validated is re-checked before the pid it belongs to is
+/// used as the next hop's subject, and a reused pid ends the walk rather
+/// than extending it with a stranger's parents.
+///
+/// Stops at pid 1, at an ancestor whose executable cannot be read (a kernel
+/// thread, or a process the daemon lost the race with), and unconditionally
+/// at `max`: each pass either pushes an entry or stops, so the bound is what
+/// terminates this over a /proc the daemon does not own the contents of.
+///
+/// Truncation is silent and the result is a prefix either way, which is why
+/// the caller renders it as "what started this", never as a complete chain.
+/// What is *not* guarded is `pid` itself: it was resolved when the packet was
+/// attributed, and a caller handing over one that has since been recycled
+/// gets that process's ancestors. The window is the hop from the verdict
+/// thread to the prompt dispatcher, and it is why this is built there rather
+/// than later.
+pub(super) fn ancestry_of(proc_root: &Path, pid: u32, max: usize) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut cur = pid;
+    let mut cur_started: Option<u64> = None;
+    while out.len() < max {
+        // Whatever the previous hop resolved must still be the process this
+        // one is about to read a ppid from.
+        if cur_started.is_some_and(|s| starttime_of(proc_root, cur) != Some(s)) {
+            break;
+        }
+        let Some((ppid, exe, started)) = parent_step(proc_root, cur) else {
+            break;
+        };
+        out.push(exe);
+        cur = ppid;
+        cur_started = Some(started);
+    }
+    out
 }
 
 /// Process start time (clock ticks since boot) from /proc/pid/stat field
@@ -782,6 +846,126 @@ mod tests {
         let (exe, cmdline) = read_proc_details(&dir, 4242);
         assert_eq!(exe, Some(PathBuf::from("/usr/bin/curl")));
         assert_eq!(cmdline.as_deref(), Some("curl https://example.org"));
+    }
+
+    /// The ancestry a prompt shows: nearest parent first, capped, and
+    /// truncated rather than guessed wherever /proc stops answering.
+    #[test]
+    fn ancestry_walks_up_and_stops_at_its_bounds() {
+        let td = crate::testutil::TestDir::new("procfs-ancestry");
+        let dir = td.path().to_path_buf();
+        // 9 -> 8 -> 7 -> 1, with 1's parent 0 the way the kernel reports it.
+        // Each stat carries a real field 22, because the walk pins every
+        // ancestor to one incarnation by its start time.
+        let chain = [(9u32, 8u32), (8, 7), (7, 1), (1, 0)];
+        for (pid, ppid) in chain {
+            std::fs::create_dir_all(dir.join(pid.to_string())).unwrap();
+            let padding = "0 ".repeat(17);
+            std::fs::write(
+                dir.join(pid.to_string()).join("stat"),
+                format!("{pid} (proc{pid}) S {ppid} {padding}{}", u64::from(pid) * 100),
+            )
+            .unwrap();
+            std::os::unix::fs::symlink(
+                format!("/usr/bin/proc{pid}"),
+                dir.join(pid.to_string()).join("exe"),
+            )
+            .unwrap();
+        }
+
+        assert_eq!(
+            ancestry_of(&dir, 9, 8),
+            [
+                PathBuf::from("/usr/bin/proc8"),
+                PathBuf::from("/usr/bin/proc7"),
+                PathBuf::from("/usr/bin/proc1"),
+            ],
+            "nearest parent first, and pid 1's parent 0 ends it"
+        );
+        assert_eq!(
+            ancestry_of(&dir, 9, 2),
+            [
+                PathBuf::from("/usr/bin/proc8"),
+                PathBuf::from("/usr/bin/proc7")
+            ],
+            "the cap truncates from the far end, keeping the near parents"
+        );
+        assert!(ancestry_of(&dir, 9, 0).is_empty(), "a zero cap walks nothing");
+        assert!(
+            ancestry_of(&dir, 4242, 8).is_empty(),
+            "a process that is already gone has no ancestry"
+        );
+
+        // An ancestor whose executable cannot be read stops the walk rather
+        // than being skipped over: an entry standing for a process other
+        // than the one below it in the list would be a chain that never
+        // existed.
+        std::fs::remove_file(dir.join("7/exe")).unwrap();
+        assert_eq!(
+            ancestry_of(&dir, 9, 8),
+            [PathBuf::from("/usr/bin/proc8")],
+            "the unreadable ancestor truncates the chain"
+        );
+    }
+
+    /// An ancestor the walk cannot pin to one process incarnation is not
+    /// walked through.
+    ///
+    /// A pid freed between two hops can be reissued to an unrelated process,
+    /// cheap to force at the default `pid_max`, and the payoff would be an
+    /// innocuous launcher chain rendered above an allow/deny question. The
+    /// guard against it is the (pid, start time) pair, so a start time that
+    /// cannot be read has to end the walk rather than be waved through. That
+    /// arm is what this pins; the mid-walk change it also guards against
+    /// cannot be staged from a fixture of static files.
+    #[test]
+    fn ancestry_stops_where_a_start_time_cannot_be_read() {
+        let td = crate::testutil::TestDir::new("procfs-ancestry-starttime");
+        let dir = td.path().to_path_buf();
+        // Start time is field 22, so the padding is what makes the field
+        // index real here rather than assumed.
+        let write_stat = |pid: u32, ppid: u32, started: Option<u64>| {
+            std::fs::create_dir_all(dir.join(pid.to_string())).unwrap();
+            let mut fields = vec![
+                pid.to_string(),
+                format!("(proc{pid})"),
+                "S".into(),
+                ppid.to_string(),
+            ];
+            if let Some(s) = started {
+                fields.extend((5..=21).map(|_| "0".to_string()));
+                fields.push(s.to_string());
+            }
+            std::fs::write(dir.join(pid.to_string()).join("stat"), fields.join(" ")).unwrap();
+        };
+        let link = |pid: u32| {
+            std::os::unix::fs::symlink(
+                format!("/usr/bin/proc{pid}"),
+                dir.join(pid.to_string()).join("exe"),
+            )
+            .unwrap();
+        };
+        for (pid, ppid) in [(9u32, 8u32), (8, 7), (7, 1)] {
+            write_stat(pid, ppid, Some(u64::from(pid) * 100));
+            link(pid);
+        }
+        write_stat(1, 0, Some(1));
+        link(1);
+
+        assert_eq!(
+            ancestry_of(&dir, 9, 8).len(),
+            3,
+            "a tree that answers every check walks all the way up"
+        );
+
+        // pid 7 keeps its exe and its ppid, and loses only the field that
+        // says which incarnation it is.
+        write_stat(7, 1, None);
+        assert_eq!(
+            ancestry_of(&dir, 9, 8),
+            [PathBuf::from("/usr/bin/proc8")],
+            "an ancestor that cannot be pinned to an incarnation ends the walk"
+        );
     }
 
     /// The scan runs on the thread that decides every packet and the number

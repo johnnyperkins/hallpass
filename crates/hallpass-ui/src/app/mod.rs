@@ -430,12 +430,17 @@ impl HallpassApp {
                 id,
                 conn,
                 deadline_ms,
+                context,
             } => {
                 let mut board = self.prompts.lock().unwrap();
                 if !board.pending.iter().any(|p| p.id == id) {
-                    board
-                        .pending
-                        .push(PromptState::new(id, conn, deadline_ms, hallpass_types::unix_ms_now()));
+                    board.pending.push(PromptState::new(
+                        id,
+                        conn,
+                        deadline_ms,
+                        hallpass_types::unix_ms_now(),
+                        context,
+                    ));
                 }
             }
             DaemonMsg::PromptExpired { id } => {
@@ -1559,11 +1564,24 @@ fn prompt_info_ui(ui: &mut egui::Ui, p: &PromptState, rest: &[String]) {
     if let Some(exe) = &conn.exe_path {
         // Full path, sanitized: this is the line the operator checks to see
         // which binary is actually asking.
-        let text = prompt::truncate(&exe.display().to_string(), 200);
-        ui.label(RichText::new(text).small().monospace());
+        ui.label(RichText::new(prompt::path_text(exe)).small().monospace());
     }
     if let Some(cmdline) = &conn.cmdline {
         ui.label(RichText::new(prompt::truncate(cmdline, 100)).small());
+    }
+    // Above the separator, with the identity lines rather than in the
+    // details grid: it says a rule was written for this program and the
+    // binary running now is not the one that rule pins, which changes what
+    // the whole window is about. Coloured like a deny for the same reason
+    // the NEW badge is: it is the thing to read first. The sentence itself
+    // is the shared one, so this window and `hallpass-cli watch` cannot end
+    // up saying different things about the same fact.
+    if let Some(what) = p.context.hash_mismatch_describe() {
+        ui.label(
+            RichText::new(format!("Warning: {}", prompt::sentence_text(&what)))
+                .strong()
+                .color(REJECT_COLOR),
+        );
     }
     ui.separator();
 
@@ -1588,6 +1606,20 @@ fn prompt_info_ui(ui: &mut egui::Ui, p: &PromptState, rest: &[String]) {
                 ui.monospace(prompt::ui_text(app));
                 ui.end_row();
             }
+            // With the identity rows rather than the history ones below:
+            // "what started this" is the question an operator meeting an
+            // unfamiliar program asks straight after "what is it". Stacked
+            // nearest parent first, one per line, because a chain joined
+            // into one cell wraps into an unreadable run in a 440px window.
+            if !p.context.ancestors.is_empty() {
+                ui.label("Started by");
+                ui.vertical(|ui| {
+                    for exe in &p.context.ancestors {
+                        ui.label(RichText::new(prompt::path_text(exe)).small().monospace());
+                    }
+                });
+                ui.end_row();
+            }
             // The badge above says something is new; this says what, since
             // the two cases lead to different answers. A hover tooltip is
             // not enough on its own: the keyboard path to the buttons never
@@ -1597,7 +1629,25 @@ fn prompt_info_ui(ui: &mut egui::Ui, p: &PromptState, rest: &[String]) {
                 ui.colored_label(REJECT_COLOR, what);
                 ui.end_row();
             }
+            // Beside the first-seen row, because the two are the halves of
+            // one question and can disagree loudly: a familiar application
+            // that has been refused ten times is a different prompt from a
+            // first sighting. Absent rather than a zero, which the shared
+            // sentence decides for both clients.
+            if let Some(what) = p.context.denials_describe() {
+                ui.label("Denied lately");
+                ui.colored_label(REJECT_COLOR, what);
+                ui.end_row();
+            }
         });
+    // Below the grid and full width: 64 hex digits do not fit beside a
+    // label column, and this is the one line here meant to be read
+    // character by character (or copied into an `exe_sha256` rule).
+    if let Some(hash) = &p.context.exe_sha256 {
+        ui.add_space(4.0);
+        ui.label(RichText::new("Executable SHA-256").small());
+        ui.label(RichText::new(prompt::truncate(hash, 64)).small().monospace());
+    }
     if !rest.is_empty() {
         ui.add_space(4.0);
         ui.label(

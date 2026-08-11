@@ -35,6 +35,12 @@ const IDLE_POLL: Duration = Duration::from_millis(2);
 pub struct PromptTask {
     pub seq: u64,
     pub conn: Connection,
+    /// The executable's hash, if this thread computed one deciding the
+    /// packet. Carried rather than recomputed on the prompt path: it is the
+    /// exact value policy was evaluated against, and re-deriving it there
+    /// would put a whole-binary read on a thread that must not block and
+    /// could disagree with what the engine actually compared.
+    pub exe_sha256: Option<String>,
 }
 
 /// Everything the queue loop needs from the rest of the daemon.
@@ -177,8 +183,9 @@ fn commit(
 enum Decision {
     /// A rule decided; the connection is carried for the event.
     Verdict(Verdict, String, Connection),
-    /// Hold the packet and ask the prompt path.
-    Prompt(Connection),
+    /// Hold the packet and ask the prompt path, carrying the executable
+    /// hash if one was computed while deciding.
+    Prompt(Connection, Option<String>),
 }
 
 /// The read-only lookups `decide` consults, bundled so a new enrichment
@@ -238,7 +245,7 @@ fn decide(
     };
     match set.match_conn(&conn, exe_sha256.as_deref()) {
         Some((rule, verdict)) => Decision::Verdict(verdict, rule.name.clone(), conn),
-        None => Decision::Prompt(conn),
+        None => Decision::Prompt(conn, exe_sha256),
     }
 }
 
@@ -500,7 +507,7 @@ pub fn run(mut queue: Queue, queue_num: u16, mut deps: QueueDeps) -> std::io::Re
                     // policy from a dialog that changed nothing. Record the
                     // configured default instead, which is what an
                     // unanswered prompt resolves to anyway.
-                    Decision::Prompt(conn) if !enforcing => {
+                    Decision::Prompt(conn, _) if !enforcing => {
                         let verdict = deps.settings.default_verdict();
                         commit(&mut queue, msg, verdict, None, conn, &deps, enforcing);
                     }
@@ -510,7 +517,7 @@ pub fn run(mut queue: Queue, queue_num: u16, mut deps: QueueDeps) -> std::io::Re
                     // exists; the counter is the same one the pending-prompt
                     // table's overflow uses, because it is the same outcome:
                     // a connection nobody was asked about.
-                    Decision::Prompt(conn) if held.len() >= MAX_HELD_PACKETS => {
+                    Decision::Prompt(conn, _) if held.len() >= MAX_HELD_PACKETS => {
                         deps.stats.record_prompt_overflow();
                         tracing::warn!(
                             held = held.len(),
@@ -519,10 +526,14 @@ pub fn run(mut queue: Queue, queue_num: u16, mut deps: QueueDeps) -> std::io::Re
                         let verdict = deps.settings.default_verdict();
                         commit(&mut queue, msg, verdict, None, conn, &deps, enforcing);
                     }
-                    Decision::Prompt(conn) => {
+                    Decision::Prompt(conn, exe_sha256) => {
                         let seq = next_seq;
                         next_seq += 1;
-                        if deps.prompt_tx.send(PromptTask { seq, conn }).is_ok() {
+                        if deps
+                            .prompt_tx
+                            .send(PromptTask { seq, conn, exe_sha256 })
+                            .is_ok()
+                        {
                             held.insert(seq, msg);
                         } else {
                             // Prompt path gone (shutdown); fail open.
@@ -689,7 +700,7 @@ mod tests {
     fn unmatched_goes_to_prompt() {
         let (chain, store, dns, hash, _dir) = setup("prompt", vec![]);
         match decide(tuple_of(&tcp_packet([1, 1, 1, 1], 8443)).unwrap(), None, &ctx(&chain, &store, &dns, &hash), None) {
-            Decision::Prompt(conn) => {
+            Decision::Prompt(conn, _) => {
                 assert_eq!(conn.tuple.dst.port(), 8443);
                 assert_eq!(conn.exe_path, None);
                 assert_eq!(conn.domain, None);
@@ -742,20 +753,20 @@ mod tests {
 
         let tuple = tuple_of(&tcp_packet([1, 1, 1, 1], 443)).unwrap();
         let first = match decide(tuple, None, &ctx(&chain, &store, &dns, &hash), Some(&mut seen)) {
-            Decision::Prompt(conn) => conn.first_seen,
+            Decision::Prompt(conn, _) => conn.first_seen,
             other => panic!("expected a prompt, got {other:?}"),
         };
         assert_eq!(first, Some(hallpass_types::FirstSeen { app: true, dest: true }));
 
         let again = match decide(tuple, None, &ctx(&chain, &store, &dns, &hash), Some(&mut seen)) {
-            Decision::Prompt(conn) => conn.first_seen,
+            Decision::Prompt(conn, _) => conn.first_seen,
             other => panic!("expected a prompt, got {other:?}"),
         };
         assert_eq!(again, Some(hallpass_types::FirstSeen { app: false, dest: false }));
 
         // Tracking off is not "seen before": the daemon has nothing to say.
         match decide(tuple, None, &ctx(&chain, &store, &dns, &hash), None) {
-            Decision::Prompt(conn) => assert_eq!(conn.first_seen, None),
+            Decision::Prompt(conn, _) => assert_eq!(conn.first_seen, None),
             other => panic!("expected a prompt, got {other:?}"),
         }
     }
@@ -780,14 +791,14 @@ mod tests {
 
         // The program resolves a name first, the way a real one does.
         let query = tuple_of(&udp_packet([127, 0, 0, 53], 53)).unwrap();
-        let Decision::Prompt(conn) = decide(query, None, &ctx, Some(&mut seen)) else {
+        let Decision::Prompt(conn, _) = decide(query, None, &ctx, Some(&mut seen)) else {
             panic!("expected a prompt for the query");
         };
         assert_eq!(conn.first_seen, None, "a resolver query is not recorded at all");
 
         // Then connects, and *that* is where the annotation belongs.
         let real = tuple_of(&tcp_packet([1, 1, 1, 1], 443)).unwrap();
-        let Decision::Prompt(conn) = decide(real, None, &ctx, Some(&mut seen)) else {
+        let Decision::Prompt(conn, _) = decide(real, None, &ctx, Some(&mut seen)) else {
             panic!("expected a prompt for the connection");
         };
         assert_eq!(
@@ -805,7 +816,7 @@ mod tests {
             addrs: vec![("1.1.1.1".parse().unwrap(), 300)],
         });
         match decide(tuple_of(&tcp_packet([1, 1, 1, 1], 443)).unwrap(), None, &ctx(&chain, &store, &dns, &hash), None) {
-            Decision::Prompt(conn) => assert_eq!(conn.domain.as_deref(), Some("example.com")),
+            Decision::Prompt(conn, _) => assert_eq!(conn.domain.as_deref(), Some("example.com")),
             _ => panic!("expected prompt"),
         }
     }

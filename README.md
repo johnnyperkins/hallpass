@@ -344,6 +344,24 @@ destinations they reached, in `/var/lib/hallpass/seen.toml` (root-only,
 rewritten at most once a minute); `first_seen = false` in the config turns the
 whole thing off and writes nothing.
 
+A prompt also carries what the daemon can find out about the process beyond
+the connection itself, which neither `events` nor export shows because only a
+prompt has anyone to inform: what launched it (its ancestors' executables,
+nearest parent first), its executable's SHA-256, and how often decisions
+still in the daemon's history said no to this same application. Loudest of
+the four, when it appears: **the names of enabled rules that this binary
+fails only on the executable hash**. That is a rule written for this program
+at this destination whose pinned hash the binary running now does not have,
+which is exactly what `exe_sha256` is bought to catch, and without it the
+operator would see only an unexplained prompt for something they had already
+made a rule about. Each part is best effort and absent on its own: a process
+can exit between the packet and the prompt, and the history is bounded and
+lost on restart, so a count of zero means "nothing in what is still
+remembered", not "never". The hash is the one the daemon computed while
+deciding the packet, so it is shown when a hash-pinning rule could have
+applied and not otherwise; with no hash there is no mismatch to report, and
+the warning stays silent rather than accusing a binary nobody hashed.
+
 The GUI (`hallpass-ui`) connects to the same socket, pops up a dialog for each
 unmatched connection (allow/deny, scope, duration), and offers a management
 window for rules, live events, and statistics. Deny leads the dialog's
@@ -470,6 +488,17 @@ attacker with root, who can delete the nftables table outright.
   export is an ordinary event subscriber, so a lagging or unreachable
   collector can lose that one line, and an alert built on it will miss that
   first contact.
+- **Prompt context describes, it does not attest.** The ancestry a prompt
+  shows is read from `/proc` after the fact, so a process reparented to init
+  the moment its parent exited has no launcher left to name, and every path
+  in the chain was chosen by a process this one may control: "what started
+  this" is worth reading and is no more a claim than `cmdline` is. The
+  executable hash carries the caveat below about which executable a process
+  is attributed to. The denial count is bounded by the daemon's in-memory
+  history and lost on restart. Each part is absent rather than approximated
+  when it cannot be established, which is why a prompt showing none of them
+  is a prompt about something the daemon could not find out more about, not a
+  clean bill of health.
 - **A process can choose which executable it is attributed to.** Attribution
   resolves the executable from `/proc/<pid>/exe` after the connection is
   observed, and a socket descriptor survives `execve`. So a process can start

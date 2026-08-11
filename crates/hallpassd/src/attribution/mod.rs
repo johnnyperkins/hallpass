@@ -147,6 +147,18 @@ impl AttributionChain {
     }
 }
 
+/// Executables of `pid`'s ancestors on the running system, nearest parent
+/// first, at most `max` of them. Empty when the process is gone.
+///
+/// Not part of [`Attributor`] and not cached: it is read once per prompt
+/// rather than per packet, and it is the one piece of process metadata that
+/// is worth *less* the older it is. The per-flow attribution cache exists to
+/// keep the verdict path off /proc; this deliberately goes there, at a rate
+/// bounded by how fast an operator can be asked questions.
+pub fn ancestry(pid: u32, max: usize) -> Vec<PathBuf> {
+    procfs::ancestry_of(Path::new("/proc"), pid, max)
+}
+
 /// Whether a cached positive attribution still describes this flow.
 ///
 /// Three things have to hold, and each rules out a different way the entry

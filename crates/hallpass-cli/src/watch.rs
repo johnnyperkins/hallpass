@@ -8,7 +8,8 @@ use std::collections::VecDeque;
 
 use hallpass_types::wire;
 use hallpass_types::{
-    unix_ms_now, ClientMsg, Connection, DaemonMsg, PromptScope, RuleDuration, Verdict,
+    unix_ms_now, ClientMsg, Connection, DaemonMsg, PromptContext, PromptScope, RuleDuration,
+    Verdict,
 };
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc;
@@ -21,6 +22,7 @@ struct Pending {
     id: u64,
     conn: Connection,
     deadline_ms: u64,
+    context: PromptContext,
 }
 
 /// Where we are in the dialog for the current prompt.
@@ -92,6 +94,36 @@ fn format_prompt(p: &Pending, now_ms: u64) -> String {
             hallpass_types::sanitize_for_display(cmdline)
         ));
     }
+    // What launched it, nearest parent first. Sanitized for the same reason
+    // the command line is: every path here was chosen by whoever exec'd it,
+    // and an unprivileged user can create one containing control characters.
+    if !p.context.ancestors.is_empty() {
+        let chain: Vec<String> = p
+            .context
+            .ancestors
+            .iter()
+            .map(|a| fmt::path_display(a))
+            .collect();
+        out.push_str(&format!("  started: {}\n", chain.join(" <- ")));
+    }
+    // The value an `exe_sha256` rule pins, in full, because copying it into
+    // one is the point of showing it.
+    if let Some(hash) = &p.context.exe_sha256 {
+        out.push_str(&format!(
+            "  sha256:  {}\n",
+            hallpass_types::sanitize_for_display(hash)
+        ));
+    }
+    // Above the destination, unlike the annotations below it: this one is
+    // not about where the connection is going, it says an existing rule was
+    // written for this program and the binary running now is not the one it
+    // pins.
+    if let Some(what) = p.context.hash_mismatch_describe() {
+        out.push_str(&format!(
+            "  WARNING: {}\n",
+            hallpass_types::sanitize_for_display(&what)
+        ));
+    }
     out.push_str(&format!(
         "  dest:    {} ({}) {}\n",
         fmt::dst_display(c),
@@ -106,6 +138,13 @@ fn format_prompt(p: &Pending, now_ms: u64) -> String {
     // no line.
     if let Some(what) = c.first_seen.and_then(|f| f.describe()) {
         out.push_str(&format!("  new:     {what}\n"));
+    }
+    // Next to the first-seen line, because they are the two halves of the
+    // same question and they can disagree loudly: an application that is not
+    // new and has been refused ten times is a different prompt from a first
+    // sighting.
+    if let Some(what) = p.context.denials_describe() {
+        out.push_str(&format!("  denied:  {what}\n"));
     }
     out.push_str(&format!("  respond within {remaining}s\n"));
     out
@@ -149,14 +188,14 @@ pub async fn watch(mut client: Client) -> Result<(), CliError> {
                     return Err(CliError::Connect("daemon closed the connection".into()));
                 }
                 Some(Err(e)) => return Err(e.into()),
-                Some(Ok(DaemonMsg::PromptRequest { id, conn, deadline_ms })) => {
+                Some(Ok(DaemonMsg::PromptRequest { id, conn, deadline_ms, context })) => {
                     // Claiming the prompt slot re-delivers everything still
                     // pending, so the reclaim below re-sends the prompts this
                     // session already holds. Without this guard the operator
                     // is walked through the same prompt twice and the second
                     // answer draws an error for an id already spent.
                     if !already_held(&current, &queue, id) {
-                        queue.push_back(Pending { id, conn, deadline_ms });
+                        queue.push_back(Pending { id, conn, deadline_ms, context });
                         if current.is_none() {
                             current = promote(&mut queue);
                         }
@@ -349,6 +388,7 @@ mod tests {
                 first_seen: None,
             },
             deadline_ms,
+            context: PromptContext::default(),
         }
     }
 
@@ -431,6 +471,7 @@ mod tests {
                 first_seen: None,
             },
             deadline_ms: 30_000,
+            context: PromptContext::default(),
         };
         let out = format_prompt(&p, 5_000);
         assert!(!out.contains('\r'), "CR reached the terminal: {out:?}");
@@ -467,6 +508,7 @@ mod tests {
                 first_seen: None,
             },
             deadline_ms: 30_000,
+            context: PromptContext::default(),
         };
         let out = format_prompt(&p, 5_000);
         assert_eq!(
@@ -504,6 +546,7 @@ mod tests {
                 first_seen: Some(hallpass_types::FirstSeen { app: true, dest: true }),
             },
             deadline_ms: 30_000,
+            context: PromptContext::default(),
         };
         assert!(
             format_prompt(&p, 5_000).contains("new:     this application has not connected before"),
@@ -519,5 +562,86 @@ mod tests {
             let out = format_prompt(&p, 5_000);
             assert!(!out.contains("new:"), "{out:?}");
         }
+    }
+
+    /// Everything the daemon establishes about the process beyond the
+    /// connection, in the block the operator answers from.
+    #[test]
+    fn prompt_block_carries_the_context() {
+        let mut p = pending(7, 30_000);
+        let empty = format_prompt(&p, 5_000);
+        for absent in ["started:", "sha256:", "WARNING:", "denied:"] {
+            assert!(!empty.contains(absent), "{empty:?}");
+        }
+
+        p.context = PromptContext {
+            ancestors: vec![PathBuf::from("/bin/bash"), PathBuf::from("/sbin/init")],
+            exe_sha256: Some("ab".repeat(32)),
+            hash_mismatch_rules: vec!["curl-pinned".into()],
+            recent_denials: 4,
+        };
+        let out = format_prompt(&p, 5_000);
+        assert!(out.contains("started: /bin/bash <- /sbin/init"), "{out:?}");
+        assert!(out.contains(&format!("sha256:  {}", "ab".repeat(32))), "{out:?}");
+        assert!(
+            out.contains("WARNING: does not have the executable hash pinned by: curl-pinned"),
+            "{out:?}"
+        );
+        assert!(out.contains("denied:  4 recent decision(s)"), "{out:?}");
+
+        // A count of zero says nothing rather than claiming this application
+        // has never been denied: the daemon's history is bounded.
+        p.context.recent_denials = 0;
+        assert!(!format_prompt(&p, 5_000).contains("denied:"));
+    }
+
+    /// Ancestor paths and rule names are read off the host like every other
+    /// field in this block, and an unprivileged user can put control
+    /// characters in a path they exec from.
+    #[test]
+    fn hostile_context_cannot_forge_the_prompt_block() {
+        let mut p = pending(7, 30_000);
+        p.conn.cmdline = None;
+        p.context = PromptContext {
+            ancestors: vec![PathBuf::from("/tmp/evil\r\x1b[2Kdest:    bank.example:443 (1.2.3.4)")],
+            exe_sha256: None,
+            hash_mismatch_rules: vec!["a\u{202e}b".into()],
+            recent_denials: 0,
+        };
+        let out = format_prompt(&p, 5_000);
+        assert!(!out.contains('\r'), "CR reached the terminal: {out:?}");
+        assert!(!out.contains('\x1b'), "ESC reached the terminal: {out:?}");
+        assert!(!out.contains('\u{202e}'), "bidi override survived: {out:?}");
+        // exe, started, WARNING, dest, countdown: no line smuggled in.
+        assert_eq!(out.lines().count(), 5, "{out:?}");
+    }
+
+    /// Counting the lines is not enough: a prompt whose lines are each
+    /// kilobytes long wraps the destination and the countdown off the top of
+    /// an 80-column terminal, and answering allow or deny without them is the
+    /// same unanswerable prompt a smuggled newline would produce.
+    ///
+    /// A path is bounded by PATH_MAX and a prompt carries up to four of them,
+    /// so anyone who can exec from a deep directory can build one.
+    #[test]
+    fn hostile_context_cannot_scroll_the_prompt_block_away() {
+        let mut p = pending(7, 30_000);
+        let deep = format!("/tmp/{}/payload", "x".repeat(4000));
+        p.conn.exe_path = Some(PathBuf::from(deep.clone()));
+        p.context = PromptContext {
+            ancestors: (0..hallpass_types::MAX_PROMPT_ANCESTORS)
+                .map(|_| PathBuf::from(deep.clone()))
+                .collect(),
+            exe_sha256: None,
+            hash_mismatch_rules: Vec::new(),
+            recent_denials: 0,
+        };
+        let out = format_prompt(&p, 5_000);
+        // 80 columns, 24 rows, and the block has to leave room for the answer
+        // prompt under it.
+        let rows: usize = out.lines().map(|l| l.chars().count().div_ceil(80).max(1)).sum();
+        assert!(rows <= 20, "the block wrapped to {rows} rows:\n{out}");
+        assert!(out.contains("dest:"), "the destination survived: {out}");
+        assert!(out.contains("respond within"), "the countdown survived: {out}");
     }
 }

@@ -13,6 +13,9 @@
 use egui_kittest::kittest::{NodeT as _, Queryable as _};
 use egui_kittest::Harness;
 
+use hallpass_types::PromptContext;
+use std::path::PathBuf;
+
 use super::tests::{conn, drain, runtime_config};
 use super::*;
 
@@ -29,11 +32,34 @@ const NOW_MS: u64 = 1_700_000_000_000;
 
 const EXE: &str = "/usr/bin/curl";
 
+/// A fully populated prompt context: ancestry, hash, a hash-mismatch
+/// warning and a denial count all present at once.
+///
+/// The default for every fixture here on purpose. This module exists to hold
+/// the layout property that the viewport is a fixed 440x330 and the verdict
+/// buttons must stay reachable no matter how much the scrolling body wants,
+/// so the fixtures carry the largest body the daemon can produce rather than
+/// the smallest.
+/// Sized from the daemon's own caps rather than a hand-picked number, so
+/// "the largest body" stays true if a cap moves.
+fn ctx() -> PromptContext {
+    PromptContext {
+        ancestors: (0..hallpass_types::MAX_PROMPT_ANCESTORS)
+            .map(|i| PathBuf::from(format!("/usr/lib/ancestor-{i}/launcher")))
+            .collect(),
+        exe_sha256: Some("ab".repeat(32)),
+        hash_mismatch_rules: (0..hallpass_types::MAX_HASH_MISMATCH_RULES)
+            .map(|i| format!("pinned-rule-{i}"))
+            .collect(),
+        recent_denials: 7,
+    }
+}
+
 /// One prompt window's body, laid out on its own the way its viewport shows
 /// it.
 fn prompt_harness() -> Harness<'static, PromptFixture> {
     let state = PromptFixture {
-        prompt: PromptState::new(1, conn(EXE, "93.184.216.34:443"), NOW_MS + 30_000, NOW_MS),
+        prompt: PromptState::new(1, conn(EXE, "93.184.216.34:443"), NOW_MS + 30_000, NOW_MS, ctx()),
         answered: Vec::new(),
     };
     Harness::builder()
@@ -56,7 +82,7 @@ fn app_with_prompts(count: u64) -> (HallpassApp, tokio::sync::mpsc::UnboundedRec
     // out, and it reads the clock to do it.
     let now = hallpass_types::unix_ms_now();
     app.prompts.lock().unwrap().pending = (1..=count)
-        .map(|id| PromptState::new(id, conn(EXE, &format!("1.1.1.{id}:443")), now + 30_000, now))
+        .map(|id| PromptState::new(id, conn(EXE, &format!("1.1.1.{id}:443")), now + 30_000, now, ctx()))
         .collect();
     (app, from_ui)
 }
@@ -77,6 +103,7 @@ fn buttons_survive_worst_case_content() {
             conn(&format!("/very/long/{}/curl", "x".repeat(180)), "93.184.216.34:443"),
             NOW_MS + 30_000,
             NOW_MS,
+            ctx(),
         ),
         answered: Vec::new(),
     };
@@ -112,7 +139,7 @@ fn buttons_survive_worst_case_content() {
 #[test]
 fn a_new_application_is_announced_in_the_prompt_window() {
     let mut fixture = PromptFixture {
-        prompt: PromptState::new(1, conn(EXE, "93.184.216.34:443"), NOW_MS + 30_000, NOW_MS),
+        prompt: PromptState::new(1, conn(EXE, "93.184.216.34:443"), NOW_MS + 30_000, NOW_MS, ctx()),
         answered: Vec::new(),
     };
     fixture.prompt.conn.first_seen = Some(hallpass_types::FirstSeen { app: true, dest: true });
@@ -136,6 +163,41 @@ fn a_new_application_is_announced_in_the_prompt_window() {
         assert!(
             harness.query_by_label("NEW").is_none(),
             "an unremarkable connection was announced as new ({quiet:?})"
+        );
+    }
+}
+
+/// The context the daemon builds has to reach the window, and the loudest
+/// part of it has to be where the operator is already looking.
+///
+/// A hash-mismatch is the strongest thing this window ever says: a rule was
+/// written for this program and the binary asking now is not the one it
+/// pins. It sits above the separator with the identity lines rather than in
+/// the details grid, because it changes what the whole prompt is about.
+#[test]
+fn the_prompt_window_carries_the_daemon_context() {
+    let mut harness = prompt_harness();
+    let context = ctx();
+    // The sentences are the shared ones, so asserting the rendered label
+    // against them also pins this window and `hallpass-cli watch` to saying
+    // the same thing.
+    harness.get_by_label(&format!(
+        "Warning: {}",
+        context.hash_mismatch_describe().unwrap()
+    ));
+    harness.get_by_label(&context.denials_describe().unwrap());
+    harness.get_by_label("/usr/lib/ancestor-2/launcher");
+    harness.get_by_label(&"ab".repeat(32));
+
+    // An empty context renders an ordinary prompt. Zero denials in
+    // particular say nothing rather than "never denied": the daemon's
+    // history is bounded and lost on restart, so it does not know that.
+    harness.state_mut().prompt.context = PromptContext::default();
+    harness.run();
+    for absent in ["Started by", "Executable SHA-256", "Denied lately"] {
+        assert!(
+            harness.query_by_label(absent).is_none(),
+            "an empty context still rendered {absent:?}"
         );
     }
 }

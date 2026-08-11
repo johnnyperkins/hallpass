@@ -7,6 +7,30 @@ carries what an upgrade changes on a running host.
 
 ### Added
 
+- **Richer prompt context (wire protocol v12).** A prompt showed the
+  connection and little else, so deciding one often meant going elsewhere to
+  find out what the program was. Prompt requests now carry four more facts,
+  each shown by both the GUI dialog and `hallpass-cli watch`: what launched
+  the process (its ancestors' executables, nearest parent first), its
+  executable's SHA-256, how many decisions still in the daemon's history said
+  no to this same application, and the names of any enabled rules this binary
+  fails only on the executable hash. That last one is the loud case: a rule
+  was written for this program at this destination and the binary asking now
+  does not have the hash it pins, which is precisely what `exe_sha256` exists
+  to catch and which previously surfaced only as an unexplained prompt. The
+  hash shown is the one the daemon computed while deciding the packet, so it
+  appears when a hash-pinning rule could have applied and not otherwise.
+  Prompt-only by design: none of it rides `events`, `--json` or syslog
+  export, which describe decisions rather than ask about them, and the
+  denial count would be meaningless stamped on a decision it precedes.
+  Nothing here reaches a verdict. Every field is best effort and absent on
+  its own when it cannot be established, so a prompt showing none of them
+  means the daemon could not find out more, not that there is nothing to
+  find. Zero denials likewise means "nothing in what is still remembered":
+  the history is capped and lost on restart.
+  No configuration and no new state on disk. The protocol bump means daemon,
+  CLI and UI must be upgraded together.
+
 - **First-seen highlighting (wire protocol v11).** Every prompt looked the
   same whether the program asking had been running here for a year or had
   never connected before, which is the single fact most likely to change the

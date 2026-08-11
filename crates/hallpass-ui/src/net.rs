@@ -202,7 +202,10 @@ async fn connect_and_serve(
                 // the UI channel is only drained while the main window
                 // paints, and the banner exists for when it does not.
                 match &msg {
-                    DaemonMsg::PromptRequest { id, conn, deadline_ms } => {
+                    // The banner shows identity and destination only, so the
+                    // prompt context is not teed to it: it is what the window
+                    // is read for, not what a two-line notification carries.
+                    DaemonMsg::PromptRequest { id, conn, deadline_ms, .. } => {
                         let _ = to_notify.send(NotifyEvent::Request {
                             id: *id,
                             conn: Box::new(conn.clone()),

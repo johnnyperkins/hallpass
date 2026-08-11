@@ -76,7 +76,13 @@ use serde::{Deserialize, Serialize};
 /// destination before, so a prompt can say which of the two is new rather
 /// than presenting a routine connection and a first-ever one identically.
 /// The struct field forces the bump, as in v2.
-pub const PROTOCOL_VERSION: u32 = 11;
+///
+/// v12: [`PromptContext`] on [`DaemonMsg::PromptRequest`]. What launched the
+/// program, what its executable hashes to, whether a hash-pinned rule was
+/// looking for a different binary, and how often this program has been denied
+/// lately: the facts an operator needs to answer the question, none of which
+/// the connection itself carries. The struct field forces the bump, as in v2.
+pub const PROTOCOL_VERSION: u32 = 12;
 
 /// Transport-layer protocol of a connection.
 // Ord so protocol can be part of a sorted grouping key (the CLI's suggest
@@ -215,6 +221,113 @@ impl FirstSeen {
             (false, true) => Some("this application has not reached this destination before"),
             (false, false) => None,
         }
+    }
+}
+
+/// Ancestors a prompt carries, nearest parent first.
+///
+/// Enough to name the launcher and the session it came from
+/// (`bash` -> `gnome-terminal` -> `systemd --user` -> `systemd`) without
+/// turning the prompt into a process tree. Every entry is a path chosen by
+/// whoever exec'd it, so this is bounded for the same reason the display
+/// truncations are.
+pub const MAX_PROMPT_ANCESTORS: usize = 4;
+
+/// Rule names a prompt lists in [`PromptContext::hash_mismatch_rules`].
+///
+/// The list exists to name the rule an operator should go look at; past a
+/// handful it stops being a pointer and starts being a rule dump, and the
+/// count of them is not what makes the point.
+pub const MAX_HASH_MISMATCH_RULES: usize = 4;
+
+/// What an operator is shown about a connection beyond the connection
+/// itself: who launched the program, what its executable hashes to, whether
+/// a hash-pinned rule was looking for a different binary, and how often this
+/// program has been denied lately.
+///
+/// Rides [`DaemonMsg::PromptRequest`] rather than [`Connection`] on purpose.
+/// Every field here answers "should I allow this", which is a question only a
+/// prompt asks. On the connection they would ride the event broadcast, the
+/// syslog line, the `--json` row and the daemon's history ring for every
+/// packet it judges, most of which nobody is ever asked about; and
+/// [`PromptContext::recent_denials`] would be actively wrong there, because
+/// it counts what happened *before* a decision and an event is the decision.
+///
+/// Every field is best effort and independently absent: the process can exit
+/// between the packet and the prompt, its executable can be unreadable or too
+/// large to hash, and the daemon's history is bounded and lost on restart. An
+/// empty field means "could not be established", never "established as
+/// nothing", the same none-is-not-zero distinction [`Connection::first_seen`]
+/// makes.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromptContext {
+    /// Executables of the process's ancestors, nearest parent first, at most
+    /// [`MAX_PROMPT_ANCESTORS`] of them. The walk stops early at pid 1, at a
+    /// process whose executable cannot be read, and at one that is reparented
+    /// while it is being read.
+    ///
+    /// A launcher is not a boundary: a process can be reparented to init the
+    /// moment its parent exits, and everything here is chosen by processes
+    /// this one may control. It answers "what started this", which is what an
+    /// operator meeting an unfamiliar program wants, and is no more a
+    /// security claim than `cmdline` is.
+    pub ancestors: Vec<PathBuf>,
+    /// SHA-256 of the executable the process is running, lowercase hex, when
+    /// it could be read. The value an `exe_sha256` rule pins, so an operator
+    /// can copy it out of a prompt into a rule.
+    pub exe_sha256: Option<String>,
+    /// Names of enabled rules that match this connection in every field
+    /// *except* the executable hash, at most [`MAX_HASH_MISMATCH_RULES`].
+    ///
+    /// Non-empty is the loudest thing a prompt can say: a rule was written
+    /// for this program at this destination, and the binary running now is
+    /// not the one it pins. That is the case hash pinning is bought for, and
+    /// without this the operator only sees an unexplained prompt for
+    /// something they already made a rule about.
+    pub hash_mismatch_rules: Vec<String>,
+    /// Decisions still in the daemon's history ring that denied this same
+    /// application (by executable and packaged-application identity),
+    /// whatever denied them: a rule, or a prompt that expired into a
+    /// fail-closed default.
+    ///
+    /// Bounded by the ring's capacity and lost on restart, so this is "lately"
+    /// in decisions rather than in time, and 0 means "nothing in what is still
+    /// remembered".
+    pub recent_denials: u32,
+}
+
+impl PromptContext {
+    /// Sentence for an operator about a hash-pinned rule this binary does not
+    /// satisfy, or `None` when there is none.
+    ///
+    /// One vocabulary for every consumer, like [`FirstSeen::describe`]: a
+    /// client decides where this goes and how loudly it is said, never what
+    /// it says. The paths and rule names inside it are read off the host, so
+    /// a client still sanitizes and bounds the result the way it does every
+    /// other daemon-supplied string.
+    pub fn hash_mismatch_describe(&self) -> Option<String> {
+        (!self.hash_mismatch_rules.is_empty()).then(|| {
+            format!(
+                "does not have the executable hash pinned by: {}",
+                self.hash_mismatch_rules.join(", ")
+            )
+        })
+    }
+
+    /// Sentence for how often this application has recently been refused, or
+    /// `None` when the daemon remembers none.
+    ///
+    /// Absent at zero rather than reading "0": the history behind the count
+    /// is capped and lost on restart, so none of it means "nothing in what is
+    /// still remembered", never "this has never been denied". Same
+    /// none-is-not-zero rule [`FirstSeen::describe`] applies to its own line.
+    pub fn denials_describe(&self) -> Option<String> {
+        (self.recent_denials > 0).then(|| {
+            format!(
+                "{} recent decision(s) for this application said no",
+                self.recent_denials
+            )
+        })
     }
 }
 
@@ -1332,6 +1445,9 @@ pub enum DaemonMsg {
         /// Deadline as Unix milliseconds; after this the default verdict
         /// applies and the prompt expires.
         deadline_ms: u64,
+        /// What else the operator is shown to decide with. Best effort and
+        /// possibly empty; see [`PromptContext`].
+        context: PromptContext,
     },
     /// A previously issued prompt timed out or was answered elsewhere.
     PromptExpired {

@@ -210,6 +210,12 @@ mod tests {
                 id: 1,
                 conn: sample_conn(),
                 deadline_ms: 1_720_000_000_000,
+                context: PromptContext {
+                    ancestors: vec![PathBuf::from("/bin/bash"), PathBuf::from("/sbin/init")],
+                    exe_sha256: Some("ab".repeat(32)),
+                    hash_mismatch_rules: vec!["curl-pinned".into()],
+                    recent_denials: 3,
+                },
             },
             DaemonMsg::PromptExpired { id: 1 },
             DaemonMsg::Event(sample_event(Verdict::Reject, true)),

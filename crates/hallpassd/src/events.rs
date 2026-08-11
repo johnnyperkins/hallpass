@@ -2,6 +2,7 @@
 //! short in-memory history a monitoring client replays on connect.
 
 use std::collections::VecDeque;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use hallpass_types::{unix_ms_now, ConnEvent, Connection, FlowTuple, Verdict};
@@ -98,6 +99,38 @@ impl EventBus {
     pub fn latest_for_tuple(&self, tuple: &FlowTuple) -> Option<Arc<ConnEvent>> {
         let guard = self.lock_history();
         guard.iter().rev().find(|ev| ev.conn.tuple == *tuple).cloned()
+    }
+
+    /// How many decisions still in the ring said no to this same
+    /// application, for the prompt that is about to ask about it again.
+    ///
+    /// Identity is the (executable, packaged application) pair rules are
+    /// written against and prompts coalesce on, so two packaged applications
+    /// running from one sandbox path are counted apart. An identity of
+    /// neither is not an identity: an unattributed connection counts nothing,
+    /// rather than being handed the sum of every other unattributed one.
+    ///
+    /// `Deny` and `Reject` both count - they are two ways of saying no, and
+    /// an operator reading "denied lately" is not asking which. So does a
+    /// decision that was only observed: what policy decided is the answer to
+    /// "have I been saying no to this", and an observe-mode host would
+    /// otherwise report nothing at all.
+    ///
+    /// Bounded by the ring, which is capacity-bounded and lost on restart, so
+    /// 0 means "nothing in what is still remembered", never "never".
+    pub fn denials_for(&self, exe_path: Option<&Path>, app_id: Option<&str>) -> u32 {
+        if exe_path.is_none() && app_id.is_none() {
+            return 0;
+        }
+        let guard = self.lock_history();
+        guard
+            .iter()
+            .filter(|ev| {
+                ev.verdict != Verdict::Allow
+                    && ev.conn.exe_path.as_deref() == exe_path
+                    && ev.conn.app_id.as_deref() == app_id
+            })
+            .count() as u32
     }
 
     /// Up to `limit` most recent events, oldest first so a client can print
@@ -264,6 +297,52 @@ mod tests {
             "encoded {} bytes",
             encoded.len()
         );
+    }
+
+    /// The count a prompt shows next to "should I allow this": how often the
+    /// answer for this same application has recently been no.
+    #[test]
+    fn denials_are_counted_per_application() {
+        use std::path::PathBuf;
+
+        let curl = PathBuf::from("/usr/bin/curl");
+        let bus = EventBus::default();
+        let with = |exe: Option<&str>, app: Option<&str>| {
+            let mut c = conn();
+            c.exe_path = exe.map(PathBuf::from);
+            c.app_id = app.map(String::from);
+            c
+        };
+
+        bus.emit(with(Some("/usr/bin/curl"), None), Verdict::Deny, None, true);
+        bus.emit(with(Some("/usr/bin/curl"), None), Verdict::Reject, None, true);
+        // Observed but not enforced still counts: what policy decided is the
+        // answer to "have I been saying no to this".
+        bus.emit(with(Some("/usr/bin/curl"), None), Verdict::Deny, None, false);
+        bus.emit(with(Some("/usr/bin/curl"), None), Verdict::Allow, None, true);
+        bus.emit(with(Some("/usr/bin/wget"), None), Verdict::Deny, None, true);
+        // Same executable, different packaged application: two sandboxed
+        // applications share one path, and one of them being refused says
+        // nothing about the other.
+        bus.emit(
+            with(Some("/usr/bin/curl"), Some("flatpak:org.example.Other")),
+            Verdict::Deny,
+            None,
+            true,
+        );
+        bus.emit(with(None, None), Verdict::Deny, None, true);
+
+        assert_eq!(bus.denials_for(Some(&curl), None), 3);
+        assert_eq!(
+            bus.denials_for(Some(&curl), Some("flatpak:org.example.Other")),
+            1
+        );
+        assert_eq!(
+            bus.denials_for(None, None),
+            0,
+            "an unattributed connection is not an identity to count against"
+        );
+        assert_eq!(bus.denials_for(Some(&PathBuf::from("/bin/sh")), None), 0);
     }
 
     /// An event too large for any reply is skipped rather than sent. Sending

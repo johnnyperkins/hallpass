@@ -131,6 +131,7 @@ fn prompt_request(id: u64, exe: &str) -> DaemonMsg {
         id,
         conn: conn(exe, "93.184.216.34:443"),
         deadline_ms: hallpass_types::unix_ms_now() + 30_000,
+        context: hallpass_types::PromptContext::default(),
     }
 }
 

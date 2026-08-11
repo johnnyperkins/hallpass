@@ -13,7 +13,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use hallpass_types::{
-    Connection, DaemonMsg, PromptScope, Proto, Rule, RuleDuration, RuleMatch, Verdict,
+    Connection, DaemonMsg, PromptContext, PromptScope, Proto, Rule, RuleDuration, RuleMatch,
+    Verdict, MAX_HASH_MISMATCH_RULES, MAX_PROMPT_ANCESTORS,
 };
 use tokio::sync::mpsc::{Sender, UnboundedSender};
 
@@ -42,6 +43,27 @@ struct Pending {
     packets: Vec<u64>,
     /// Absolute deadline sent with the request, kept for re-delivery.
     deadline_ms: u64,
+    /// What the operator is shown beyond the connection. Kept for
+    /// re-delivery, like the connection and the deadline beside it.
+    context: PromptContext,
+}
+
+impl Pending {
+    /// The request for this prompt.
+    ///
+    /// One constructor for both senders, the creation path and the
+    /// re-delivery sweep in [`PromptTable::set_handler`], so the two cannot
+    /// describe one prompt differently. It has to hold because both clients
+    /// ignore a repeat request for an id they already hold: whichever
+    /// request arrives first is the one the operator answers.
+    fn request(&self, id: u64) -> DaemonMsg {
+        DaemonMsg::PromptRequest {
+            id,
+            conn: self.conn.clone(),
+            deadline_ms: self.deadline_ms,
+            context: self.context.clone(),
+        }
+    }
 }
 
 /// Most packets one prompt will hold while it waits for an answer.
@@ -183,12 +205,9 @@ impl PromptTable {
                 // before this handler connected (or while the previous
                 // one was dying) would sit invisible until their
                 // timeout applies the default verdict.
+                //
                 for (&id, p) in inner.by_id.iter() {
-                    let _ = tx.try_send(DaemonMsg::PromptRequest {
-                        id,
-                        conn: p.conn.clone(),
-                        deadline_ms: p.deadline_ms,
-                    });
+                    let _ = tx.try_send(p.request(id));
                 }
                 inner.handler = Some(Handler { tx, unanswered: 0 });
                 true
@@ -208,7 +227,7 @@ impl PromptTable {
     /// thread. Either coalesces into an existing prompt, opens a new one,
     /// or resolves immediately with the default verdict (no handler
     /// connected, or the pending table is full).
-    pub fn handle_new(self: &Arc<Self>, conn: Connection, seq: u64) {
+    pub fn handle_new(self: &Arc<Self>, conn: Connection, seq: u64, exe_sha256: Option<String>) {
         // The queue thread does not hand over packets while observing, but
         // it reads the mode per packet and this runs on a different task, so
         // a toggle can land between the two: without this check a packet
@@ -228,6 +247,13 @@ impl PromptTable {
             conn.tuple.dst.ip(),
             conn.tuple.dst.port(),
         );
+        // Before the lock, and therefore also for packets that turn out to
+        // coalesce into a prompt that already exists. That waste is bounded
+        // by MAX_PACKETS_PER_PROMPT and every piece of it is cheap (see
+        // `build_context`); holding the table lock across an ancestry walk
+        // would instead put a /proc read in front of every prompt reply and
+        // every handler reconnect.
+        let context = self.build_context(&conn, exe_sha256);
         let mut inner = self.inner.lock().unwrap();
 
         // Both budgets, before either path can take a slot: one caps what a
@@ -312,21 +338,16 @@ impl PromptTable {
                 conn: conn.clone(),
                 packets: vec![seq],
                 deadline_ms,
+                context,
             },
         );
+        let request = inner.by_id[&id].request(id);
         drop(inner);
 
         self.stats.record_prompted();
         // try_send: never block the dispatcher on a stalled client. A
         // dropped request is resolved by the timeout below.
-        if handler
-            .try_send(DaemonMsg::PromptRequest {
-                id,
-                conn,
-                deadline_ms,
-            })
-            .is_err()
-        {
+        if handler.try_send(request).is_err() {
             tracing::warn!(id, "prompt handler not accepting requests");
         }
 
@@ -335,6 +356,56 @@ impl PromptTable {
             tokio::time::sleep(timeout).await;
             table.expire(id);
         });
+    }
+
+    /// Everything a prompt shows beyond the connection itself.
+    ///
+    /// Runs inline on the prompt dispatcher, before the table lock, and does
+    /// no disk IO at all. That is the whole design constraint. An earlier cut
+    /// built this on a blocking worker and sent the request afterwards, which
+    /// bought a freshly read executable hash and cost four defects: a prompt
+    /// whose build outran its deadline expired without ever being sent (and
+    /// `strike_handler` charged that to the handler, evicting a healthy GUI
+    /// after three), `expire` freed the table slot while the build ran on so
+    /// `max_pending` stopped bounding the work in flight, delivery order
+    /// stopped matching prompt-id order, and a request could arrive after the
+    /// `PromptExpired` for its own id. A prompt request must leave with the
+    /// packet, not after an unbounded read.
+    ///
+    /// So `exe_sha256` is the value the verdict thread already computed while
+    /// deciding this packet, passed in rather than re-read. It is present
+    /// exactly when a hash-pinning rule could have applied, which is the case
+    /// this feature exists for, and it is the same value the engine compared,
+    /// so the mismatch list below cannot disagree with the decision that
+    /// raised the prompt.
+    ///
+    /// What is left reads only procfs and memory: an ancestry walk of at most
+    /// [`MAX_PROMPT_ANCESTORS`] hops, one bounded scan of the history ring,
+    /// and one rule-set scan. The queue thread already does /proc reads per
+    /// packet, so this is well inside the daemon's existing tolerance, and it
+    /// is paid once per unmatched connection rather than per packet.
+    ///
+    /// The rule snapshot is taken here rather than reused from the packet
+    /// path, so a rule added between the two shows up. That is the same drift
+    /// `resolve_covered_by` exists for and it errs the readable way: what the
+    /// prompt says about rules describes the rules as they are while it is on
+    /// screen.
+    fn build_context(&self, conn: &Connection, exe_sha256: Option<String>) -> PromptContext {
+        PromptContext {
+            ancestors: conn
+                .pid
+                .map(|pid| crate::attribution::ancestry(pid, MAX_PROMPT_ANCESTORS))
+                .unwrap_or_default(),
+            hash_mismatch_rules: self.store.ruleset().hash_mismatch_rules(
+                conn,
+                exe_sha256.as_deref(),
+                MAX_HASH_MISMATCH_RULES,
+            ),
+            exe_sha256,
+            recent_denials: self
+                .events
+                .denials_for(conn.exe_path.as_deref(), conn.app_id.as_deref()),
+        }
     }
 
     /// Apply a client's decision to a pending prompt.
@@ -710,6 +781,7 @@ mod tests {
         store: Arc<RuleStore>,
         stats: Arc<Counters>,
         settings: Arc<crate::config::RuntimeSettings>,
+        events: Arc<EventBus>,
         _dir: crate::testutil::TestDir,
     }
 
@@ -730,9 +802,10 @@ mod tests {
         let settings = Arc::new(crate::config::RuntimeSettings::new(
             crate::testutil::runtime_config(5, default),
         ));
+        let events = Arc::new(EventBus::default());
         let table = Arc::new(PromptTable::new(
             verdict_tx,
-            Arc::new(EventBus::default()),
+            Arc::clone(&events),
             Arc::clone(&stats),
             Arc::clone(&store),
             Arc::clone(&settings),
@@ -744,6 +817,7 @@ mod tests {
             store,
             stats,
             settings,
+            events,
             _dir: dir,
         }
     }
@@ -770,7 +844,7 @@ mod tests {
     #[tokio::test]
     async fn no_handler_applies_default_immediately() {
         let mut h = harness("nohandler", 4, Verdict::Deny);
-        h.table.handle_new(conn("/bin/a", "1.1.1.1:443"), 7);
+        h.table.handle_new(conn("/bin/a", "1.1.1.1:443"), 7, None);
         assert_eq!(h.verdict_rx.recv().await, Some((7, Verdict::Deny)));
         // Nobody was asked, and the event this emits is indistinguishable
         // from a rule having chosen the same verdict. The counters are the
@@ -792,7 +866,7 @@ mod tests {
 
         for seq in 1..=u64::from(MAX_UNANSWERED_EXPIRIES) {
             h.table
-                .handle_new(conn("/bin/a", &format!("1.1.1.{seq}:443")), seq);
+                .handle_new(conn("/bin/a", &format!("1.1.1.{seq}:443")), seq, None);
             tokio::time::advance(Duration::from_secs(6)).await;
             assert_eq!(h.verdict_rx.recv().await, Some((seq, Verdict::Allow)));
         }
@@ -831,7 +905,7 @@ mod tests {
             for _ in 0..MAX_UNANSWERED_EXPIRIES - 1 {
                 seq += 1;
                 h.table
-                    .handle_new(conn("/bin/a", &format!("1.1.1.{seq}:443")), seq);
+                    .handle_new(conn("/bin/a", &format!("1.1.1.{seq}:443")), seq, None);
                 tokio::time::advance(Duration::from_secs(6)).await;
                 assert_eq!(h.verdict_rx.recv().await, Some((seq, Verdict::Allow)));
             }
@@ -840,7 +914,7 @@ mod tests {
             while prompt_rx.try_recv().is_ok() {}
             seq += 1;
             h.table
-                .handle_new(conn("/bin/a", &format!("1.1.1.{seq}:443")), seq);
+                .handle_new(conn("/bin/a", &format!("1.1.1.{seq}:443")), seq, None);
             let DaemonMsg::PromptRequest { id, .. } = prompt_rx.recv().await.unwrap() else {
                 panic!("expected PromptRequest");
             };
@@ -936,6 +1010,71 @@ mod tests {
         assert_ne!(sanitize_rule_stem("evil"), a, "dropped chars would collide");
     }
 
+    /// The request carries what the operator reads to decide, not just the
+    /// connection. Built off the dispatcher, so this is also the proof that
+    /// the deferred send arrives at all.
+    #[tokio::test]
+    async fn the_request_carries_the_prompt_context() {
+        let h = harness("context", 4, Verdict::Deny);
+        let (tx, mut prompt_rx) = mpsc::channel(16);
+        assert!(h.table.set_handler(tx));
+
+        // Two earlier refusals for this application, and one for another, so
+        // the count has to be per identity rather than a total.
+        let mut denied = conn("/bin/a", "9.9.9.9:443");
+        denied.app_id = Some("snap:thing".into());
+        h.events.emit(denied.clone(), Verdict::Deny, None, true);
+        h.events.emit(denied.clone(), Verdict::Reject, None, true);
+        h.events
+            .emit(conn("/bin/other", "9.9.9.9:443"), Verdict::Deny, None, true);
+
+        let mut asked = conn("/bin/a", "1.1.1.1:443");
+        asked.app_id = Some("snap:thing".into());
+        h.table.handle_new(asked, 1, None);
+
+        let DaemonMsg::PromptRequest { context, .. } = prompt_rx.recv().await.unwrap() else {
+            panic!("expected PromptRequest");
+        };
+        assert_eq!(context.recent_denials, 2);
+        // No rule in this store pins a hash, so there is nothing to warn
+        // about, and the exe of a fixture connection does not exist to hash.
+        assert!(context.hash_mismatch_rules.is_empty());
+        assert_eq!(context.exe_sha256, None);
+    }
+
+    /// A prompt is on its way to the handler before `handle_new` returns,
+    /// and in prompt-id order.
+    ///
+    /// Both were true by construction until the request was briefly built
+    /// and sent from a task of its own. That cost four defects at once, and
+    /// this is the property that rules them all out: nothing may sit between
+    /// entering a prompt in the table and offering it to the handler. If it
+    /// does, the expiry timer armed alongside it can fire first - applying
+    /// the default verdict to a connection nobody was shown, and charging
+    /// the silence to a handler that was never asked, until three of them
+    /// evict it - and the order the operator is walked through prompts stops
+    /// matching the order the packets arrived in.
+    #[tokio::test]
+    async fn requests_are_sent_before_handle_new_returns_and_in_order() {
+        let h = harness("sync-delivery", 8, Verdict::Deny);
+        let (tx, mut prompt_rx) = mpsc::channel(16);
+        assert!(h.table.set_handler(tx));
+
+        for seq in 1..=4u64 {
+            h.table
+                .handle_new(conn("/bin/a", &format!("1.1.1.{seq}:443")), seq, None);
+            // try_recv, not recv().await: nothing may be awaited for the
+            // request to exist.
+            let msg = prompt_rx
+                .try_recv()
+                .expect("the request is sent synchronously");
+            let DaemonMsg::PromptRequest { id, .. } = msg else {
+                panic!("expected PromptRequest");
+            };
+            assert_eq!(id, seq, "prompt ids reach the handler in creation order");
+        }
+    }
+
     /// Prompt ids are a monotonic counter from 1, so they are trivially
     /// guessable. Only the client holding the handler slot may answer, or any
     /// other connected client could race the GUI and allow what the operator
@@ -949,7 +1088,7 @@ mod tests {
         let (other, _other_rx) = mpsc::channel(16);
         assert!(!h.table.set_handler(other.clone()), "slot is exclusive");
 
-        h.table.handle_new(conn("/bin/a", "1.1.1.1:443"), 1);
+        h.table.handle_new(conn("/bin/a", "1.1.1.1:443"), 1, None);
         let DaemonMsg::PromptRequest { id, .. } = prompt_rx.recv().await.unwrap() else {
             panic!("expected PromptRequest");
         };
@@ -976,8 +1115,8 @@ mod tests {
         assert!(!h.table.set_handler(tx.clone()), "slot is exclusive");
 
         // Same key twice: one prompt, two held packets.
-        h.table.handle_new(conn("/bin/a", "1.1.1.1:443"), 1);
-        h.table.handle_new(conn("/bin/a", "1.1.1.1:443"), 2);
+        h.table.handle_new(conn("/bin/a", "1.1.1.1:443"), 1, None);
+        h.table.handle_new(conn("/bin/a", "1.1.1.1:443"), 2, None);
         let DaemonMsg::PromptRequest { id, .. } = prompt_rx.recv().await.unwrap() else {
             panic!("expected PromptRequest");
         };
@@ -1005,7 +1144,7 @@ mod tests {
         assert!(h.table.set_handler(tx.clone()));
         let mut c = conn("/usr/bin/dig", "9.9.9.9:53");
         c.tuple.proto = Proto::Udp;
-        h.table.handle_new(c, 1);
+        h.table.handle_new(c, 1, None);
         let DaemonMsg::PromptRequest { id, .. } = prompt_rx.recv().await.unwrap() else {
             panic!("expected PromptRequest");
         };
@@ -1026,10 +1165,10 @@ mod tests {
         assert!(h.table.set_handler(tx.clone()));
 
         // One app, three endpoints; another app, one endpoint.
-        h.table.handle_new(conn("/usr/bin/chrome", "1.1.1.1:443"), 1);
-        h.table.handle_new(conn("/usr/bin/chrome", "2.2.2.2:443"), 2);
-        h.table.handle_new(conn("/usr/bin/chrome", "3.3.3.3:80"), 3);
-        h.table.handle_new(conn("/bin/other", "4.4.4.4:443"), 4);
+        h.table.handle_new(conn("/usr/bin/chrome", "1.1.1.1:443"), 1, None);
+        h.table.handle_new(conn("/usr/bin/chrome", "2.2.2.2:443"), 2, None);
+        h.table.handle_new(conn("/usr/bin/chrome", "3.3.3.3:80"), 3, None);
+        h.table.handle_new(conn("/bin/other", "4.4.4.4:443"), 4, None);
         let DaemonMsg::PromptRequest { id: first, .. } = prompt_rx.recv().await.unwrap() else {
             panic!("expected PromptRequest");
         };
@@ -1077,8 +1216,8 @@ mod tests {
         let mut h = harness("narrow", 8, Verdict::Deny);
         let (tx, mut prompt_rx) = mpsc::channel(16);
         assert!(h.table.set_handler(tx.clone()));
-        h.table.handle_new(conn("/usr/bin/chrome", "1.1.1.1:443"), 1);
-        h.table.handle_new(conn("/usr/bin/chrome", "2.2.2.2:443"), 2);
+        h.table.handle_new(conn("/usr/bin/chrome", "1.1.1.1:443"), 1, None);
+        h.table.handle_new(conn("/usr/bin/chrome", "2.2.2.2:443"), 2, None);
         let DaemonMsg::PromptRequest { id: first, .. } = prompt_rx.recv().await.unwrap() else {
             panic!("expected PromptRequest");
         };
@@ -1101,10 +1240,10 @@ mod tests {
         let mut h = harness("proto", 4, Verdict::Allow);
         let (tx, mut prompt_rx) = mpsc::channel(16);
         assert!(h.table.set_handler(tx.clone()));
-        h.table.handle_new(conn("/bin/a", "1.1.1.1:443"), 1);
+        h.table.handle_new(conn("/bin/a", "1.1.1.1:443"), 1, None);
         let mut udp = conn("/bin/a", "1.1.1.1:443");
         udp.tuple.proto = Proto::Udp;
-        h.table.handle_new(udp, 2);
+        h.table.handle_new(udp, 2, None);
 
         let DaemonMsg::PromptRequest { id: tcp_id, .. } = prompt_rx.recv().await.unwrap() else {
             panic!("expected PromptRequest");
@@ -1134,7 +1273,7 @@ mod tests {
         let mut h = harness("redeliver", 4, Verdict::Allow);
         let (tx1, mut rx1) = mpsc::channel(16);
         assert!(h.table.set_handler(tx1));
-        h.table.handle_new(conn("/bin/a", "1.1.1.1:443"), 1);
+        h.table.handle_new(conn("/bin/a", "1.1.1.1:443"), 1, None);
         let DaemonMsg::PromptRequest { id, .. } = rx1.recv().await.unwrap() else {
             panic!("expected PromptRequest");
         };
@@ -1160,10 +1299,10 @@ mod tests {
         let mut h = harness("overflow", 1, Verdict::Deny);
         let (tx, mut prompt_rx) = mpsc::channel(16);
         assert!(h.table.set_handler(tx.clone()));
-        h.table.handle_new(conn("/bin/a", "1.1.1.1:443"), 1);
+        h.table.handle_new(conn("/bin/a", "1.1.1.1:443"), 1, None);
         let _ = prompt_rx.recv().await.unwrap();
         // Different key while table is full.
-        h.table.handle_new(conn("/bin/b", "2.2.2.2:80"), 2);
+        h.table.handle_new(conn("/bin/b", "2.2.2.2:80"), 2, None);
         assert_eq!(h.verdict_rx.recv().await, Some((2, Verdict::Deny)));
     }
 
@@ -1179,7 +1318,7 @@ mod tests {
         assert!(h.table.set_handler(tx.clone()));
 
         for seq in 0..MAX_PACKETS_PER_PROMPT as u64 {
-            h.table.handle_new(conn("/bin/a", "1.1.1.1:443"), seq);
+            h.table.handle_new(conn("/bin/a", "1.1.1.1:443"), seq, None);
         }
         let DaemonMsg::PromptRequest { id, .. } = prompt_rx.recv().await.unwrap() else {
             panic!("expected PromptRequest");
@@ -1191,7 +1330,7 @@ mod tests {
 
         // One past the budget: released now, and counted as a connection
         // nobody was asked about.
-        h.table.handle_new(conn("/bin/a", "1.1.1.1:443"), 999);
+        h.table.handle_new(conn("/bin/a", "1.1.1.1:443"), 999, None);
         assert_eq!(h.verdict_rx.recv().await, Some((999, Verdict::Deny)));
         assert_eq!(h.snapshot().prompts_overflowed, 1);
 
@@ -1220,7 +1359,7 @@ mod tests {
         let mut seq = 0u64;
         for port in 0..(MAX_PACKETS_PER_EXE as u16) {
             h.table
-                .handle_new(conn("/bin/loud", &format!("1.1.1.1:{}", 1000 + port)), seq);
+                .handle_new(conn("/bin/loud", &format!("1.1.1.1:{}", 1000 + port)), seq, None);
             seq += 1;
         }
         assert!(
@@ -1230,14 +1369,14 @@ mod tests {
 
         // One more from the same executable, to a fresh destination: over
         // budget, released immediately rather than holding another slot.
-        h.table.handle_new(conn("/bin/loud", "1.1.1.1:9999"), seq);
+        h.table.handle_new(conn("/bin/loud", "1.1.1.1:9999"), seq, None);
         assert_eq!(h.verdict_rx.recv().await, Some((seq, Verdict::Deny)));
         assert_eq!(h.snapshot().prompts_overflowed, 1);
 
         // A different executable is unaffected: this is a per-exe share, not
         // a global stop.
         seq += 1;
-        h.table.handle_new(conn("/bin/quiet", "2.2.2.2:443"), seq);
+        h.table.handle_new(conn("/bin/quiet", "2.2.2.2:443"), seq, None);
         assert!(
             h.verdict_rx.try_recv().is_err(),
             "one loud executable must not deny everyone else a prompt"
@@ -1265,15 +1404,15 @@ mod tests {
         // The first application spends its whole share.
         let mut seq = 0u64;
         for port in 0..(MAX_PACKETS_PER_EXE as u16) {
-            h.table.handle_new(from("flatpak:com.example.First", 1000 + port), seq);
+            h.table.handle_new(from("flatpak:com.example.First", 1000 + port), seq, None);
             seq += 1;
         }
-        h.table.handle_new(from("flatpak:com.example.First", 9999), seq);
+        h.table.handle_new(from("flatpak:com.example.First", 9999), seq, None);
         assert_eq!(h.verdict_rx.recv().await, Some((seq, Verdict::Deny)));
 
         // The second is still asked about, though it runs from the same path.
         seq += 1;
-        h.table.handle_new(from("flatpak:com.example.Second", 443), seq);
+        h.table.handle_new(from("flatpak:com.example.Second", 443), seq, None);
         assert!(
             h.verdict_rx.try_recv().is_err(),
             "a second application must not inherit the first's spent budget"
@@ -1289,7 +1428,7 @@ mod tests {
         let mut h = harness("observe-release", 8, Verdict::Allow);
         let (tx, mut prompt_rx) = mpsc::channel(16);
         assert!(h.table.set_handler(tx.clone()));
-        h.table.handle_new(conn("/bin/a", "1.1.1.1:443"), 11);
+        h.table.handle_new(conn("/bin/a", "1.1.1.1:443"), 11, None);
         let DaemonMsg::PromptRequest { id, .. } = prompt_rx.recv().await.unwrap() else {
             panic!("expected PromptRequest");
         };
@@ -1314,7 +1453,7 @@ mod tests {
         let mut h = harness("disabled-sweep", 8, Verdict::Deny);
         let (tx, mut prompt_rx) = mpsc::channel(16);
         assert!(h.table.set_handler(tx.clone()));
-        h.table.handle_new(conn("/bin/a", "1.1.1.1:443"), 21);
+        h.table.handle_new(conn("/bin/a", "1.1.1.1:443"), 21, None);
         let _ = prompt_rx.recv().await.unwrap();
 
         let mut rule = Rule {
@@ -1345,7 +1484,7 @@ mod tests {
         let mut h = harness("timeout", 4, Verdict::Deny);
         let (tx, mut prompt_rx) = mpsc::channel(16);
         assert!(h.table.set_handler(tx.clone()));
-        h.table.handle_new(conn("/bin/a", "1.1.1.1:443"), 9);
+        h.table.handle_new(conn("/bin/a", "1.1.1.1:443"), 9, None);
         let DaemonMsg::PromptRequest { id, .. } = prompt_rx.recv().await.unwrap() else {
             panic!("expected PromptRequest");
         };
@@ -1365,7 +1504,7 @@ mod tests {
         assert!(h.table.set_handler(tx.clone()));
 
         // Armed under timeout=5s.
-        h.table.handle_new(conn("/bin/a", "1.1.1.1:443"), 1);
+        h.table.handle_new(conn("/bin/a", "1.1.1.1:443"), 1, None);
         let DaemonMsg::PromptRequest { deadline_ms: first_deadline, .. } =
             prompt_rx.recv().await.unwrap()
         else {
@@ -1377,7 +1516,7 @@ mod tests {
             .expect("valid settings");
 
         // A prompt created after the change carries the longer deadline.
-        h.table.handle_new(conn("/bin/b", "2.2.2.2:443"), 2);
+        h.table.handle_new(conn("/bin/b", "2.2.2.2:443"), 2, None);
         let DaemonMsg::PromptRequest { deadline_ms: second_deadline, .. } =
             prompt_rx.recv().await.unwrap()
         else {
@@ -1408,7 +1547,7 @@ mod tests {
         let mut h = harness("rule", 4, Verdict::Allow);
         let (tx, mut prompt_rx) = mpsc::channel(16);
         assert!(h.table.set_handler(tx.clone()));
-        h.table.handle_new(conn("/usr/bin/curl", "9.9.9.9:853"), 1);
+        h.table.handle_new(conn("/usr/bin/curl", "9.9.9.9:853"), 1, None);
         let DaemonMsg::PromptRequest { id, .. } = prompt_rx.recv().await.unwrap() else {
             panic!("expected PromptRequest");
         };

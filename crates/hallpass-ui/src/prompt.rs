@@ -1,7 +1,7 @@
 //! State and pure helpers for prompt popup windows.
 
 use hallpass_types::{
-    sanitize_for_display, ClientMsg, Connection, PromptScope, RuleDuration, Verdict,
+    sanitize_for_display, ClientMsg, Connection, PromptContext, PromptScope, RuleDuration, Verdict,
 };
 
 /// State of one pending prompt popup (one immediate viewport each).
@@ -28,11 +28,20 @@ pub struct PromptState {
     pub duration: RuleDuration,
     /// Selected rule scope.
     pub scope: PromptScope,
+    /// What the daemon found out about the process beyond the connection
+    /// itself. Best effort and possibly empty; see [`PromptContext`].
+    pub context: PromptContext,
 }
 
 impl PromptState {
     /// Create popup state with the spec defaults (Session / This port).
-    pub fn new(id: u64, conn: Connection, deadline_ms: u64, received_ms: u64) -> Self {
+    pub fn new(
+        id: u64,
+        conn: Connection,
+        deadline_ms: u64,
+        received_ms: u64,
+        context: PromptContext,
+    ) -> Self {
         Self {
             id,
             conn,
@@ -41,6 +50,7 @@ impl PromptState {
             fronted_ms: None,
             duration: RuleDuration::Session,
             scope: PromptScope::ThisPort,
+            context,
         }
     }
 
@@ -113,6 +123,30 @@ pub fn format_dest(conn: &Connection) -> String {
         Some(domain) => format!("{} ({}):{}", truncate(domain, 80), dst.ip(), dst.port()),
         None => dst.to_string(),
     }
+}
+
+/// Bound for a path shown in full: long enough that a real path is never
+/// cut, short enough that one chosen to be long cannot fill the window.
+const PATH_MAX: usize = 200;
+
+/// A path read off the host, bounded and sanitized for a full-width label.
+pub fn path_text(p: &std::path::Path) -> String {
+    truncate(&p.display().to_string(), PATH_MAX)
+}
+
+/// Bound for a sentence the daemon composed from several bounded parts.
+///
+/// [`UI_TEXT_MAX`] is sized for one label-sized value; a sentence that names
+/// up to `MAX_HASH_MISMATCH_RULES` operator-chosen rules is several of them,
+/// and cutting it there truncates the rule names the operator is being told
+/// to go and open, which is the only thing that sentence is for. This is
+/// generous enough to hold the longest one the daemon can build, and the
+/// prompt body scrolls.
+const SENTENCE_MAX: usize = 700;
+
+/// A daemon-composed sentence, bounded and sanitized for a wrapping label.
+pub fn sentence_text(s: &str) -> String {
+    truncate(s, SENTENCE_MAX)
 }
 
 /// Executable file name for display; falls back to "unknown".
@@ -202,7 +236,7 @@ mod tests {
     #[test]
     fn countdown_restarts_when_the_prompt_reaches_the_front() {
         // Received at t=0 with a 30s deadline, surfaced at t=20s.
-        let mut p = PromptState::new(1, conn(None, None), 30_000, 0);
+        let mut p = PromptState::new(1, conn(None, None), 30_000, 0, PromptContext::default());
         assert!((p.remaining_fraction(20_000) - 1.0 / 3.0).abs() < 1e-6);
         p.fronted_ms = Some(20_000);
         assert_eq!(p.remaining_fraction(20_000), 1.0, "bar restarts full");
@@ -213,7 +247,7 @@ mod tests {
 
     #[test]
     fn remaining_secs_saturates() {
-        let p = PromptState::new(1, conn(None, None), 10_000, 4_000);
+        let p = PromptState::new(1, conn(None, None), 10_000, 4_000, PromptContext::default());
         assert_eq!(p.remaining_secs(4_000), 6);
         assert_eq!(p.remaining_secs(9_400), 0);
         assert_eq!(p.remaining_secs(20_000), 0);
@@ -240,7 +274,7 @@ mod tests {
 
     #[test]
     fn prompt_reply_uses_selected_options() {
-        let mut p = PromptState::new(7, conn(None, None), 10_000, 0);
+        let mut p = PromptState::new(7, conn(None, None), 10_000, 0, PromptContext::default());
         // Defaults per spec: Session / This port.
         assert_eq!(p.duration, RuleDuration::Session);
         assert_eq!(p.scope, PromptScope::ThisPort);

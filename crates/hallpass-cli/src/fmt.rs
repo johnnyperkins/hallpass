@@ -451,14 +451,44 @@ fn format_rule_table(rules: &[Rule], hits: Option<&[RuleHit]>) -> String {
     render_table(Palette::new(false), &header, &rows)
 }
 
-/// Display string for a connection's executable path, or "?" if unknown.
+/// Longest path this prints before eliding the middle of it.
 ///
-/// Sanitized: the path is chosen by the process being judged, and this string
-/// is what the operator reads before allowing or denying it.
+/// A path is bounded by PATH_MAX (4096) and a prompt can carry several, so
+/// unbounded they wrap an 80-column terminal into hundreds of rows and push
+/// the destination and the countdown off the top of it - an unanswerable
+/// prompt anyone who can exec from a deep directory can construct. 200 is
+/// the same bound the GUI prompt window applies to a path.
+const PATH_DISPLAY_MAX: usize = 200;
+
+/// Display string for a path read off the host.
+///
+/// Sanitized and bounded: every path the CLI shows was chosen by whoever
+/// exec'd or created it, an unprivileged user can put control characters or
+/// several kilobytes in one, and the operator reads these lines to decide.
+///
+/// Elides the middle rather than the tail. The head of a path says where it
+/// lives and the tail names the binary, and both matter here; a plain
+/// truncation would leave every deeply nested path reading as the same
+/// prefix.
+pub fn path_display(p: &std::path::Path) -> String {
+    let text = sanitize_for_display(&p.display().to_string()).into_owned();
+    let len = text.chars().count();
+    if len <= PATH_DISPLAY_MAX {
+        return text;
+    }
+    // Char boundaries: a path is arbitrary bytes and the sanitizer leaves
+    // multi-byte characters intact.
+    let keep = PATH_DISPLAY_MAX - 3;
+    let head: String = text.chars().take(keep - keep / 2).collect();
+    let tail: String = text.chars().skip(len - keep / 2).collect();
+    format!("{head}...{tail}")
+}
+
+/// Display string for a connection's executable path, or "?" if unknown.
 pub fn exe_display(conn: &Connection) -> String {
     conn.exe_path
-        .as_ref()
-        .map(|p| sanitize_for_display(&p.display().to_string()).into_owned())
+        .as_deref()
+        .map(path_display)
         .unwrap_or_else(|| "?".to_string())
 }
 

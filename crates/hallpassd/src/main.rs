@@ -278,7 +278,7 @@ async fn main() {
     let dispatcher_prompts = Arc::clone(&prompts);
     tokio::spawn(async move {
         while let Some(task) = prompt_rx.recv().await {
-            dispatcher_prompts.handle_new(task.conn, task.seq);
+            dispatcher_prompts.handle_new(task.conn, task.seq, task.exe_sha256);
         }
     });
 

@@ -124,11 +124,66 @@ impl RuleSet {
     /// the verdict. Keeps binary hashing off the packet path unless a
     /// hash rule is actually in play for this connection.
     pub fn wants_exe_hash_for(&self, conn: &Connection) -> bool {
+        self.hash_pinning_candidates(conn).next().is_some()
+    }
+
+    /// Names of enabled rules that `conn` satisfies in every field except
+    /// the executable hash, which it has and which does not match, at most
+    /// `max` of them in evaluation order.
+    ///
+    /// `exe_sha256` is the hash policy was actually evaluated against. With
+    /// `None` this answers nothing, deliberately: the connection reached a
+    /// prompt without a hash ever being computed (no rule pinned one, or the
+    /// binary was too large or unreadable), and "no hash" is not a mismatch.
+    /// Reporting one would put the loudest warning a prompt can show -
+    /// "the binary asking is not the one your rule pins" - above a
+    /// connection whose binary nobody ever looked at, and, when the fallback
+    /// path did produce a hash for display, above the pinned hash itself.
+    ///
+    /// The comparison is [`CompiledRule::matches`], the predicate that
+    /// declined this connection in the first place, so a named rule is
+    /// always one that really did refuse this binary.
+    ///
+    /// Names rather than rules: this is read by a person on their way to look
+    /// one up.
+    pub fn hash_mismatch_rules(
+        &self,
+        conn: &Connection,
+        exe_sha256: Option<&str>,
+        max: usize,
+    ) -> Vec<String> {
+        let Some(hash) = exe_sha256 else {
+            return Vec::new();
+        };
+        self.hash_pinning_candidates(conn)
+            .filter(|r| !r.matches(conn, Some(hash)))
+            .take(max)
+            .map(|r| r.name.clone())
+            .collect()
+    }
+
+    /// Enabled rules whose hash operand is the only thing standing between
+    /// `conn` and their verdict, in evaluation order.
+    ///
+    /// One definition for two questions the packet path and the prompt path
+    /// must not answer differently: "is a hash worth computing for this
+    /// connection" and "which rules did the hash it produced miss". Written
+    /// twice, a prompt could name rules the engine never consulted, or stay
+    /// silent about the ones it did.
+    fn hash_pinning_candidates<'a>(
+        &'a self,
+        conn: &'a Connection,
+    ) -> impl Iterator<Item = &'a CompiledRule> {
+        // Precomputed at compile time, so a set with no hash-pinning rule in
+        // it costs neither path a scan to find that out.
         self.has_hash_rules
-            && self
-                .rules
-                .iter()
-                .any(|r| r.enabled && r.wants_exe_hash() && r.matches_ignoring_hash(conn))
+            .then(|| {
+                self.rules
+                    .iter()
+                    .filter(move |r| r.enabled && r.wants_exe_hash() && r.matches_ignoring_hash(conn))
+            })
+            .into_iter()
+            .flatten()
     }
 }
 
@@ -620,6 +675,122 @@ mod tests {
                 field: "exe_sha256".to_string()
             }
         );
+    }
+
+    /// What a prompt tells the operator when a hash-pinned rule was written
+    /// for this program and the binary running now is not the one it pins.
+    #[test]
+    fn hash_mismatch_rules_names_the_rules_the_binary_missed() {
+        let pinned = |name: &str, priority: u32, enabled: bool| {
+            rule(
+                name,
+                Action::Allow,
+                priority,
+                enabled,
+                RuleMatch {
+                    exe: Some(PathBuf::from("/usr/bin/curl")),
+                    exe_sha256: Some("ab".repeat(32)),
+                    ..Default::default()
+                },
+            )
+        };
+        let rules = vec![
+            pinned("pin-high", 10, true),
+            pinned("pin-low", 1, true),
+            pinned("pin-off", 20, false),
+            // Pins a hash but is not about this program at all.
+            rule(
+                "other-exe",
+                Action::Allow,
+                30,
+                true,
+                RuleMatch {
+                    exe: Some(PathBuf::from("/usr/bin/wget")),
+                    exe_sha256: Some("cd".repeat(32)),
+                    ..Default::default()
+                },
+            ),
+            // About this program, but decides without a hash, so it is not a
+            // rule the operator is being asked to go and look at.
+            rule(
+                "no-hash",
+                Action::Deny,
+                40,
+                true,
+                RuleMatch {
+                    exe: Some(PathBuf::from("/usr/bin/curl")),
+                    ..Default::default()
+                },
+            ),
+        ];
+        let set = RuleSet::compile(&rules);
+        let pinned_hash = "ab".repeat(32);
+        let other_hash = "cd".repeat(32);
+
+        assert_eq!(
+            set.hash_mismatch_rules(&curl(), Some(&other_hash), 4),
+            ["pin-high", "pin-low"],
+            "only enabled hash-pinning rules that match this connection otherwise"
+        );
+        assert_eq!(
+            set.hash_mismatch_rules(&curl(), Some(&other_hash), 1),
+            ["pin-high"],
+            "capped in evaluation order, so the rule that would have decided comes first"
+        );
+
+        // The whole point of the warning: it must not fire against a binary
+        // that satisfies the rule. Such a connection would normally have been
+        // decided rather than prompted, but a lower-priority deny can prompt
+        // it anyway, and either way the sentence would be a lie.
+        assert!(
+            set.hash_mismatch_rules(&curl(), Some(&pinned_hash), 4).is_empty(),
+            "a binary that has the pinned hash mismatches nothing"
+        );
+
+        // No hash is not a mismatch. The connection reached a prompt without
+        // one being computed (nothing pinned, or the binary was too large or
+        // unreadable), and claiming tampering there is the loudest thing this
+        // window can say about something nobody looked at.
+        assert!(
+            set.hash_mismatch_rules(&curl(), None, 4).is_empty(),
+            "an uncomputed hash is not a failed comparison"
+        );
+
+        let wget = conn(
+            "/usr/bin/wget",
+            "93.184.216.34:443",
+            Proto::Tcp,
+            Some("example.org"),
+            1000,
+        );
+        assert_eq!(
+            set.hash_mismatch_rules(&wget, Some(&pinned_hash), 4),
+            ["other-exe"],
+            "the rule for this exe pins cd..cd, and this binary hashes to ab..ab"
+        );
+        assert!(set
+            .hash_mismatch_rules(&wget, Some(&other_hash), 4)
+            .is_empty());
+    }
+
+    /// A set with no hash-pinning rule in it has nothing to say about a
+    /// hash, and must not pay a scan per prompt to find that out.
+    #[test]
+    fn hash_mismatch_rules_is_empty_without_hash_rules() {
+        let rules = vec![rule(
+            "plain",
+            Action::Allow,
+            10,
+            true,
+            RuleMatch {
+                exe: Some(PathBuf::from("/usr/bin/curl")),
+                ..Default::default()
+            },
+        )];
+        let set = RuleSet::compile(&rules);
+        let hash = "ab".repeat(32);
+        assert!(set.hash_mismatch_rules(&curl(), Some(&hash), 4).is_empty());
+        assert!(!set.wants_exe_hash_for(&curl()));
     }
 
     #[test]

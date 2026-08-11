@@ -148,6 +148,43 @@ handler and a timer is armed for `prompt_timeout_secs`; the reply or the
 timeout sends `(seq, verdict)` back over the verdict channel, and the verdict
 is applied on the thread that owns the queue handle.
 
+That request carries a `PromptContext` alongside the connection: the
+process's ancestry, the executable's SHA-256, the names of any enabled rules
+that match this connection in every field *except* the executable hash and
+whose pinned hash it fails, and how many decisions still in the history ring
+said no to this same application.
+
+It rides `PromptRequest` rather than `Connection` because it is prompt-only:
+on the connection it would ride the event broadcast, syslog, `--json` and the
+history ring for every packet the daemon judges, and the denial count would
+be wrong there anyway, since it counts what happened before a decision and an
+event *is* the decision.
+
+**Nothing sits between entering a prompt in the table and offering it to the
+handler.** The context is built inline on the dispatcher, before the table
+lock, and the request goes out in the same pass. An earlier cut of this built
+the context on a blocking worker so it could read the executable fresh, and
+sent the request afterwards. That is wrong in four ways at once, all worth
+recording because they are what any future "just do this bit asynchronously"
+runs into: the expiry timer is armed alongside the prompt, so a build slower
+than `prompt_timeout_secs` (an executable on a stalled network mount) expires
+a prompt nobody was ever shown, applying the default verdict; `strike_handler`
+then charges that silence to the handler, and three of them evict a GUI that
+was idle and healthy; `expire` frees the table slot while the build runs on,
+so `max_pending` stops bounding the work in flight and wedged blocking-pool
+threads starve every other `spawn_blocking` in the daemon; and delivery stops
+happening in prompt-id order, which the CLI's FIFO queue turns into walking
+the operator through the newest connection while an older deadline burns.
+
+What makes the inline build affordable is that the executable hash is not
+computed there. The verdict thread already computed one if any hash-pinning
+rule could apply, and it is passed along on `PromptTask`. That is the same
+value the engine compared, so the mismatch list cannot disagree with the
+decision that raised the prompt, and it keeps the hash cache's occupancy
+bounded by the hash-pinned rule set rather than by every binary that ever
+prompted. What remains is procfs and memory: an ancestry walk of at most four
+hops, one bounded scan of the history ring, and one rule-set scan.
+
 ## Threads and tasks
 
 The daemon is one multi-threaded tokio runtime plus one std thread.
@@ -163,8 +200,10 @@ The daemon is one multi-threaded tokio runtime plus one std thread.
   blackhole or bypass all new traffic while looking healthy, so the loop
   signals `main` and the process shuts down with a non-zero status.
 - **The prompt dispatcher** (task) drains the prompt channel into the prompt
-  table. It uses `try_send` to the handler client, so a stalled GUI cannot
-  block it; a dropped request is resolved by the timeout.
+  table, building each prompt's context and sending its request in the same
+  pass. It uses `try_send` to the handler client, so a stalled GUI cannot
+  block it; a dropped request is resolved by the timeout. It deliberately
+  does no disk IO: see the decision flow above for what happened when it did.
 - **One expiry timer per prompt** (task) sleeps for the timeout and then
   applies the default verdict to whatever is still pending under that id.
 - **The DNS snoop consumer** (task) drains a *bounded* channel, parses,
@@ -201,8 +240,11 @@ The daemon is one multi-threaded tokio runtime plus one std thread.
 
 Who can block whom: nothing on the tokio side can stall the verdict thread
 through a channel, by construction. The one shared lock between them is the
-event bus history mutex, which the verdict thread takes on every decision and
-an IPC handler takes to answer a history request. Anything else the verdict
+event bus history mutex, which the verdict thread takes on every decision, an
+IPC handler takes to answer a history request, and a prompt context builder
+takes to count how often this application has been denied. All three are
+bounded by the ring's capacity, and the deep copying a reply needs happens
+after the guard is dropped. Anything else the verdict
 thread reads and writes per packet is owned by it outright (the first-seen
 store) or reached through a channel, deliberately: a second shared lock would
 be a second thing an operator request can make a packet wait for. That is why the history
@@ -313,8 +355,8 @@ a new layout produces garbage rather than an error. This is why v2 exists
 (`RuleMatch::exe_sha256`) and why v3 exists (`ConnEvent::enforced` plus three
 `Stats` fields); the request/reply pairs added alongside v3 would not have
 needed a bump on their own, being appended variants. The current version is
-v11 (`Connection::first_seen`); every bump is documented at
-`PROTOCOL_VERSION` with what forced it.
+v12 (`PromptContext` on `DaemonMsg::PromptRequest`); every bump is documented
+at `PROTOCOL_VERSION` with what forced it.
 
 ## Startup ordering invariants
 
