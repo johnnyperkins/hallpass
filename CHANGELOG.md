@@ -37,12 +37,12 @@ carries what an upgrade changes on a running host.
   one. The GUI's Rules tab gets the same three: the column, a tag picker that
   narrows the table, and Enable all / Disable all for the picked tag (shown
   only once one is picked, since they act on the set rather than on what is
-  displayed). Tags label rules; they never match connections. A rule already in the
-  requested state is left alone, a tag no rule carries is an error from both
-  the listing and the toggle, and a rule whose file cannot be written keeps
-  the state it had and is named in the CLI's non-zero exit. An unusable tag
-  in a rules.d file never costs that rule its enforcement - the tag is
-  dropped with a journal warning and the rule still filters - while `rules
+  displayed). Tags label rules; they never match connections. A rule already
+  in the requested state is left alone, a tag no rule carries is an error from
+  both the listing and the toggle, and a rule whose file cannot be written
+  keeps the state it had and is named in the CLI's non-zero exit. An unusable
+  tag in a rules.d file never costs that rule its enforcement: the tag is
+  dropped with a journal warning and the rule still filters, while `rules
   add`, an IPC add and the GUI editor refuse one outright.
 
   Two things to know before using it. Rule files written before this keep
@@ -128,12 +128,12 @@ carries what an upgrade changes on a running host.
   application that happens to run from the same sandbox path. A deny stays
   scoped to the executable alone: the operand only narrows, and a block that
   quietly stopped applying because an application turned up without a
-  recognized cgroup scope is the wrong way to fail. A cgroup name is chosen
-  by whoever created the cgroup, and any user can start a command under a
-  scope of their choosing,
-  so `app_id` scopes rules the way `cmdline_contains` does and is not a
-  boundary; pair it with `exe` or `exe_sha256` where that matters. The
-  protocol bump means daemon, CLI and UI must be upgraded together.
+  recognized cgroup scope is the wrong way to fail. A cgroup name is chosen by
+  whoever created the cgroup, and any user can start a command under a scope
+  of their choosing, so `app_id` scopes rules the way `cmdline_contains` does
+  and is not a boundary; pair it with `exe` or `exe_sha256` where that
+  matters. The protocol bump means daemon, CLI and UI must be upgraded
+  together.
 
 - **Flow accounting: how much each connection moved (wire protocol v9).**
   The daemon decides a connection from its first packet and never saw its
@@ -235,8 +235,8 @@ carries what an upgrade changes on a running host.
   AppIndicator extension, which Ubuntu ships enabled). Closing the main
   window parks it behind the icon instead of quitting, so prompts keep
   appearing while the window is out of the way; the icon's menu (or a
-  click on it) brings the window back. Quit - the status-bar button or
-  the tray menu item - still denies open prompts once, releases the
+  click on it) brings the window back. Quit (the status-bar button or the
+  tray menu item) still denies open prompts once, releases the
   prompt-handler slot, and exits. The installed autostart entry now
   launches `hallpass-ui --hidden`, so login gets a prompt surface with no
   window in the way; the app-menu entry still opens the window. On a

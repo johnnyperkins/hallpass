@@ -64,9 +64,9 @@ Binaries land in `target/release/`: `hallpassd`, `hallpass-cli`, `hallpass-ui`.
 ### eBPF attribution (recommended)
 
 eBPF attribution records the owning process at `connect()` time in the
-kernel, so even processes that exit before the first packet is inspected
-attribute correctly; procfs attribution races those and can come up empty.
-The eBPF programs need a nightly toolchain (picked up automatically via
+kernel, so a process that exits before its first packet is inspected still
+attributes correctly; procfs races those and can come up empty. The eBPF
+programs need a nightly toolchain (picked up automatically from
 `crates/hallpass-ebpf/rust-toolchain.toml`, including `rust-src`) and
 [bpf-linker](https://github.com/aya-rs/bpf-linker):
 
@@ -78,8 +78,8 @@ cargo build --release --features ebpf -p hallpassd
 cargo xtask build
 ```
 
-Building the object is only needed if you do not already have one. The
-`ebpf` feature embeds whichever object it finds first:
+The `ebpf` feature embeds an object; it does not build one. It takes the
+first it finds:
 
 1. `HALLPASS_EBPF_OBJ`, if set, pointing at the object file.
 2. `crates/hallpassd/prebuilt/hallpass-ebpf`, for a vendored or packaged
@@ -88,18 +88,17 @@ Building the object is only needed if you do not already have one. The
    build-ebpf` writes.
 
 So a prebuilt object can be dropped in or pointed at, and the daemon
-itself then builds on stable with no nightly and no bpf-linker. If none
-of the three exists the build fails with these instructions rather than
-an error from inside the embedding macro.
+then builds on stable with no nightly and no bpf-linker. With none of
+the three the build fails with these instructions rather than an error
+from inside the embedding macro.
 
-At load time the daemon resolves the kernel struct offsets the programs
-read (`sock_common`, `msghdr`) from the running kernel's BTF
+At load time the daemon reads the kernel struct offsets the programs
+need (`sock_common`, `msghdr`) from the running kernel's BTF
 (`/sys/kernel/btf/vmlinux`) and patches them into the object, so the
 programs are not tied to one kernel version or architecture layout.
-Kernels without BTF fall back to compiled-in x86_64 offsets. At runtime
-the daemon loads the eBPF object if it was compiled in and the kernel
-accepts it; otherwise it silently falls back to procfs attribution, and
-any flow eBPF cannot resolve is retried through procfs.
+Kernels without BTF fall back to compiled-in x86_64 offsets. If no
+object was compiled in, or the kernel rejects it, attribution falls back
+to procfs; so does any individual flow eBPF cannot resolve.
 
 ## Installing
 
@@ -144,43 +143,46 @@ systemctl enable --now hallpassd
 Configuration lives in `/etc/hallpass/config.toml` (default verdict, prompt
 timeout, queue number, socket path, rules directory).
 
-A deny rule applies to established flows too, not only the next
-connection: on every ruleset change (and on an observe-to-enforce flip)
+A deny rule applies to established flows, not only to the next
+connection. On every ruleset change (and on an observe-to-enforce flip)
 the daemon deletes the conntrack entries of flows the changed ruleset
 explicitly denies, so each one's next packet is judged as a new
 connection and the rule catches it there. Flows the ruleset leaves
 unmatched are never touched (a rule edit cannot cause a prompt storm),
-observe mode kills nothing, and every kill is logged with the rule that
-caused it. Best-effort by design: the daemon finds these flows in its
-recent-decision history (the newest 1024 decisions, kept since daemon
-start), so a flow whose decision has aged out of that window, or that
-predates the daemon, keeps running until it ends; a rule that matches
-only by executable hash cannot identify flows to kill; and a flow whose
-peer is transmitting can re-establish its conntrack entry from the
-unfiltered inbound side before its next outbound packet, surviving the
-kill until it goes quiet. `kill_established = false` restores the old
-next-connection-only behavior.
+observe mode kills nothing, and every kill is logged with the rule
+behind it.
 
-Setting `mode = "observe"` there evaluates policy and records what it
-decided without applying any of it. Nothing is blocked: a rule that would
-deny is recorded as a deny and the connection goes out anyway, and unmatched
-connections record `default_verdict` and never prompt, because answering a
-dialog that changes nothing would be misleading. It exists because the honest
-answer to "what will this policy break" cannot be read off the rule files; it
-depends on what the host actually talks to. So the way to size a rollout is
-to run in observe mode, watch `hallpass-cli top` and `hallpass-cli events`
-for a while, then fold what was observed into a reviewable ruleset with
+Best effort by design. Candidates come from the recent-decision history
+(the newest 1024 decisions, kept since daemon start), so a flow older
+than that window, or predating the daemon, keeps running until it ends;
+a rule matching only by executable hash cannot identify flows to kill;
+and a flow whose peer keeps transmitting can re-establish its conntrack
+entry from the unfiltered inbound side before its next outbound packet,
+surviving the kill until it goes quiet. `kill_established = false`
+restores next-connection-only behavior.
+
+`mode = "observe"` evaluates policy and records each decision without
+applying it. Nothing is blocked: a rule that would deny is recorded as a deny
+and the connection goes out anyway, and unmatched connections record
+`default_verdict` and never prompt, because a dialog that changes nothing
+would mislead.
+
+It exists because what a policy will break cannot be read off the rule
+files; it depends on what the host actually talks to. So the way to size a
+rollout is to run in observe mode, watch `hallpass-cli top` and `hallpass-cli
+events` for a while, fold what you saw into a reviewable ruleset with
 `hallpass-cli suggest` (one proposed allow rule per executable, protocol,
 port and destination, wildcarded where enough hosts share a suffix; the
-output is a `rules export`-shaped document for `rules import`), and only
-then enforce. The GUI has an **Enforce** switch in its
-tab bar that flips the mode at runtime - active filtering on, passive
-watching off - lasting until the daemon restarts; the config file decides
-the mode it starts in. The mode is visible in `hallpass-cli status`, in
-every event as an unenforced verdict (a recorded block reads `WOULD-DENY`,
-never `DENY`), on syslog export as `enforced="false"`, in a warning at
-startup, and as a banner in the GUI. **It is not a security posture.** While
-it is on, this host is not filtered.
+output is a `rules export`-shaped document for `rules import`), and only then
+enforce.
+
+The GUI's tab bar has an **Enforce** switch that flips the mode at runtime,
+lasting until the daemon restarts; the config file decides the mode it starts
+in. The mode is visible in `hallpass-cli status`, in every event as an
+unenforced verdict (a recorded block reads `WOULD-DENY`, never `DENY`), on
+syslog export as `enforced="false"`, in a warning at startup, and as a banner
+in the GUI. **It is not a security posture.** While it is on, this host is
+not filtered.
 
 Persistent rules are TOML files in `/etc/hallpass/rules.d/`, one rule per
 file:
@@ -224,16 +226,16 @@ Tags label a rule; they never match a connection. `hallpass-cli rules --tag
 work` lists the set, and `hallpass-cli rules toggle --tag work off` disables
 all of it as one change, so no connection is ever judged against half of it.
 A rule already in the requested state is left alone, and a tag no rule
-carries is an error from both - a typo fails loudly rather than reporting an
-empty set. Tags are set when the rule is written: `rules add --tag work`, the
-`tags` key in the file, or the Tags field in the GUI editor.
+carries is an error from both commands: a typo fails loudly rather than
+reporting an empty set. Tags are set when the rule is written: `rules add
+--tag work`, the `tags` key in the file, or the Tags field in the GUI editor.
 
 Because a tag cannot change what a rule matches, an unusable one never costs
 a rule its enforcement: a rules.d file whose `tags` are misspelled, repeated
-or over the cap still loads and enforces, with the unusable entries dropped
-and named in the journal. The stricter entrances refuse instead, because
-there the cost is an error message rather than a rule that stopped filtering:
-`rules add`, an IPC add, and the GUI editor all reject a bad tag outright.
+or over the cap still loads and filters, with the bad entries dropped and
+named in the journal. `rules add`, an IPC add and the GUI editor reject a bad
+tag outright instead, because there the cost is an error message rather than
+a rule that stopped filtering.
 
 **Adding a rule under an existing name replaces it wholesale**, which is how
 a rule's tags are changed from the CLI - and also means everything else must
@@ -272,26 +274,26 @@ of them can delete a deny rule; both transitions are logged with the peer's
 uid and pid.
 
 Three things to know before relying on it. **Only new connections are
-judged**, so everything already established keeps running - lockdown is not a
+judged**, so everything already established keeps running: lockdown is not a
 kill switch for open flows. **The verdict queue's fail-open flag is fixed at
 startup**, so on the shipped `queue_bypass = true` default a kernel-side
 queue overflow still accepts packets the posture would have denied; the flag
 cannot be changed on a live queue without losing the packets already on it,
-and `status` and `doctor` both report it. And **a locked-down host usually cannot resolve
-names**: unless something pinned covers DNS, the resolver's own upstream
-query is denied like anything else, and rules written against a `domain` then
-stop matching, because a connection only carries a domain when the daemon saw
-its lookup. `lockdown on` prints what survives and warns when nothing pinned
-covers DNS; it also refuses outright when *no* rule survives, unless you pass
-`--force` to say you mean it.
+and `status` and `doctor` both report it. And **a locked-down host usually
+cannot resolve names**: unless something pinned covers DNS, the resolver's
+own upstream query is denied like anything else, and `domain` rules then stop
+matching, because a connection only carries a domain when the daemon saw its
+lookup. `lockdown on` prints what survives and warns when nothing pinned
+covers DNS; it refuses outright when *no* rule survives, unless you pass
+`--force`.
 
 The one rule the installer drops in, `example-allow-dns.toml`, ships with
 `enabled = false`. Matching on port and protocol alone would let every local
-process send arbitrary UDP to port 53 on any host, which is a standard
-exfiltration channel, so scope it (with `dest` or `exe`) before enabling it.
-Reinstalling never overwrites it, so your edits survive upgrades. **If you
-installed before this changed, check that file:** the old copy shipped
-`enabled = true` and an upgrade will not touch it.
+process send arbitrary UDP to port 53 on any host, a standard exfiltration
+channel, so scope it (with `dest` or `exe`) before enabling it. Reinstalling
+never overwrites it, so your edits survive upgrades. **If you installed
+before this changed, check that file:** the old copy shipped `enabled = true`
+and an upgrade will not touch it.
 
 With `flow_accounting = true` the daemon also records how much each
 connection moved. It joins the conntrack destroy multicast group and, as
@@ -302,10 +304,10 @@ the flow was attributed to and how much it sent and received, and folds
 the totals into `hallpass-cli status` (`flows accounted`, `flow bytes`,
 `flow packets`). The group carries every conntrack teardown on the host,
 so only flows matching a connection still in the daemon's decision history
-are counted - the totals are hallpass-governed traffic, not whole-host
+are counted: the totals are hallpass-governed traffic, not whole-host
 volume, and a hallpass flow whose decision has aged out of that short
-history is missed. It is observe-only: it reads notifications the kernel
-sends anyway and never affects a verdict.
+history is missed. Observe-only: it reads notifications the kernel sends
+anyway and never affects a verdict.
 
 Decided connections can also be exported to syslog (local socket or a
 remote collector) for SIEM ingestion, as RFC 5424 structured data or JSON:
@@ -324,8 +326,8 @@ control characters are neutralized, so a process cannot forge log records
 through its own command line. Export datagrams do not need a rule: the
 daemon marks its own export socket and the ruleset accepts that mark from
 root-owned sockets, so they never enter the verdict queue. Filtering them
-would not just cost logs under a default-deny posture, it would feed the
-daemon its own tail - an unanswered UDP flow stays `ct state new`, so each
+would not only cost logs under a default-deny posture, it would feed the
+daemon its own tail: an unanswered UDP flow stays `ct state new`, so each
 exported event would be decided as a new connection and emit the event that
 produces the next datagram.
 
@@ -351,12 +353,12 @@ hallpass-cli sessions                      # grants open right now
 
 `run` is for the command you are about to run once: while it runs,
 connections from it and everything it spawns that no rule matches are
-allowed instead of prompting, and the grant disappears when it exits. It is
-the alternative to writing a permanent allow rule for a build, an installer,
-or a test suite - and to answering forty prompts for one of them. Events
-allowed this way name the grant (`run-session:7`) instead of a rule, so they
-are visible in `events`, `top`, syslog and the GUI like any other decision,
-and `suggest` leaves them out of the rules it proposes.
+allowed instead of prompting, and the grant ends when it exits. It is the
+alternative to a permanent allow rule for a build, an installer or a test
+suite, and to answering forty prompts for one of them. Events allowed this way
+name the grant (`run-session:7`) instead of a rule, so they show in `events`,
+`top`, syslog and the GUI like any other decision, and `suggest` leaves them
+out of the rules it proposes.
 
 `explain` asks what policy would do with a connection without sending a
 packet. It answers with the verdict, then every rule in evaluation order and
@@ -375,15 +377,15 @@ deny-all              0  not reached
 It evaluates through the same predicate the packet path uses, so an
 explanation cannot disagree with enforcement. The connection is described
 entirely by the flags, so it answers for the facts you state: nothing is
-verified against `/proc`, and `--exe-sha256` has to be supplied if a
+verified against `/proc`, and `--exe-sha256` must be supplied when a
 hash-pinning rule is in play, since the daemon will not hash a path a client
 named for it.
 
 `rules --stats` adds hit counts and a last-hit time to the listing, which is
 how a rule that never matches anything becomes visible. Counts are per rule
 name and survive a rules-directory reload, so editing one file keeps its
-history; they reset when the daemon restarts, because this answers "is this
-rule doing anything", not "what happened last month".
+history; they reset on daemon restart, because this answers "is this rule
+doing anything", not "what happened last month".
 
 `rules export` writes the ruleset as one TOML document using the same field
 names as the files in `rules.d`, so it can be read, diffed, and checked into
@@ -415,31 +417,30 @@ Connections carry whether they are the first the daemon has seen from an
 application, and the first that application has made to a destination. A
 prompt shows a **NEW** badge and says which of the two it is, `events` marks
 the line `new=app`, `new=dest` or `new=app,dest`, and syslog export carries a
-`first_seen` field. It is an annotation and never a verdict: the record
-behind it is bounded and lossy in one direction only, so an application the
-daemon has forgotten reads as new a second time rather than a familiar one
-being flagged never. What the record holds is a list of applications and the
-destinations they reached, in `/var/lib/hallpass/seen.toml` (root-only,
-rewritten at most once a minute); `first_seen = false` in the config turns the
-whole thing off and writes nothing.
+`first_seen` field. It is an annotation, never a verdict: the record behind
+it is bounded and lossy in one direction only, so a forgotten application
+reads as new a second time rather than a familiar one going unflagged. The
+record is a list of applications and the destinations they reached, in
+`/var/lib/hallpass/seen.toml` (root-only, rewritten at most once a minute);
+`first_seen = false` in the config turns it off and writes nothing.
 
 A prompt also carries what the daemon can find out about the process beyond
 the connection itself, which neither `events` nor export shows because only a
-prompt has anyone to inform: what launched it (its ancestors' executables,
+prompt has someone to inform: what launched it (its ancestors' executables,
 nearest parent first), its executable's SHA-256, and how often decisions
 still in the daemon's history said no to this same application. Loudest of
-the four, when it appears: **the names of enabled rules that this binary
-fails only on the executable hash**. That is a rule written for this program
-at this destination whose pinned hash the binary running now does not have,
-which is exactly what `exe_sha256` is bought to catch, and without it the
-operator would see only an unexplained prompt for something they had already
-made a rule about. Each part is best effort and absent on its own: a process
-can exit between the packet and the prompt, and the history is bounded and
-lost on restart, so a count of zero means "nothing in what is still
-remembered", not "never". The hash is the one the daemon computed while
-deciding the packet, so it is shown when a hash-pinning rule could have
-applied and not otherwise; with no hash there is no mismatch to report, and
-the warning stays silent rather than accusing a binary nobody hashed.
+the four, when it appears: **the names of enabled rules this binary fails
+only on the executable hash**. That is a rule written for this program at
+this destination whose pinned hash the running binary does not have, exactly
+what `exe_sha256` is bought to catch; without it the operator sees only an
+unexplained prompt for something they had already made a rule about. Each
+part is best effort and absent on its own: a process can exit between the
+packet and the prompt, and the history is bounded and lost on restart, so a
+count of zero means "nothing in what is still remembered", not "never". The
+hash is the one the daemon computed while deciding the packet, so it appears
+when a hash-pinning rule could have applied and not otherwise; with no hash
+there is no mismatch to report, and the warning stays silent rather than
+accusing a binary nobody hashed.
 
 The GUI (`hallpass-ui`) connects to the same socket, pops up a dialog for each
 unmatched connection (allow/deny, scope, duration), and offers a management
@@ -468,10 +469,9 @@ attacker with root, who can delete the nftables table outright.
   `queue_bypass = false` to invert it and have new connections dropped
   whenever no live daemon is deciding them (daemon dead, queue full). In
   that mode a panic deliberately leaves the table up, so enforcement holds
-  until the daemon restarts; clean shutdown still removes it. The
-  DNS snoop queues always keep `bypass` - they are observe-only, and
-  dropping DNS with the daemon gone would cost availability without adding
-  enforcement.
+  until the daemon restarts; clean shutdown still removes it. The DNS snoop
+  queues always keep `bypass`: they are observe-only, and dropping DNS with
+  the daemon gone would cost availability without adding enforcement.
 - **IPC socket**: `/run/hallpass/hallpass.sock`, directory 0750, socket 0660
   root:hallpass. Only root and the `hallpass` group can manage rules or answer
   prompts. The socket is created inside a 0700 staging directory and moved
@@ -525,9 +525,9 @@ attacker with root, who can delete the nftables table outright.
   kernels older than 5.8, where `bpf()` requires it, eBPF attribution falls
   back to procfs and logs why; and on kernel lines whose uprobe perf PMU
   demands it (kprobes accept `CAP_PERFMON`), the libc-resolver DNS snoop is
-  unavailable under the unit and logs why - the wire snooper still covers
-  plaintext port 53, so the loss is names resolved through a stub resolver
-  or an encrypted upstream. Both are restored per host by a
+  unavailable under the unit and logs why. The wire snooper still covers
+  plaintext port 53 there, so the loss is names resolved through a stub
+  resolver or an encrypted upstream. Both are restored per host by a
   `systemctl edit hallpassd` drop-in re-adding `CAP_SYS_ADMIN`; the unit
   file shows the exact lines.
 - **Config file trust**: the config is read under the same ownership and
@@ -574,14 +574,13 @@ attacker with root, who can delete the nftables table outright.
 ## Limitations
 
 - **DoT / DoH are invisible to the wire snooper**: it only sees names
-  resolved through plaintext UDP port 53. With the `ebpf` feature the
-  daemon also snoops the libc resolver entry points (`getaddrinfo`, the
+  resolved through plaintext UDP port 53. With the `ebpf` feature the daemon
+  also snoops the libc resolver entry points (`getaddrinfo`, the
   `gethostbyname` family, and their reentrant `_r` variants) via uprobes,
-  which catches
-  resolutions through systemd-resolved's stub and encrypted upstreams as
-  long as the process uses the system resolver. Statically linked
-  programs, non-libc runtimes, and apps doing their own DoH still match
-  by IP/port/exe only.
+  which catches resolutions through systemd-resolved's stub and encrypted
+  upstreams as long as the process uses the system resolver. Statically
+  linked programs, non-libc runtimes, and apps doing their own DoH still
+  match by IP/port/exe only.
 - Only new connections (`ct state new`) are evaluated; established flows are
   never re-checked.
 - **"NEW" is an observation, not a claim about the past.** The first-seen
@@ -590,16 +589,15 @@ attacker with root, who can delete the nftables table outright.
   loss forgets the last minute of it; and it keys on the same identity a rule
   would (executable plus `app_id`), which a process can influence for the same
   reason it can influence that rule. Every one of those errs toward flagging
-  something familiar, which is the harmless direction. The absence of a flag
-  is the weaker signal: it can also mean the daemon is not tracking, which
+  something familiar, the harmless direction. The absence of a flag is the
+  weaker signal: it can also mean the daemon is not tracking, which
   `--json`'s `first_seen: null` distinguishes and a text line does not.
-  Resolver queries are deliberately not annotated at all, since a new
-  program's DNS lookup would otherwise spend its first sighting on a packet
-  nobody judges. And because the record is written as it is reported, exactly
-  one event per application and destination ever carries the field: syslog
-  export is an ordinary event subscriber, so a lagging or unreachable
-  collector can lose that one line, and an alert built on it will miss that
-  first contact.
+  Resolver queries are deliberately not annotated, since a new program's DNS
+  lookup would otherwise spend its first sighting on a packet nobody judges.
+  And because the record is written as it is reported, exactly one event per
+  application and destination ever carries the field: syslog export is an
+  ordinary event subscriber, so a lagging or unreachable collector can lose
+  that line, and an alert built on it will miss that first contact.
 - **Prompt context describes, it does not attest.** The ancestry a prompt
   shows is read from `/proc` after the fact, so a process reparented to init
   the moment its parent exited has no launcher left to name, and every path
@@ -608,9 +606,8 @@ attacker with root, who can delete the nftables table outright.
   executable hash carries the caveat below about which executable a process
   is attributed to. The denial count is bounded by the daemon's in-memory
   history and lost on restart. Each part is absent rather than approximated
-  when it cannot be established, which is why a prompt showing none of them
-  is a prompt about something the daemon could not find out more about, not a
-  clean bill of health.
+  when it cannot be established, so a prompt showing none of them means the
+  daemon could not find out more, not a clean bill of health.
 - **A process can choose which executable it is attributed to.** Attribution
   resolves the executable from `/proc/<pid>/exe` after the connection is
   observed, and a socket descriptor survives `execve`. So a process can start

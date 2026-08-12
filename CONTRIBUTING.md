@@ -23,11 +23,11 @@ The kernel crate needs a different target (`bpfel-unknown-none`), a
 with `rust-src`. None of that is spelled out in the task: the target and
 target directory come from `crates/hallpass-ebpf/.cargo/config.toml`, the
 toolchain from `crates/hallpass-ebpf/rust-toolchain.toml`, which rustup
-installs on first use. The task's own contribution is to clear
-`RUSTUP_TOOLCHAIN` and `CARGO` from the environment, so the nested build
-picks up the crate's toolchain instead of the one that invoked xtask. That
-is the part that is easy to get wrong by hand, and it is why there is one
-owner of the recipe rather than a documented incantation.
+installs on first use. The task's own contribution is clearing
+`RUSTUP_TOOLCHAIN` and `CARGO` from the environment, so the nested build picks
+up the crate's toolchain instead of the one that invoked xtask. That is the
+part easy to get wrong by hand, and why there is one owner of the recipe
+rather than a documented incantation.
 
 [bpf-linker](https://github.com/aya-rs/bpf-linker) must be on `PATH`
 (`cargo install bpf-linker`; CI pins `--locked --version 0.10.4`).
@@ -71,9 +71,9 @@ for the feature build.
 Clippy needs three invocations, not one. The workspace run cannot see code
 behind the `ebpf` feature, and neither workspace run can see
 `crates/hallpass-ebpf` at all, because it is deliberately not a workspace
-member. That left the one crate in the project containing `unsafe` (the
-workspace is `unsafe_code = "deny"`) and running in the kernel as the only
-crate never linted, which is what `cargo xtask clippy-ebpf` exists to fix.
+member. That left the one crate containing `unsafe` (the workspace is
+`unsafe_code = "deny"`), and the one running in the kernel, as the only crate
+never linted, which is what `cargo xtask clippy-ebpf` exists to fix.
 
 `cargo xtask doc` treats rustdoc warnings as errors on purpose. The doc
 comments in this tree carry the security reasoning and lean on intra-doc
@@ -85,16 +85,16 @@ The GUI is covered by that plain workspace run, with no display and no daemon.
 `HallpassApp` owns both ends of its channel pair, so a test builds one with
 `HallpassApp::with_channels`, feeds it `UiEvent`s and asserts on the
 `ClientMsg`s that come back. That seam is where the volume goes, because the
-GUI defects this project has had to fix were state logic that happened to live
-behind a window rather than anything to do with drawing: an edit applied
-before the daemon agreed to it, a backfill appended twice, a claim about
-enforcement made before anything had said so. Properties that genuinely need a
-laid-out widget tree use `egui_kittest`, which reads the AccessKit tree and
-needs no GPU: which button the prompt window's keyboard traversal reaches
-first, and the paths that exist only because a widget was operated, where what
-is worth proving is that the operation reaches the state logic at all. Its
-`snapshot` and `wgpu` features are deliberately left off: pixel diffing is the
-flaky part and proves nothing these tests do not.
+GUI defects this project has had to fix were state logic living behind a
+window rather than anything to do with drawing: an edit applied before the
+daemon agreed to it, a backfill appended twice, a claim about enforcement made
+before anything had said so. Properties that genuinely need a laid-out widget
+tree use `egui_kittest`, which reads the AccessKit tree and needs no GPU:
+which button the prompt window's keyboard traversal reaches first, and paths
+that exist only because a widget was operated, where what matters is that the
+operation reaches the state logic at all. Its `snapshot` and `wgpu` features
+are deliberately left off: pixel diffing is the flaky part and proves nothing
+these tests do not.
 
 There is no `cargo fmt` gate. The tree is hand-formatted.
 
@@ -151,11 +151,11 @@ one's socket or `/etc/hallpass`.
 
 Interception is off in that mode: binding an nfqueue needs `CAP_NET_ADMIN`,
 so the bind fails, no nftables table is installed, and no packet is judged.
-What does work is everything a client talks to, which is the IPC server, the
-rule store and its directory watcher, the prompt table, events, and stats.
-That is the entire surface `hallpass-cli` and `hallpass-ui` are written
-against, so both can be developed and driven end to end without root. The
-task prints the socket path and the commands to point a client at it.
+What does work is everything a client talks to: the IPC server, the rule
+store and its directory watcher, the prompt table, events, and stats. That is
+the entire surface `hallpass-cli` and `hallpass-ui` are written against, so
+both can be developed and driven end to end without root. The task prints the
+socket path and the commands to point a client at it.
 
 ## Commits
 

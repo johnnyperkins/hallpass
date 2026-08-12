@@ -71,9 +71,9 @@ A new outbound connection then travels like this:
    records pid and uid at `connect()` time from a kprobe on
    `tcp_v4_connect`/`tcp_v6_connect` (and the UDP `sendmsg` path), so a
    process that exits before its first packet is inspected still attributes.
-   Procfs is the fallback and the retry for anything eBPF cannot resolve: it
-   resolves the flow's local address to the socket inode and owning uid, then
-   walks `/proc/*/fd/*` to find the pid. The address half is one
+   Procfs is the fallback, and the retry for anything eBPF cannot resolve: it
+   maps the flow's local address to the socket inode and owning uid, then
+   walks `/proc/*/fd/*` for the pid. The address half is one
    `NETLINK_SOCK_DIAG` lookup on the protocols a startup probe proved this
    kernel answers, and a whole-table read of
    `/proc/net/{tcp,tcp6,udp,udp6}` otherwise (`udp_diag` is a separate,
@@ -85,12 +85,12 @@ A new outbound connection then travels like this:
    A cached positive hit is revalidated before use, because source ports are
    reused and serving a stale entry would hand the old process's identity,
    and its allow rules, to whatever owns the port now. Revalidation is three
-   questions, and each rules out a different way the entry can have gone
-   wrong: does the recorded process still hold the recorded socket inode
-   (the flow is the same one), is its start time unchanged (the pid was not
-   recycled), and does its exe symlink still read the same (it did not exec
-   in place). An entry the source could not attach an inode to is never
-   served from the cache at all.
+   questions, each ruling out a different way the entry can have gone wrong:
+   does the recorded process still hold the recorded socket inode (the flow
+   is the same one), is its start time unchanged (the pid was not recycled),
+   and does its exe symlink still read the same (it did not exec in place).
+   An entry the source could not attach an inode to is never served from the
+   cache at all.
 
 5. **Annotated with a domain.** The destination IP is looked up in the
    IP-to-domain cache. Two independent snoopers fill that cache. The wire
@@ -123,10 +123,18 @@ A new outbound connection then travels like this:
    apply, because hashing reads the binary off disk on the verdict thread.
 
 7. **Decided, or held.** A match produces a verdict, a rule name, and the
-   connection. No match consults the live session grants, and otherwise
-   produces a prompt. Either way the decision is counted, the rule's hit
-   counter is bumped, and an event is emitted before the packet is handed
-   back.
+   connection. No match consults the lockdown posture first and the live
+   session grants second, and otherwise produces a prompt. Either way the
+   decision is counted, the rule's hit counter is bumped, and an event is
+   emitted before the packet is handed back.
+
+   The posture is read before the grant because a grant is a prompt
+   suppressor that allows: consulting it first would let anything started
+   under `hallpass-cli run` walk straight through the posture, and a build
+   script is exactly what tends to be running when someone reaches for one.
+   Both are read off the same ruleset snapshot that just failed to match, so
+   a posture lifted between the match and the check cannot deny a connection
+   against a set that would have allowed it.
 
    The grant check sits in the no-match arm on purpose: a session
    (`hallpass-cli run`) suppresses a question, it does not answer one, so an
@@ -157,12 +165,12 @@ For the prompt path, the packet's `nfq::Message` stays in a map on the
 verdict thread keyed by a local sequence number, and only the sequence number
 and the `Connection` cross to the async side. The prompt table coalesces by
 (executable, application id, protocol, destination IP, destination port), so
-one dialog can cover several held packets. If no client holds the prompt-handler slot, or
-the pending table is full, the connection resolves immediately with
-`default_verdict` rather than waiting. Otherwise a request goes to the
-handler and a timer is armed for `prompt_timeout_secs`; the reply or the
-timeout sends `(seq, verdict)` back over the verdict channel, and the verdict
-is applied on the thread that owns the queue handle.
+one dialog can cover several held packets. If no client holds the
+prompt-handler slot, or the pending table is full, the connection resolves
+immediately with `default_verdict` rather than waiting. Otherwise a request
+goes to the handler and a timer is armed for `prompt_timeout_secs`; the reply
+or the timeout sends `(seq, verdict)` back over the verdict channel, and the
+verdict is applied on the thread that owns the queue handle.
 
 That request carries a `PromptContext` alongside the connection: the
 process's ancestry, the executable's SHA-256, the names of any enabled rules
@@ -269,9 +277,9 @@ bounded by the ring's capacity, and the deep copying a reply needs happens
 after the guard is dropped. Anything else the verdict
 thread reads and writes per packet is owned by it outright (the first-seen
 store) or reached through a channel, deliberately: a second shared lock would
-be a second thing an operator request can make a packet wait for. That is why the history
-reply is capped by both count and bytes: the verdict thread waits for exactly
-one bounded copy.
+be a second thing an operator request can make a packet wait for. That is why
+the history reply is capped by both count and bytes: the verdict thread waits
+for exactly one bounded copy.
 
 ## Fail-open, fail-closed, and observe mode
 
@@ -354,6 +362,120 @@ snapshot, `enforced="false"` on syslog export, `WOULD-DENY` rather than
 **Observe mode is not a security posture.** Nothing is blocked while it is
 on. It sizes a rollout; it does not defend a host.
 
+## Rule tags
+
+A tag is a label on a rule. It is never a match operand, and that one fact
+decides everything else about it.
+
+Because a tag cannot change what a rule matches, the two entrances validate
+differently on purpose. A rules.d file is already policy, so `retain_valid_tags`
+drops the entries that are malformed, repeated or over the cap, names them in
+the journal, and loads the rule: refusing the file instead would mean
+`tags = ["Prod"]` on a deny rule silently passes the traffic that rule exists
+to stop. An interactive entrance (`rules add`, an IPC add, the GUI editor)
+calls `validate_tags` and refuses, because there the cost is an error message.
+Duplicates are refused rather than folded, since `["work", "work"]` is a typo
+for a tag the operator meant to write. Both the grammar and the list rules
+(count cap, repeats) live in `validate_tags` rather than at each entrance: the
+first cut had the CLI checking repeats but not the count, so nine `--tag` flags
+passed client-side validation and were refused only by the daemon, which is
+the round trip a client-side check exists to avoid.
+
+`toggle_tag` is `set_enabled` with a tag predicate, and it is one change:
+one lock over the entries, every affected file persisted under that lock, one
+recompile at the end. Nothing is ever judged against half a set. A rule
+already in the requested state is skipped, so `changed` counts what actually
+moved; a rule whose file cannot be written has its in-memory state reverted
+and is returned by name, so a partial disk failure cannot leave memory and
+disk disagreeing. A tag no rule carries is an error, not an empty success: it
+is nearly always a typo, and a quiet zero reads as "your rules are disabled".
+
+## The lockdown posture
+
+Lockdown narrows the whole host to the allow rules carrying a pinned tag. It
+is a posture, not a rule edit. Three shapes were considered and rejected, and
+each rejection is a property worth keeping:
+
+- **Not a mass toggle of `enabled`.** Rewriting every untagged rule's file
+  makes the way back a snapshot taken before the write, and a crash between
+  the two leaves a half-locked host with no record of the other half. It also
+  overwrites an operator who disables a rule *during* a lockdown. Here
+  nothing on disk changes and lifting is one swap.
+- **Not a rule.** A rule can be edited, reordered, deleted or shadowed by a
+  higher priority, and a posture any group member can delete by name is not a
+  posture.
+- **Not runtime-only.** The daemon restarts on package upgrades, and a
+  posture that silently lifts when it does is the wrong failure direction. It
+  is persisted (`/var/lib/hallpass/posture.toml`) and re-read at startup,
+  before the rules watcher and before anything is installed.
+
+Suppression happens at compile time. `RuleSet::compile_with_lockdown` sets
+`suppressed` on every rule for which `Rule::active_under_lockdown` is false,
+which is *allow* rules carrying none of the pinned tags: a deny is never
+suppressed, because a posture exists to permit less and suppressing a block
+would permit more. One predicate carries it into the packet path,
+`CompiledRule::deciding` (`enabled && !suppressed`), so the matcher skips a
+suppressed rule exactly as it skips a disabled one. `explain` reports
+`TraceOutcome::Suppressed` separately, because the rule is as the operator
+left it and what stopped it is a posture they can lift rather than an
+`enabled = false` they will go looking for.
+
+The store holds the pinned tags itself (`lockdown_tags`), so every rebuild
+recompiles under the posture: a rules.d reload, an expiry sweep, or an add
+during a lockdown cannot quietly produce an unsuppressed set. Only
+`lockdown::apply` writes them.
+
+Two things the engine cannot cover, handled beside it. Packets whose
+transport carries no `Connection` never reach a rule, so the posture is
+applied to them directly: `locked_down()` forces `Deny` in place of
+`unhandled_proto_verdict`. Without that, ICMP, SCTP, GRE, ESP and anything
+unparsable keep leaving a host whose operator was told everything unpinned is
+denied, and an ICMP tunnel survives the posture raised to stop it. On the
+no-match arm, a connection that stays on the host
+(loopback at *both* ends) is allowed as `lockdown:loopback`, since it never
+leaves the host and refusing it would cost the resolver stub and every local
+service; everything else is denied as `lockdown:denied` with no prompt,
+because a dialog would let anyone at the keyboard answer their way out, and
+the rule that answer writes would carry no pinned tag and be suppressed on
+creation. `lockdown:` is a reserved rule-name prefix for the same reason
+`run-session:` is.
+
+The mode and the default verdict are forced, not assigned.
+`RuntimeSettings::default_verdict` returns `Deny` and
+`RuntimeSettings::enforcing` returns true while the flag is set, leaving the
+operator's stored values untouched, so lifting restores exactly what they
+had, including a change made while the posture was on. `ConfigGet` reports
+the stored values rather than the forced ones, because every client changes a
+setting by reading that struct, editing one field and writing it back.
+
+`lockdown::apply` takes one guard across read, write, save and rebuild, so
+two clients cannot interleave into a state where the file, memory and the
+compiled set disagree and the next restart resolves it in favour of a posture
+the host was never in. The file is saved *before* anything starts enforcing,
+and a failed save changes nothing: a posture in force but unrecorded lifts at
+the next restart with nobody told. `on` is stored explicitly rather than
+inferred from the tag list, because pinning no tags is a real and maximal
+posture; the file stays in place when the posture is lifted, so "lifted" and
+"never written" read the same. A posture leaving no allow rule standing is
+refused unless `--force`, since that is far more often a tag that does not
+exist, and finding out from a host that has gone silent is the worst way.
+
+The file is read with symlinks refused, like the first-seen state and unlike
+the config: nothing about it is operator-authored, so a link planted where it
+reads would only ever aim a root open somewhere the planter chose.
+
+Every failure to read the file is "no posture", loudly. Refusing to start
+would leave the host with no firewall at all, assuming the strictest posture
+would leave it reaching nothing, and no operator is present to judge which
+was meant. Unlike the other fail-open defaults this one is visible: `status`
+and `doctor` both report the posture.
+
+Engaging a posture deliberately does not wake the flow-kill sweeper. That
+sweeper kills flows an explicit deny *rule* matches, and a posture denies by
+suppressing allows rather than by adding a deny, so waking it would find
+nothing to kill and read as a promise the code does not keep. Flows already
+established when a posture engages keep running.
+
 ## The wire protocol
 
 Clients speak postcard over a Unix socket, framed with a 4-byte
@@ -377,8 +499,8 @@ a new layout produces garbage rather than an error. This is why v2 exists
 (`RuleMatch::exe_sha256`) and why v3 exists (`ConnEvent::enforced` plus three
 `Stats` fields); the request/reply pairs added alongside v3 would not have
 needed a bump on their own, being appended variants. The current version is
-v12 (`PromptContext` on `DaemonMsg::PromptRequest`); every bump is documented
-at `PROTOCOL_VERSION` with what forced it.
+v15 (the lockdown posture: `Stats::lockdown` and a new `TraceOutcome`
+variant); every bump is documented at `PROTOCOL_VERSION` with what forced it.
 
 ## Startup ordering invariants
 
@@ -417,15 +539,16 @@ consulting policy: the buffering above only covers as many packets as the
 queue holds. Overflow is governed by the queue's `NFQA_CFG_F_FAIL_OPEN` flag
 (`nfqueue::bind`), not by the ruleset's `bypass` keyword, which the kernel
 consults only when nothing is bound to the queue at all. The two are set
-together so the configured posture holds in both cases. The install used to sit before `RuleStore::new`, which reads every rule
-file and every domain, IP and hash list in `rules.d`, so the undrained window
-was as long as that takes and bounded by nothing the daemon controls. It is
-now the last thing startup does. The cost is that the host is unfiltered for
-the whole of startup rather than part of it, which is deliberate: that is the
-state the machine is in before the daemon runs at all and it ends at the
-install. The other order produced a state nothing else produces, an installed
-table with no verdicts behind it, which reads as healthy from outside while
-policy is not being applied to a single packet.
+together so the configured posture holds in both cases. The install used to
+sit before `RuleStore::new`, which reads every rule file and every domain, IP
+and hash list in `rules.d`, so the undrained window was as long as that takes
+and bounded by nothing the daemon controls. It is now the last thing startup
+does. The cost is that the host is unfiltered for the whole of startup rather
+than part of it, which is deliberate: that is the state the machine is in
+before the daemon runs at all, and it ends at the install. The other order
+produced a state nothing else produces, an installed table with no verdicts
+behind it, which reads as healthy from outside while policy is not being
+applied to a single packet.
 
 **3. The resolver uprobes capture the queried name at call entry, and every
 entry-probe bail-out clears that thread's scratch entry.** Capturing at entry

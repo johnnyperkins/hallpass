@@ -33,8 +33,8 @@ The procfs source is the expensive one, and it is two separable halves:
   `verified_proc_details` runs `pid_holds_inode` a second time on the winner.
 
 An earlier draft of this note called the first half the more expensive one,
-on the strength of its complexity class. That was wrong, and it was wrong in
-the direction that would have sent the work at the wrong target. Measured
+on the strength of its complexity class. That was wrong, and wrong in the
+direction that would have aimed the work at the wrong target. Measured
 (`attribution_cost` in `procfs.rs`, an ignored test that prints):
 
 | | idle desktop |
@@ -68,8 +68,8 @@ inflates the second term for **everyone**, not only for itself.
 ### A. Attribution on a worker with a hard per-packet deadline
 
 The mechanics work: the held-packet map, the sequence numbers and the verdict
-channel that the prompt path already uses would carry it, and a deadline
-sweep on the queue loop needs no timer task. That is not the problem.
+channel the prompt path already uses would carry it, and a deadline sweep on
+the queue loop needs no timer task. That is not the problem.
 
 The problem is what happens when the deadline fires. Seven rule operands
 depend on attribution: `exe`, `exe_glob`, `exe_sha256`, `hashes_file`, `user`,
@@ -104,11 +104,11 @@ It aims at the right half, which is more than the other two manage: the
 `user` is a rule operand, but the walk is the expensive half and an index is
 an attempt to skip it.
 
-It has no feed on the hosts that need it, and that is what kills it. procfs generates no
-inotify events; the netlink proc connector carries fork/exec/exit and no fd or
-socket event at all; fanotify does not see sockets; and the "eBPF sock
-tracepoints we already have" do not exist, `inode`, `i_ino` and `sk_socket`
-appear nowhere in the eBPF crate. Where eBPF does load, the existing
+It has no feed on the hosts that need it, and that is what kills it. procfs
+generates no inotify events; the netlink proc connector carries fork/exec/exit
+and no fd or socket event at all; fanotify does not see sockets; and the "eBPF
+sock tracepoints we already have" do not exist, `inode`, `i_ino` and
+`sk_socket` appear nowhere in the eBPF crate. Where eBPF does load, the existing
 `SOCK_MAP` already answers tuple to pid in one lookup and procfs is never
 consulted, so an index there is a worse copy of a map that exists. Where eBPF
 does not load, which is exactly the population that pays for the walk, the
@@ -177,10 +177,10 @@ where the inode index of option B does not: it is keyed on the process, which
 persists across connections, rather than on the socket, which by definition
 did not exist last time.
 
-**1. Cap the executable hash** (`hash.rs:87-98`). **Done.** `std::io::copy` into the
-hasher has no size cap and no regular-file check, and it runs inline on the
-verdict thread. The gate in front of it is not the mitigation it looks like:
-an unscoped `hashes_file` blocklist rule, which is the canonical way to write
+**1. Cap the executable hash** (`hash.rs:87-98`). **Done.** `std::io::copy`
+into the hasher has no size cap and no regular-file check, and it runs inline
+on the verdict thread. The gate in front of it is not the mitigation it looks
+like: an unscoped `hashes_file` blocklist rule, the canonical way to write
 one, has no other criteria and so matches every new connection, and the daemon
 then hashes whatever binary the process just exec'd. The `FileId` key is taken
 by fstat on the already-open fd, so the cache cannot be poisoned by a path
