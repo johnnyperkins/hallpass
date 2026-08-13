@@ -236,6 +236,7 @@ fn ack_kinds_are_distinct_per_request() {
         verdict: Verdict::Deny,
         duration: RuleDuration::Once,
         scope: PromptScope::ThisPort,
+        pin_exe: false,
     }), Some(AckKind::Other));
     // Requests answered with data, not an ack, must not enter the FIFO
     // at all or every later reply is matched to the wrong request.
@@ -828,6 +829,7 @@ fn a_dismissed_prompt_is_denied_for_this_connection_only() {
             verdict: Verdict::Deny,
             duration: RuleDuration::Once,
             scope: PromptScope::ThisPort,
+            pin_exe: false,
         }
     );
 }

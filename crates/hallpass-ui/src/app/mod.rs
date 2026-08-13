@@ -1976,6 +1976,24 @@ fn prompt_actions_ui(
                     ui.selectable_value(&mut p.scope, s, scope_label(s));
                 }
             });
+        // Only when the daemon computed a hash for this prompt: it pins the
+        // value shown here and nothing else, so a prompt without one has
+        // nothing to pin and a reply asking anyway would create no rule at
+        // all. Hidden rather than disabled - a permanently greyed control on
+        // a firewall dialog reads as something broken.
+        //
+        // Not offered for Once either, which creates no rule to pin, and the
+        // reply drops the flag on a deny (a deny keyed on the path should keep
+        // blocking whatever is written there).
+        if p.can_pin() && p.duration != RuleDuration::Once {
+            ui.checkbox(&mut p.pin_exe, "Pin binary")
+                .on_hover_text(
+                    "Allow only this exact executable: the rule stops matching if the \
+                     file at that path is replaced. Worth it for anything you can write \
+                     yourself, since a path is not an identity. The rule will need \
+                     answering again after the program updates.",
+                );
+        }
     });
     ui.add_space(6.0);
 

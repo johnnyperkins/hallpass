@@ -453,10 +453,21 @@ unexplained prompt for something they had already made a rule about. Each
 part is best effort and absent on its own: a process can exit between the
 packet and the prompt, and the history is bounded and lost on restart, so a
 count of zero means "nothing in what is still remembered", not "never". The
-hash is the one the daemon computed while deciding the packet, so it appears
-when a hash-pinning rule could have applied and not otherwise; with no hash
-there is no mismatch to report, and the warning stays silent rather than
-accusing a binary nobody hashed.
+hash is computed while deciding the packet, so it is the value policy was
+evaluated against; with no hash there is no mismatch to report, and the
+warning stays silent rather than accusing a binary nobody hashed.
+
+That hash is also what **"Pin binary"** writes. A rule generated from a
+prompt is keyed on the executable's path, and a path is not an identity: an
+allow granted to something under a home directory, a build tree, or anywhere
+else you can write yourself keeps matching after anything at all is written
+there. Ticking the box (or answering the pin question in `hallpass-cli
+watch`) adds `exe_sha256` to the rule, so it stops matching the moment that
+file is replaced and the connection is asked about again. It is offered only
+on an allow - a deny should keep blocking whatever is put at that path - and
+only when the prompt actually carries a hash. A reply asking to pin one that
+does not creates no rule at all rather than the broader unpinned rule, which
+would look identical in every listing.
 
 The GUI (`hallpass-ui`) connects to the same socket, pops up a dialog for each
 unmatched connection (allow/deny, scope, duration), and offers a management

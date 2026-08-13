@@ -28,6 +28,9 @@ pub struct PromptState {
     pub duration: RuleDuration,
     /// Selected rule scope.
     pub scope: PromptScope,
+    /// Whether the operator asked to pin the rule to this exact binary.
+    /// Only offered when [`PromptState::can_pin`], and only sent on an allow.
+    pub pin_exe: bool,
     /// What the daemon found out about the process beyond the connection
     /// itself. Best effort and possibly empty; see [`PromptContext`].
     pub context: PromptContext,
@@ -50,6 +53,12 @@ impl PromptState {
             fronted_ms: None,
             duration: RuleDuration::Session,
             scope: PromptScope::ThisPort,
+            // Off unless the operator ticks it, and offered at all only when
+            // this prompt carries a hash (`can_pin`). Defaulting it on would
+            // make the common answer create a rule that stops matching the
+            // next time the program is updated, which reads as the firewall
+            // breaking rather than as the pin working.
+            pin_exe: false,
             context,
         }
     }
@@ -60,6 +69,17 @@ impl PromptState {
         self.fronted_ms.unwrap_or(self.received_ms)
     }
 
+    /// Whether pinning the executable is on offer for this prompt.
+    ///
+    /// Needs a hash: the daemon pins the value it showed here and nothing
+    /// else, so a prompt whose binary it could not read (or that was past the
+    /// size cap) has nothing to pin, and a reply asking anyway creates no rule
+    /// at all. Hiding the control is what keeps that a backstop rather than a
+    /// way to lose a rule the operator thought they wrote.
+    pub fn can_pin(&self) -> bool {
+        self.context.exe_sha256.is_some()
+    }
+
     /// Build the reply message for the given verdict.
     pub fn reply(&self, verdict: Verdict) -> ClientMsg {
         ClientMsg::PromptReply {
@@ -67,6 +87,10 @@ impl PromptState {
             verdict,
             duration: self.duration,
             scope: self.scope,
+            // Only an allow narrows by being pinned. A deny keyed on the path
+            // should keep blocking whatever is written there, so the flag is
+            // dropped rather than sent and ignored.
+            pin_exe: self.pin_exe && verdict == Verdict::Allow && self.can_pin(),
         }
     }
 
@@ -96,6 +120,7 @@ pub fn close_reply(id: u64) -> ClientMsg {
         verdict: Verdict::Deny,
         duration: RuleDuration::Once,
         scope: PromptScope::ThisPort,
+        pin_exe: false,
     }
 }
 
@@ -287,6 +312,7 @@ mod tests {
                 verdict: Verdict::Allow,
                 duration: RuleDuration::Forever,
                 scope: PromptScope::AppAnywhere,
+                pin_exe: false,
             }
         );
     }

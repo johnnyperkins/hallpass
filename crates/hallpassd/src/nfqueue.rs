@@ -295,7 +295,25 @@ fn decide(
         },
         None => match session_grant(&conn, ctx) {
             Some(id) => Decision::Verdict(Verdict::Allow, crate::session::rule_name(id), conn),
-            None => Decision::Prompt(conn, exe_sha256),
+            // A connection on its way to a prompt gets its executable hashed
+            // even when no rule asked for one, because the operator may answer
+            // "allow, and pin this binary" - and the value pinned has to be
+            // the value the prompt showed them, not one computed behind them
+            // when the reply arrives. Computing it there would also mean a
+            // whole-binary read on a runtime thread at reply time, and a hash
+            // the operator never saw.
+            //
+            // Paid only here, on the path that is already about to wait for a
+            // human, and once per distinct binary: `ExeHashCache` keys on
+            // (dev, ino, mtime, ctime, size), so a program that prompts often
+            // is read once. Oversized and unreadable binaries stay `None` and
+            // are remembered as such; the prompt then offers no pin, which is
+            // the honest answer rather than an unpinned rule that looks
+            // pinned.
+            None => {
+                let exe_sha256 = exe_sha256.or_else(|| ctx.exe_hash.for_connection(&conn));
+                Decision::Prompt(conn, exe_sha256)
+            }
         },
     }
 }

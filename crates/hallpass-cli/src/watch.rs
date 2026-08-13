@@ -30,12 +30,34 @@ enum Stage {
     Verdict,
     Duration { verdict: Verdict },
     Scope { verdict: Verdict, duration: RuleDuration },
+    /// Asked only when pinning could actually change the rule: an allow, a
+    /// duration that creates one, and a prompt the daemon computed a hash
+    /// for. Skipping it otherwise keeps the dialog from asking a question
+    /// whose answer is discarded.
+    Pin {
+        verdict: Verdict,
+        duration: RuleDuration,
+        scope: PromptScope,
+    },
 }
 
 const VERDICT_HINT: &str = "  [a]llow / [d]eny?";
 const DURATION_HINT: &str =
     "  duration: [1] once / [2] session / [3] forever / timespan (30s, 5m, 2h)?";
 const SCOPE_HINT: &str = "  scope: [p]ort / [h]ost / [a]pp anywhere?";
+const PIN_HINT: &str =
+    "  pin this exact binary (rule stops matching if the file is replaced)? [y]es / [n]o";
+
+/// Parse the pin answer. Anything but an explicit yes is no: the pinned rule
+/// needs answering again after the program updates, so it is not a default to
+/// fall into by pressing return.
+fn parse_pin(line: &str) -> Option<bool> {
+    match line.trim() {
+        "y" | "yes" => Some(true),
+        "n" | "no" | "" => Some(false),
+        _ => None,
+    }
+}
 
 /// Parse a verdict answer: a=allow, d=deny.
 fn parse_verdict(line: &str) -> Option<Verdict> {
@@ -333,32 +355,78 @@ async fn step<W: tokio::io::AsyncWrite + Unpin>(
         },
         Stage::Scope { verdict, duration } => match parse_scope(line) {
             Some(scope) => {
-                wire::write_msg(
-                    w,
-                    &ClientMsg::PromptReply {
-                        id: pending.id,
-                        verdict,
-                        duration,
-                        scope,
-                    },
-                )
-                .await?;
-                println!(
-                    "prompt #{}: {} {} {}",
-                    pending.id,
-                    verdict.as_str(),
-                    duration.as_str(),
-                    fmt::scope_str(scope)
-                );
-                return Ok(promote(queue));
+                // The pin question is only worth asking when the answer can
+                // change the rule; otherwise reply straight away, exactly as
+                // before this stage existed.
+                if can_pin(&pending, verdict, duration) {
+                    println!("{PIN_HINT}");
+                    Stage::Pin { verdict, duration, scope }
+                } else {
+                    return send_reply(w, queue, &pending, verdict, duration, scope, false).await;
+                }
             }
             None => {
                 println!("{SCOPE_HINT}");
                 Stage::Scope { verdict, duration }
             }
         },
+        Stage::Pin { verdict, duration, scope } => match parse_pin(line) {
+            Some(pin_exe) => {
+                return send_reply(w, queue, &pending, verdict, duration, scope, pin_exe).await;
+            }
+            None => {
+                println!("{PIN_HINT}");
+                Stage::Pin { verdict, duration, scope }
+            }
+        },
     };
     Ok(Some((pending, next)))
+}
+
+/// Whether pinning could change the rule this answer creates.
+///
+/// Three conditions, and all of them are the daemon's rules rather than this
+/// client's taste: `Once` creates no rule, a deny is deliberately left keyed
+/// on the path so it keeps blocking whatever is written there, and a prompt
+/// with no hash has nothing to pin - the daemon pins the value it showed and
+/// refuses to write a broader rule instead.
+fn can_pin(pending: &Pending, verdict: Verdict, duration: RuleDuration) -> bool {
+    verdict == Verdict::Allow
+        && duration != RuleDuration::Once
+        && pending.context.exe_sha256.is_some()
+}
+
+/// Send the reply and report it, then move to the next queued prompt.
+#[allow(clippy::too_many_arguments)]
+async fn send_reply<W: tokio::io::AsyncWrite + Unpin>(
+    w: &mut W,
+    queue: &mut VecDeque<Pending>,
+    pending: &Pending,
+    verdict: Verdict,
+    duration: RuleDuration,
+    scope: PromptScope,
+    pin_exe: bool,
+) -> Result<Option<(Pending, Stage)>, CliError> {
+    wire::write_msg(
+        w,
+        &ClientMsg::PromptReply {
+            id: pending.id,
+            verdict,
+            duration,
+            scope,
+            pin_exe,
+        },
+    )
+    .await?;
+    println!(
+        "prompt #{}: {} {} {}{}",
+        pending.id,
+        verdict.as_str(),
+        duration.as_str(),
+        fmt::scope_str(scope),
+        if pin_exe { " pinned" } else { "" }
+    );
+    Ok(promote(queue))
 }
 
 #[cfg(test)]

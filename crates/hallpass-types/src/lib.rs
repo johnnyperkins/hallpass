@@ -108,7 +108,14 @@ use serde::{Deserialize, Serialize};
 /// queue depth rather than inheriting the 1024 default, and the depth in
 /// force is not in `/proc` for a client to read for itself. The struct field
 /// forces the bump, as in v2.
-pub const PROTOCOL_VERSION: u32 = 16;
+///
+/// v17: [`ClientMsg::PromptReply::pin_exe`], so an operator answering a
+/// prompt can pin the rule to the binary they approved rather than to the
+/// path it happened to sit at. A field added to an existing variant, which
+/// postcard writes positionally: an older daemon would read the new field's
+/// byte as the start of the next message, so the bump is what turns that into
+/// the handshake's refusal.
+pub const PROTOCOL_VERSION: u32 = 17;
 
 /// Prefix reserved for the synthetic rule name a session grant reports.
 ///
@@ -1665,6 +1672,24 @@ pub enum ClientMsg {
         duration: RuleDuration,
         /// How broadly the resulting rule matches.
         scope: PromptScope,
+        /// Pin the rule to the executable's SHA-256 as well as its path, so
+        /// it stops matching if that binary is replaced.
+        ///
+        /// A path is not an identity. An allow the operator granted to
+        /// `~/.local/bin/tool` or to something in a build tree keeps matching
+        /// after anything else is written to that path, which is the one
+        /// direction a remembered allow should never drift in. Pinning is the
+        /// operator saying they approved these bytes, not this name.
+        ///
+        /// Only meaningful together with [`Verdict::Allow`] and a duration
+        /// other than [`RuleDuration::Once`], and only when the prompt
+        /// carried a hash: the value pinned is
+        /// [`PromptContext::exe_sha256`], the one the operator was shown, and
+        /// never a hash computed behind them at reply time. A reply asking to
+        /// pin a prompt that has none creates no rule at all rather than a
+        /// broader one the operator did not ask for; both clients hide the
+        /// option in that case, so it is a backstop rather than a path.
+        pin_exe: bool,
     },
     /// Request the current rule list.
     RuleList,

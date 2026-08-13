@@ -424,6 +424,7 @@ impl PromptTable {
         verdict: Verdict,
         duration: RuleDuration,
         scope: PromptScope,
+        pin_exe: bool,
     ) -> Result<(), String> {
         let pending = self.take_as_handler(tx, id)?;
 
@@ -450,10 +451,37 @@ impl PromptTable {
             return Ok(());
         }
 
+        // The hash the operator was shown, and only that one. Pinning is
+        // meaningless on a deny (which should keep matching however the binary
+        // changes) and the packet path already computes this for every
+        // connection that reaches a prompt, so `None` here means the binary
+        // could not be read or was past the size cap.
+        let pin = match pin_exe && verdict == Verdict::Allow {
+            true => pending.context.exe_sha256.as_deref(),
+            false => None,
+        };
+        if pin_exe && verdict == Verdict::Allow && pin.is_none() {
+            // No rule at all, rather than the unpinned one that would
+            // otherwise be written. The operator asked to remember a set of
+            // bytes; remembering a path instead is broader than what they
+            // answered, and it would look identical in every listing. The
+            // verdict below still applies to the held packets, so this costs
+            // the memory of the decision and nothing else - the connection is
+            // asked about again, which is the visible failure.
+            tracing::warn!(
+                id,
+                "prompt reply asked to pin the executable but this prompt carries \
+                 no hash (unreadable or past the size cap); applying the verdict \
+                 without creating a rule"
+            );
+            self.finish(pending.conn, pending.packets, verdict, None);
+            return Ok(());
+        }
+
         let mut rule_name = None;
         let mut added_rule = None;
         if duration != RuleDuration::Once {
-            match rule_from_reply(&self.run_tag, id, &pending.conn, verdict, duration, scope) {
+            match rule_from_reply(&self.run_tag, id, &pending.conn, verdict, duration, scope, pin) {
                 Some(rule) => {
                     rule_name = Some(rule.name.clone());
                     if let Err(e) = self.store.add(rule.clone()) {
@@ -744,6 +772,7 @@ fn rule_from_reply(
     verdict: Verdict,
     duration: RuleDuration,
     scope: PromptScope,
+    pin_sha256: Option<&str>,
 ) -> Option<Rule> {
     let exe = conn.exe_path.clone()?;
     // The stem becomes part of the rule's persisted name, which the CLI and
@@ -784,6 +813,13 @@ fn rule_from_reply(
     if verdict == Verdict::Allow {
         matcher.app_id = conn.app_id.clone();
     }
+    // The operator approved these bytes rather than this name. An exe path is
+    // not an identity: an allow granted to something under a home directory or
+    // a build tree keeps matching after anything else is written there, and a
+    // remembered allow must not widen on its own. Caller-supplied, and already
+    // filtered to allows, so a deny stays keyed on the path and keeps blocking
+    // whatever gets put at it.
+    matcher.exe_sha256 = pin_sha256.map(str::to_string);
     match scope {
         PromptScope::ThisPort => {
             matcher.dest = Some(dst.ip().to_string());
@@ -948,7 +984,7 @@ mod tests {
 
         h.settings.set_locked_down(true);
         h.table
-            .reply(&tx, id, Verdict::Allow, RuleDuration::Forever, PromptScope::ThisPort)
+            .reply(&tx, id, Verdict::Allow, RuleDuration::Forever, PromptScope::ThisPort, false)
             .expect("the reply is accepted, the answer is not");
         assert_eq!(h.verdict_rx.recv().await, Some((1, Verdict::Deny)));
         // And no rule is written: it would carry no pinned tag, so it would
@@ -1028,7 +1064,7 @@ mod tests {
                 panic!("expected PromptRequest");
             };
             h.table
-                .reply(&tx, id, Verdict::Deny, RuleDuration::Once, PromptScope::ThisPort)
+                .reply(&tx, id, Verdict::Deny, RuleDuration::Once, PromptScope::ThisPort, false)
                 .expect("the handler answers");
             assert_eq!(h.verdict_rx.recv().await, Some((seq, Verdict::Deny)));
         }
@@ -1053,6 +1089,7 @@ mod tests {
             Verdict::Deny,
             RuleDuration::Forever,
             PromptScope::ThisPort,
+            None,
         )
         .expect("a rule is generated");
         assert!(!rule.name.contains('\x1b'), "{:?}", rule.name);
@@ -1065,6 +1102,112 @@ mod tests {
         );
         // The exe criterion keeps the real path: only the name is reduced.
         assert_eq!(rule.matcher.exe, Some(PathBuf::from(hostile)));
+    }
+
+    /// **A path is not an identity.** An allow the operator granted to
+    /// something they can write themselves - a home directory, a build tree -
+    /// keeps matching after anything else is written to that path, which is
+    /// the one direction a remembered allow must never drift in. Pinning is
+    /// the operator saying they approved these bytes, not this name.
+    #[test]
+    fn a_pinned_allow_carries_the_hash_the_operator_was_shown() {
+        let c = conn("/home/u/.local/bin/tool", "1.1.1.1:443");
+        let hash = "ab".repeat(32);
+        let rule = rule_from_reply(
+            "abc",
+            7,
+            &c,
+            Verdict::Allow,
+            RuleDuration::Forever,
+            PromptScope::ThisPort,
+            Some(&hash),
+        )
+        .expect("a rule is generated");
+        assert_eq!(rule.matcher.exe_sha256.as_deref(), Some(hash.as_str()));
+        // The path is still there: the pin narrows the rule, it does not
+        // replace what it was already keyed on.
+        assert_eq!(
+            rule.matcher.exe,
+            Some(PathBuf::from("/home/u/.local/bin/tool"))
+        );
+
+        // Unpinned is the old shape exactly, so an operator who did not ask
+        // for this gets the rule they always got.
+        let plain = rule_from_reply(
+            "abc",
+            7,
+            &c,
+            Verdict::Allow,
+            RuleDuration::Forever,
+            PromptScope::ThisPort,
+            None,
+        )
+        .expect("a rule is generated");
+        assert_eq!(plain.matcher.exe_sha256, None);
+    }
+
+    /// Pinning is refused rather than downgraded. The rule an unpinned write
+    /// would produce is broader than what the operator answered and looks
+    /// identical in every listing, so the reply applies its verdict to the
+    /// held packets and remembers nothing - the connection is asked about
+    /// again, which is the visible failure.
+    #[tokio::test]
+    async fn a_pin_request_with_no_hash_creates_no_rule_at_all() {
+        let mut h = harness("pin-no-hash", 8, Verdict::Deny);
+        let (tx, mut rx) = mpsc::channel(8);
+        assert!(h.table.set_handler(tx.clone()));
+
+        // No hash on the prompt: the binary was unreadable or past the cap.
+        h.table
+            .handle_new(conn("/usr/bin/curl", "1.1.1.1:443"), 1, None);
+        let id = match rx.recv().await.expect("a prompt request") {
+            DaemonMsg::PromptRequest { id, context, .. } => {
+                assert_eq!(context.exe_sha256, None, "the fixture has no hash");
+                id
+            }
+            other => panic!("expected a prompt request, got {other:?}"),
+        };
+
+        h.table
+            .reply(&tx, id, Verdict::Allow, RuleDuration::Forever, PromptScope::ThisPort, true)
+            .expect("the reply is accepted");
+
+        // The verdict still reached the held packet: refusing to remember a
+        // decision must not refuse to apply it.
+        assert_eq!(h.verdict_rx.recv().await, Some((1, Verdict::Allow)));
+        assert!(
+            h.store.list().is_empty(),
+            "an unpinnable pin request must not fall back to an unpinned rule"
+        );
+    }
+
+    /// Pinning narrows, and narrowing runs the wrong way for a deny: a deny
+    /// that stops matching because the binary was updated resolves the
+    /// connection with `default_verdict`, which ships as allow. So the flag is
+    /// dropped rather than honoured, the same way `app_id` already is.
+    #[test]
+    fn a_deny_is_never_pinned() {
+        let c = conn("/usr/bin/curl", "1.1.1.1:443");
+        for verdict in [Verdict::Deny, Verdict::Reject] {
+            let rule = rule_from_reply(
+                "abc",
+                7,
+                &c,
+                verdict,
+                RuleDuration::Forever,
+                PromptScope::ThisPort,
+                Some(&"ab".repeat(32)),
+            )
+            .expect("a rule is generated");
+            // `reply` filters the flag before it reaches here; this asserts
+            // the same thing one layer down, so a future caller that forgets
+            // cannot quietly produce a self-expiring block.
+            assert_eq!(
+                rule.matcher.exe,
+                Some(PathBuf::from("/usr/bin/curl")),
+                "{verdict:?} stays keyed on the path"
+            );
+        }
     }
 
     /// An allow answered for a sandboxed application names the application,
@@ -1081,7 +1224,7 @@ mod tests {
         let mut c = conn("/app/bin/firefox", "1.1.1.1:443");
         c.app_id = Some("flatpak:org.mozilla.firefox".into());
         let generated = |verdict| {
-            rule_from_reply("abc", 7, &c, verdict, RuleDuration::Forever, PromptScope::AppAnywhere)
+            rule_from_reply("abc", 7, &c, verdict, RuleDuration::Forever, PromptScope::AppAnywhere, None)
                 .expect("a rule is generated")
         };
 
@@ -1104,6 +1247,7 @@ mod tests {
             Verdict::Allow,
             RuleDuration::Forever,
             PromptScope::AppAnywhere,
+            None,
         )
         .expect("a rule is generated");
         assert_eq!(rule.matcher.app_id, None);
@@ -1204,14 +1348,14 @@ mod tests {
 
         let err = h
             .table
-            .reply(&other, id, Verdict::Allow, RuleDuration::Once, PromptScope::ThisPort)
+            .reply(&other, id, Verdict::Allow, RuleDuration::Once, PromptScope::ThisPort, false)
             .expect_err("a non-handler must not answer");
         assert!(err.contains("prompt handler"), "{err}");
         // The prompt is untouched: no verdict released, still answerable.
         assert!(h.verdict_rx.try_recv().is_err());
 
         h.table
-            .reply(&tx, id, Verdict::Deny, RuleDuration::Once, PromptScope::ThisPort)
+            .reply(&tx, id, Verdict::Deny, RuleDuration::Once, PromptScope::ThisPort, false)
             .expect("the handler may answer");
         assert_eq!(h.verdict_rx.recv().await, Some((1, Verdict::Deny)));
     }
@@ -1232,13 +1376,13 @@ mod tests {
         assert!(prompt_rx.try_recv().is_err(), "second packet coalesced");
 
         h.table
-            .reply(&tx, id, Verdict::Deny, RuleDuration::Once, PromptScope::ThisPort)
+            .reply(&tx, id, Verdict::Deny, RuleDuration::Once, PromptScope::ThisPort, false)
             .unwrap();
         assert_eq!(h.verdict_rx.recv().await, Some((1, Verdict::Deny)));
         assert_eq!(h.verdict_rx.recv().await, Some((2, Verdict::Deny)));
         // Once: no rule created.
         assert!(h.store.list().is_empty());
-        assert!(h.table.reply(&tx, id, Verdict::Allow, RuleDuration::Once, PromptScope::ThisPort).is_err());
+        assert!(h.table.reply(&tx, id, Verdict::Allow, RuleDuration::Once, PromptScope::ThisPort, false).is_err());
     }
 
     #[tokio::test]
@@ -1258,7 +1402,7 @@ mod tests {
             panic!("expected PromptRequest");
         };
         h.table
-            .reply(&tx, id, Verdict::Allow, RuleDuration::Once, PromptScope::ThisHost)
+            .reply(&tx, id, Verdict::Allow, RuleDuration::Once, PromptScope::ThisHost, false)
             .unwrap();
         assert_eq!(h.verdict_rx.recv().await, Some((1, Verdict::Allow)));
         assert!(h.store.list().is_empty(), "Once creates no rule for UDP either");
@@ -1287,7 +1431,7 @@ mod tests {
 
         // Allow the app anywhere: every chrome prompt resolves allow.
         h.table
-            .reply(&tx, first, Verdict::Allow, RuleDuration::Session, PromptScope::AppAnywhere)
+            .reply(&tx, first, Verdict::Allow, RuleDuration::Session, PromptScope::AppAnywhere, false)
             .unwrap();
         let mut released = std::collections::HashMap::new();
         for _ in 0..3 {
@@ -1313,7 +1457,7 @@ mod tests {
         assert!(h.verdict_rx.try_recv().is_err());
         let other_id = first + 3;
         h.table
-            .reply(&tx, other_id, Verdict::Deny, RuleDuration::Once, PromptScope::ThisPort)
+            .reply(&tx, other_id, Verdict::Deny, RuleDuration::Once, PromptScope::ThisPort, false)
             .unwrap();
         assert_eq!(h.verdict_rx.recv().await, Some((4, Verdict::Deny)));
     }
@@ -1333,7 +1477,7 @@ mod tests {
         let _ = prompt_rx.recv().await.unwrap();
 
         h.table
-            .reply(&tx, first, Verdict::Allow, RuleDuration::Session, PromptScope::ThisPort)
+            .reply(&tx, first, Verdict::Allow, RuleDuration::Session, PromptScope::ThisPort, false)
             .unwrap();
         assert_eq!(h.verdict_rx.recv().await, Some((1, Verdict::Allow)));
         // The second endpoint's prompt is still pending: no verdict, no
@@ -1363,13 +1507,13 @@ mod tests {
         assert_ne!(tcp_id, udp_id);
 
         h.table
-            .reply(&tx, tcp_id, Verdict::Deny, RuleDuration::Once, PromptScope::ThisPort)
+            .reply(&tx, tcp_id, Verdict::Deny, RuleDuration::Once, PromptScope::ThisPort, false)
             .unwrap();
         assert_eq!(h.verdict_rx.recv().await, Some((1, Verdict::Deny)));
         // The UDP prompt is untouched and still answerable.
         assert!(h.verdict_rx.try_recv().is_err());
         h.table
-            .reply(&tx, udp_id, Verdict::Allow, RuleDuration::Once, PromptScope::ThisPort)
+            .reply(&tx, udp_id, Verdict::Allow, RuleDuration::Once, PromptScope::ThisPort, false)
             .unwrap();
         assert_eq!(h.verdict_rx.recv().await, Some((2, Verdict::Allow)));
     }
@@ -1398,7 +1542,7 @@ mod tests {
 
         // The new handler owns the slot now, so it is the one that may answer.
         h.table
-            .reply(&tx2, id, Verdict::Deny, RuleDuration::Once, PromptScope::ThisPort)
+            .reply(&tx2, id, Verdict::Deny, RuleDuration::Once, PromptScope::ThisPort, false)
             .unwrap();
         assert_eq!(h.verdict_rx.recv().await, Some((1, Verdict::Deny)));
     }
@@ -1446,7 +1590,7 @@ mod tests {
         // The prompt is untouched: still one popup, still answerable, and
         // its answer still governs every packet it did hold.
         h.table
-            .reply(&tx, id, Verdict::Allow, RuleDuration::Once, PromptScope::ThisPort)
+            .reply(&tx, id, Verdict::Allow, RuleDuration::Once, PromptScope::ThisPort, false)
             .expect("the prompt survives the packet budget");
         assert_eq!(h.verdict_rx.recv().await, Some((0, Verdict::Allow)));
     }
@@ -1550,7 +1694,7 @@ mod tests {
         // rather than resolving a flow that was already released.
         assert!(h
             .table
-            .reply(&tx, id, Verdict::Deny, RuleDuration::Once, PromptScope::ThisPort)
+            .reply(&tx, id, Verdict::Deny, RuleDuration::Once, PromptScope::ThisPort, false)
             .is_err());
     }
 
@@ -1662,7 +1806,7 @@ mod tests {
             panic!("expected PromptRequest");
         };
         h.table
-            .reply(&tx, id, Verdict::Allow, RuleDuration::Session, PromptScope::ThisHost)
+            .reply(&tx, id, Verdict::Allow, RuleDuration::Session, PromptScope::ThisHost, false)
             .unwrap();
         assert_eq!(h.verdict_rx.recv().await, Some((1, Verdict::Allow)));
 
@@ -1678,13 +1822,13 @@ mod tests {
     #[test]
     fn scope_matchers() {
         let c = conn("/usr/bin/curl", "9.9.9.9:853");
-        let r = rule_from_reply("abc", 1, &c, Verdict::Deny, RuleDuration::Session, PromptScope::ThisPort)
+        let r = rule_from_reply("abc", 1, &c, Verdict::Deny, RuleDuration::Session, PromptScope::ThisPort, None)
             .unwrap();
         assert_eq!(r.matcher.dest.as_deref(), Some("9.9.9.9"));
         assert_eq!(r.matcher.port, Some(853));
         assert_eq!(r.action, hallpass_types::Action::Deny);
 
-        let r = rule_from_reply("abc", 2, &c, Verdict::Allow, RuleDuration::Forever, PromptScope::AppAnywhere)
+        let r = rule_from_reply("abc", 2, &c, Verdict::Allow, RuleDuration::Forever, PromptScope::AppAnywhere, None)
             .unwrap();
         assert_eq!(r.matcher.dest, None);
         assert_eq!(r.matcher.port, None);
@@ -1692,6 +1836,6 @@ mod tests {
 
         let mut anon = c.clone();
         anon.exe_path = None;
-        assert!(rule_from_reply("abc", 3, &anon, Verdict::Allow, RuleDuration::Session, PromptScope::AppAnywhere).is_none());
+        assert!(rule_from_reply("abc", 3, &anon, Verdict::Allow, RuleDuration::Session, PromptScope::AppAnywhere, None).is_none());
     }
 }

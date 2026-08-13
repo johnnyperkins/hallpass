@@ -419,9 +419,10 @@ async fn message_loop(
                 verdict,
                 duration,
                 scope,
+                pin_exe,
             } => {
-                tracing::info!(?peer_uid, id, ?verdict, "prompt reply");
-                match deps.prompts.reply(out_tx, id, verdict, duration, scope) {
+                tracing::info!(?peer_uid, id, ?verdict, pin_exe, "prompt reply");
+                match deps.prompts.reply(out_tx, id, verdict, duration, scope, pin_exe) {
                     Ok(()) => DaemonMsg::Ok,
                     Err(message) => DaemonMsg::Err { message },
                 }

@@ -7,6 +7,19 @@ carries what an upgrade changes on a running host.
 
 ### Added
 
+- **Prompts can pin the rule to the binary you approved, not the path it sat
+  at (wire protocol v17).** Tick "Pin binary" in the GUI, or answer the new
+  pin question in `hallpass-cli watch`, and the rule carries the executable's
+  SHA-256 as well as its path: it stops matching the moment the file there is
+  replaced. Worth it for anything you can write yourself - a home directory, a
+  build tree, `/opt` - where an allow keyed on a path alone silently carries
+  over to whatever is written next. The pinned rule needs answering again
+  after the program updates, which is the point. Offered only on an allow (a
+  deny should keep blocking whatever is put at that path) and only when the
+  prompt shows a hash; a reply asking to pin one that has none creates no rule
+  at all rather than the broader unpinned one. The UI and CLI are wire peers
+  and must be restarted with the daemon.
+
 - **The daemon refuses to trust a policy directory anyone else can write.**
   `/etc/hallpass` and the rules directory are now checked for root ownership
   and group/world write at startup, reported at error level, and fatal under

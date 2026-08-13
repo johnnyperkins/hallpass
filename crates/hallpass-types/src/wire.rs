@@ -219,6 +219,7 @@ mod tests {
                 verdict: Verdict::Deny,
                 duration: RuleDuration::Session,
                 scope: PromptScope::ThisHost,
+                pin_exe: false,
             },
             ClientMsg::RuleList,
             ClientMsg::RuleAdd(sample_rule()),
@@ -336,6 +337,10 @@ mod tests {
                         verdict: v,
                         duration: d,
                         scope: s,
+                        // Both values, so the appended field's strong
+                        // encoding rides through rather than only postcard's
+                        // single zero byte for `false`.
+                        pin_exe: v == Verdict::Allow,
                     };
                     let back = roundtrip(&msg).await;
                     assert_eq!(back, msg);
@@ -450,6 +455,7 @@ mod tests {
                 verdict: Verdict::Deny,
                 duration: RuleDuration::Session,
                 scope: PromptScope::ThisHost,
+                pin_exe: false,
             },
             ClientMsg::RuleList,
             ClientMsg::RuleAdd(sample_rule()),
@@ -639,7 +645,7 @@ mod tests {
         bytes.iter().map(|b| format!("{b:02x}")).collect()
     }
 
-    /// What [`client_fixtures`] encodes to at wire protocol v16.
+    /// What [`client_fixtures`] encodes to at wire protocol v17.
     ///
     /// Regenerate with `cargo test -p hallpass-types print_wire_golden --
     /// --ignored --nocapture`, and only ever in the same commit as the
@@ -647,7 +653,7 @@ mod tests {
     const CLIENT_GOLDEN: &[(&str, &str)] = &[
         ("Hello", "000f"),
         ("Subscribe", "010100"),
-        ("PromptReply", "0207010101"),
+        ("PromptReply", "020701010100"),
         ("RuleList", "03"),
         ("RuleAdd", "040a616c6c6f772d6375726c00020a0100010d2f7573722f62696e2f6375726c010a2f7573722f62696e2f2a014061616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161010a31302e302e302e302f3801bb03018008ffff03010d2a2e6578616d706c652e6f726701e8070101011e2f6574632f68616c6c706173732f72756c65732e642f6164732e6c69737401222f6574632f68616c6c706173732f72756c65732e642f6261642d6970732e6c69737401242f6574632f68616c6c706173732f72756c65732e642f6d616c776172652e73686132353601097363726970742e7079010d2f7573722f62696e2f62617368010e3139322e3136382e312e302f323401c0b802010465746830010c736e61703a66697265666f78"),
         ("RuleDelete", "050a616c6c6f772d6375726c"),
@@ -665,7 +671,7 @@ mod tests {
         ("LockdownSet", "110104636f72650100"),
     ];
 
-    /// What [`daemon_fixtures`] encodes to at wire protocol v16. See
+    /// What [`daemon_fixtures`] encodes to at wire protocol v17. See
     /// [`CLIENT_GOLDEN`] for how to regenerate it.
     const DAEMON_GOLDEN: &[(&str, &str)] = &[
         ("HelloAck", "000f"),
