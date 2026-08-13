@@ -18,7 +18,7 @@ fn main() -> ExitCode {
         Some("build-ebpf") => build_ebpf(),
         Some("clippy-ebpf") => clippy_ebpf(),
         Some("build") => build_ebpf().and_then(|()| build_workspace()),
-        Some("e2e") => test_e2e(),
+        Some("e2e") => test_e2e(std::env::args().any(|a| a == "--ebpf")),
         Some("dev") => dev(),
         Some(other) => {
             eprintln!("unknown task: {other}");
@@ -50,8 +50,10 @@ fn print_usage() {
     eprintln!("  doc           cargo doc --no-deps with -D warnings (broken links fail)");
     eprintln!("  ci            everything CI runs that does not need root, failing at");
     eprintln!("                the first stage that breaks; cargo-deny if it is installed");
-    eprintln!("  e2e           run the hallpassd e2e tests (compiles as you, runs the");
-    eprintln!("                test binary under sudo -E; will prompt for your password)");
+    eprintln!("  e2e [--ebpf]  run the hallpassd e2e tests (compiles as you, runs the");
+    eprintln!("                test binary under sudo -E; will prompt for your password).");
+    eprintln!("                --ebpf builds the object first and enables the feature, so");
+    eprintln!("                the tests that skip without it actually run");
     eprintln!();
     eprintln!("builds:");
     eprintln!("  build-ebpf    build the hallpass-ebpf kernel programs");
@@ -240,21 +242,29 @@ fn ci() -> Result<(), String> {
 /// only the finished test binary runs under sudo, via cargo's per-target
 /// `runner`. `cfg(all())` matches every host triple, so no triple is
 /// hard-coded here.
-fn test_e2e() -> Result<(), String> {
-    run(Command::new(cargo())
-        .args([
-            "test",
-            "-p",
-            "hallpassd",
-            "--test",
-            "e2e",
-            "--config",
-            "target.'cfg(all())'.runner=\"sudo -E\"",
-            "--",
-            "--ignored",
-            "--test-threads=1",
-        ])
-        .current_dir(workspace_root()))
+///
+/// `ebpf` builds the kernel programs first and enables the feature. Several
+/// tests are gated on it and skip loudly without it - the libc-resolver
+/// uprobes and the exec-after-connect race - so a run without this exercises
+/// neither, and a suite that skips the tests for a feature reports the same
+/// green as one that passed them.
+fn test_e2e(ebpf: bool) -> Result<(), String> {
+    if ebpf {
+        build_ebpf()?;
+    }
+    let mut cmd = Command::new(cargo());
+    cmd.args(["test", "-p", "hallpassd", "--test", "e2e"]);
+    if ebpf {
+        cmd.args(["--features", "ebpf"]);
+    }
+    cmd.args([
+        "--config",
+        "target.'cfg(all())'.runner=\"sudo -E\"",
+        "--",
+        "--ignored",
+        "--test-threads=1",
+    ]);
+    run(cmd.current_dir(workspace_root()))
 }
 
 /// Escape a string for a TOML basic string (`"..."`).

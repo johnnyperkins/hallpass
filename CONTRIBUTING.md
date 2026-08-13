@@ -131,8 +131,10 @@ compilation unprivileged.)
 `--test-threads=1` is required. The tests share fixed namespace names, so
 two running at once fight over the same veth pair.
 
-Add `--features ebpf` to include the libc-resolver uprobe test, which skips
-itself without the feature.
+Add `--features ebpf` (or run `cargo xtask e2e --ebpf`, which builds the
+object first) to include the tests gated on it: the libc-resolver uprobes and
+the exec-after-connect race. Both skip themselves without the feature, so a
+run without it says nothing about either.
 
 The suite skips gracefully and passes when the environment cannot run it, so
 a green run is not proof the tests ran. CI greps the output for the `SKIP
