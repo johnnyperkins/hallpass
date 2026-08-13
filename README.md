@@ -505,6 +505,17 @@ attacker with root, who can delete the nftables table outright.
   are skipped, and the ownership check and the parsed bytes come from the
   same file descriptor, so the file that was checked is the file that is
   read. The same policy and mechanism apply to match-list files.
+- **Policy directories**: the daemon checks that `/etc/hallpass` and the
+  rules directory are root-owned and not group/world-writable, warns at error
+  level when they are not, and refuses to start under `queue_bypass = false`.
+  The per-file checks above are worth nothing without it: unlinking a file
+  needs write permission on the *directory*, not on the file, so on a
+  group-writable `rules.d` any member of that group can delete root's deny
+  rules without ever touching a file those checks would look at - and a
+  vanished rule file is an ordinary delete, so nothing is skipped, nothing is
+  counted, and the shrunken set is applied as policy. A sticky directory is
+  accepted, because `t` takes exactly that power back. `hallpass-cli doctor`
+  reports the same check as `policy-dirs`.
 - **systemd hardening**: `ProtectSystem=strict`, `ProtectHome`,
   `NoNewPrivileges`, `MemoryDenyWriteExecute`, `RestrictNamespaces`,
   `RestrictSUIDSGID`, `PrivateTmp`, `ProtectKernelTunables`/`Logs`/`Modules`,

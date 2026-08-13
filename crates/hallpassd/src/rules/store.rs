@@ -6,7 +6,7 @@
 //! reads rules lock-free.
 
 use std::io::Read;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -149,6 +149,61 @@ pub const MAX_RULE_WIRE_BYTES: usize = 768;
 /// own euid, for non-root development runs) and not group/world-writable.
 pub(crate) fn file_perms_ok(file_uid: u32, mode: u32, self_uid: u32) -> bool {
     (file_uid == 0 || file_uid == self_uid) && mode & 0o022 == 0
+}
+
+/// Whether the *directory* holding policy files is as trustworthy as the
+/// files in it are required to be.
+///
+/// [`file_perms_ok`] and the symlink refusal in [`load_dir`] both check
+/// files, and every one of those checks silently assumes this. Unlinking a
+/// file needs write permission on the **directory**, not on the file: on a
+/// group-writable `rules.d`, any member of that group can delete root's deny
+/// rules without ever touching a file the per-file checks would look at. It
+/// is silent, too - `load_dir` classifies a vanished file as an ordinary
+/// delete, so nothing is skipped, nothing is counted, and `reload_disk`
+/// applies the shrunken set as authoritative policy.
+///
+/// The sticky bit is honoured because it takes exactly that power back: with
+/// `t` set, a user may only unlink files they own, so a group-writable
+/// sticky directory cannot lose root's rules. Files *created* there are owned
+/// by whoever created them and are refused by [`file_perms_ok`] as before.
+pub(crate) fn dir_trust_ok(dir_uid: u32, mode: u32, self_uid: u32) -> bool {
+    if dir_uid != 0 && dir_uid != self_uid {
+        return false;
+    }
+    mode & 0o022 == 0 || mode & 0o1000 != 0
+}
+
+/// How a directory the daemon trusts policy from failed its check, or `Ok`
+/// when it is fine or simply absent.
+///
+/// Absent is not a failure: `rules_dir` is created on the first persisted
+/// rule, and an operator who has written no rules yet has a directory that
+/// does not exist rather than one that cannot be trusted.
+pub fn check_policy_dir(path: &Path) -> Result<(), String> {
+    let meta = match std::fs::metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(format!("cannot stat {}: {e}", path.display())),
+    };
+    if !meta.is_dir() {
+        return Err(format!("{} is not a directory", path.display()));
+    }
+    let self_uid = effective_uid().unwrap_or(u32::MAX);
+    if dir_trust_ok(meta.uid(), meta.mode(), self_uid) {
+        return Ok(());
+    }
+    Err(format!(
+        "{} is uid {} mode {:04o}: anyone who can write this directory can \
+         delete or replace the policy files in it, whatever those files' own \
+         permissions say. Expected root-owned and not group/world-writable \
+         (chown root {} && chmod 755 {})",
+        path.display(),
+        meta.uid(),
+        meta.mode() & 0o7777,
+        path.display(),
+        path.display(),
+    ))
 }
 
 /// Effective UID via the st_uid of /proc/self; avoids a libc dependency.
@@ -940,8 +995,22 @@ impl RuleStore {
     }
 
     fn persist(&self, rule: &Rule, entries: &[Entry]) -> Result<PathBuf, String> {
-        std::fs::create_dir_all(&self.rules_dir)
-            .map_err(|e| format!("create {}: {e}", self.rules_dir.display()))?;
+        // An explicit mode, not plain `create_dir_all`: that creates with
+        // `0777 & ~umask`, so a daemon started outside the shipped unit (which
+        // sets `UMask=0077`) by a shell with the `umask 002` Debian and Ubuntu
+        // default would create the rules directory group-writable - and a
+        // group-writable rules directory is exactly what `dir_trust_ok`
+        // exists to refuse. The daemon must not create the state it warns
+        // about. Only applies when this call creates the directory; an
+        // existing one keeps whatever the operator gave it.
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o755)
+            .create(&self.rules_dir)
+            .or_else(|e| match self.rules_dir.is_dir() {
+                true => Ok(()),
+                false => Err(format!("create {}: {e}", self.rules_dir.display())),
+            })?;
         let path = self.unique_path(&rule.name, entries);
         self.persist_to(rule, &path)?;
         Ok(path)
@@ -1120,6 +1189,76 @@ mod tests {
         let mut r = rule("listy", RuleDuration::Session);
         r.matcher.ips_file = Some(path.to_path_buf());
         r
+    }
+
+    /// **Unlinking a file needs write on the directory, not on the file.**
+    /// Every per-file check in this module is worth nothing if the directory
+    /// holding those files can be written by someone the daemon does not
+    /// trust: they cannot forge a rule (a file they create is theirs, and
+    /// `file_perms_ok` refuses it), but they can *delete* root's deny rules,
+    /// and `load_dir` reads a vanished file as an ordinary delete - nothing
+    /// skipped, nothing counted, the shrunken set applied as policy.
+    #[test]
+    fn a_writable_policy_directory_is_not_trusted() {
+        let self_uid = 1000;
+        // The shipped shape.
+        assert!(dir_trust_ok(0, 0o755, self_uid), "root-owned 0755");
+        // A non-root development run owns its own directory.
+        assert!(dir_trust_ok(self_uid, 0o755, self_uid));
+
+        // Group or world write is the delete power, whichever it is.
+        assert!(!dir_trust_ok(0, 0o775, self_uid), "group-writable");
+        assert!(!dir_trust_ok(0, 0o757, self_uid), "world-writable");
+        // Owned by someone else entirely: they can replace it wholesale.
+        assert!(!dir_trust_ok(1234, 0o755, self_uid));
+
+        // The sticky bit takes the delete power back, so it is not a finding:
+        // with `t` set a user may only unlink files they own, and files they
+        // create are refused by `file_perms_ok` as before.
+        assert!(dir_trust_ok(0, 0o1777, self_uid), "sticky");
+    }
+
+    /// The same check over a real directory, including the two answers that
+    /// are not failures: a directory that does not exist yet (no rule has
+    /// been persisted), and one at the shipped mode.
+    #[test]
+    fn check_policy_dir_accepts_absent_and_well_moded_directories() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_td, dir) = tmpdir("policy-dir");
+        let rules = trusted_dir(&dir.join("rules.d"));
+        check_policy_dir(&rules).expect("0755 is the shipped mode");
+
+        // Never created, because nothing has been persisted yet.
+        check_policy_dir(&dir.join("never-made")).expect("absent is not untrusted");
+
+        // A file where a directory belongs is a misconfiguration worth
+        // naming rather than reading rules out of.
+        let not_a_dir = write(dir.join("regular"), "");
+        assert!(check_policy_dir(&not_a_dir).is_err());
+
+        std::fs::set_permissions(&rules, std::fs::Permissions::from_mode(0o775)).unwrap();
+        let err = check_policy_dir(&rules).expect_err("group-writable must be refused");
+        // The message has to say what to do about it: this is read by an
+        // operator in a journal, not by a developer at a backtrace.
+        assert!(err.contains("delete or replace"), "{err}");
+        assert!(err.contains("chmod 755"), "{err}");
+    }
+
+    /// The daemon must not create the state it refuses to start on. Plain
+    /// `create_dir_all` uses `0777 & ~umask`, so under the `umask 002` that
+    /// Debian and Ubuntu ship, a daemon run outside the unit would make its
+    /// own rules directory group-writable on the first persisted rule.
+    #[test]
+    fn persisting_creates_the_rules_directory_at_a_trusted_mode() {
+        let (_td, dir) = tmpdir("persist-mkdir");
+        let rules_dir = dir.join("made-on-demand");
+        let store = RuleStore::new(rules_dir.clone());
+        store
+            .add(rule("keeper", RuleDuration::Forever))
+            .expect("a forever rule is persisted, creating the directory");
+        assert!(rules_dir.is_dir(), "the directory was created");
+        check_policy_dir(&rules_dir).expect("and at a mode the daemon trusts");
     }
 
     /// A list path outside the rules directory is refused before anything

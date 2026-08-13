@@ -7,6 +7,17 @@ carries what an upgrade changes on a running host.
 
 ### Added
 
+- **The daemon refuses to trust a policy directory anyone else can write.**
+  `/etc/hallpass` and the rules directory are now checked for root ownership
+  and group/world write at startup, reported at error level, and fatal under
+  `queue_bypass = false`. Every per-file check already there assumed this:
+  unlinking a file needs write on the *directory*, not on the file, so on a
+  group-writable `rules.d` any member of that group could delete root's deny
+  rules without touching a file those checks would ever look at - and a
+  vanished rule file reads as an ordinary delete, so nothing was skipped,
+  nothing counted, and the shrunken set applied as policy. Sticky directories
+  are accepted. `hallpass-cli doctor` reports the same check as `policy-dirs`.
+
 - **With the `ebpf` feature, a process can no longer inherit another binary's
   allow rule by exec'ing after it connects.** A socket descriptor survives
   `execve`, so a process could start a non-blocking `connect()`, immediately

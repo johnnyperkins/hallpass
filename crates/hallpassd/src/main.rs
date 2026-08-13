@@ -51,6 +51,30 @@ use crate::prompt::PromptTable;
 use crate::rules::store::RuleStore;
 use crate::stats::Counters;
 
+/// Check the two directories the daemon trusts policy from, reporting
+/// whether both passed.
+///
+/// The config's parent as well as the rules directory: writing that one lets
+/// a planter rename `config.toml` away, and the shipped unit names the path
+/// explicitly, which makes a missing config fatal (`config::Config::load`).
+/// The host is then unfiltered with the daemon refusing to start - a denial
+/// of service reached by a directory mode rather than by any privilege.
+///
+/// Reported at error level whatever the posture, because the finding is the
+/// same either way; only whether it stops the daemon differs, and the caller
+/// decides that from `queue_bypass`.
+fn policy_dirs_trusted(config_path: &std::path::Path, rules_dir: &std::path::Path) -> bool {
+    let mut ok = true;
+    let config_dir = config_path.parent().unwrap_or(std::path::Path::new("."));
+    for (what, dir) in [("config directory", config_dir), ("rules directory", rules_dir)] {
+        if let Err(e) = rules::store::check_policy_dir(dir) {
+            tracing::error!("{what} is not trustworthy: {e}");
+            ok = false;
+        }
+    }
+    ok
+}
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
@@ -88,6 +112,30 @@ async fn main() {
         tracing::warn!(
             "not running as root: nftables install and packet interception will likely fail"
         );
+    }
+
+    // Before the socket and long before the nftables install, because this is
+    // the one check whose failure means the policy about to be loaded may not
+    // be the policy root wrote. It reads two directories and changes nothing,
+    // so running it first costs nothing and leaves backing out free.
+    //
+    // Every per-file trust check in this daemon - `file_perms_ok`, the
+    // symlink refusal, the same-fd stat - assumes the directory holding those
+    // files cannot be written by anyone untrusted, and nothing verified it.
+    // See `rules::store::dir_trust_ok` for what a group-writable rules
+    // directory costs.
+    if !policy_dirs_trusted(&config_arg.path, &cfg.rules_dir) && !cfg.queue_bypass {
+        // Fail-closed already trades availability for enforcement, so an
+        // operator who chose it is asking not to run with policy that may
+        // have been edited out from under them. Under fail-open the same
+        // finding is a loud warning: refusing there would take a working
+        // firewall down over a directory mode, which is the wrong trade for
+        // the posture that already prefers availability.
+        tracing::error!(
+            "refusing to start: policy directories are not trustworthy and \
+             queue_bypass is off"
+        );
+        std::process::exit(1);
     }
 
     // Take the control socket before installing any nftables rules. A

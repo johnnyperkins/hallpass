@@ -136,6 +136,7 @@ pub async fn run(socket: &Path, out: Output) -> i32 {
 
     let env = Env::load();
     socket_check(socket, &env, &mut checks);
+    policy_dirs_check(&env, &mut checks);
     group_check(&env, &mut checks);
     nft_checks(env.euid, &mut checks);
     btf_check(&mut checks);
@@ -452,6 +453,122 @@ fn socket_check(socket: &Path, env: &Env, checks: &mut Vec<Check>) {
     }
 }
 
+/// Where the daemon's policy lives when nothing says otherwise. Kept here
+/// rather than shared with the daemon's `config` module, because the CLI does
+/// not depend on the daemon crate; the values are the ones
+/// `hallpassd::config::Config::default` uses.
+const DEFAULT_CONFIG: &str = "/etc/hallpass/config.toml";
+const DEFAULT_RULES_DIR: &str = "/etc/hallpass/rules.d";
+
+/// The directories the daemon trusts policy out of.
+///
+/// **This is a check about deletion, not about forgery.** Every per-file
+/// trust check the daemon makes - root-owned, not group/world-writable,
+/// symlinks refused, ownership and content from one descriptor - assumes the
+/// directory holding those files cannot be written by anyone untrusted, and
+/// nothing in the install verifies it afterwards. Unlinking a file needs
+/// write on the *directory*: on a group-writable `rules.d`, any member of
+/// that group deletes root's deny rules without touching a file the per-file
+/// checks would ever look at, and the daemon reads the result as policy.
+///
+/// `fail`, not `warn`: unlike the socket modes above, nothing here is a
+/// deployment choice that might have been made on purpose. The sticky bit is
+/// accepted, because it takes exactly the delete power back.
+fn policy_dirs_check(env: &Env, checks: &mut Vec<Check>) {
+    let rules_dir = configured_rules_dir();
+    let config_dir = Path::new(DEFAULT_CONFIG)
+        .parent()
+        .unwrap_or(Path::new("/etc/hallpass"))
+        .to_path_buf();
+
+    let mut details = Vec::new();
+    let mut bad = Vec::new();
+    for dir in [&config_dir, &rules_dir] {
+        match dir_trust(dir, env) {
+            DirTrust::Missing => details.push(format!("{} absent", dir.display())),
+            DirTrust::Ok(mode) => details.push(format!("{} mode {mode:04o}", dir.display())),
+            DirTrust::Unreadable(e) => details.push(format!("{}: {e}", dir.display())),
+            DirTrust::Writable { uid, mode } => {
+                let owner =
+                    name_for_id(env.etc_passwd.as_deref(), uid).unwrap_or_else(|| uid.to_string());
+                details.push(format!("{} mode {mode:04o} {owner}", dir.display()));
+                bad.push(dir.display().to_string());
+            }
+        }
+    }
+
+    let detail = details.join(", ");
+    if bad.is_empty() {
+        checks.push(Check::ok("policy-dirs", detail));
+    } else {
+        checks.push(Check::fail(
+            "policy-dirs",
+            detail,
+            Some(format!(
+                "anyone who can write these can delete the rule files in them, \
+                 whatever the files' own modes say: sudo chown root {0} && sudo chmod 755 {0}",
+                bad.join(" ")
+            )),
+        ));
+    }
+}
+
+/// What one policy directory looks like.
+enum DirTrust {
+    /// Not there. `rules.d` is created on the first persisted rule, so this
+    /// is an ordinary state rather than a finding.
+    Missing,
+    /// Trustworthy, at this mode.
+    Ok(u32),
+    /// Could not be looked at, which is not the same as being wrong.
+    Unreadable(String),
+    /// Writable by someone the daemon does not trust.
+    Writable { uid: u32, mode: u32 },
+}
+
+fn dir_trust(dir: &Path, env: &Env) -> DirTrust {
+    use std::os::unix::fs::MetadataExt;
+
+    let md = match std::fs::metadata(dir) {
+        Ok(md) => md,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return DirTrust::Missing,
+        Err(e) => return DirTrust::Unreadable(e.to_string()),
+    };
+    let mode = md.mode() & 0o7777;
+    if !md.is_dir() {
+        return DirTrust::Unreadable("not a directory".into());
+    }
+    // The daemon's own predicate (`rules::store::dir_trust_ok`): owned by
+    // root or by the daemon's euid, and not group/world-writable unless the
+    // sticky bit takes that power back. The daemon runs as root, so its euid
+    // is 0 here rather than this invocation's.
+    let owner_ok = md.uid() == 0 || env.euid == Some(md.uid());
+    if owner_ok && (mode & 0o022 == 0 || mode & 0o1000 != 0) {
+        DirTrust::Ok(mode)
+    } else {
+        DirTrust::Writable { uid: md.uid(), mode }
+    }
+}
+
+/// `rules_dir` as the daemon will read it: from the config file when that is
+/// readable, otherwise the built-in default.
+///
+/// Best effort by design. The config is 0644 in a normal install so this
+/// usually succeeds, and when it does not, checking the default is still
+/// worth more than checking nothing - a moved rules directory is rare, and
+/// the reported path says which one was looked at either way.
+fn configured_rules_dir() -> std::path::PathBuf {
+    #[derive(serde::Deserialize)]
+    struct JustRulesDir {
+        rules_dir: Option<std::path::PathBuf>,
+    }
+    std::fs::read_to_string(DEFAULT_CONFIG)
+        .ok()
+        .and_then(|t| toml::from_str::<JustRulesDir>(&t).ok())
+        .and_then(|c| c.rules_dir)
+        .unwrap_or_else(|| std::path::PathBuf::from(DEFAULT_RULES_DIR))
+}
+
 /// Whether this invocation can reach the socket by group, and the one
 /// diagnosis a permission error cannot make on its own: added to the group
 /// on disk but running in a session that predates it.
@@ -716,6 +833,54 @@ fn print_human(checks: &[Check], pal: Palette) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The predicate must agree with the daemon's `rules::store::dir_trust_ok`,
+    /// which this crate cannot call (the CLI does not depend on the daemon).
+    /// Two copies of a security predicate drift, so both are asserted against
+    /// the same four shapes: the shipped mode, group write, world write, and
+    /// the sticky bit that takes the delete power back.
+    #[test]
+    fn policy_directory_trust_matches_the_daemons_predicate() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("hallpass-doctor-dirs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Owned by this test user, so the check compares against `euid`
+        // rather than against root, which is the non-root development shape.
+        let env = Env {
+            euid: effective_uid(),
+            etc_group: None,
+            etc_passwd: None,
+        };
+        let at = |mode: u32| {
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode)).unwrap();
+            dir_trust(&dir, &env)
+        };
+
+        assert!(matches!(at(0o755), DirTrust::Ok(0o755)), "the shipped mode");
+        assert!(
+            matches!(at(0o775), DirTrust::Writable { .. }),
+            "group-writable is the delete power"
+        );
+        assert!(
+            matches!(at(0o757), DirTrust::Writable { .. }),
+            "world-writable likewise"
+        );
+        assert!(
+            matches!(at(0o1777), DirTrust::Ok(0o1777)),
+            "sticky takes the delete power back"
+        );
+
+        // Absent is an ordinary state: rules.d is created on the first
+        // persisted rule, so a host with no rules yet must not read as broken.
+        assert!(matches!(
+            dir_trust(&dir.join("never-made"), &env),
+            DirTrust::Missing
+        ));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// A depth is reported against the length in force, so a reader can tell
     /// pressure from idle. Without a known length it stays bare rather than
