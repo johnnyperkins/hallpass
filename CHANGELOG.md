@@ -299,6 +299,15 @@ carries what an upgrade changes on a running host.
 
 ### Changed
 
+- **`install.sh` now writes the hardened config on a fresh install.**
+  Unmatched and unanswered connections are denied, unmodelled transports are
+  denied, and enforcement survives a dead daemon (`queue_bypass = false`).
+  `HALLPASS_POSTURE=desktop ./install.sh` keeps the previous permissive
+  config. An existing `/etc/hallpass/config.toml` is never replaced either
+  way, so this changes nothing on an upgrade.
+- The installer and README now state what joining the `hallpass` group means:
+  a member can disable enforcement, lift a lockdown posture, delete any rule,
+  or take the prompt-handler slot. There is no read-only tier.
 - Fixed a dependency advisory (RUSTSEC-2026-0257, `webbrowser` argument
   injection) pulled in through the GUI's window stack.
 - **The UI prefers the X11 backend (XWayland on Wayland sessions).**

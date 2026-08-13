@@ -1,9 +1,10 @@
 #!/bin/sh
 # Hallpass one-command installer.
 #
-#   ./install.sh                   # build + install + enable
-#   HALLPASS_EBPF=1 ./install.sh   # require eBPF attribution (fail if toolchain missing)
-#   HALLPASS_EBPF=0 ./install.sh   # force the procfs-only build
+#   ./install.sh                          # build + install + enable
+#   HALLPASS_EBPF=1 ./install.sh          # require eBPF attribution (fail if toolchain missing)
+#   HALLPASS_EBPF=0 ./install.sh          # force the procfs-only build
+#   HALLPASS_POSTURE=desktop ./install.sh # permissive config instead of the hardened one
 #
 # eBPF attribution is recommended and built by default when the toolchain
 # (nightly Rust + bpf-linker) is available; otherwise the build falls back
@@ -44,6 +45,25 @@ auto)
 	;;
 esac
 
+# Which config a *fresh* install starts from. Hardened by default: the
+# permissive one allows every unmatched connection, every unanswered prompt,
+# every transport the rule engine does not model, and everything at all while
+# the daemon is dead (queue_bypass), so a machine that installs it is not
+# filtered until someone writes rules. That is a reasonable desktop default
+# and a bad default for anything else, and the difference is one word here
+# rather than a file an operator has to know exists.
+#
+# Only ever applies when there is no config yet; an edited one is never
+# replaced, whatever this says.
+case ${HALLPASS_POSTURE:=hardened} in
+hardened) posture_file=etc/config.hardened.toml ;;
+desktop) posture_file=etc/config.toml ;;
+*)
+	echo "HALLPASS_POSTURE must be 'hardened' or 'desktop'; got '${HALLPASS_POSTURE}'" >&2
+	exit 1
+	;;
+esac
+
 # Pick the login user even when the script itself is later re-run under sudo.
 target_user=${SUDO_USER:-$(id -un)}
 
@@ -52,8 +72,9 @@ echo ">> Installing (sudo)..."
 # unprivileged shell before being piped into a root one, so a value like
 # SUDO_USER (which sudo does not set when the script is run directly, and which
 # nothing validates) would be interpolated straight into root's input.
-sudo sh -eus -- "$target_user" <<'INSTALL'
+sudo sh -eus -- "$target_user" "$posture_file" <<'INSTALL'
 target_user=$1
+posture_file=$2
 install -Dm755 target/release/hallpassd   /usr/bin/hallpassd
 install -Dm755 target/release/hallpass-cli /usr/bin/hallpass-cli
 install -Dm755 target/release/hallpass-ui  /usr/bin/hallpass-ui
@@ -65,7 +86,7 @@ install -Dm755 target/release/hallpass-ui  /usr/bin/hallpass-ui
 # Explicit mode on the directories: the rule-trust design depends on rules.d
 # not being group-writable, so do not lean on coreutils' implicit default.
 install -d -m755 /etc/hallpass /etc/hallpass/rules.d
-[ -f /etc/hallpass/config.toml ] || install -m644 etc/config.toml /etc/hallpass/config.toml
+[ -f /etc/hallpass/config.toml ] || install -m644 "$posture_file" /etc/hallpass/config.toml
 [ -e /etc/hallpass/rules.d/example-allow-dns.toml ] \
   || install -m644 etc/rules.d/example-allow-dns.toml /etc/hallpass/rules.d/example-allow-dns.toml
 
@@ -94,6 +115,12 @@ install -Dm644 etc/hallpass-ui.desktop /usr/share/applications/hallpass-ui.deskt
 install -Dm644 etc/hallpass-ui-autostart.desktop /etc/xdg/autostart/hallpass-ui.desktop
 
 # Let the installing user manage the daemon without sudo.
+#
+# There is no read-only tier: the socket's group is the whole authorization
+# model, so a member can set enforce = false, lift a lockdown posture, delete
+# every deny rule, or claim the prompt-handler slot and answer allow. That is
+# the designed boundary, not an oversight - but it is worth more than a line
+# in the README, because this is where it is handed out.
 groupadd -f hallpass
 usermod -aG hallpass "$target_user"
 
@@ -103,6 +130,14 @@ INSTALL
 
 echo
 echo ">> Done. hallpassd is running."
+echo "   - Posture: ${HALLPASS_POSTURE}. A fresh install writes"
+echo "     /etc/hallpass/config.toml from ${posture_file}; an existing one is never"
+echo "     replaced. 'hardened' denies unmatched and unanswered connections and"
+echo "     keeps enforcing when the daemon dies; 'desktop' allows all three."
+echo "   - '$target_user' is now in the 'hallpass' group, which is full control of"
+echo "     the firewall: members can disable enforcement, lift a lockdown, and"
+echo "     delete any rule. There is no read-only tier. Add only who you would"
+echo "     trust with that."
 echo "   - Log out and back in once so '$target_user' picks up the 'hallpass' group."
 echo "   - The Hallpass UI autostarts on next login and pops up connection prompts."
 echo "   - Terminal client: hallpass-cli status | rules | events | watch"

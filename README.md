@@ -105,9 +105,10 @@ to procfs; so does any individual flow eBPF cannot resolve.
 One command builds, installs, and starts everything:
 
 ```sh
-./install.sh                    # eBPF attribution when the toolchain is present
-HALLPASS_EBPF=1 ./install.sh    # require eBPF (fail instead of falling back)
-HALLPASS_EBPF=0 ./install.sh    # force the procfs-only build (stable Rust)
+./install.sh                          # eBPF attribution when the toolchain is present
+HALLPASS_EBPF=1 ./install.sh          # require eBPF (fail instead of falling back)
+HALLPASS_EBPF=0 ./install.sh          # force the procfs-only build (stable Rust)
+HALLPASS_POSTURE=desktop ./install.sh # permissive config instead of the hardened one
 ```
 
 It builds the release binaries as your user, then uses `sudo` (prompting
@@ -116,6 +117,21 @@ once) to install them to `/usr/bin`, drop the config and example rule into
 systemd unit and desktop entry, autostart the UI, add you to the `hallpass`
 group, and `systemctl enable --now hallpassd`. Log out and back in once so the
 group membership and UI autostart take effect.
+
+Two things it does that are worth reading before you run it:
+
+- **A fresh install starts from `etc/config.hardened.toml`.** Unmatched and
+  unanswered connections are denied, transports the rule engine does not model
+  are denied, and `queue_bypass = false` keeps enforcement up when the daemon
+  is dead or its queue is full. `HALLPASS_POSTURE=desktop` writes
+  `etc/config.toml` instead, which allows all three - fine for a desktop where
+  you are at the keyboard to answer prompts, wrong for anything unattended.
+  Either way an existing `config.toml` is left exactly as you edited it.
+- **The `hallpass` group is full control of the firewall**, and the script
+  adds you to it. A member can set `enforce = false`, lift a lockdown posture,
+  delete any rule, or take the prompt-handler slot and answer allow. There is
+  no read-only tier; the socket's group is the whole authorization model. Add
+  only accounts you would trust with that.
 
 Remove it again with `./uninstall.sh` (add `HALLPASS_PURGE=1` to also delete
 `/etc/hallpass` and `/var/lib/hallpass`).
