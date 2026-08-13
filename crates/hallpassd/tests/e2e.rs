@@ -2345,6 +2345,17 @@ fn lockdown_suppresses_untagged_allows_against_a_real_queue() {
         String::from_utf8_lossy(&on.stderr).trim(),
         env.daemon_log()
     );
+
+    // Both probes above completed, and a completed connection ends its
+    // listener: `nc -l` serves one and exits. Without fresh ones the next
+    // probe is refused rather than filtered, which from here is
+    // indistinguishable from the posture blocking it - and it reads as this
+    // test failing on the pinned rule, which is exactly what it did the
+    // first time it ran. The blocked probe below consumes nothing, so its
+    // listener is still there for the one after `lockdown off`.
+    env.start_listener(PINNED);
+    env.start_listener(UNPINNED);
+
     assert!(
         env.connect(PINNED),
         "a pinned allow must keep deciding under the posture; daemon log:\n{}",
