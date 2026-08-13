@@ -1099,6 +1099,23 @@ mod tests {
         (td, path)
     }
 
+    /// A directory the trust checks accept, whatever the umask. Rule and
+    /// list files are refused unless they are not group/world-writable, and
+    /// `create_dir_all` alone inherits the umask; see
+    /// [`crate::testutil::trust_mode`].
+    fn trusted_dir(path: &Path) -> PathBuf {
+        std::fs::create_dir_all(path).unwrap();
+        crate::testutil::trust_mode(path);
+        path.to_path_buf()
+    }
+
+    /// Write a rule or list file the loader will accept. See
+    /// [`crate::testutil::write_trusted`].
+    fn write(path: PathBuf, text: &str) -> PathBuf {
+        crate::testutil::write_trusted(&path, text);
+        path
+    }
+
     fn rule_with_ips_file(path: &Path) -> Rule {
         let mut r = rule("listy", RuleDuration::Session);
         r.matcher.ips_file = Some(path.to_path_buf());
@@ -1110,13 +1127,11 @@ mod tests {
     #[test]
     fn add_refuses_list_file_outside_rules_dir() {
         let (_td, dir) = tmpdir("outside-list");
-        let outside = dir.join("elsewhere");
-        std::fs::create_dir_all(&outside).unwrap();
-        let list = outside.join("ips.list");
-        std::fs::write(&list, "10.0.0.1\n").unwrap();
+        let outside = trusted_dir(&dir.join("elsewhere"));
+        let list = write(outside.join("ips.list"), "10.0.0.1\n");
 
         let store = RuleStore::new(dir.join("rules.d"));
-        std::fs::create_dir_all(dir.join("rules.d")).unwrap();
+        trusted_dir(&dir.join("rules.d"));
         let err = store.add(rule_with_ips_file(&list)).unwrap_err();
         assert!(err.contains("ips_file must name a file in"), "{err}");
     }
@@ -1126,12 +1141,10 @@ mod tests {
     #[test]
     fn add_list_file_rejection_does_not_leak_existence() {
         let (_td, dir) = tmpdir("oracle-list");
-        let rules_dir = dir.join("rules.d");
-        std::fs::create_dir_all(&rules_dir).unwrap();
+        let rules_dir = trusted_dir(&dir.join("rules.d"));
         let store = RuleStore::new(rules_dir);
 
-        let real_but_outside = dir.join("real.list");
-        std::fs::write(&real_but_outside, "10.0.0.1\n").unwrap();
+        let real_but_outside = write(dir.join("real.list"), "10.0.0.1\n");
         let missing = dir.join("definitely-absent.list");
 
         let a = store.add(rule_with_ips_file(&real_but_outside)).unwrap_err();
@@ -1143,10 +1156,8 @@ mod tests {
     #[test]
     fn add_accepts_list_file_inside_rules_dir() {
         let (_td, dir) = tmpdir("inside-list");
-        let rules_dir = dir.join("rules.d");
-        std::fs::create_dir_all(&rules_dir).unwrap();
-        let list = rules_dir.join("ips.list");
-        std::fs::write(&list, "10.0.0.1\n").unwrap();
+        let rules_dir = trusted_dir(&dir.join("rules.d"));
+        let list = write(rules_dir.join("ips.list"), "10.0.0.1\n");
 
         let store = RuleStore::new(rules_dir);
         store.add(rule_with_ips_file(&list)).expect("in-dir list accepted");
@@ -1168,15 +1179,12 @@ mod tests {
     #[test]
     fn symlinked_rule_file_is_skipped() {
         let (_td, dir) = tmpdir("symlink");
-        let outside = dir.join("real.txt");
-        std::fs::write(
-            &outside,
+        let outside = write(
+            dir.join("real.txt"),
             "name = \"linked\"\naction = \"allow\"\nduration = \"forever\"\n\
              priority = 1\nenabled = true\n[match]\nport = 80\n",
-        )
-        .unwrap();
-        let rules = dir.join("rules.d");
-        std::fs::create_dir_all(&rules).unwrap();
+        );
+        let rules = trusted_dir(&dir.join("rules.d"));
         std::os::unix::fs::symlink(&outside, rules.join("linked.toml")).unwrap();
 
         let store = RuleStore::new(rules);
@@ -1246,7 +1254,7 @@ mod tests {
         let (_td, dir) = tmpdir("toggle-origin");
         let text = "name = \"block-x\"\naction = \"deny\"\nduration = \"forever\"\n\
                     priority = 1\nenabled = true\n[match]\nport = 25\n";
-        std::fs::write(dir.join("00-block.toml"), text).unwrap();
+        write(dir.join("00-block.toml"), text);
         let store = RuleStore::new(dir.clone());
         store.toggle("block-x", false).unwrap();
 
@@ -1311,7 +1319,7 @@ mod tests {
         let text = "name = \"deny-telemetry\"\naction = \"deny\"\nduration = \"forever\"\n\
                     priority = 1\nenabled = true\ntags = [\"Prod\", \"work\", \"work\", \"-\"]\n\
                     [match]\nport = 25\n";
-        std::fs::write(dir.join("00-deny.toml"), text).unwrap();
+        write(dir.join("00-deny.toml"), text);
         let store = RuleStore::new(dir.clone());
         let loaded = store.list();
         assert_eq!(loaded.len(), 1, "an unusable tag skipped the whole rule");
@@ -1383,7 +1391,7 @@ mod tests {
         let (_td, dir) = tmpdir("pre-tags");
         let text = "name = \"old\"\naction = \"deny\"\nduration = \"forever\"\n\
                     priority = 1\nenabled = true\n[match]\nport = 25\n";
-        std::fs::write(dir.join("00-old.toml"), text).unwrap();
+        write(dir.join("00-old.toml"), text);
         let store = RuleStore::new(dir.clone());
         let loaded = store.list();
         assert_eq!(loaded.len(), 1, "pre-tags rule file must load");
@@ -1418,7 +1426,7 @@ mod tests {
         let (_td, dir) = tmpdir("invalid-disk");
         let text = "name = \"bad\"\naction = \"deny\"\nduration = \"forever\"\n\
                     priority = 1\nenabled = true\n[match]\ndest = \"not-an-ip\"\n";
-        std::fs::write(dir.join("bad.toml"), text).unwrap();
+        write(dir.join("bad.toml"), text);
         let store = RuleStore::new(dir);
         assert!(store.list().is_empty());
         assert_eq!(store.rules_skipped(), 1);
@@ -1434,7 +1442,7 @@ mod tests {
         let text = "name = \"typo\"\naction = \"allow\"\nduration = \"forever\"\n\
                     priority = 100\nenabled = true\n[match]\n\
                     exe_path = \"/usr/bin/curl\"\nprt = 443\n";
-        std::fs::write(dir.join("typo.toml"), text).unwrap();
+        write(dir.join("typo.toml"), text);
         let store = RuleStore::new(dir);
         assert!(
             store.list().is_empty(),
@@ -1450,7 +1458,7 @@ mod tests {
         let (_td, dir) = tmpdir("typo-toplevel");
         let text = "name = \"t\"\naction = \"deny\"\nduration = \"forever\"\n\
                     priority = 1\nenabled = true\nprioritee = 9\n[match]\nport = 25\n";
-        std::fs::write(dir.join("t.toml"), text).unwrap();
+        write(dir.join("t.toml"), text);
         let store = RuleStore::new(dir);
         assert!(store.list().is_empty());
         assert_eq!(store.rules_skipped(), 1);
@@ -1508,7 +1516,7 @@ mod tests {
                     deadline_ms = 1000\n\
                     [match]\n\
                     port = 25\n";
-        std::fs::write(dir.join("stale.toml"), text).unwrap();
+        write(dir.join("stale.toml"), text);
         let store = RuleStore::new(dir.clone());
         assert_eq!(store.list().len(), 1);
         assert!(store.sweep_expired());
@@ -1602,7 +1610,7 @@ mod tests {
         let (_td, dir) = tmpdir("reserved-disk");
         let mut r = rule("impostor", RuleDuration::Forever);
         r.name = format!("{}7", hallpass_types::RUN_SESSION_RULE_PREFIX);
-        std::fs::write(dir.join("impostor.toml"), toml::to_string(&r).unwrap()).unwrap();
+        write(dir.join("impostor.toml"), &toml::to_string(&r).unwrap());
 
         let store = RuleStore::new(dir);
         assert!(
@@ -1884,7 +1892,7 @@ mod tests {
 
         // The legitimate write that starts the cycle.
         let text = toml::to_string(&rule("quiesce", RuleDuration::Forever)).unwrap();
-        std::fs::write(dir.join("quiesce.toml"), text).unwrap();
+        write(dir.join("quiesce.toml"), &text);
 
         // Wait for the debounced reload to apply rather than a fixed
         // interval, so a loaded machine cannot push the first reload's

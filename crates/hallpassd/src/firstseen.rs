@@ -869,12 +869,11 @@ mod tests {
     #[test]
     fn an_over_long_state_file_keeps_the_newest_entries() {
         let dir = TestDir::new("firstseen-overlong");
-        let path = dir.path().join("seen.toml");
         let mut text = String::from("version = 1\n");
         for i in 0..MAX_APPS + 3 {
             text.push_str(&format!("[[app]]\nexe = \"/usr/bin/p{i}\"\nfirst_ms = {i}\n"));
         }
-        std::fs::write(&path, text).unwrap();
+        let path = dir.write("seen.toml", text);
 
         let mut seen = load(&path);
         assert_eq!(seen.len().0, MAX_APPS);
@@ -928,18 +927,16 @@ mod tests {
     #[test]
     fn hostile_entries_are_dropped_on_load() {
         let dir = TestDir::new("firstseen-hostile");
-        let path = dir.path().join("seen.toml");
         let long = "a".repeat(MAX_KEY_BYTES * 2);
-        std::fs::write(
-            &path,
+        let path = dir.write(
+            "seen.toml",
             format!(
                 "version = 1\n\
                  [[app]]\nfirst_ms = 1\n\
                  [[app]]\nexe = \"{long}\"\nfirst_ms = 1\n\
                  [[app]]\nexe = \"/usr/bin/curl\"\nfirst_ms = 1\n"
             ),
-        )
-        .unwrap();
+        );
         let seen = load(&path);
         assert_eq!(seen.len(), (1, 0));
     }
@@ -951,9 +948,8 @@ mod tests {
     #[test]
     fn reading_refuses_a_symlink_and_never_echoes_content() {
         let dir = TestDir::new("firstseen-link");
-        let secret_path = dir.path().join("secret");
         let secret = "root:$6$SUPERSECRETHASH:19000:0:99999:7:::";
-        std::fs::write(&secret_path, secret).unwrap();
+        let secret_path = dir.write("secret", secret);
         let path = dir.path().join("seen.toml");
         std::os::unix::fs::symlink(&secret_path, &path).unwrap();
 
@@ -963,7 +959,7 @@ mod tests {
         // And the error text for a real file that does not parse carries no
         // line of it either.
         std::fs::remove_file(&path).unwrap();
-        std::fs::write(&path, secret).unwrap();
+        crate::testutil::write_trusted(&path, secret);
         let text = read_trusted(&path).expect("a real file is read");
         let e = toml::from_str::<StateFile>(&text).expect_err("not toml");
         assert!(

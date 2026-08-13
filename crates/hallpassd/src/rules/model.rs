@@ -533,10 +533,8 @@ mod tests {
     fn list_files_compile_and_match() {
         use crate::testutil::TestDir;
         let dir = TestDir::new("model-lists");
-        let domains = dir.path().join("ads.list");
-        std::fs::write(&domains, "0.0.0.0 ads.example.com\n").unwrap();
-        let ips = dir.path().join("bad.list");
-        std::fs::write(&ips, "10.0.0.0/8\n").unwrap();
+        let domains = dir.write("ads.list", "0.0.0.0 ads.example.com\n");
+        let ips = dir.write("bad.list", "10.0.0.0/8\n");
 
         let conn = |domain: Option<&str>, dst: &str| Connection {
             tuple: hallpass_types::FlowTuple {
@@ -580,8 +578,7 @@ mod tests {
         assert!(CompiledRule::compile(&r).is_err());
 
         // A hashes_file makes the rule want executable hashing.
-        let hashes = dir.path().join("h.sha256");
-        std::fs::write(&hashes, format!("{}\n", "ab".repeat(32))).unwrap();
+        let hashes = dir.write("h.sha256", format!("{}\n", "ab".repeat(32)));
         let r = rule_with(RuleMatch {
             hashes_file: Some(hashes),
             ..Default::default()
@@ -797,12 +794,9 @@ mod tests {
     fn first_failing_field_for_list_operands() {
         use crate::testutil::TestDir;
         let dir = TestDir::new("model-fail-fields");
-        let domains = dir.path().join("ads.list");
-        std::fs::write(&domains, "ads.example.com\n").unwrap();
-        let ips = dir.path().join("bad.list");
-        std::fs::write(&ips, "10.0.0.0/8\n").unwrap();
-        let hashes = dir.path().join("h.sha256");
-        std::fs::write(&hashes, format!("{}\n", "ab".repeat(32))).unwrap();
+        let domains = dir.write("ads.list", "ads.example.com\n");
+        let ips = dir.write("bad.list", "10.0.0.0/8\n");
+        let hashes = dir.write("h.sha256", format!("{}\n", "ab".repeat(32)));
 
         let conn = Connection {
             tuple: hallpass_types::FlowTuple {

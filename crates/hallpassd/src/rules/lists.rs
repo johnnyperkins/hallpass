@@ -255,9 +255,7 @@ mod tests {
     use crate::testutil::TestDir;
 
     fn write(dir: &TestDir, name: &str, text: &str) -> std::path::PathBuf {
-        let path = dir.path().join(name);
-        std::fs::write(&path, text).unwrap();
-        path
+        dir.write(name, text)
     }
 
     /// A non-regular file is refused before it is read. Reading a FIFO blocks
@@ -266,8 +264,7 @@ mod tests {
     #[test]
     fn non_regular_list_file_is_refused() {
         let d = TestDir::new("lists-not-a-file");
-        let dir_as_list = d.path().join("subdir");
-        std::fs::create_dir(&dir_as_list).unwrap();
+        let dir_as_list = d.subdir("subdir");
         let err = IpSet::load(&dir_as_list).unwrap_err();
         assert!(
             err.contains("not a regular file") || err.contains("Is a directory"),

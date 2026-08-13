@@ -495,12 +495,10 @@ mod tests {
     #[test]
     fn a_stored_posture_drops_unusable_tags() {
         let dir = TestDir::new("lockdown-badtag");
-        let path = dir.path().join("posture.toml");
-        std::fs::write(
-            &path,
+        let path = dir.write(
+            "posture.toml",
             "version = 1\non = true\nsince_ms = 5\ntags = [\"Work\", \"work\"]\n",
-        )
-        .unwrap();
+        );
         let posture = Posture::load(&path);
         assert!(posture.is_on(), "the posture stays on without the bad tag");
         assert_eq!(posture.tags(), Some(vec!["work".to_string()]));
