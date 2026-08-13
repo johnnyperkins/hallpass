@@ -288,6 +288,8 @@ carries what an upgrade changes on a running host.
 
 ### Changed
 
+- Fixed a dependency advisory (RUSTSEC-2026-0257, `webbrowser` argument
+  injection) pulled in through the GUI's window stack.
 - **The UI prefers the X11 backend (XWayland on Wayland sessions).**
   Close-to-tray needs to hide the window, keep painting prompts while
   hidden, and re-show on demand; the Wayland backend can do none of that
