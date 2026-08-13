@@ -92,6 +92,38 @@ A new outbound connection then travels like this:
    An entry the source could not attach an inode to is never served from the
    cache at all.
 
+   None of those three questions can see an exec that happened *between* the
+   connect and the read, which is the evasion the README describes: a socket
+   descriptor survives `execve`, and so do the pid and the start time, so a
+   process that connects non-blocking and immediately becomes something else
+   is read as the something else. The eBPF path narrows it with a fourth fact
+   the process does not control: a per-pid counter the exec tracepoint bumps,
+   stamped into the flow record at connect and compared when the executable
+   is resolved (`FlowVal::exec_gen`, `EbpfAttributor::exec_raced`). Any
+   inequality refuses the executable and the command line rather than
+   reporting them, so the connection carries no name and matches no `exe`
+   rule in either direction. The ambiguous inequalities refuse too - an entry
+   evicted from the kernel's LRU, or dropped when a pid exited - because the
+   cost of refusing is a prompt and the cost of vouching is the rule.
+
+   One limit goes with it, recorded in the README's threat notes: the chain
+   falls back to procfs when the flow record itself is missing from its LRU,
+   and the procfs path has no generation to compare, so evicting that record
+   puts a connection back on the unguarded path. Evicting the *generation*
+   does not do the same, and the map's design is the reason: a generation is
+   a unique nonzero timestamp rather than a count, so an entry that is lost
+   and recreated cannot land back on a value an earlier connect stamped, and
+   the kernel side claims one at connect for a process that has none so that
+   zero means "no entry" and nothing else. Every way an entry can be lost
+   therefore reads as a disagreement, which refuses.
+
+   The attributor's own per-pid detail cache needs the same care and does not
+   get it from the counter: it is refreshed by the exec ring buffer, which is
+   asynchronous and lossy, so a stale entry can name the pre-exec binary for
+   a flow the counter finds nothing wrong with. `EbpfAttributor::details_for`
+   therefore checks the exe symlink before serving an entry, the same third
+   question `cached_still_valid` asks and for the same reason.
+
 5. **Annotated with a domain.** The destination IP is looked up in the
    IP-to-domain cache. Two independent snoopers fill that cache. The wire
    snooper consumes the snoop queue: it records outbound queries in a query

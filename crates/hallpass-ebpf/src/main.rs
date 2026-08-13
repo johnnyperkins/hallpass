@@ -23,8 +23,8 @@
 
 use aya_ebpf::{
     helpers::{
-        bpf_get_current_pid_tgid, bpf_get_current_uid_gid, bpf_probe_read_kernel,
-        bpf_probe_read_user, bpf_probe_read_user_str_bytes,
+        bpf_get_current_pid_tgid, bpf_get_current_uid_gid, bpf_ktime_get_ns,
+        bpf_probe_read_kernel, bpf_probe_read_user, bpf_probe_read_user_str_bytes,
     },
     macros::{kprobe, kretprobe, map, tracepoint, uprobe, uretprobe},
     maps::{LruHashMap, PerCpuArray, RingBuf},
@@ -87,6 +87,33 @@ static PROC_SCRATCH: LruHashMap<u64, u64> = LruHashMap::with_max_entries(512, 0)
 #[map]
 static EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
 
+/// pid -> the generation of the image it is currently running.
+///
+/// Stamped into [`FlowVal::exec_gen`] at connect and compared by userspace
+/// when it resolves the executable, which happens after the fact and would
+/// otherwise name whatever the process exec'd into in between.
+///
+/// A generation is a timestamp, not a count, and never zero: two execs
+/// anywhere on the host cannot produce the same one, so an entry that is
+/// evicted and recreated never lands back on a value some earlier connect
+/// already stamped. That is what makes losing an entry safe in *every*
+/// direction rather than most of them. A counter would not: evict a pid at
+/// generation 1 and its next exec starts from 1 again, agreeing with a
+/// connect that recorded the first one.
+///
+/// Zero is reserved for "no entry", which is why [`current_flow_val`]
+/// inserts one rather than stamping the zero it read. Without that, a
+/// process that can force its own eviction twice - the map is LRU, so
+/// enough execs from anywhere on the host will do it - could stamp zero
+/// before an exec and read zero after it, and walk a connection across the
+/// exec with both sides agreeing.
+///
+/// LRU, and sized like [`SOCK_MAP`]: an entry per process that has exec'd
+/// or connected, which is bounded in practice but not by anything this
+/// program controls.
+#[map]
+static EXEC_GEN: LruHashMap<u32, u64> = LruHashMap::with_max_entries(8192, 0);
+
 /// getaddrinfo entry scratch: the queried name is copied here at entry so
 /// the return probe records what was actually looked up, not whatever the
 /// (attacker-controllable) node buffer holds after the blocking call. LRU
@@ -135,10 +162,38 @@ unsafe fn read<T>(base: u64, off: usize) -> Result<T, ()> {
 }
 
 fn current_flow_val() -> FlowVal {
+    let pid = (bpf_get_current_pid_tgid() >> 32) as u32;
     FlowVal {
-        pid: (bpf_get_current_pid_tgid() >> 32) as u32,
+        pid,
         uid: bpf_get_current_uid_gid() as u32,
+        // Read here, at connect, which is the whole point: an exec after
+        // this replaces the generation and userspace sees the two disagree.
+        exec_gen: exec_gen_of(pid),
     }
+}
+
+/// The generation to stamp on a flow this process is opening now.
+///
+/// A process that has not exec'd since these programs loaded has no entry,
+/// and one is claimed for it here rather than stamping the zero the lookup
+/// returned. Zero has to stay reserved for "no entry": a stamp that can
+/// equal an absent lookup is a stamp an eviction can forge agreement with.
+/// The claimed value is stamped whether or not the insert lands, so a full
+/// or racing map costs a refusal (nothing to agree with later) and never a
+/// false agreement.
+fn exec_gen_of(pid: u32) -> u64 {
+    if let Some(gen) = unsafe { EXEC_GEN.get(pid) } {
+        return *gen;
+    }
+    let gen = new_generation();
+    let _ = EXEC_GEN.insert(pid, gen, 0);
+    gen
+}
+
+/// A generation nothing else will be issued: the monotonic clock, forced
+/// nonzero so it can never collide with the "no entry" reading.
+fn new_generation() -> u64 {
+    unsafe { bpf_ktime_get_ns() | 1 }
 }
 
 /// Build the FlowKey for a connected socket. `proto` is PROTO_TCP or
@@ -590,6 +645,17 @@ fn emit_event(kind: u32) {
 
 #[tracepoint]
 pub fn sched_process_exec(_ctx: TracePointContext) -> u32 {
+    // Replaced before the event is emitted, so a connect racing this
+    // handler either reads the old generation (and is judged against the
+    // executable that was current when it connected) or the new one (and is
+    // judged against the one it exec'd into). Neither leaves a flow stamped
+    // with a generation no lookup can match.
+    //
+    // Overwritten rather than incremented: the value only has to differ
+    // from every other one ever issued, and a fresh timestamp does that
+    // without reading the old entry first.
+    let pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+    let _ = EXEC_GEN.insert(pid, new_generation(), 0);
     emit_event(EVENT_EXEC);
     0
 }
@@ -599,6 +665,12 @@ pub fn sched_process_exit(_ctx: TracePointContext) -> u32 {
     let id = bpf_get_current_pid_tgid();
     // The tracepoint fires per thread; only whole-process exit matters.
     if (id >> 32) as u32 == id as u32 {
+        // Dropped so a recycled pid claims a fresh generation rather than
+        // inheriting one from whoever held the number before it. Losing
+        // this (the handler can be missed) costs a refused executable,
+        // never a wrongly accepted one: the stale entry cannot equal what
+        // the new process's own connect stamps.
+        let _ = EXEC_GEN.remove((id >> 32) as u32);
         emit_event(EVENT_EXIT);
     }
     0

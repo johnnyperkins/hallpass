@@ -89,6 +89,22 @@ pub struct FlowVal {
     pub pid: u32,
     /// Effective UID at connect time.
     pub uid: u32,
+    /// The process's exec generation when the connect was recorded.
+    ///
+    /// A socket descriptor survives `execve`, so a process can start a
+    /// non-blocking connect and immediately exec a different binary, and
+    /// anything that resolves the executable afterwards - `/proc/<pid>/exe`,
+    /// including the read this attributor does - names the binary it exec'd
+    /// into rather than the one that connected. The pid alone cannot tell
+    /// the two apart, because a pid survives exec exactly as the socket
+    /// does, and so does the process start time that guards pid reuse.
+    ///
+    /// The generation is bumped by the exec tracepoint and stamped here at
+    /// connect. Userspace compares it with the pid's current generation and
+    /// refuses the executable when they differ. Zero means the process had
+    /// not exec'd since the programs loaded, which is the ordinary state of
+    /// anything that started before the daemon.
+    pub exec_gen: u64,
 }
 
 /// Process lifecycle event kinds carried over the ring buffer.
@@ -197,7 +213,11 @@ mod tests {
     #[test]
     fn flow_key_layout_has_no_hidden_padding() {
         assert_eq!(core::mem::size_of::<FlowKey>(), 40);
-        assert_eq!(core::mem::size_of::<FlowVal>(), 8);
+        // u32, u32, u64: 8-aligned, laid out at 0, 4, 8, so the 16 bytes
+        // are all fields. A size that grew past its fields would mean
+        // padding the kernel side does not write and userspace would read
+        // as whatever the map slot last held.
+        assert_eq!(core::mem::size_of::<FlowVal>(), 16);
         assert_eq!(core::mem::size_of::<ExecEvent>(), ExecEvent::SIZE);
     }
 

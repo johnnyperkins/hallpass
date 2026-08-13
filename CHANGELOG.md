@@ -7,6 +7,29 @@ carries what an upgrade changes on a running host.
 
 ### Added
 
+- **With the `ebpf` feature, a process can no longer inherit another binary's
+  allow rule by exec'ing after it connects.** A socket descriptor survives
+  `execve`, so a process could start a non-blocking `connect()`, immediately
+  become a different binary, and be attributed to that one instead, retrying
+  until it won the race. Neither the pid nor the process start time can see
+  that happen; both survive exec too.
+
+  The kernel programs now stamp the running image's generation into the flow
+  record at connect and the daemon compares it when it resolves the
+  executable, refusing to name one that has moved. So a masquerade gets a
+  connection carrying no executable, decided by the prompt or the default
+  verdict, rather than one wearing the identity it exec'd into. Requires
+  rebuilding the eBPF object: a prebuilt one from before this change fails to
+  load, and the daemon says so rather than falling back silently.
+
+  Two things it does not do. The honest name is refused along with the
+  dishonest one, so a deny rule keyed on `exe` can still be stepped out of,
+  though the connection now asks instead of being quietly allowed under the
+  wrong name. And attribution still falls back to procfs when the kernel has
+  no record of the flow, which has no generation to compare. `exe`,
+  `exe_glob` and `exe_sha256` remain scoping conveniences rather than
+  boundaries on the procfs-only build; the README says which is which.
+
 - **The daemon sets the kernel's verdict-queue length instead of inheriting
   it (wire protocol v16).** It was on the kernel's own default of 1024, out
   of which the daemon spends up to 256 slots on packets held for prompt

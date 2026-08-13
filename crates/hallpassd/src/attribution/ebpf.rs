@@ -59,11 +59,22 @@ type AppIdCache = Mutex<LruCache<u32, (Option<String>, u64)>>;
 
 const PID_CACHE_CAP: usize = 4096;
 
+/// How many pids the exec-race warning remembers before it repeats itself.
+/// Small on purpose: it exists to collapse one process's retries into one
+/// line, not to keep a history.
+const RACED_LOG_CAP: usize = 256;
+
 pub struct EbpfAttributor {
     /// Keeps programs attached; dropping it detaches everything.
     _ebpf: Ebpf,
     sock_map: FlowMap<MapData, FlowKey, FlowVal>,
+    /// pid -> exec generation, the counter [`EbpfAttributor::exec_raced`]
+    /// compares a flow's stamp against.
+    exec_gen: FlowMap<MapData, u32, u64>,
     cache: ProcCache,
+    /// Pids already warned about, so one evading process logs once rather
+    /// than once per packet or once per retry.
+    raced_seen: Mutex<LruCache<u32, ()>>,
     app_ids: AppIdCache,
     /// Stop signal for the ring-buffer readers; the [`Drop`] impl sends on
     /// it, and dropping it alone would also wake them.
@@ -85,7 +96,24 @@ impl EbpfAttributor {
                 Some(a)
             }
             Err(e) => {
-                tracing::warn!("eBPF attribution unavailable, using procfs fallback: {e}");
+                // The embedded object is located by build.rs and can be one
+                // somebody vendored, so "your object is older than this
+                // binary" is a real and otherwise baffling way to land here:
+                // it reads exactly like a kernel that refuses eBPF, and the
+                // host quietly loses the exec-race guard with it. The map
+                // errors that say so are worth naming rather than passing
+                // through as one more load failure.
+                let stale = e.contains("EXEC_GEN") || e.contains("invalid value size");
+                if stale {
+                    tracing::warn!(
+                        "eBPF attribution unavailable, using procfs fallback: {e}. This looks \
+                         like an embedded object built before the daemon: rebuild it with \
+                         `cargo xtask build-ebpf`, or replace the prebuilt one, and note that \
+                         exe rules are only scoping conveniences until it loads"
+                    );
+                } else {
+                    tracing::warn!("eBPF attribution unavailable, using procfs fallback: {e}");
+                }
                 None
             }
         }
@@ -115,6 +143,15 @@ impl EbpfAttributor {
                 .ok_or("SOCK_MAP missing from object")?,
         )
         .map_err(|e| format!("SOCK_MAP: {e}"))?;
+        // Sizes are checked against the object's own map definitions here,
+        // so a `FlowVal` that gained a field without the embedded object
+        // being rebuilt fails to load loudly instead of reading a stamp
+        // the kernel side never wrote.
+        let exec_gen = FlowMap::try_from(
+            ebpf.take_map("EXEC_GEN")
+                .ok_or("EXEC_GEN missing from object")?,
+        )
+        .map_err(|e| format!("EXEC_GEN: {e}"))?;
         let ring = RingBuf::try_from(
             ebpf.take_map("EVENTS").ok_or("EVENTS missing from object")?,
         )
@@ -163,12 +200,74 @@ impl EbpfAttributor {
         Ok(EbpfAttributor {
             _ebpf: ebpf,
             sock_map,
+            exec_gen,
             cache,
+            raced_seen: Mutex::new(LruCache::new(
+                NonZeroUsize::new(RACED_LOG_CAP).expect("nonzero capacity"),
+            )),
             app_ids: Mutex::new(LruCache::new(
                 NonZeroUsize::new(PID_CACHE_CAP).expect("nonzero capacity"),
             )),
             stop,
         })
+    }
+
+    /// Whether `pid` exec'd between recording this flow and now, which
+    /// makes every after-the-fact read of its executable name the wrong
+    /// binary.
+    ///
+    /// A socket descriptor survives `execve`, so a process can start a
+    /// non-blocking `connect()` (or send a datagram), immediately exec
+    /// something else, and be attributed to that instead - retrying until
+    /// it wins the race. Neither the pid nor the start time can see it:
+    /// both survive exec, so the pid-plus-starttime half of the guard in
+    /// [`Self::details_for`] is the wrong instrument here. It guards pid
+    /// reuse, a different problem. (The exe check that sits beside it is
+    /// aimed at this one, but at a different vector: a *stale cache entry*
+    /// rather than a stale flow stamp. Both are needed.)
+    ///
+    /// The kernel side stamps [`FlowVal::exec_gen`] at connect from a map
+    /// its exec tracepoint replaces, so the comparison is between two facts
+    /// the process cannot forge. Generations are timestamps rather than
+    /// counts and are never zero, which is what makes every way the entry
+    /// can be lost - LRU eviction, the exit handler, a reload - produce a
+    /// disagreement rather than an accidental agreement; see `EXEC_GEN` in
+    /// the kernel programs. Any inequality refuses: a refusal costs a
+    /// prompt for a connection that would otherwise match an `exe` rule,
+    /// and the alternative costs the rule.
+    ///
+    /// What this does not cover is a flow the kernel side never recorded,
+    /// or lost from its own LRU. There is nothing to compare then, the
+    /// whole source misses, and the chain falls through to procfs, which
+    /// resolves the executable after the fact with no counter at all. That
+    /// is the fallback working as designed - eBPF misses legitimate flows
+    /// too - and it is why the README calls this a narrowing rather than a
+    /// closure.
+    fn exec_raced(&self, val: &FlowVal) -> bool {
+        // A missing entry reads as 0, which the kernel side never stamps:
+        // it claims a generation at connect for a process that has none, so
+        // an absent entry here always disagrees.
+        let now = self.exec_gen.get(&val.pid, 0).unwrap_or(0);
+        if now == val.exec_gen {
+            return false;
+        }
+        // Logged once per pid, not once per (pid, generation): the attack
+        // this names is "retry until it wins the race", and every retry is
+        // another exec and therefore another generation, so keying on the
+        // pair would let an unprivileged process meter out a journal line
+        // per attempt. A UDP flow, re-attributed per datagram, would do the
+        // same at packet rate.
+        if self.raced_seen.lock().unwrap().put(val.pid, ()).is_none() {
+            tracing::warn!(
+                pid = val.pid,
+                uid = val.uid,
+                at_connect = val.exec_gen,
+                now,
+                "process exec'd after connecting; refusing to name its executable, so \
+                 exe rules cannot match this connection either way"
+            );
+        }
+        true
     }
 
     /// Details for `pid`, with the start time they were read at. The
@@ -180,8 +279,24 @@ impl EbpfAttributor {
         // this pid; only serve it while the starttime still matches
         // the process the snapshot was taken from.
         let now_start = procfs::starttime_of(Path::new("/proc"), pid);
+        // The start time cannot see an execve - that is the whole premise of
+        // [`Self::exec_raced`] - so it cannot tell a cached snapshot apart
+        // from the binary the process has since become either. The exe
+        // symlink can, and this is the same check the chain's own cache
+        // makes for the same reason (`super::cached_still_valid`).
+        //
+        // `exec_raced` does not cover this: it compares a *flow's* stamp
+        // with the counter, and a flow opened after the exec carries the new
+        // generation and agrees. What is stale is this cache, whose refresh
+        // rides the exec ring buffer - an asynchronous reader that drops
+        // under pressure and can simply lose the race to the verdict thread.
+        // Without this check, a process holding an `exe` allow rule that
+        // execs into something else keeps handing that rule to the new
+        // image for as long as the stale entry lives.
+        let now_exe =
+            std::fs::read_link(Path::new("/proc").join(pid.to_string()).join("exe")).ok();
         if let Some((d, cached_start)) = self.cache.lock().unwrap().get(&pid) {
-            if now_start.is_some() && *cached_start == now_start {
+            if now_start.is_some() && *cached_start == now_start && d.0 == now_exe {
                 return (d.clone(), now_start);
             }
         }
@@ -246,6 +361,14 @@ impl Attributor for EbpfAttributor {
     fn attribute(&self, tuple: &FlowTuple) -> Option<ProcInfo> {
         let val = self.sock_map.get(&flow_key(tuple), 0).ok()?;
         let ((exe_path, cmdline, parent_exe), starttime) = self.details_for(val.pid);
+        // Refused rather than reported when the process exec'd after it
+        // connected: both describe the image, and the image is exactly what
+        // changed. `parent_exe` describes the launcher, which an exec here
+        // does not touch, and is kept.
+        let (exe_path, cmdline) = match self.exec_raced(&val) {
+            true => (None, None),
+            false => (exe_path, cmdline),
+        };
         Some(ProcInfo {
             pid: Some(val.pid),
             uid: val.uid,

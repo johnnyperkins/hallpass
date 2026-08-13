@@ -608,18 +608,40 @@ attacker with root, who can delete the nftables table outright.
   history and lost on restart. Each part is absent rather than approximated
   when it cannot be established, so a prompt showing none of them means the
   daemon could not find out more, not a clean bill of health.
-- **A process can choose which executable it is attributed to.** Attribution
-  resolves the executable from `/proc/<pid>/exe` after the connection is
-  observed, and a socket descriptor survives `execve`. So a process can start
-  a non-blocking `connect()` (or send a UDP datagram), immediately exec a
-  different binary, and be attributed to that binary instead; it can retry
-  until it wins the race. The eBPF path records the pid at connect time,
-  which is more precise than the procfs scan, but the executable is still
-  resolved afterwards, so it is affected too. Rules keyed on `exe`,
-  `exe_glob`, or `exe_sha256` are therefore a scoping convenience against
-  ordinary software, not a boundary against a process that is actively
-  evading them. The same caveat already applies for a different reason to
-  `cmdline_contains` and `parent_exe`, which a process controls outright.
+- **A process can choose which executable it is attributed to; the eBPF
+  attributor narrows this rather than closing it.** Attribution resolves the
+  executable from
+  `/proc/<pid>/exe` after the connection is observed, and a socket descriptor
+  survives `execve`. So a process can start a non-blocking `connect()` (or
+  send a UDP datagram), immediately exec a different binary, and be
+  attributed to that binary instead; it can retry until it wins the race.
+
+  With the `ebpf` feature the kernel side stamps the process's exec
+  generation into the flow record at connect, and the daemon refuses to name
+  an executable whose generation has moved since. A masquerade that wins the
+  ordinary race therefore does not inherit the other binary's allow rule: the
+  connection carries no executable at all and is decided by the prompt or the
+  default verdict instead. What it still costs is the honest name - an `exe`
+  rule that *would* have matched the program that really connected does not
+  match either, so a deny rule keyed on `exe` can still be stepped out of,
+  and a connection that would have been quietly allowed now asks. Both
+  failures are visible; neither hands out an identity.
+
+  One way around it remains, and it needs more of the attacker than the plain
+  race: attribution falls back to procfs whenever the eBPF flow record is
+  missing, and that record lives in a fixed-size LRU, so a process that can
+  evict it puts its connection back on the path that has no generation to
+  compare. Evicting the *generation* is not a second way in - generations are
+  unique timestamps and never zero, so an entry that is lost and recreated
+  cannot land back on a value an earlier connect already stamped, and every
+  loss reads as a disagreement.
+
+  On the procfs path nothing closes this at all, because resolving `/proc`
+  after the fact is what that path is. Rules keyed on `exe`, `exe_glob`, or
+  `exe_sha256` are therefore a boundary only as strong as the attributor
+  underneath them, and a scoping convenience without eBPF. The same caveat
+  applies for a different reason to `cmdline_contains` and `parent_exe`,
+  which a process controls outright.
 - **`app_id` names a cgroup, and a user names their own cgroups.** The
   packaged-application identity comes from `/proc/<pid>/cgroup`, which is
   whatever the launcher called the scope it started the process in. Any

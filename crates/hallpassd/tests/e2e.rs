@@ -146,6 +146,30 @@ else:
     s.recvfrom(512)
 "#;
 
+/// The exec-after-connect race, as a program: start a non-blocking
+/// connect, then immediately become a different binary. The socket
+/// descriptor survives `execve`, so the connection is already on the wire
+/// under an identity the process no longer has, and anything reading
+/// `/proc/<pid>/exe` afterwards sees the new one.
+///
+/// `connect_ex` on a non-blocking socket returns EINPROGRESS rather than
+/// waiting, which is what leaves the exec free to win the race. The exec'd
+/// binary sleeps only so the pid stays alive long enough to be read.
+///
+/// `set_inheritable` is what makes the premise true here: PEP 446 gives
+/// every descriptor Python creates `FD_CLOEXEC`, so without it `execv`
+/// closes the socket and the test models a process that abandoned its
+/// connection rather than one that carried it across the exec.
+const EXEC_RACER: &str = r#"import os, socket, sys
+
+host, port, become = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+s = socket.socket()
+s.setblocking(False)
+os.set_inheritable(s.fileno(), True)
+s.connect_ex((host, port))
+os.execv(become, [become, "3"])
+"#;
+
 /// Counting UDP collector for the syslog export tests. Publishes its
 /// running total by writing it to a file, replaced atomically so a reader
 /// polling the file never sees a half-written number, and at most every
@@ -2340,4 +2364,123 @@ fn lockdown_suppresses_untagged_allows_against_a_real_queue() {
         "lifting the posture must restore the rule the operator wrote; daemon log:\n{}",
         env.daemon_log()
     );
+}
+
+/// A process that connects and then execs must not inherit the allow rule
+/// of the binary it became.
+///
+/// This is the exec-after-connect race the README documents as a limit of
+/// `exe` matching. The eBPF path narrows it by stamping the process's exec
+/// generation into the flow record at connect and refusing to name the
+/// executable when it no longer matches; the procfs path cannot, is the
+/// fallback whenever the flow record is missing, and is not tested here.
+///
+/// The assertion is the security property rather than one of the two
+/// outcomes, because which one happens is a race by construction: if
+/// attribution reads /proc before the exec lands, the record names the
+/// program that really connected, and if it reads after, the record names
+/// nothing. Both are correct. Naming the binary it exec'd into is the
+/// failure, and under a default-deny posture with an allow rule for that
+/// binary, it would also be the difference between a blocked connection and
+/// a permitted one.
+#[test]
+#[ignore = "requires root and network namespaces"]
+fn an_exec_after_connect_does_not_inherit_the_new_binarys_rule() {
+    const PORT: u16 = 19021;
+    if !cfg!(feature = "ebpf") {
+        eprintln!("SKIP e2e execrace: built without the ebpf feature");
+        return;
+    }
+    let Some(mut env) = TestEnv::setup("execrace") else { return };
+    if !tool_available("python3", "--version") {
+        eprintln!("SKIP e2e execrace: python3 not found");
+        return;
+    }
+    let Some(sleep_bin) = tool_path("sleep") else {
+        eprintln!("SKIP e2e execrace: cannot resolve the sleep binary");
+        return;
+    };
+    env.start_listener(PORT);
+
+    let sock_path = env.tmp.join("syslog.sock");
+    let collector = UnixDatagram::bind(&sock_path).expect("bind syslog collector");
+    collector
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .expect("set read timeout");
+
+    // The masquerade target: everything is denied except this one binary,
+    // so inheriting its identity is worth something to an attacker and the
+    // test can tell whether the inheritance happened.
+    let racer = env.write_aux("exec_racer.py", EXEC_RACER);
+    env.start_daemon_with(
+        "deny",
+        &[&rule_with("e2e-execrace", Action::Allow, PORT, |m| {
+            m.exe = Some(sleep_bin.clone())
+        })],
+        &format!(
+            "[syslog]\n\
+             format = \"json\"\n\
+             [syslog.target]\n\
+             kind = \"local\"\n\
+             path = \"{}\"\n",
+            sock_path.display()
+        ),
+    );
+    env.assert_daemon_alive();
+
+    // Without eBPF attribution there is no exec generation to compare, and
+    // the procfs path resolves the executable after the fact by design.
+    if !env.wait_for_log("eBPF attribution active", Duration::from_secs(5)) {
+        eprintln!(
+            "SKIP e2e execrace: eBPF attribution never came up; daemon log:\n{}",
+            env.daemon_log()
+        );
+        return;
+    }
+
+    let out = ns_run(
+        &env.ns_cli,
+        &[
+            "python3",
+            &racer.to_string_lossy(),
+            SRV_IP,
+            &PORT.to_string(),
+            &sleep_bin.to_string_lossy(),
+        ],
+    );
+    assert_ok(&out, "exec racer");
+
+    let dst = format!("\"dst\":\"{SRV_IP}:{PORT}\"");
+    let stolen = format!("\"exe\":\"{}\"", sleep_bin.display());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut seen = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        assert!(
+            Instant::now() < deadline,
+            "no syslog record for {dst} arrived; records seen:\n{}\ndaemon log:\n{}",
+            seen.join("\n"),
+            env.daemon_log()
+        );
+        let Ok(n) = collector.recv(&mut buf) else {
+            continue;
+        };
+        let record = String::from_utf8_lossy(&buf[..n]).to_string();
+        if !record.contains(&dst) {
+            seen.push(record);
+            continue;
+        }
+        assert!(
+            !record.contains(&stolen),
+            "the connection was attributed to the binary it exec'd into, which is the \
+             race this closes: {record}\ndaemon log:\n{}",
+            env.daemon_log()
+        );
+        assert!(
+            record.contains("\"verdict\":\"deny\""),
+            "only the exec'd-into binary has an allow rule, so an honest attribution \
+             must leave this denied: {record}"
+        );
+        return;
+    }
 }
