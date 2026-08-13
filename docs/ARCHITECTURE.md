@@ -484,8 +484,8 @@ decode, and on read before anything is allocated. The first message on a
 connection must be `Hello`, and its version must equal `PROTOCOL_VERSION`
 exactly; anything else gets an error and the connection closes.
 
-Two rules follow from postcard's encoding, and both are easy to violate
-without a test noticing.
+Two rules follow from postcard's encoding, and both used to be easy to
+violate without a test noticing.
 
 **Enum variants are append-only.** Postcard encodes an enum by its variant
 index, with no name or tag. Reordering or removing a variant does not fail to
@@ -501,6 +501,19 @@ a new layout produces garbage rather than an error. This is why v2 exists
 needed a bump on their own, being appended variants. The current version is
 v15 (the lockdown posture: `Stats::lockdown` and a new `TraceOutcome`
 variant); every bump is documented at `PROTOCOL_VERSION` with what forced it.
+
+**What now enforces both.** `client_wire_layout_is_frozen` and
+`daemon_wire_layout_is_frozen` hold one fixture per variant of each enum
+together with the exact bytes it encodes to, so a changed field or a moved
+variant fails the suite instead of shipping. Nothing enforced this before,
+and the round-trip tests structurally could not: they encode and decode
+through the same layout, so any change made to both sides at once - which is
+every change - left them green. A message's first byte is asserted to equal
+its own position separately from its bytes, because a variant inserted
+mid-enum is the dangerous case and deserves to be named as itself rather than
+reported as every message after it having changed shape. Regenerate the
+tables with the `#[ignore]`d `print_wire_golden`, in the same commit as the
+bump that forced it.
 
 ## Startup ordering invariants
 

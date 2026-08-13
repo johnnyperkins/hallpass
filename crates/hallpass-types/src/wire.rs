@@ -143,6 +143,45 @@ mod tests {
         }
     }
 
+    fn sample_stats() -> Stats {
+        Stats {
+            connections_total: 100,
+            allowed: 80,
+            denied: 15,
+            prompted: 5,
+            rules_loaded: 3,
+            lockdown: None,
+            uptime_secs: 3600,
+            dns_spoof_rejected: 2,
+            rules_skipped: 1,
+            prompts_overflowed: 4,
+            other_proto_total: 6,
+            observed_only: 9,
+            dns_snoop_dropped: 11,
+            enforcing: false,
+            prompt_handler_connected: true,
+            prompts_unanswered: 13,
+            prompt_handlers_evicted: 2,
+            // A Some/None mix, so the roundtrip covers both encodings.
+            verdict_queue_dropped: Some(7),
+            verdict_queue_user_dropped: Some(0),
+            verdict_queue_depth: Some(12),
+            snoop_queue_dropped: None,
+            snoop_queue_user_dropped: None,
+            snoop_queue_depth: Some(1),
+            verdict_queue_fail_open: Some(false),
+            snoop_queue_fail_open: None,
+            // Nonzero and Some, so the appended v8 tail round-trips its
+            // strong encodings, not just postcard's single zero byte.
+            nft_flushes: 3,
+            nft_last_flush_ms: Some(1_720_000_000_000),
+            // v9 flow-accounting tail, likewise nonzero.
+            flows_accounted: 41,
+            flow_bytes: 9_000_000,
+            flow_packets: 7_200,
+        }
+    }
+
     async fn roundtrip<T>(msg: &T) -> T
     where
         T: Serialize + DeserializeOwned + PartialEq + std::fmt::Debug,
@@ -221,42 +260,7 @@ mod tests {
             DaemonMsg::PromptExpired { id: 1 },
             DaemonMsg::Event(sample_event(Verdict::Reject, true)),
             DaemonMsg::Rules(vec![sample_rule()]),
-            DaemonMsg::Stats(Stats {
-                connections_total: 100,
-                allowed: 80,
-                denied: 15,
-                prompted: 5,
-                rules_loaded: 3,
-                lockdown: None,
-                uptime_secs: 3600,
-                dns_spoof_rejected: 2,
-                rules_skipped: 1,
-                prompts_overflowed: 4,
-                other_proto_total: 6,
-                observed_only: 9,
-                dns_snoop_dropped: 11,
-                enforcing: false,
-                prompt_handler_connected: true,
-                prompts_unanswered: 13,
-                prompt_handlers_evicted: 2,
-                // A Some/None mix, so the roundtrip covers both encodings.
-                verdict_queue_dropped: Some(7),
-                verdict_queue_user_dropped: Some(0),
-                verdict_queue_depth: Some(12),
-                snoop_queue_dropped: None,
-                snoop_queue_user_dropped: None,
-                snoop_queue_depth: Some(1),
-                verdict_queue_fail_open: Some(false),
-                snoop_queue_fail_open: None,
-                // Nonzero and Some, so the appended v8 tail round-trips its
-                // strong encodings, not just postcard's single zero byte.
-                nft_flushes: 3,
-                nft_last_flush_ms: Some(1_720_000_000_000),
-                // v9 flow-accounting tail, likewise nonzero.
-                flows_accounted: 41,
-                flow_bytes: 9_000_000,
-                flow_packets: 7_200,
-            }),
+            DaemonMsg::Stats(sample_stats()),
             DaemonMsg::Ok,
             DaemonMsg::Err {
                 message: "no such rule".to_string(),
@@ -417,6 +421,484 @@ mod tests {
         assert_eq!(roundtrip(&on).await, on);
         let off = DaemonMsg::LockdownState(None);
         assert_eq!(roundtrip(&off).await, off);
+    }
+
+    /// One [`ClientMsg`] per variant, in declaration order.
+    ///
+    /// Built from the same `sample_*` helpers as the round trips above, so
+    /// editing one of those changes the golden bytes below. That is not a
+    /// false alarm to silence: the failure message says which message moved,
+    /// and the question it asks - did a wire *type* change - is the whole
+    /// point of the check.
+    ///
+    /// The handshake's version is the literal 15 rather than
+    /// [`PROTOCOL_VERSION`], because these freeze the *layout*: a bump is
+    /// the expected outcome of a layout change, so a fixture that moved
+    /// with it would assert nothing.
+    fn client_fixtures() -> Vec<ClientMsg> {
+        vec![
+            ClientMsg::Hello { version: 15 },
+            ClientMsg::Subscribe {
+                events: true,
+                prompts: false,
+            },
+            ClientMsg::PromptReply {
+                id: 7,
+                verdict: Verdict::Deny,
+                duration: RuleDuration::Session,
+                scope: PromptScope::ThisHost,
+            },
+            ClientMsg::RuleList,
+            ClientMsg::RuleAdd(sample_rule()),
+            ClientMsg::RuleDelete {
+                name: "allow-curl".to_string(),
+            },
+            ClientMsg::RuleToggle {
+                name: "allow-curl".to_string(),
+                enabled: false,
+            },
+            ClientMsg::Stats,
+            ClientMsg::EventHistory { limit: 200 },
+            ClientMsg::RuleStats,
+            ClientMsg::Explain(ExplainRequest {
+                conn: sample_conn(),
+                exe_sha256: Some("b".repeat(64)),
+            }),
+            ClientMsg::ConfigGet,
+            ClientMsg::ConfigSet(sample_config()),
+            ClientMsg::RunSessionStart {
+                label: "curl".to_string(),
+            },
+            ClientMsg::RunSessionList,
+            ClientMsg::RuleToggleTag {
+                tag: "work".to_string(),
+                enabled: false,
+            },
+            ClientMsg::LockdownGet,
+            ClientMsg::LockdownSet {
+                tags: vec!["core".to_string()],
+                on: true,
+                force: false,
+            },
+        ]
+    }
+
+    /// One [`DaemonMsg`] per variant, in declaration order. See
+    /// [`client_fixtures`] for what these are for.
+    fn daemon_fixtures() -> Vec<DaemonMsg> {
+        vec![
+            DaemonMsg::HelloAck { version: 15 },
+            DaemonMsg::PromptRequest {
+                id: 1,
+                conn: sample_conn(),
+                deadline_ms: 1_720_000_000_000,
+                context: PromptContext {
+                    ancestors: vec![PathBuf::from("/bin/bash"), PathBuf::from("/sbin/init")],
+                    exe_sha256: Some("ab".repeat(32)),
+                    hash_mismatch_rules: vec!["curl-pinned".into()],
+                    recent_denials: 3,
+                },
+            },
+            DaemonMsg::PromptExpired { id: 1 },
+            DaemonMsg::Event(sample_event(Verdict::Reject, true)),
+            DaemonMsg::Rules(vec![sample_rule()]),
+            DaemonMsg::Stats(sample_stats()),
+            DaemonMsg::Ok,
+            DaemonMsg::Err {
+                message: "no such rule".to_string(),
+            },
+            DaemonMsg::Events(vec![sample_event(Verdict::Allow, true)]),
+            DaemonMsg::RuleHits(vec![RuleHit {
+                name: "allow-curl".to_string(),
+                hits: 12,
+                last_hit_ms: Some(1_720_000_000_123),
+            }]),
+            // Every `TraceOutcome` variant, so that enum's indices are
+            // frozen here too rather than only where one is convenient.
+            DaemonMsg::Explanation(Explanation {
+                verdict: Verdict::Deny,
+                rule_name: Some("block-all".to_string()),
+                would_prompt: false,
+                enforced: true,
+                trace: vec![
+                    RuleTrace {
+                        name: "hit".to_string(),
+                        priority: 0,
+                        outcome: TraceOutcome::Matched,
+                    },
+                    RuleTrace {
+                        name: "off".to_string(),
+                        priority: 9,
+                        outcome: TraceOutcome::Disabled,
+                    },
+                    RuleTrace {
+                        name: "pinned-out".to_string(),
+                        priority: 8,
+                        outcome: TraceOutcome::Suppressed,
+                    },
+                    RuleTrace {
+                        name: "narrow".to_string(),
+                        priority: 5,
+                        outcome: TraceOutcome::NoMatch {
+                            field: "port".to_string(),
+                        },
+                    },
+                    RuleTrace {
+                        name: "later".to_string(),
+                        priority: 0,
+                        outcome: TraceOutcome::NotReached,
+                    },
+                ],
+            }),
+            DaemonMsg::PromptHandlerRevoked,
+            DaemonMsg::Config(sample_config()),
+            DaemonMsg::RunSessionStarted { id: 7 },
+            DaemonMsg::RunSessions(vec![RunSessionInfo {
+                id: 7,
+                uid: 1000,
+                root_pid: 4242,
+                label: "curl".into(),
+                allowed: 3,
+                age_secs: 12,
+            }]),
+            DaemonMsg::RulesToggled {
+                changed: 3,
+                failed: vec!["locked-rule".into()],
+            },
+            DaemonMsg::LockdownState(Some(Lockdown {
+                tags: vec!["core".into()],
+                since_ms: 1_720_000_000_123,
+                rules_suppressed: 4,
+            })),
+        ]
+    }
+
+    fn sample_config() -> RuntimeConfig {
+        RuntimeConfig {
+            prompt_timeout_secs: 30,
+            default_verdict: Verdict::Allow,
+            enforce: true,
+        }
+    }
+
+    /// Name of a fixture's variant, for failure messages.
+    ///
+    /// Exhaustive on purpose: a new variant fails to compile here, which is
+    /// the reminder to add it to [`client_fixtures`] and to the golden table
+    /// as well.
+    fn client_variant(msg: &ClientMsg) -> &'static str {
+        match msg {
+            ClientMsg::Hello { .. } => "Hello",
+            ClientMsg::Subscribe { .. } => "Subscribe",
+            ClientMsg::PromptReply { .. } => "PromptReply",
+            ClientMsg::RuleList => "RuleList",
+            ClientMsg::RuleAdd(_) => "RuleAdd",
+            ClientMsg::RuleDelete { .. } => "RuleDelete",
+            ClientMsg::RuleToggle { .. } => "RuleToggle",
+            ClientMsg::Stats => "Stats",
+            ClientMsg::EventHistory { .. } => "EventHistory",
+            ClientMsg::RuleStats => "RuleStats",
+            ClientMsg::Explain(_) => "Explain",
+            ClientMsg::ConfigGet => "ConfigGet",
+            ClientMsg::ConfigSet(_) => "ConfigSet",
+            ClientMsg::RunSessionStart { .. } => "RunSessionStart",
+            ClientMsg::RunSessionList => "RunSessionList",
+            ClientMsg::RuleToggleTag { .. } => "RuleToggleTag",
+            ClientMsg::LockdownGet => "LockdownGet",
+            ClientMsg::LockdownSet { .. } => "LockdownSet",
+        }
+    }
+
+    /// See [`client_variant`]; same job, same reason.
+    fn daemon_variant(msg: &DaemonMsg) -> &'static str {
+        match msg {
+            DaemonMsg::HelloAck { .. } => "HelloAck",
+            DaemonMsg::PromptRequest { .. } => "PromptRequest",
+            DaemonMsg::PromptExpired { .. } => "PromptExpired",
+            DaemonMsg::Event(_) => "Event",
+            DaemonMsg::Rules(_) => "Rules",
+            DaemonMsg::Stats(_) => "Stats",
+            DaemonMsg::Ok => "Ok",
+            DaemonMsg::Err { .. } => "Err",
+            DaemonMsg::Events(_) => "Events",
+            DaemonMsg::RuleHits(_) => "RuleHits",
+            DaemonMsg::Explanation(_) => "Explanation",
+            DaemonMsg::PromptHandlerRevoked => "PromptHandlerRevoked",
+            DaemonMsg::Config(_) => "Config",
+            DaemonMsg::RunSessionStarted { .. } => "RunSessionStarted",
+            DaemonMsg::RunSessions(_) => "RunSessions",
+            DaemonMsg::RulesToggled { .. } => "RulesToggled",
+            DaemonMsg::LockdownState(_) => "LockdownState",
+        }
+    }
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// What [`client_fixtures`] encodes to at wire protocol v15.
+    ///
+    /// Regenerate with `cargo test -p hallpass-types print_wire_golden --
+    /// --ignored --nocapture`, and only ever in the same commit as the
+    /// [`PROTOCOL_VERSION`] bump that the change forced.
+    const CLIENT_GOLDEN: &[(&str, &str)] = &[
+        ("Hello", "000f"),
+        ("Subscribe", "010100"),
+        ("PromptReply", "0207010101"),
+        ("RuleList", "03"),
+        ("RuleAdd", "040a616c6c6f772d6375726c00020a0100010d2f7573722f62696e2f6375726c010a2f7573722f62696e2f2a014061616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161010a31302e302e302e302f3801bb03018008ffff03010d2a2e6578616d706c652e6f726701e8070101011e2f6574632f68616c6c706173732f72756c65732e642f6164732e6c69737401222f6574632f68616c6c706173732f72756c65732e642f6261642d6970732e6c69737401242f6574632f68616c6c706173732f72756c65732e642f6d616c776172652e73686132353601097363726970742e7079010d2f7573722f62696e2f62617368010e3139322e3136382e312e302f323401c0b802010465746830010c736e61703a66697265666f78"),
+        ("RuleDelete", "050a616c6c6f772d6375726c"),
+        ("RuleToggle", "060a616c6c6f772d6375726c00"),
+        ("Stats", "07"),
+        ("EventHistory", "08c801"),
+        ("RuleStats", "09"),
+        ("Explain", "0a00007f000001b1a8030126064700000000000000000000001111bb0301e807019221010d2f7573722f62696e2f6375726c01186375726c2068747470733a2f2f6578616d706c652e6f726700010b6578616d706c652e6f726700011b666c617470616b3a6f72672e6d6f7a696c6c612e66697265666f7800014062626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262"),
+        ("ConfigGet", "0b"),
+        ("ConfigSet", "0c1e0001"),
+        ("RunSessionStart", "0d046375726c"),
+        ("RunSessionList", "0e"),
+        ("RuleToggleTag", "0f04776f726b00"),
+        ("LockdownGet", "10"),
+        ("LockdownSet", "110104636f72650100"),
+    ];
+
+    /// What [`daemon_fixtures`] encodes to at wire protocol v15. See
+    /// [`CLIENT_GOLDEN`] for how to regenerate it.
+    const DAEMON_GOLDEN: &[(&str, &str)] = &[
+        ("HelloAck", "000f"),
+        ("PromptRequest", "010100007f000001b1a8030126064700000000000000000000001111bb0301e807019221010d2f7573722f62696e2f6375726c01186375726c2068747470733a2f2f6578616d706c652e6f726700010b6578616d706c652e6f726700011b666c617470616b3a6f72672e6d6f7a696c6c612e66697265666f780080e0f4bf873202092f62696e2f626173680a2f7362696e2f696e6974014061626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162010b6375726c2d70696e6e656403"),
+        ("PromptExpired", "0201"),
+        ("Event", "0300007f000001b1a8030126064700000000000000000000001111bb0301e807019221010d2f7573722f62696e2f6375726c01186375726c2068747470733a2f2f6578616d706c652e6f726700010b6578616d706c652e6f726700011b666c617470616b3a6f72672e6d6f7a696c6c612e66697265666f7800020109626c6f636b2d616c6cfbe0f4bf873201"),
+        ("Rules", "04010a616c6c6f772d6375726c00020a0100010d2f7573722f62696e2f6375726c010a2f7573722f62696e2f2a014061616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161010a31302e302e302e302f3801bb03018008ffff03010d2a2e6578616d706c652e6f726701e8070101011e2f6574632f68616c6c706173732f72756c65732e642f6164732e6c69737401222f6574632f68616c6c706173732f72756c65732e642f6261642d6970732e6c69737401242f6574632f68616c6c706173732f72756c65732e642f6d616c776172652e73686132353601097363726970742e7079010d2f7573722f62696e2f62617368010e3139322e3136382e312e302f323401c0b802010465746830010c736e61703a66697265666f78"),
+        ("Stats", "0564500f0503901c02010406090b0000010d0201070100010c00000101010000030180e0f4bf873229c0a8a504a038"),
+        ("Ok", "06"),
+        ("Err", "070c6e6f20737563682072756c65"),
+        ("Events", "080100007f000001b1a8030126064700000000000000000000001111bb0301e807019221010d2f7573722f62696e2f6375726c01186375726c2068747470733a2f2f6578616d706c652e6f726700010b6578616d706c652e6f726700011b666c617470616b3a6f72672e6d6f7a696c6c612e66697265666f7800000109626c6f636b2d616c6cfbe0f4bf873201"),
+        ("RuleHits", "09010a616c6c6f772d6375726c0c01fbe0f4bf8732"),
+        ("Explanation", "0a010109626c6f636b2d616c6c000105036869740000036f666609010a70696e6e65642d6f75740802066e6172726f77050304706f7274056c617465720004"),
+        ("PromptHandlerRevoked", "0b"),
+        ("Config", "0c1e0001"),
+        ("RunSessionStarted", "0d07"),
+        ("RunSessions", "0e0107e8079221046375726c030c"),
+        ("RulesToggled", "0f03010b6c6f636b65642d72756c65"),
+        ("LockdownState", "10010104636f7265fbe0f4bf873204"),
+    ];
+
+    /// The wire layout, frozen.
+    ///
+    /// Postcard writes struct fields positionally and enum variants by
+    /// index, with no names in the bytes, so a reordered variant or an added
+    /// field is decoded as *something else* by a peer built before the
+    /// change rather than rejected. [`PROTOCOL_VERSION`] is what turns that
+    /// into the handshake's clean refusal, and until this test nothing made
+    /// forgetting the bump fail: the round trips above encode and decode
+    /// through the same layout, so they stay green through any change made
+    /// to both sides at once, which is every change.
+    ///
+    /// The byte comparison catches an added, removed or retyped field. The
+    /// separate assertion that each message's first byte is its own position
+    /// catches the worse case, a variant inserted or reordered in the middle,
+    /// and names the first one that moved instead of failing on all of them.
+    #[test]
+    fn client_wire_layout_is_frozen() {
+        let fixtures = client_fixtures();
+        assert_eq!(
+            fixtures.len(),
+            CLIENT_GOLDEN.len(),
+            "every ClientMsg variant needs a golden row"
+        );
+        for (i, msg) in fixtures.iter().enumerate() {
+            let (name, want) = CLIENT_GOLDEN[i];
+            assert_eq!(client_variant(msg), name, "fixture {i} is out of order");
+            let frame = encode(msg).unwrap();
+            let payload = &frame[FRAME_PREFIX_BYTES..];
+            assert_eq!(
+                payload[0], i as u8,
+                "ClientMsg::{name} now encodes as variant {}, not {i}: a variant was inserted or \
+                 reordered, which silently reinterprets an older peer's messages",
+                payload[0]
+            );
+            assert_eq!(
+                hex(payload),
+                want,
+                "ClientMsg::{name} changed shape; bump PROTOCOL_VERSION (now {PROTOCOL_VERSION}) \
+                 and regenerate this table in the same commit"
+            );
+        }
+    }
+
+    /// See [`client_wire_layout_is_frozen`]; the daemon's half of the same
+    /// guarantee.
+    #[test]
+    fn daemon_wire_layout_is_frozen() {
+        let fixtures = daemon_fixtures();
+        assert_eq!(
+            fixtures.len(),
+            DAEMON_GOLDEN.len(),
+            "every DaemonMsg variant needs a golden row"
+        );
+        for (i, msg) in fixtures.iter().enumerate() {
+            let (name, want) = DAEMON_GOLDEN[i];
+            assert_eq!(daemon_variant(msg), name, "fixture {i} is out of order");
+            let frame = encode(msg).unwrap();
+            let payload = &frame[FRAME_PREFIX_BYTES..];
+            assert_eq!(
+                payload[0], i as u8,
+                "DaemonMsg::{name} now encodes as variant {}, not {i}: a variant was inserted or \
+                 reordered, which silently reinterprets an older peer's messages",
+                payload[0]
+            );
+            assert_eq!(
+                hex(payload),
+                want,
+                "DaemonMsg::{name} changed shape; bump PROTOCOL_VERSION (now {PROTOCOL_VERSION}) \
+                 and regenerate this table in the same commit"
+            );
+        }
+    }
+
+    /// The variant indices of the enums carried *inside* those messages.
+    ///
+    /// The golden tables above only freeze the values a fixture happens to
+    /// use, which is one or two per nested enum. That leaves the same hole
+    /// they exist to close: swapping [`RuleDuration::Once`] with
+    /// [`RuleDuration::Forever`] leaves `Session` at index 1, so every
+    /// golden row is unchanged and a peer built before the swap sends
+    /// "forever" that a peer built after reads as "once" - a rule that was
+    /// meant to be permanent silently expiring, with no handshake refusal
+    /// because nothing forced a [`PROTOCOL_VERSION`] bump.
+    ///
+    /// Asserted as the first payload byte, which is postcard's varint of the
+    /// variant index, so this is the same fact the tables freeze, listed for
+    /// every variant rather than the convenient ones.
+    #[test]
+    fn nested_enum_indices_are_frozen() {
+        /// One value per variant of `$t`, checked against an exhaustive
+        /// match so a new variant fails to compile here rather than shipping
+        /// unfrozen, and against the count so it cannot be added to the
+        /// match alone.
+        macro_rules! frozen {
+            ($t:ty, $count:literal, [$($v:expr),+ $(,)?], |$b:pat_param| $arms:expr) => {{
+                let all: Vec<$t> = vec![$($v),+];
+                assert_eq!(all.len(), $count, concat!(stringify!($t), " gained a variant"));
+                for (i, v) in all.iter().enumerate() {
+                    // Exhaustive by construction: the arms map every variant
+                    // to its frozen index, so adding one is a compile error.
+                    let want: u8 = match v { $b => $arms };
+                    let got = postcard::to_allocvec(v).expect("encode")[0];
+                    assert_eq!(
+                        got, want,
+                        "{}::{v:?} encodes as variant {got}, not {want}: a nested enum was \
+                         reordered, which silently reinterprets an older peer's messages \
+                         without changing any message's own shape",
+                        stringify!($t)
+                    );
+                    assert_eq!(want as usize, i, "fixture {i} is out of order");
+                }
+            }};
+        }
+        frozen!(Proto, 2, [Proto::Tcp, Proto::Udp], |v| match v {
+            Proto::Tcp => 0,
+            Proto::Udp => 1,
+        });
+        frozen!(
+            Action,
+            3,
+            [Action::Allow, Action::Deny, Action::Reject],
+            |v| match v {
+                Action::Allow => 0,
+                Action::Deny => 1,
+                Action::Reject => 2,
+            }
+        );
+        frozen!(
+            Verdict,
+            3,
+            [Verdict::Allow, Verdict::Deny, Verdict::Reject],
+            |v| match v {
+                Verdict::Allow => 0,
+                Verdict::Deny => 1,
+                Verdict::Reject => 2,
+            }
+        );
+        frozen!(
+            RuleDuration,
+            4,
+            [
+                RuleDuration::Once,
+                RuleDuration::Session,
+                RuleDuration::Forever,
+                RuleDuration::Until { deadline_ms: 1 },
+            ],
+            |v| match v {
+                RuleDuration::Once => 0,
+                RuleDuration::Session => 1,
+                RuleDuration::Forever => 2,
+                RuleDuration::Until { .. } => 3,
+            }
+        );
+        frozen!(
+            PromptScope,
+            3,
+            [
+                PromptScope::ThisPort,
+                PromptScope::ThisHost,
+                PromptScope::AppAnywhere,
+            ],
+            |v| match v {
+                PromptScope::ThisPort => 0,
+                PromptScope::ThisHost => 1,
+                PromptScope::AppAnywhere => 2,
+            }
+        );
+        frozen!(
+            TraceOutcome,
+            5,
+            [
+                TraceOutcome::Matched,
+                TraceOutcome::Disabled,
+                TraceOutcome::Suppressed,
+                TraceOutcome::NoMatch {
+                    field: "port".into()
+                },
+                TraceOutcome::NotReached,
+            ],
+            |v| match v {
+                TraceOutcome::Matched => 0,
+                TraceOutcome::Disabled => 1,
+                TraceOutcome::Suppressed => 2,
+                TraceOutcome::NoMatch { .. } => 3,
+                TraceOutcome::NotReached => 4,
+            }
+        );
+    }
+
+    /// Regenerate the golden tables. Ignored, so it runs only when asked:
+    /// `cargo test -p hallpass-types print_wire_golden -- --ignored
+    /// --nocapture`.
+    #[test]
+    #[ignore = "prints the golden tables for regeneration"]
+    fn print_wire_golden() {
+        println!("const CLIENT_GOLDEN: &[(&str, &str)] = &[");
+        for msg in &client_fixtures() {
+            let frame = encode(msg).unwrap();
+            println!(
+                "    ({:?}, {:?}),",
+                client_variant(msg),
+                hex(&frame[FRAME_PREFIX_BYTES..])
+            );
+        }
+        println!("];");
+        println!("const DAEMON_GOLDEN: &[(&str, &str)] = &[");
+        for msg in &daemon_fixtures() {
+            let frame = encode(msg).unwrap();
+            println!(
+                "    ({:?}, {:?}),",
+                daemon_variant(msg),
+                hex(&frame[FRAME_PREFIX_BYTES..])
+            );
+        }
+        println!("];");
     }
 
     #[test]
