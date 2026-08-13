@@ -208,7 +208,10 @@ pub fn format_stats(s: &Stats, pal: Palette) -> String {
         // painted when nonzero because they mean packets were dropped
         // without policy running; the snoop queue's cost is only domain
         // annotations, so its rows stay plain like `dns snoop dropped`.
-        ("verdict queue depth", kernel_count(s.verdict_queue_depth)),
+        (
+            "verdict queue depth",
+            queue_depth(s.verdict_queue_depth, s.verdict_queue_max_len),
+        ),
         (
             "verdict queue dropped",
             warn_if_positive(pal, s.verdict_queue_dropped),
@@ -299,6 +302,17 @@ fn warn_if_positive(pal: Palette, n: Option<u64>) -> String {
     match n {
         Some(v) if v > 0 => pal.paint(Style::Warn, &v.to_string()),
         _ => kernel_count(n),
+    }
+}
+
+/// Render the verdict queue's depth against the length in force, because a
+/// depth alone has no scale: 900 is idle on one queue and overflowing on
+/// another. Falls back to the bare count when no queue is bound, or when the
+/// kernel refused the length and its own default is in force unreported.
+fn queue_depth(depth: Option<u64>, max_len: Option<u32>) -> String {
+    match (depth, max_len) {
+        (Some(depth), Some(max_len)) => format!("{depth} / {max_len}"),
+        _ => kernel_count(depth),
     }
 }
 
@@ -980,6 +994,7 @@ mod tests {
             snoop_queue_depth: Some(0),
             verdict_queue_fail_open: Some(true),
             snoop_queue_fail_open: Some(true),
+            verdict_queue_max_len: Some(4096),
             nft_flushes: 0,
             nft_last_flush_ms: None,
             flows_accounted: 0,
@@ -1075,7 +1090,8 @@ mod tests {
     #[test]
     fn stats_table_kernel_queue_rows() {
         let out = format_stats(&stats(true), plain());
-        assert!(out.contains(&row("verdict queue depth", "3")), "{out}");
+        // Against the length in force, since a depth alone has no scale.
+        assert!(out.contains(&row("verdict queue depth", "3 / 4096")), "{out}");
         assert!(out.contains(&row("verdict queue dropped", "0")), "{out}");
         assert!(out.contains(&row("verdict queue undelivered", "0")), "{out}");
         assert!(out.contains(&row("verdict queue fail-open", "yes")), "{out}");
@@ -1084,6 +1100,17 @@ mod tests {
         assert!(out.contains(&row("snoop queue undelivered", "0")), "{out}");
         assert!(out.contains(&row("snoop queue fail-open", "yes")), "{out}");
         assert!(!out.contains("dropped by the kernel"), "{out}");
+    }
+
+    /// A kernel that refused the queue length leaves its own default in
+    /// force and nothing to report it, so the depth is shown bare rather
+    /// than against a limit this daemon did not set.
+    #[test]
+    fn stats_table_depth_without_a_known_limit() {
+        let mut s = stats(true);
+        s.verdict_queue_max_len = None;
+        let out = format_stats(&s, plain());
+        assert!(out.contains(&row("verdict queue depth", "3")), "{out}");
     }
 
     /// The flag is rendered plainly either way: "no" is the intended state

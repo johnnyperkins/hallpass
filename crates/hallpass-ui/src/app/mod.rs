@@ -1385,12 +1385,15 @@ impl HallpassApp {
             };
             ui.end_row();
             ui.label("Verdict queue depth");
-            match s.verdict_queue_depth {
-                // 1024 is the kernel's default queue length, which the
-                // daemon deliberately never changes; the depth only reads
-                // as pressure against that ceiling.
-                Some(n) => ui.monospace(format!("{n} of 1024")),
-                None => ui.monospace("unavailable"),
+            match (s.verdict_queue_depth, s.verdict_queue_max_len) {
+                // Against the length the daemon set at bind, because a
+                // depth only reads as pressure against its ceiling. No
+                // ceiling means the kernel refused the request and kept its
+                // own, which the daemon logged and this panel will not
+                // guess at.
+                (Some(n), Some(max)) => ui.monospace(format!("{n} of {max}")),
+                (Some(n), None) => ui.monospace(n.to_string()),
+                (None, _) => ui.monospace("unavailable"),
             };
             ui.end_row();
             ui.label("Snoop queue kernel drops");

@@ -35,6 +35,11 @@ pub struct QueueStats {
     pub verdict_fail_open: Option<bool>,
     /// See [`QueueStats::verdict_fail_open`].
     pub snoop_fail_open: Option<bool>,
+    /// Verdict-queue length in force, from bind for the same reason as the
+    /// flags above: the kernel does not report it in /proc either. It is
+    /// what makes `depth` readable, since a depth without its limit has no
+    /// scale.
+    pub verdict_max_len: Option<u32>,
 }
 
 /// Read the kernel's counters for the verdict queue and its snoop queue.
@@ -297,6 +302,7 @@ impl Counters {
             snoop_queue_depth: queues.snoop.map(|q| q.depth),
             verdict_queue_fail_open: queues.verdict_fail_open,
             snoop_queue_fail_open: queues.snoop_fail_open,
+            verdict_queue_max_len: queues.verdict_max_len,
             nft_flushes,
             // Gated on the count so the pair can never contradict itself
             // in either direction: a timestamp is reported exactly when at

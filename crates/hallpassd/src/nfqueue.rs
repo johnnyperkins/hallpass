@@ -349,8 +349,21 @@ pub fn bind(queue_num: u16, fail_open: bool) -> std::io::Result<(Queue, BoundQue
     // they are read, so a full snoop queue must never cost a DNS reply. It
     // keeps fail-open in every posture, matching its always-`bypass` rule.
     let snoop_set = set_fail_open(&mut queue, snoop_queue, true);
+    // The verdict queue only. The snoop queue's packets are accepted the
+    // moment they are read, so nothing sits in it for a prompt window and
+    // the reason for a deeper queue does not apply; giving it one would
+    // quadruple the skbs the daemon can pin for no stated benefit, and its
+    // length is not reported anywhere, so an operator reading a snoop depth
+    // would have to guess which limit it was against.
+    let max_len = set_max_len(&mut queue, queue_num);
     queue.set_nonblocking(true);
-    tracing::info!(queue_num, snoop_queue, fail_open, "nfqueues bound");
+    tracing::info!(
+        queue_num,
+        snoop_queue,
+        fail_open,
+        max_len,
+        "nfqueues bound"
+    );
     Ok((
         queue,
         BoundQueues {
@@ -359,6 +372,7 @@ pub fn bind(queue_num: u16, fail_open: bool) -> std::io::Result<(Queue, BoundQue
             // failed-to-set both leave the kernel's default, off.
             verdict_fail_open: fail_open && verdict_set,
             snoop_fail_open: snoop_set,
+            verdict_max_len: max_len,
         },
     ))
 }
@@ -382,6 +396,55 @@ pub struct BoundQueues {
     /// Snoop queue: wanted true in every posture, so false means the flag
     /// did not take and a reply flood can cost DNS replies.
     pub snoop_fail_open: bool,
+    /// Slots the kernel will hold for the verdict queue, or `None` when it
+    /// refused the request and the queue is on its own default. Reported
+    /// because it is the budget the held-prompt cap is spent out of, and
+    /// nothing in `/proc` carries it.
+    pub verdict_max_len: Option<u32>,
+}
+
+/// Slots to ask the kernel to hold for the verdict queue.
+///
+/// The kernel's own default is 1024 and nothing used to change it, which
+/// spent a quarter of the queue on held prompts: [`MAX_HELD_PACKETS`]
+/// packets sit in it for a whole prompt window, and everything else on the
+/// host is judged out of what is left. At this depth that share is a few
+/// percent.
+///
+/// What it does not do is out-run a sustained overload. A queue drains at
+/// the rate the verdict thread decides packets, so anything arriving faster
+/// than that fills any depth; the deeper queue absorbs bursts and buys time,
+/// and eBPF attribution (rather than a bigger buffer) is what raises the
+/// drain rate. See `docs/attribution-threading.md`.
+///
+/// The cost is kernel memory: every queued packet pins its skb until a
+/// verdict, so the worst case scales with this number. 4096 is chosen to
+/// keep that bound in the same order as the kernel's own default while
+/// leaving the held-prompt budget a small fraction of the queue.
+const QUEUE_MAX_LEN: u32 = 4096;
+
+/// Ask the kernel to hold [`QUEUE_MAX_LEN`] slots for `queue_num`. Returns
+/// the depth in force, or `None` when the request failed and the queue kept
+/// the kernel's default.
+///
+/// Safe to send here and nowhere else: this runs before the nftables rules
+/// that feed the queue exist, so the config message's ack cannot arrive in a
+/// batch alongside queued packets. On a live queue it could, and `nfq`
+/// discards every packet in that batch (see the same note on
+/// [`set_fail_open`]).
+#[must_use]
+fn set_max_len(queue: &mut Queue, queue_num: u16) -> Option<u32> {
+    match queue.set_queue_max_len(queue_num, QUEUE_MAX_LEN) {
+        Ok(()) => Some(QUEUE_MAX_LEN),
+        Err(e) => {
+            tracing::warn!(
+                queue_num,
+                error = %e,
+                "could not set queue length; the kernel default applies"
+            );
+            None
+        }
+    }
 }
 
 /// Ask the kernel to accept rather than drop when `queue_num` is full.
@@ -415,7 +478,8 @@ const MAX_RECV_ERRORS: u32 = 50;
 /// prompt.
 ///
 /// A held packet occupies a slot in the kernel's queue for the whole prompt
-/// window, and that queue is 1024 entries deep by default. Nothing else
+/// window, and that queue is [`QUEUE_MAX_LEN`] entries deep (1024 if the
+/// kernel refused the request). Nothing else
 /// bounds this: prompts coalesce by (exe, proto, dst ip, dst port), so one
 /// process looping connect() to one endpoint produces a single prompt (a
 /// single popup) that holds a packet per attempt. Left uncapped it fills the
@@ -431,11 +495,16 @@ const MAX_RECV_ERRORS: u32 = 50;
 /// is counted the same way.
 const MAX_HELD_PACKETS: usize = 256;
 
-/// The kernel's default nfnetlink_queue depth. Nothing calls
-/// `set_queue_max_len`, so this is the real budget the daemon is spending
-/// out of, and the check below fails the build rather than a test run if a
-/// future bump to [`MAX_HELD_PACKETS`] starts crowding it.
-const KERNEL_QUEUE_DEPTH: usize = 1024;
+/// The depth the daemon can count on: what [`set_max_len`] asks for, or the
+/// kernel's own default when it refuses, whichever is smaller. That is the
+/// real budget [`MAX_HELD_PACKETS`] is spent out of, and the check below
+/// fails the build rather than a test run if a future bump to either
+/// constant starts crowding the other.
+const KERNEL_QUEUE_DEPTH: usize = if (QUEUE_MAX_LEN as usize) < 1024 {
+    QUEUE_MAX_LEN as usize
+} else {
+    1024
+};
 const _: () = assert!(
     MAX_HELD_PACKETS <= KERNEL_QUEUE_DEPTH / 2,
     "the held-packet budget must leave most of the kernel queue for traffic that can still be judged"

@@ -103,7 +103,12 @@ use serde::{Deserialize, Serialize};
 /// [`DaemonMsg::LockdownState`]. The struct field forces the bump, as in v2,
 /// and the new trace outcome would otherwise be a variant older clients
 /// cannot decode in a reply they already ask for.
-pub const PROTOCOL_VERSION: u32 = 15;
+///
+/// v16: [`Stats::verdict_queue_max_len`]. The daemon now sets the kernel's
+/// queue depth rather than inheriting the 1024 default, and the depth in
+/// force is not in `/proc` for a client to read for itself. The struct field
+/// forces the bump, as in v2.
+pub const PROTOCOL_VERSION: u32 = 16;
 
 /// Prefix reserved for the synthetic rule name a session grant reports.
 ///
@@ -1433,10 +1438,10 @@ pub struct Stats {
     pub verdict_queue_user_dropped: Option<u64>,
     /// Packets sitting in the verdict queue right now, awaiting a verdict.
     ///
-    /// A live pressure gauge against the kernel's default queue length of
-    /// 1024, and on a fail-open queue the only overflow signal there is:
-    /// a depth pinned at the limit means overflow is being resolved
-    /// without policy right now.
+    /// A live pressure gauge against [`Stats::verdict_queue_max_len`], and
+    /// on a fail-open queue the only overflow signal there is: a depth
+    /// pinned at the limit means overflow is being resolved without policy
+    /// right now.
     pub verdict_queue_depth: Option<u64>,
     /// Packets the kernel dropped because the DNS snoop queue was full.
     ///
@@ -1488,6 +1493,18 @@ pub struct Stats {
     pub flow_bytes: u64,
     /// Total packets across those flows, both directions.
     pub flow_packets: u64,
+    /// Slots the kernel holds for the verdict queue, which is what
+    /// [`Stats::verdict_queue_depth`] is a fraction of.
+    ///
+    /// The daemon asks for this at bind; `None` means the kernel refused and
+    /// the queue kept its own default of 1024, which the journal says at
+    /// startup. Not in `/proc`, so a client cannot read it for itself, and
+    /// without it a depth is a number with no scale: 900 is idle on one
+    /// queue and overflowing on another.
+    ///
+    /// `None` also when no queue is bound by this daemon, the same as the
+    /// fail-open flags.
+    pub verdict_queue_max_len: Option<u32>,
 }
 
 /// How often one rule has decided a connection, for [`ClientMsg::RuleStats`].

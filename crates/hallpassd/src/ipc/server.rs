@@ -506,6 +506,7 @@ async fn message_loop(
                         let mut s = crate::stats::read_queue_stats(q.queue_num);
                         s.verdict_fail_open = Some(q.verdict_fail_open);
                         s.snoop_fail_open = Some(q.snoop_fail_open);
+                        s.verdict_max_len = q.verdict_max_len;
                         s
                     }
                     None => Default::default(),

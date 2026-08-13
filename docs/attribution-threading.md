@@ -92,7 +92,7 @@ policy decision the attacker makes, which is strictly worse.
 Two further costs that are easy to miss. `nfq::Message` pins the receive
 buffer, so holding becomes the rule rather than the exception and the loop's
 allocation-free receive path is defeated on every packet. And the kernel
-queue is 1024 entries deep (nothing calls `set_queue_max_len`); a held packet
+queue is `QUEUE_MAX_LEN` entries deep (4096, set at bind); a held packet
 occupies a slot for the whole deadline window, so at ordinary connection rates
 the queue fills, and an overflowed queue is resolved by the `bypass` flag
 alone, with no event and no counter.
@@ -271,11 +271,17 @@ The ordering in item 0 is a locality heuristic, and locality is exactly what
 an attacker declines to have. A process that forks a fresh child per
 connection is never in the recent list, so each of those connections pays a
 full walk, bounded at 65536 descriptors, around 70 ms. Verdicts stay correct
-- this is throughput, not policy - but at roughly fourteen connections a
-second the kernel's 1024 queue slots fill, and an overflowed queue is decided
-by the `bypass` flag rather than by policy, which under the shipped default
-means fail-open. That is the same exposure `nfqueue.rs:141` is listed for,
-and it is unchanged by any of this.
+- this is throughput, not policy - but a queue drains at the rate the verdict
+thread decides packets, so a sustained fourteen connections a second fills
+it, and an overflowed queue is decided by the `bypass` flag rather than by
+policy, which under the shipped default means fail-open. That is the same
+exposure `nfqueue.rs:141` is listed for, and it is unchanged by any of this.
+
+The queue is now `QUEUE_MAX_LEN` (4096) slots rather than the kernel's 1024
+default, which does not change that paragraph and was not meant to. Depth
+absorbs bursts and stops held prompts from spending a quarter of the queue;
+it cannot out-run an arrival rate above the drain rate, and no depth can.
+Raising the drain rate is what eBPF attribution is for.
 
 The only source with no walk in it is eBPF, so the honest summary is that
 procfs attribution is now fast enough for the machine it is on and still

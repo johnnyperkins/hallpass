@@ -7,6 +7,25 @@ carries what an upgrade changes on a running host.
 
 ### Added
 
+- **The daemon sets the kernel's verdict-queue length instead of inheriting
+  it (wire protocol v16).** It was on the kernel's own default of 1024, out
+  of which the daemon spends up to 256 slots on packets held for prompt
+  replies, so a quarter of the queue could be unavailable to traffic that
+  could still be judged. It now asks for 4096, and `status`, `doctor` and the
+  GUI report the length in force beside the live depth, because a depth with
+  no limit next to it has no scale.
+
+  This buys burst headroom and nothing more. A queue drains at the rate the
+  daemon decides packets, so a sustained arrival rate above that fills any
+  depth; what raises the drain rate is eBPF attribution, not a bigger buffer.
+  The cost is kernel memory, since every queued packet is held until it is
+  decided. The snoop queue is deliberately left on the kernel's default: its
+  packets are accepted the moment they are read, so nothing sits in it.
+
+  Nothing to configure, and nothing to do on upgrade. If your kernel refuses
+  the request the daemon logs it at startup, keeps running on the default,
+  and reports the length as unavailable rather than claiming one.
+
 - **`hallpass-cli lockdown on --tag core`: a whole-host posture (wire
   protocol v15).** While it is on, only allow rules carrying a pinned tag
   decide connections, everything else is denied without a prompt, and the

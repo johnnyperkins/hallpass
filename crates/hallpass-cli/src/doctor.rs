@@ -259,6 +259,7 @@ fn stats_checks(s: &Stats, checks: &mut Vec<Check>) {
         QueueStats {
             fail_open: s.verdict_queue_fail_open,
             depth: s.verdict_queue_depth,
+            max_len: s.verdict_queue_max_len,
             dropped: s.verdict_queue_dropped,
             user_dropped: s.verdict_queue_user_dropped,
         },
@@ -271,6 +272,10 @@ fn stats_checks(s: &Stats, checks: &mut Vec<Check>) {
         QueueStats {
             fail_open: s.snoop_queue_fail_open,
             depth: s.snoop_queue_depth,
+            // The daemon leaves this queue on the kernel's own length, so
+            // there is no daemon-set limit to report and the depth stands
+            // alone.
+            max_len: None,
             dropped: s.snoop_queue_dropped,
             user_dropped: s.snoop_queue_user_dropped,
         },
@@ -328,6 +333,10 @@ fn count_warn(checks: &mut Vec<Check>, name: &'static str, n: u64, what: &str) {
 struct QueueStats {
     fail_open: Option<bool>,
     depth: Option<u64>,
+    /// Slots the queue holds, when the daemon knows them. Reported with the
+    /// depth so a reader can tell pressure from idle; `None` leaves the
+    /// depth bare rather than inventing a limit.
+    max_len: Option<u32>,
     dropped: Option<u64>,
     user_dropped: Option<u64>,
 }
@@ -349,6 +358,7 @@ fn queue_check(
     let QueueStats {
         fail_open,
         depth,
+        max_len,
         dropped,
         user_dropped,
     } = q;
@@ -362,9 +372,10 @@ fn queue_check(
         return;
     };
     let posture = if fail_open { "fail-open" } else { "fail-closed" };
-    let depth = match depth {
-        Some(d) => format!("depth {d}"),
-        None => "depth unavailable".into(),
+    let depth = match (depth, max_len) {
+        (Some(d), Some(max)) => format!("depth {d}/{max}"),
+        (Some(d), None) => format!("depth {d}"),
+        (None, _) => "depth unavailable".into(),
     };
     let lost = dropped.unwrap_or(0) + user_dropped.unwrap_or(0);
     if lost > 0 {
@@ -705,6 +716,25 @@ fn print_human(checks: &[Check], pal: Palette) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A depth is reported against the length in force, so a reader can tell
+    /// pressure from idle. Without a known length it stays bare rather than
+    /// being measured against a limit this daemon did not set.
+    #[test]
+    fn queue_check_reports_depth_against_the_length_in_force() {
+        let stats = |max_len| QueueStats {
+            fail_open: Some(true),
+            depth: Some(3),
+            max_len,
+            dropped: Some(0),
+            user_dropped: Some(0),
+        };
+        let mut checks = Vec::new();
+        queue_check(&mut checks, "q", Status::Fail, stats(Some(4096)), "unused");
+        queue_check(&mut checks, "q", Status::Fail, stats(None), "unused");
+        assert!(checks[0].detail.contains("depth 3/4096"), "{checks:?}");
+        assert!(checks[1].detail.contains("depth 3,"), "{checks:?}");
+    }
 
     #[test]
     fn chain_order_accepts_the_installed_shape() {

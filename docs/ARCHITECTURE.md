@@ -308,6 +308,23 @@ trade. The consequence to know: toggling to observe at runtime under
 `queue_bypass = false` keeps dropping on overflow, and `mode = "observe"` in
 the config file plus a restart is what relaxes it.
 
+**How full is full** is set at bind rather than inherited: `QUEUE_MAX_LEN`
+(4096) instead of the kernel's 1024 default. The reason is the daemon's own
+held packets - `MAX_HELD_PACKETS` of them sit in the queue for whole prompt
+windows, and against 1024 that was a quarter of it unavailable to traffic
+that could still be judged. It buys burst headroom and nothing more: a queue
+drains at the rate the verdict thread decides packets, so a sustained arrival
+rate above that fills any depth (see `docs/attribution-threading.md`), and
+the cost of a deeper one is the kernel memory pinned by queued skbs. The
+depth in force is reported in `status` and `doctor` beside the live depth,
+because a depth without its limit has no scale; `None` there means either
+that no queue is bound or that the kernel refused the request and its own
+default applies, which the journal says at startup. The snoop queue keeps
+the kernel's own length: its packets are accepted the moment they are read,
+so nothing sits in it for a prompt window and the reason for a deeper queue
+does not apply to it. Its depth therefore prints bare, with no limit beside
+it, because there is no daemon-set limit to print.
+
 With `queue_bypass = false` those packets are dropped instead. Enforcement
 wins, and the arrangement inverts to match: an nfqueue bind failure or an
 nftables install failure refuses to start rather than running unenforced, the
@@ -499,8 +516,8 @@ a new layout produces garbage rather than an error. This is why v2 exists
 (`RuleMatch::exe_sha256`) and why v3 exists (`ConnEvent::enforced` plus three
 `Stats` fields); the request/reply pairs added alongside v3 would not have
 needed a bump on their own, being appended variants. The current version is
-v15 (the lockdown posture: `Stats::lockdown` and a new `TraceOutcome`
-variant); every bump is documented at `PROTOCOL_VERSION` with what forced it.
+v16 (`Stats::verdict_queue_max_len`); every bump is documented at
+`PROTOCOL_VERSION` with what forced it.
 
 **What now enforces both.** `client_wire_layout_is_frozen` and
 `daemon_wire_layout_is_frozen` hold one fixture per variant of each enum
