@@ -502,6 +502,16 @@ covers rather than leaving them to the timeout: dismissing a decision is a
 decision, and it is the one the operator can undo. The deny is `Once`, so it
 writes no rule. Only one client at a time can hold the prompt-handler role.
 
+The management window reads as a status surface: the mark in its top-left
+corner carries the same colour as the tray icon (green enforcing, amber
+observing, red under a lockdown posture, grey until the daemon has said),
+verdicts are colour-coded everywhere they appear, and the event feed carries
+a strip of the last few minutes so a burst of denies is visible without
+reading rows. `Ctrl+1` to `Ctrl+5` switch tabs, `Ctrl+F` jumps to the filter,
+and the All/Allowed/Blocked lens beside it narrows the feed and the Traffic
+tab by outcome - "Blocked" includes the decisions observe mode recorded
+without applying, which are the ones worth looking at on an unenforced host.
+
 ## Security model
 
 **The enforcement guarantee in one sentence: by default, hallpass only blocks

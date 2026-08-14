@@ -346,6 +346,26 @@ carries what an upgrade changes on a running host.
 
 ### Changed
 
+- **The GUI has one palette and reads as a status surface.** Everything the
+  window says about a connection is now said in colour first: verdicts are
+  chips in a fixed green/red/amber, an activity strip above the event feed
+  shows when the denies happened rather than only that they did, every
+  traffic row carries a bar for its allowed/blocked mix, and the Stats tab
+  leads with four headline numbers over cards grouped by what fails
+  together. The mark in the top-left corner takes the colour of whatever
+  the host is doing, from the same state the tray icon reads, so a glance
+  answers "is this thing on" without a tab change. Observe mode, a
+  lockdown posture and a daemon error are notices with a coloured edge
+  instead of a line of red text. The prompt window keeps its layout (the
+  actions stay pinned, the process description scrolls) and gains a header
+  band coloured by what the daemon found out about the process, segmented
+  duration and scope pickers that show what is selected without being
+  opened, and a countdown that warms from green to red as the default
+  verdict approaches. New: `Ctrl+1` to `Ctrl+5` switch tabs, `Ctrl+F`
+  jumps to the filter, and an All/Allowed/Blocked lens narrows the feed
+  and the traffic view by outcome. The window is dark whatever the desktop
+  theme is: the palette is calibrated against one background, and the
+  three verdict colours have to stay apart from each other at a glance.
 - **`install.sh` now writes the hardened config on a fresh install.**
   Unmatched and unanswered connections are denied, unmodelled transports are
   denied, and enforcement survives a dead daemon (`queue_bypass = false`).
