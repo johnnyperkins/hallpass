@@ -7,6 +7,40 @@ carries what an upgrade changes on a running host.
 
 ### Added
 
+- **A read-only socket, so watching the firewall no longer means being
+  trusted to turn it off.** The daemon serves `/run/hallpass/observe.sock`
+  alongside the control socket, `0660 root:hallpass-observer`, speaking the
+  same protocol and giving the same answers. It serves stats, the event stream
+  and history, the rule list and hit counts, `explain`, and the config and
+  lockdown state; it refuses rule edits, `config set`, lockdown changes,
+  prompt replies, session grants and the prompt-handler slot, with an error
+  naming what was refused. Point a client at it with `hallpass-cli --socket
+  /run/hallpass/observe.sock`.
+
+  Read-only is not the same as harmless: the event stream describes every
+  process on this host, root's included, with the executable path, command
+  line, uid and destination. A member of the group can watch what every other
+  user is running and talking to. Worth knowing before adding an account.
+
+  **Upgrade notes.** `install.sh` creates the `hallpass-observer` group and
+  adds nobody to it; add a monitoring account with `sudo usermod -aG
+  hallpass-observer <user>`. `/run/hallpass` moves from mode 0750 to 0751, and
+  the shipped unit's `RuntimeDirectoryMode` with it, so an observer who is not
+  in `hallpass` can traverse the directory to reach the socket meant for them;
+  others gain traversal of a known path, not the ability to list the directory,
+  and each socket's own 0660 and group still decide who may connect. A host
+  that keeps its old unit file keeps 0750, where the read-only socket exists
+  but is unreachable except by `hallpass` members and root. `hallpass-cli
+  doctor` reports both sockets, the directory mode, and which tier the running
+  session can reach.
+
+  `install.sh` now ends in an explicit `systemctl restart hallpassd`.
+  `enable --now` is a no-op on a unit that is already running, so re-running
+  the installer over a live install used to leave the old daemon serving the
+  new binaries - every client failing the wire handshake, no read-only socket
+  bound at all, and `/run/hallpass` keeping its old mode, because systemd only
+  applies a changed `RuntimeDirectoryMode` when it recreates the directory.
+
 - **Prompts can pin the rule to the binary you approved, not the path it sat
   at (wire protocol v17).** Tick "Pin binary" in the GUI, or answer the new
   pin question in `hallpass-cli watch`, and the rule carries the executable's
@@ -320,7 +354,40 @@ carries what an upgrade changes on a running host.
   way, so this changes nothing on an upgrade.
 - The installer and README now state what joining the `hallpass` group means:
   a member can disable enforcement, lift a lockdown posture, delete any rule,
-  or take the prompt-handler slot. There is no read-only tier.
+  or take the prompt-handler slot.
+- **The tray icon now says whether anything is being enforced.** The UI
+  autostarts hidden, so a host enforcing nothing showed the same icon as one
+  enforcing everything; the icon and its tooltip now distinguish enforcing, a
+  lockdown posture, observe mode, and "waiting for the daemon". Nothing is
+  claimed until the daemon on the current connection has said so, so a
+  reconnect no longer re-asserts the previous daemon's mode, and a posture
+  lifted while the window was disconnected no longer reappears with it.
+- **`hallpass-cli doctor` reports a `forwarding` check.** Hallpass filters the
+  `output` and `input` hooks only, so traffic this host *routes* - containers,
+  VMs, bridged namespaces - is not seen and not matched against any rule. That
+  is a scope decision rather than an unfinished one (a forwarded packet has no
+  local process, so every `exe`, `app_id`, `cmdline_contains` and `user`
+  operand is inapplicable to it), and it is now delivered as a warning on any
+  host that actually forwards, naming the interfaces and bridges, instead of
+  waiting to be read in the README. The whole `conf/<iface>/forwarding` tree is
+  read, not `net.ipv4.ip_forward` alone, because the global knob is only an
+  alias for `conf/all` and the kernel consults the arrival interface's own.
+
+### Fixed
+
+- **A prompt rule that pinned a binary hash resolved no other prompts.**
+  Answering one of several stacked prompts for the same application with
+  "allow, forever, this app anywhere" and the pin ticked wrote the rule but
+  left the siblings open until they timed out into `default_verdict` - the
+  opposite verdict on a hardened host. Not deployed in any release.
+- **Observe mode hashed a binary for every unmatched connection and threw the
+  result away.** The hash a prompt needs so it can offer to pin was computed on
+  the packet-decision thread for connections that never raise a prompt: observe
+  mode, a spent held-packet budget, and any host with no GUI or `hallpass-cli
+  watch` attached. It is now paid only where a prompt is actually raised.
+- A prompt answered with a pin and duration `Once` no longer logs a warning
+  about a rule that was never going to be written, and a deny can no longer be
+  pinned even by a future caller that forgets to filter it.
 - Fixed a dependency advisory (RUSTSEC-2026-0257, `webbrowser` argument
   injection) pulled in through the GUI's window stack.
 - **The UI prefers the X11 backend (XWayland on Wayland sessions).**

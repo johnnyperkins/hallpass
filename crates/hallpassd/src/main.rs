@@ -75,6 +75,7 @@ fn policy_dirs_trusted(config_path: &std::path::Path, rules_dir: &std::path::Pat
     ok
 }
 
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
@@ -145,7 +146,7 @@ async fn main() {
     // "allow"` is an open firewall that looks healthy. Binding first
     // makes that failure free to back out of: nothing is installed yet,
     // so exiting leaves the system exactly as it was found.
-    let ipc_listener = match ipc::server::bind(&cfg.socket_path) {
+    let ipc_listener = match ipc::server::bind(&cfg.socket_path, ipc::server::CONTROL_GROUP) {
         Ok(l) => l,
         Err(e) => {
             tracing::error!(
@@ -153,6 +154,24 @@ async fn main() {
                 "failed to bind the IPC socket, refusing to filter without a control channel: {e}"
             );
             std::process::exit(1);
+        }
+    };
+
+    // The read-only socket, beside the control one. Not fatal when it fails,
+    // which is the opposite of the decision above and deliberately so: the
+    // control socket is what makes a filtering daemon governable, while this
+    // one only lets an unprivileged account read what it is doing. Refusing
+    // to start would take a working firewall down to protect a monitoring
+    // convenience.
+    let observe_path = config::observe_socket_path(&cfg.socket_path);
+    let observe_listener = match ipc::server::bind(&observe_path, ipc::server::OBSERVE_GROUP) {
+        Ok(l) => Some(l),
+        Err(e) => {
+            tracing::error!(
+                path = %observe_path.display(),
+                "failed to bind the read-only socket; continuing without it: {e}"
+            );
+            None
         }
     };
 
@@ -457,10 +476,26 @@ async fn main() {
         queues: bound_queues,
         sessions,
     });
+    let observe_deps = Arc::clone(&ipc_deps);
     let ipc_task = tokio::spawn(async move {
-        if let Err(e) = ipc::server::serve(ipc_listener, ipc_deps).await {
+        if let Err(e) =
+            ipc::server::serve(ipc_listener, ipc_deps, ipc::server::Tier::Control).await
+        {
             tracing::error!("IPC server failed: {e}");
         }
+    });
+    // Same dependencies, same handlers, different tier. The two listeners
+    // share everything below the authorization gate on purpose: a read-only
+    // client that saw a different `Stats` or a different rule list from the
+    // control socket would be a monitoring surface that cannot be trusted to
+    // describe the host it is watching.
+    let observe_task = observe_listener.map(|listener| {
+        let deps = observe_deps;
+        tokio::spawn(async move {
+            if let Err(e) = ipc::server::serve(listener, deps, ipc::server::Tier::Observe).await {
+                tracing::error!("read-only IPC server failed: {e}");
+            }
+        })
     });
 
     // Wait for SIGTERM, SIGINT, or a fatal queue-loop error.
@@ -521,9 +556,25 @@ async fn main() {
             );
         }
     }
-    if let Err(e) = std::fs::remove_file(&cfg.socket_path) {
-        if e.kind() != std::io::ErrorKind::NotFound {
-            tracing::warn!("failed to remove socket {}: {e}", cfg.socket_path.display());
+    // Only what this process actually bound. The read-only socket is
+    // survivable when its bind fails, and one way it can fail is something
+    // else already occupying that path - an admin-placed file, a leftover
+    // from another tool. Unlinking it on the way out would delete a file this
+    // daemon never created and never owned.
+    let bound_observe = observe_task.is_some();
+    if let Some(t) = observe_task {
+        t.abort();
+    }
+    let sockets: &[&std::path::PathBuf] = if bound_observe {
+        &[&cfg.socket_path, &observe_path]
+    } else {
+        &[&cfg.socket_path]
+    };
+    for path in sockets {
+        if let Err(e) = std::fs::remove_file(path) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!("failed to remove socket {}: {e}", path.display());
+            }
         }
     }
     if let Some(t) = queue_thread {
@@ -544,3 +595,4 @@ async fn main() {
         std::process::exit(1);
     }
 }
+

@@ -61,6 +61,23 @@ pub struct ConfigArg {
 /// terminating NUL.
 const MAX_SOCKET_PATH: usize = 107;
 
+/// File name of the read-only socket. Part of the deployment contract, and
+/// `hallpass-cli doctor` re-derives it independently.
+pub const OBSERVE_SOCKET_NAME: &str = "observe.sock";
+
+/// Where the read-only socket lives, given the control socket's path.
+///
+/// Derived rather than configured, and a sibling rather than a path of its
+/// own. Two knobs would let a deployment point them at different directories,
+/// and `ipc::server::bind` sets the mode and group of the directory it is
+/// handed - so the second bind would silently re-own whatever the first had
+/// set up, or land somewhere `install.sh`, the unit's `RuntimeDirectory` and
+/// `doctor` know nothing about. Deriving keeps one deployment contract instead
+/// of two that can disagree.
+pub fn observe_socket_path(control: &std::path::Path) -> std::path::PathBuf {
+    control.with_file_name(OBSERVE_SOCKET_NAME)
+}
+
 /// Whether the daemon applies its verdicts or only records them.
 ///
 /// Observe mode exists because the honest answer to "what will this policy
@@ -438,6 +455,23 @@ impl Config {
                 "socket_path is {socket_len} bytes, must be at most {MAX_SOCKET_PATH}"
             ));
         }
+        // And the read-only socket derived from it, which is longer whenever
+        // the control socket's own basename is shorter than `observe.sock`.
+        // Failing to bind that one is survivable by design, so without this
+        // the tier would simply not exist on such a host, reported by one
+        // journal line and by `doctor` saying the daemon may use another path.
+        // A config that cannot ever produce it is an operator error, catchable
+        // here, before anything is installed - the same argument the check
+        // above makes.
+        let observe = observe_socket_path(&self.socket_path);
+        let observe_len = observe.as_os_str().len();
+        if observe_len > MAX_SOCKET_PATH {
+            return Err(format!(
+                "the read-only socket derived from socket_path ({}) is {observe_len} bytes, \
+                 must be at most {MAX_SOCKET_PATH}",
+                observe.display()
+            ));
+        }
         Ok(())
     }
 }
@@ -543,6 +577,63 @@ mod tests {
         let path = |n: usize| format!("socket_path = \"/{}\"", "s".repeat(n - 1));
         assert!(parse(&path(MAX_SOCKET_PATH)).validate().is_ok());
         assert!(parse(&path(MAX_SOCKET_PATH + 1)).validate().is_err());
+    }
+
+    /// The read-only socket is a sibling of the control one, and
+    /// `hallpass-cli doctor` re-derives it the same way without being able to
+    /// call this (the CLI does not depend on this crate). Two copies of a
+    /// deployment path drift, so both are asserted against the same shapes.
+    #[test]
+    fn the_observe_socket_is_a_sibling_of_the_control_socket() {
+        use std::path::{Path, PathBuf};
+        for (control, want) in [
+            ("/run/hallpass/hallpass.sock", "/run/hallpass/observe.sock"),
+            // A test daemon in its own directory, the shape the syslog
+            // recipe uses: the pair must move together, never back to /run.
+            (
+                "/run/hp-syslogtest/hallpass.sock",
+                "/run/hp-syslogtest/observe.sock",
+            ),
+            ("hallpass.sock", "observe.sock"),
+        ] {
+            assert_eq!(
+                observe_socket_path(Path::new(control)),
+                PathBuf::from(want),
+                "derived the wrong read-only socket for {control}"
+            );
+        }
+    }
+
+    /// `observe.sock` is longer than a short control basename, so a
+    /// `socket_path` that fits can derive one that does not. Binding the
+    /// read-only socket is survivable by design, so without this check the
+    /// tier would simply not exist on such a host and the only signal would
+    /// be one journal line.
+    #[test]
+    fn a_socket_path_whose_sibling_would_not_fit_is_refused() {
+        // Directory chosen so the control path fits and the derived one is
+        // one byte over: `/d.../s.sock` against `/d.../observe.sock`.
+        let dir_len = MAX_SOCKET_PATH - "/observe.sock".len() + 1;
+        let dir = format!("/{}", "d".repeat(dir_len - 1));
+        let control = format!("{dir}/s.sock");
+        assert!(
+            control.len() <= MAX_SOCKET_PATH,
+            "the control path itself must fit, or this tests the wrong thing"
+        );
+        assert!(
+            observe_socket_path(std::path::Path::new(&control))
+                .as_os_str()
+                .len()
+                > MAX_SOCKET_PATH
+        );
+
+        let err = parse(&format!("socket_path = \"{control}\""))
+            .validate()
+            .expect_err("a socket_path with an unbindable sibling must be refused");
+        assert!(
+            err.contains("read-only socket"),
+            "the error must name what does not fit: {err}"
+        );
     }
 
     #[test]

@@ -59,7 +59,8 @@ if [ "$purge" = "1" ]; then
 	rm -rf /var/lib/hallpass
 	echo "   removed /var/lib/hallpass"
 fi
-# The 'hallpass' group is left in place; delete it with: groupdel hallpass
+# The groups are left in place; delete with:
+#   groupdel hallpass && groupdel hallpass-observer
 REMOVE
 
 echo ">> Done."

@@ -404,18 +404,68 @@ fn queue_check(
     }
 }
 
-/// The socket file as installed: type, mode, ownership, and the parent
+/// Expected group of each socket, and the mode of the directory holding
+/// them. Mirrors `ipc::server`, which the CLI cannot depend on; the daemon
+/// side carries the reasoning for the 0751.
+const CONTROL_GROUP: &str = "hallpass";
+const OBSERVE_GROUP: &str = "hallpass-observer";
+const SOCKET_DIR_MODE: u32 = 0o751;
+const OBSERVE_SOCKET_NAME: &str = "observe.sock";
+const CONTROL_SOCKET_NAME: &str = "hallpass.sock";
+
+/// Both sockets as installed: type, mode, ownership, and the parent
 /// directory's mode. Deviations warn rather than fail: a connect that
 /// already succeeded proves access, and a custom deployment may have chosen
 /// differently on purpose.
+///
+/// The pair is worked out from which of the two `--socket` names, because the
+/// README tells an observer to run `hallpass-cli --socket
+/// /run/hallpass/observe.sock doctor` and deriving a sibling unconditionally
+/// resolved that to itself: the control socket went unchecked, and the
+/// read-only one was compared against the control group, so the one command
+/// an observer is documented to run reported a warning about a correctly
+/// installed host. A control socket under any other name still takes the
+/// second branch, which is the configurable one.
+///
+/// A missing socket is reported like any other: an older daemon does not
+/// create the read-only one, and neither does a daemon that failed to bind
+/// it, and the difference is in the journal rather than here.
 fn socket_check(socket: &Path, env: &Env, checks: &mut Vec<Check>) {
+    let (control, observe) = socket_pair(socket);
+    one_socket_check("socket", &control, CONTROL_GROUP, env, checks);
+    one_socket_check("observe-socket", &observe, OBSERVE_GROUP, env, checks);
+}
+
+/// The (control, read-only) pair implied by the socket this invocation was
+/// pointed at. Split out to be testable without either file existing.
+fn socket_pair(socket: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    if socket.file_name().is_some_and(|n| n == OBSERVE_SOCKET_NAME) {
+        (
+            socket.with_file_name(CONTROL_SOCKET_NAME),
+            socket.to_path_buf(),
+        )
+    } else {
+        (
+            socket.to_path_buf(),
+            socket.with_file_name(OBSERVE_SOCKET_NAME),
+        )
+    }
+}
+
+fn one_socket_check(
+    name: &'static str,
+    socket: &Path,
+    want_group: &str,
+    env: &Env,
+    checks: &mut Vec<Check>,
+) {
     use std::os::unix::fs::{FileTypeExt, MetadataExt};
 
     let md = match std::fs::metadata(socket) {
         Ok(md) => md,
         Err(e) => {
             checks.push(Check::warn(
-                "socket",
+                name,
                 format!("{}: {e}", socket.display()),
                 Some("the daemon creates it at startup; if it runs, the path may differ".into()),
             ));
@@ -424,7 +474,7 @@ fn socket_check(socket: &Path, env: &Env, checks: &mut Vec<Check>) {
     };
     if !md.file_type().is_socket() {
         checks.push(Check::warn(
-            "socket",
+            name,
             format!("{} exists but is not a socket", socket.display()),
             None,
         ));
@@ -436,11 +486,11 @@ fn socket_check(socket: &Path, env: &Env, checks: &mut Vec<Check>) {
     let group = name_for_id(env.etc_group.as_deref(), md.gid())
         .unwrap_or_else(|| md.gid().to_string());
     let mut detail = format!("{} mode {mode:04o} {owner}:{group}", socket.display());
-    let mut warn = mode != 0o660 || md.uid() != 0 || group != "hallpass";
+    let mut warn = mode != 0o660 || md.uid() != 0 || group != want_group;
     if let Some(dir) = socket.parent() {
         if let Ok(dmd) = std::fs::metadata(dir) {
             let dmode = dmd.mode() & 0o7777;
-            if dmode != 0o750 {
+            if dmode != SOCKET_DIR_MODE {
                 detail.push_str(&format!(", directory mode {dmode:04o}"));
                 warn = true;
             }
@@ -448,12 +498,14 @@ fn socket_check(socket: &Path, env: &Env, checks: &mut Vec<Check>) {
     }
     if warn {
         checks.push(Check::warn(
-            "socket",
+            name,
             detail,
-            Some("expected mode 0660 root:hallpass in a 0750 directory".into()),
+            Some(format!(
+                "expected mode 0660 root:{want_group} in a {SOCKET_DIR_MODE:04o} directory"
+            )),
         ));
     } else {
-        checks.push(Check::ok("socket", detail));
+        checks.push(Check::ok(name, detail));
     }
 }
 
@@ -573,9 +625,16 @@ fn configured_rules_dir() -> std::path::PathBuf {
         .unwrap_or_else(|| std::path::PathBuf::from(DEFAULT_RULES_DIR))
 }
 
-/// Whether this invocation can reach the socket by group, and the one
-/// diagnosis a permission error cannot make on its own: added to the group
-/// on disk but running in a session that predates it.
+/// Which tier this invocation can reach by group, and the one diagnosis a
+/// permission error cannot make on its own: added to a group on disk but
+/// running in a session that predates it.
+///
+/// **Observer membership is reported as a working state, not as a missing
+/// `hallpass` membership.** The naive version told a read-only account to run
+/// `usermod -aG hallpass`, on a host where nothing was wrong - doctor
+/// instructing the operator to grant the account full control of the firewall
+/// is the exact escalation the second tier exists to avoid, and a check that
+/// hands out a remedy nobody needed is worse than one that says nothing.
 fn group_check(env: &Env, checks: &mut Vec<Check>) {
     if env.euid == Some(0) {
         checks.push(Check::ok("group", "running as root".into()));
@@ -585,37 +644,58 @@ fn group_check(env: &Env, checks: &mut Vec<Check>) {
         checks.push(Check::skip("group", "cannot read /etc/group".into()));
         return;
     };
-    let Some((gid, members)) = group_entry(etc_group, "hallpass") else {
+    let me = env
+        .euid
+        .and_then(|uid| name_for_id(env.etc_passwd.as_deref(), uid));
+    let gids = session_gids();
+
+    // Control first: a member of both is a control client, and saying so is
+    // the more important of the two facts.
+    for (group, held) in [
+        (CONTROL_GROUP, "this session controls the daemon"),
+        (
+            OBSERVE_GROUP,
+            "this session can read the daemon over the read-only socket and change nothing",
+        ),
+    ] {
+        let Some((gid, members)) = group_entry(etc_group, group) else {
+            continue;
+        };
+        if gids.contains(&gid) {
+            checks.push(Check::ok("group", held.into()));
+            return;
+        }
+        if me.as_deref().is_some_and(|name| members.iter().any(|m| m == name)) {
+            checks.push(Check::warn(
+                "group",
+                format!("in the {group} group on disk, but not in this session"),
+                Some("log out and back in for the membership to take effect".into()),
+            ));
+            return;
+        }
+    }
+
+    if group_entry(etc_group, CONTROL_GROUP).is_none() {
         checks.push(Check::warn(
             "group",
             "no hallpass group on this host".into(),
             Some("the installer creates it; `sudo groupadd -f hallpass`".into()),
         ));
         return;
-    };
-    if session_gids().contains(&gid) {
-        checks.push(Check::ok(
-            "group",
-            "this session is in the hallpass group".into(),
-        ));
-        return;
     }
-    let me = env
-        .euid
-        .and_then(|uid| name_for_id(env.etc_passwd.as_deref(), uid));
-    if me.as_deref().is_some_and(|name| members.iter().any(|m| m == name)) {
-        checks.push(Check::warn(
-            "group",
-            "in the hallpass group on disk, but not in this session".into(),
-            Some("log out and back in for the membership to take effect".into()),
-        ));
-    } else {
-        checks.push(Check::warn(
-            "group",
-            "not in the hallpass group: the daemon socket will refuse this user".into(),
-            Some("`sudo usermod -aG hallpass <user>`, then log out and back in".into()),
-        ));
-    }
+    // Neither group. Both remedies are offered, with what each one costs,
+    // rather than the control one alone: an account that only needs to read
+    // should not be told to take the firewall.
+    checks.push(Check::warn(
+        "group",
+        "in neither hallpass group: both daemon sockets will refuse this user".into(),
+        Some(format!(
+            "to read only: `sudo usermod -aG {OBSERVE_GROUP} <user>`, then use \
+             `--socket /run/hallpass/{OBSERVE_SOCKET_NAME}`. To control the firewall \
+             (disable enforcement, delete any rule): `sudo usermod -aG {CONTROL_GROUP} \
+             <user>`. Either way, log out and back in"
+        )),
+    ));
 }
 
 /// The nftables checks: table present, and the syslog export exemption
@@ -1109,6 +1189,53 @@ mod tests {
             on: on.iter().map(|s| s.to_string()).collect(),
             blind,
         }
+    }
+
+    /// The daemon derives the read-only socket as a sibling of the control
+    /// one (`config::observe_socket_path`), and this crate cannot call that
+    /// function. Two copies of a deployment path drift, so both are asserted
+    /// against the same shapes; the daemon side asserts the same table.
+    #[test]
+    fn the_observe_socket_is_derived_the_way_the_daemon_derives_it() {
+        for (control, want) in [
+            ("/run/hallpass/hallpass.sock", "/run/hallpass/observe.sock"),
+            (
+                "/run/hp-syslogtest/hallpass.sock",
+                "/run/hp-syslogtest/observe.sock",
+            ),
+            ("hallpass.sock", "observe.sock"),
+        ] {
+            assert_eq!(
+                Path::new(control).with_file_name(OBSERVE_SOCKET_NAME),
+                std::path::PathBuf::from(want),
+                "doctor looked for the read-only socket in the wrong place for {control}"
+            );
+        }
+    }
+
+    /// The README tells an observer to run
+    /// `hallpass-cli --socket /run/hallpass/observe.sock doctor`, and on that
+    /// invocation deriving a sibling unconditionally resolved to the same
+    /// file: the control socket went unchecked and the read-only one was
+    /// compared against the control group, so the one command an observer is
+    /// documented to run warned about a correctly installed host.
+    #[test]
+    fn doctor_checks_both_sockets_whichever_one_it_was_pointed_at() {
+        let control = Path::new("/run/hallpass/hallpass.sock");
+        let observe = Path::new("/run/hallpass/observe.sock");
+
+        for pointed_at in [control, observe] {
+            let (c, o) = socket_pair(pointed_at);
+            assert_eq!(c, control, "pointed at {}", pointed_at.display());
+            assert_eq!(o, observe, "pointed at {}", pointed_at.display());
+            assert_ne!(c, o, "the two checks must not be the same file");
+        }
+
+        // A control socket under some other name is still the configurable
+        // one, and its sibling is still derived.
+        let (c, o) = socket_pair(Path::new("/run/hp-test/custom.sock"));
+        assert_eq!(c, Path::new("/run/hp-test/custom.sock"));
+        assert_eq!(o, Path::new("/run/hp-test/observe.sock"));
     }
 
     /// The forwarding check exists to be seen on exactly the hosts it applies

@@ -14,11 +14,15 @@ ExecStart=/usr/bin/hallpassd --config /etc/hallpass/config.toml
 Restart=on-failure
 RestartSec=2
 
-# Runtime directory for the client socket. 0750 so the directory is not
-# world-traversable before the daemon starts; the daemon re-applies this
-# mode and sets the group to hallpass, which is what grants group access.
+# Runtime directory for the two client sockets. The daemon re-applies this
+# mode and sets the group to hallpass. 0751 rather than 0750 because two
+# sockets with two groups live here and a directory carries one: a member of
+# hallpass-observer and not of hallpass has to traverse this to reach the
+# read-only socket. The x for others is traversal of a known path, not
+# listing, and each socket's own 0660 plus its group still decides who may
+# connect.
 RuntimeDirectory=hallpass
-RuntimeDirectoryMode=0750
+RuntimeDirectoryMode=0751
 
 # /var/lib/hallpass, for the first-seen state (which applications, and which
 # destinations for them, this host has already seen). systemd creates it and

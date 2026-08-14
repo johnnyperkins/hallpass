@@ -116,16 +116,44 @@ install -Dm644 etc/hallpass-ui-autostart.desktop /etc/xdg/autostart/hallpass-ui.
 
 # Let the installing user manage the daemon without sudo.
 #
-# There is no read-only tier: the socket's group is the whole authorization
-# model, so a member can set enforce = false, lift a lockdown posture, delete
-# every deny rule, or claim the prompt-handler slot and answer allow. That is
-# the designed boundary, not an oversight - but it is worth more than a line
-# in the README, because this is where it is handed out.
+# Membership of 'hallpass' is full control of the firewall, not access to it:
+# a member can set enforce = false, lift a lockdown posture, delete every deny
+# rule, or claim the prompt-handler slot and answer allow. That is the
+# designed boundary, not an oversight - but it is worth more than a line in
+# the README, because this is where it is handed out.
 groupadd -f hallpass
 usermod -aG hallpass "$target_user"
 
+# The read-only tier, for accounts that need to watch the firewall without
+# being trusted to turn it off: a member of this group and not of 'hallpass'
+# reaches /run/hallpass/observe.sock, which serves Stats, the event stream and
+# history, the rule list and hit counts, Explain, and the config and lockdown
+# state - and refuses everything that changes any of it.
+#
+# Read-only is not the same as harmless, and this is the part that is easy to
+# miss: the event stream describes every process on this host, root's
+# included, and each event carries the executable path, the command line, the
+# uid and the destination. A member of this group can watch what every other
+# user on the box is running and talking to. That is what a network monitor
+# is, but it is worth knowing before adding a junior account to it.
+#
+# Created empty, and nobody is added. A monitoring account is a deployment
+# decision this script cannot make, and a group that exists costs nothing:
+# without it the daemon logs that the socket stays root-only, which is the
+# tighter direction. Add one with:
+#   sudo usermod -aG hallpass-observer <user>
+groupadd -f hallpass-observer
+
 systemctl daemon-reload
 systemctl enable --now hallpassd
+# Not redundant: `enable --now` is a no-op on a unit that is already running,
+# so on an upgrade it leaves the old daemon serving the new binaries. Every
+# client then fails the wire handshake, and anything the new daemon binds at
+# startup is simply absent - which is how re-running this script over a live
+# install left no observe.sock at all while the message below announced the
+# group that reaches it. systemd also only applies a changed
+# RuntimeDirectoryMode when it recreates /run/hallpass, i.e. on a restart.
+systemctl restart hallpassd
 INSTALL
 
 echo
@@ -136,8 +164,12 @@ echo "     replaced. 'hardened' denies unmatched and unanswered connections and"
 echo "     keeps enforcing when the daemon dies; 'desktop' allows all three."
 echo "   - '$target_user' is now in the 'hallpass' group, which is full control of"
 echo "     the firewall: members can disable enforcement, lift a lockdown, and"
-echo "     delete any rule. There is no read-only tier. Add only who you would"
-echo "     trust with that."
+echo "     delete any rule. Add only who you would trust with that."
+echo "   - For an account that only needs to watch, the 'hallpass-observer' group"
+echo "     reaches /run/hallpass/observe.sock: stats, events, rules and config,"
+echo "     read-only. Note the event stream names every process on this host and"
+echo "     its command line, root's included. Created empty; add with"
+echo "     'sudo usermod -aG hallpass-observer <user>'."
 echo "   - Log out and back in once so '$target_user' picks up the 'hallpass' group."
 echo "   - The Hallpass UI autostarts on next login and pops up connection prompts."
 echo "   - Terminal client: hallpass-cli status | rules | events | watch"

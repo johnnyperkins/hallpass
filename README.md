@@ -129,9 +129,32 @@ Two things it does that are worth reading before you run it:
   Either way an existing `config.toml` is left exactly as you edited it.
 - **The `hallpass` group is full control of the firewall**, and the script
   adds you to it. A member can set `enforce = false`, lift a lockdown posture,
-  delete any rule, or take the prompt-handler slot and answer allow. There is
-  no read-only tier; the socket's group is the whole authorization model. Add
-  only accounts you would trust with that.
+  delete any rule, or take the prompt-handler slot and answer allow. Add only
+  accounts you would trust with that.
+- **For anything that only needs to watch, use `hallpass-observer`.** The
+  daemon serves a second socket, `/run/hallpass/observe.sock`, `0660
+  root:hallpass-observer`, carrying the same protocol and the same answers as
+  the control socket and refusing everything that changes anything: stats, the
+  event stream and history, the rule list and hit counts, `explain`, and the
+  config and lockdown state are served; rule edits, `config set`, lockdown
+  changes, prompt replies, session grants and the prompt-handler slot are
+  refused with an error naming what was refused. The installer creates the
+  group empty and adds nobody, because a monitoring account is a deployment
+  decision; add one with `sudo usermod -aG hallpass-observer <user>` and point
+  the client at it with `hallpass-cli --socket /run/hallpass/observe.sock`.
+
+  Read-only is not the same as harmless, and this is the part worth knowing
+  before adding an account: the event stream describes *every* process on this
+  host, root's included, and each event carries the executable path, the
+  command line, the uid and the destination. A member can watch what everyone
+  else on the box is running and talking to. That is what a network monitor
+  is, but it is a real grant and it is not implied by "read-only".
+
+  Which socket a client reached is the whole authorization decision, and the
+  kernel makes it at `connect()`. It is not per-message uid checking, and that
+  is not an implementation shortcut: `SO_PEERCRED` carries the peer's *primary*
+  gid and never its supplementary groups, so a daemon holding an accepted
+  connection cannot tell whether the peer is in a group the normal way.
 
 Remove it again with `./uninstall.sh` (add `HALLPASS_PURGE=1` to also delete
 `/etc/hallpass` and `/var/lib/hallpass`).
@@ -147,8 +170,10 @@ install -Dm644 etc/rules.d/example-allow-dns.toml /etc/hallpass/rules.d/example-
 install -Dm644 etc/hallpassd.service     /etc/systemd/system/hallpassd.service
 install -Dm644 etc/hallpass-ui.desktop   /usr/share/applications/hallpass-ui.desktop
 
-# Optional: members of the "hallpass" group may talk to the daemon socket.
+# Optional: members of the "hallpass" group control the daemon; members of
+# "hallpass-observer" reach the read-only socket and can change nothing.
 groupadd -f hallpass && usermod -aG hallpass "$USER"
+groupadd -f hallpass-observer
 
 systemctl daemon-reload
 systemctl enable --now hallpassd

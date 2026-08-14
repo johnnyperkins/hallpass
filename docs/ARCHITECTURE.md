@@ -293,6 +293,22 @@ The daemon is one multi-threaded tokio runtime plus one std thread.
   off and retries but never ends the loop, because retiring the control
   channel while enforcement continued is the exact state the bind-first
   ordering exists to prevent.
+- **The read-only IPC server** (task) is the same `serve` over a second
+  listener, `/run/hallpass/observe.sock`, `0660 root:hallpass-observer`,
+  carrying `Tier::Observe`. Same `IpcDeps`, same handlers, same answers: a
+  monitoring surface that could disagree with the control socket about the
+  host it is watching would be worse than none. One gate sits in front of the
+  whole dispatch, driven by `observe_allows`, which is a single exhaustive
+  match with no catch-all, so a new `ClientMsg` variant stops the build rather
+  than arriving here reachable by default. Which listener a connection came in
+  on is the entire authorization decision and the kernel made it at
+  `connect()`: `SO_PEERCRED` carries only the peer's primary gid, so
+  per-message group checks are not reliably implementable in this process.
+  Failing to bind it is logged and survivable, unlike the control socket,
+  because refusing to start would take a working firewall down to protect a
+  monitoring convenience. `/run/hallpass` is 0751 rather than 0750 so an
+  observer who is not in `hallpass` can traverse it; each socket's own mode
+  and group still decide who may connect.
 - **The rules-directory watcher** (notify watcher plus a task) debounces
   200ms and reloads disk rules. Session rules survive the reload.
 - **The expiry sweeper** (task) drops rules whose deadline has passed once a
