@@ -393,6 +393,25 @@ carries what an upgrade changes on a running host.
   distribution where `/usr/sbin` links to `/usr/bin` a rule naming
   `/usr/sbin/NetworkManager` would list correctly and match nothing.
 
+- **LLMNR is denied by default.** `etc/rules.d/20-deny-llmnr.toml` blocks port
+  5355. LLMNR resolves a bare hostname by asking the local network segment,
+  nothing authenticates the reply, and whoever answers first is believed, so
+  anyone sharing a network can claim to be the name you asked for. Disabling
+  it is standard hardening, and distributions differ on whether
+  systemd-resolved ships it on.
+
+  A rule rather than a prompt, because the alternative reappears for as long
+  as resolved keeps trying, and a prompt dismissed daily is one that stops
+  being read. Unlike the allow rules beside it this one names no executable:
+  a block should cover whatever speaks the protocol. Delete the file if you
+  resolve local hostnames only LLMNR knows, or set `LLMNR=no` in
+  `/etc/systemd/resolved.conf` to stop the queries at the source.
+
+  mDNS (port 5353, the `.local` names Avahi serves) is deliberately not
+  covered either way. It is a preference rather than something the host needs
+  to boot, so it prompts once and the answer is yours. Expect that prompt on a
+  desktop running `avahi-daemon`.
+
 - **The desktop profile holds 128 pending prompts, up from 64.** Past the cap
   a connection takes the default verdict without raising a prompt at all.
   Under the old allow default that overflow was a silent pass; under deny it

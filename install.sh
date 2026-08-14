@@ -94,6 +94,15 @@ install -d -m755 /etc/hallpass /etc/hallpass/rules.d
 [ -e /etc/hallpass/rules.d/example-allow-dns.toml ] \
   || install -m644 etc/rules.d/example-allow-dns.toml /etc/hallpass/rules.d/example-allow-dns.toml
 
+# The LLMNR deny is installed unconditionally rather than through the loop
+# below. It names no executable, on purpose: a block should cover whatever
+# speaks the protocol rather than one binary that happens to today. That
+# also means there is no binary to check for, and nothing to skip when the
+# host has no systemd-resolved, since anything else reaching that port is
+# what the rule is for.
+[ -e /etc/hallpass/rules.d/20-deny-llmnr.toml ] \
+  || install -m644 etc/rules.d/20-deny-llmnr.toml /etc/hallpass/rules.d/20-deny-llmnr.toml
+
 # Baseline rules for the daemons that run before anyone can answer a prompt.
 # Installed only when the binary the rule names is actually on this host: a
 # rule pointing at a systemd-timesyncd that a chrony machine does not have
