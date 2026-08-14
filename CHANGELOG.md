@@ -361,11 +361,18 @@ carries what an upgrade changes on a running host.
   band coloured by what the daemon found out about the process, segmented
   duration and scope pickers that show what is selected without being
   opened, and a countdown that warms from green to red as the default
-  verdict approaches. New: `Ctrl+1` to `Ctrl+5` switch tabs, `Ctrl+F`
-  jumps to the filter, and an All/Allowed/Blocked lens narrows the feed
-  and the traffic view by outcome. The window is dark whatever the desktop
-  theme is: the palette is calibrated against one background, and the
-  three verdict colours have to stay apart from each other at a glance.
+  verdict approaches, and `Esc` dismisses it exactly as the close button
+  does (deny, once, for every prompt that window covers). New: `Ctrl+1` to
+  `Ctrl+5` switch tabs, `Ctrl+F` jumps to the filter, an All/Allowed/
+  Blocked lens narrows the feed and the traffic view by outcome, the
+  traffic column headings sort (busiest first by default; click a heading
+  to rank by blocked, by peers, by last seen), and any value a column had
+  to clip is on its row's hover. The window now has an icon - the same
+  mark, in the colour of what the host is doing, so the taskbar entry
+  carries the state too (X11; Wayland shows the desktop entry's icon
+  instead). The window is dark whatever the desktop theme is: the palette
+  is calibrated against one background, and the three verdict colours have
+  to stay apart from each other at a glance.
 - **`install.sh` now writes the hardened config on a fresh install.**
   Unmatched and unanswered connections are denied, unmodelled transports are
   denied, and enforcement survives a dead daemon (`queue_bypass = false`).
