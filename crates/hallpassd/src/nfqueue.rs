@@ -15,8 +15,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use nfq::{Queue, Verdict as NfqVerdict};
 use hallpass_types::{Connection, FlowTuple, Verdict};
+use nfq::{Queue, Verdict as NfqVerdict};
 use tokio::sync::mpsc::{Sender, UnboundedReceiver, UnboundedSender};
 
 use crate::attribution::hash::ExeHashCache;
@@ -374,13 +374,7 @@ pub fn bind(queue_num: u16, fail_open: bool) -> std::io::Result<(Queue, BoundQue
     // would have to guess which limit it was against.
     let max_len = set_max_len(&mut queue, queue_num);
     queue.set_nonblocking(true);
-    tracing::info!(
-        queue_num,
-        snoop_queue,
-        fail_open,
-        max_len,
-        "nfqueues bound"
-    );
+    tracing::info!(queue_num, snoop_queue, fail_open, max_len, "nfqueues bound");
     Ok((
         queue,
         BoundQueues {
@@ -584,7 +578,11 @@ pub fn run(mut queue: Queue, queue_num: u16, mut deps: QueueDeps) -> std::io::Re
                     if let packet::Parsed::Flow(t) = parsed {
                         // try_send: this runs on the verdict thread, which
                         // must never block on the DNS consumer.
-                        if deps.dns_tx.try_send((t, msg.get_payload().to_vec())).is_err() {
+                        if deps
+                            .dns_tx
+                            .try_send((t, msg.get_payload().to_vec()))
+                            .is_err()
+                        {
                             deps.stats.record_dns_snoop_dropped();
                         }
                     }
@@ -652,7 +650,10 @@ pub fn run(mut queue: Queue, queue_num: u16, mut deps: QueueDeps) -> std::io::Re
                 // The first query on a DNS flow is `ct state new` and thus
                 // arrives on the verdict queue; snoop it before deciding.
                 if packet::is_dns_query(&tuple)
-                    && deps.dns_tx.try_send((tuple, msg.get_payload().to_vec())).is_err()
+                    && deps
+                        .dns_tx
+                        .try_send((tuple, msg.get_payload().to_vec()))
+                        .is_err()
                 {
                     deps.stats.record_dns_snoop_dropped();
                 }
@@ -667,7 +668,15 @@ pub fn run(mut queue: Queue, queue_num: u16, mut deps: QueueDeps) -> std::io::Re
                 };
                 match decide(tuple, iface, &ctx, seen.as_mut()) {
                     Decision::Verdict(verdict, rule_name, conn) => {
-                        commit(&mut queue, msg, verdict, Some(rule_name), conn, &deps, enforcing);
+                        commit(
+                            &mut queue,
+                            msg,
+                            verdict,
+                            Some(rule_name),
+                            conn,
+                            &deps,
+                            enforcing,
+                        );
                     }
                     // Observe mode never holds a packet for a prompt: the
                     // operator would be asked to decide something that is
@@ -747,7 +756,11 @@ pub fn run(mut queue: Queue, queue_num: u16, mut deps: QueueDeps) -> std::io::Re
                         });
                         if deps
                             .prompt_tx
-                            .send(PromptTask { seq, conn, exe_sha256 })
+                            .send(PromptTask {
+                                seq,
+                                conn,
+                                exe_sha256,
+                            })
                             .is_ok()
                         {
                             held.insert(seq, msg);
@@ -822,7 +835,10 @@ mod tests {
 
     struct NoAttr;
     impl crate::attribution::Attributor for NoAttr {
-        fn attribute(&self, _t: &hallpass_types::FlowTuple) -> Option<crate::attribution::ProcInfo> {
+        fn attribute(
+            &self,
+            _t: &hallpass_types::FlowTuple,
+        ) -> Option<crate::attribution::ProcInfo> {
             None
         }
     }
@@ -831,7 +847,10 @@ mod tests {
     /// connection with an identity on it.
     struct FixedExe(&'static str);
     impl crate::attribution::Attributor for FixedExe {
-        fn attribute(&self, _t: &hallpass_types::FlowTuple) -> Option<crate::attribution::ProcInfo> {
+        fn attribute(
+            &self,
+            _t: &hallpass_types::FlowTuple,
+        ) -> Option<crate::attribution::ProcInfo> {
             Some(crate::attribution::ProcInfo {
                 pid: Some(1),
                 uid: 1000,
@@ -849,7 +868,10 @@ mod tests {
     /// it covers what it decides.
     struct SelfProc;
     impl crate::attribution::Attributor for SelfProc {
-        fn attribute(&self, _t: &hallpass_types::FlowTuple) -> Option<crate::attribution::ProcInfo> {
+        fn attribute(
+            &self,
+            _t: &hallpass_types::FlowTuple,
+        ) -> Option<crate::attribution::ProcInfo> {
             Some(crate::attribution::ProcInfo {
                 pid: Some(std::process::id()),
                 uid: crate::testutil::own_uid(),
@@ -866,14 +888,26 @@ mod tests {
     fn setup(
         tag: &str,
         rules: Vec<Rule>,
-    ) -> (AttributionChain, Arc<RuleStore>, IpDomainCache, ExeHashCache, TestDir) {
+    ) -> (
+        AttributionChain,
+        Arc<RuleStore>,
+        IpDomainCache,
+        ExeHashCache,
+        TestDir,
+    ) {
         let dir = TestDir::new(&format!("nfq-{tag}"));
         let store = Arc::new(RuleStore::new(dir.path().to_path_buf()));
         for r in rules {
             store.add(r).unwrap();
         }
         let chain = AttributionChain::new(vec![Box::new(NoAttr)]);
-        (chain, store, IpDomainCache::new(16), ExeHashCache::default(), dir)
+        (
+            chain,
+            store,
+            IpDomainCache::new(16),
+            ExeHashCache::default(),
+            dir,
+        )
     }
 
     fn ctx<'a>(
@@ -883,7 +917,13 @@ mod tests {
         exe_hash: &'a ExeHashCache,
         sessions: &'a crate::session::SessionRegistry,
     ) -> DecideCtx<'a> {
-        DecideCtx { attribution, rules, dns_cache, exe_hash, sessions }
+        DecideCtx {
+            attribution,
+            rules,
+            dns_cache,
+            exe_hash,
+            sessions,
+        }
     }
 
     /// A packet that stays on the host: loopback on both ends, which is
@@ -935,7 +975,12 @@ mod tests {
         };
         let sessions = crate::session::SessionRegistry::default();
         let (chain, store, dns, hash, _dir) = setup("rule", vec![deny]);
-        match decide(tuple_of(&tcp_packet([1, 1, 1, 1], 443)).unwrap(), None, &ctx(&chain, &store, &dns, &hash, &sessions), None) {
+        match decide(
+            tuple_of(&tcp_packet([1, 1, 1, 1], 443)).unwrap(),
+            None,
+            &ctx(&chain, &store, &dns, &hash, &sessions),
+            None,
+        ) {
             Decision::Verdict(Verdict::Deny, name, conn) => {
                 assert_eq!(name, "deny-443");
                 assert_eq!(conn.tuple.dst.port(), 443);
@@ -948,7 +993,12 @@ mod tests {
     fn unmatched_goes_to_prompt() {
         let sessions = crate::session::SessionRegistry::default();
         let (chain, store, dns, hash, _dir) = setup("prompt", vec![]);
-        match decide(tuple_of(&tcp_packet([1, 1, 1, 1], 8443)).unwrap(), None, &ctx(&chain, &store, &dns, &hash, &sessions), None) {
+        match decide(
+            tuple_of(&tcp_packet([1, 1, 1, 1], 8443)).unwrap(),
+            None,
+            &ctx(&chain, &store, &dns, &hash, &sessions),
+            None,
+        ) {
             Decision::Prompt(conn, _) => {
                 assert_eq!(conn.tuple.dst.port(), 8443);
                 assert_eq!(conn.exe_path, None);
@@ -980,7 +1030,10 @@ mod tests {
     #[test]
     fn observe_mode_forces_fail_open_on_a_full_queue() {
         assert!(want_fail_open(true, true), "fail-open posture, enforcing");
-        assert!(!want_fail_open(false, true), "fail-closed posture, enforcing");
+        assert!(
+            !want_fail_open(false, true),
+            "fail-closed posture, enforcing"
+        );
         assert!(want_fail_open(true, false), "fail-open posture, observing");
         assert!(
             want_fail_open(false, false),
@@ -1009,7 +1062,12 @@ mod tests {
             .expect("register");
 
         // With no posture the grant answers, as it always has.
-        match decide(tuple, None, &ctx(&chain, &store, &dns, &hash, &sessions), None) {
+        match decide(
+            tuple,
+            None,
+            &ctx(&chain, &store, &dns, &hash, &sessions),
+            None,
+        ) {
             Decision::Verdict(Verdict::Allow, name, _) => {
                 assert_eq!(name, format!("run-session:{id}"));
             }
@@ -1017,7 +1075,12 @@ mod tests {
         }
 
         store.rebuild_for_posture(Some(&["work".to_string()]));
-        match decide(tuple, None, &ctx(&chain, &store, &dns, &hash, &sessions), None) {
+        match decide(
+            tuple,
+            None,
+            &ctx(&chain, &store, &dns, &hash, &sessions),
+            None,
+        ) {
             Decision::Verdict(Verdict::Deny, name, _) => {
                 assert_eq!(name, hallpass_types::LOCKDOWN_DENIED_RULE);
             }
@@ -1031,7 +1094,12 @@ mod tests {
         // Loopback is exempt: it never leaves the host, so refusing it costs
         // the resolver stub and every local service and buys nothing.
         let local = tuple_of(&loopback_packet()).unwrap();
-        match decide(local, None, &ctx(&chain, &store, &dns, &hash, &sessions), None) {
+        match decide(
+            local,
+            None,
+            &ctx(&chain, &store, &dns, &hash, &sessions),
+            None,
+        ) {
             Decision::Verdict(Verdict::Allow, name, _) => {
                 assert_eq!(name, hallpass_types::LOCKDOWN_LOOPBACK_RULE);
             }
@@ -1058,8 +1126,7 @@ mod tests {
         };
         let allow = allow_rule("allow-any", 443, Vec::new());
         let tagged = allow_rule("allow-work", 8443, vec!["work".to_string()]);
-        let (_chain, store, dns, hash, _dir) =
-            setup("lockdown-rules", vec![allow, tagged]);
+        let (_chain, store, dns, hash, _dir) = setup("lockdown-rules", vec![allow, tagged]);
         let chain = AttributionChain::new(vec![Box::new(SelfProc)]);
         let untagged_hit = tuple_of(&tcp_packet([1, 1, 1, 1], 443)).unwrap();
         let tagged_hit = tuple_of(&tcp_packet([1, 1, 1, 1], 8443)).unwrap();
@@ -1094,7 +1161,12 @@ mod tests {
         let tuple = tuple_of(&tcp_packet([1, 1, 1, 1], 443)).unwrap();
 
         // Without a session, this is the prompt the grant exists to remove.
-        match decide(tuple, None, &ctx(&chain, &store, &dns, &hash, &sessions), None) {
+        match decide(
+            tuple,
+            None,
+            &ctx(&chain, &store, &dns, &hash, &sessions),
+            None,
+        ) {
             Decision::Prompt(_, _) => {}
             other => panic!("expected a prompt with no session open, got {other:?}"),
         }
@@ -1106,7 +1178,12 @@ mod tests {
                 "curl".into(),
             )
             .expect("register");
-        match decide(tuple, None, &ctx(&chain, &store, &dns, &hash, &sessions), None) {
+        match decide(
+            tuple,
+            None,
+            &ctx(&chain, &store, &dns, &hash, &sessions),
+            None,
+        ) {
             Decision::Verdict(Verdict::Allow, name, _) => {
                 assert_eq!(name, format!("run-session:{id}"));
             }
@@ -1116,7 +1193,12 @@ mod tests {
         // And it stops the moment the session does, even though the cache
         // has an answer for this process.
         sessions.unregister(id);
-        match decide(tuple, None, &ctx(&chain, &store, &dns, &hash, &sessions), None) {
+        match decide(
+            tuple,
+            None,
+            &ctx(&chain, &store, &dns, &hash, &sessions),
+            None,
+        ) {
             Decision::Prompt(_, _) => {}
             other => panic!("expected a prompt once the session ended, got {other:?}"),
         }
@@ -1199,20 +1281,47 @@ mod tests {
         let (mut seen, _writer) = crate::firstseen::start(dir.path().join("seen.toml"));
 
         let tuple = tuple_of(&tcp_packet([1, 1, 1, 1], 443)).unwrap();
-        let first = match decide(tuple, None, &ctx(&chain, &store, &dns, &hash, &sessions), Some(&mut seen)) {
+        let first = match decide(
+            tuple,
+            None,
+            &ctx(&chain, &store, &dns, &hash, &sessions),
+            Some(&mut seen),
+        ) {
             Decision::Prompt(conn, _) => conn.first_seen,
             other => panic!("expected a prompt, got {other:?}"),
         };
-        assert_eq!(first, Some(hallpass_types::FirstSeen { app: true, dest: true }));
+        assert_eq!(
+            first,
+            Some(hallpass_types::FirstSeen {
+                app: true,
+                dest: true
+            })
+        );
 
-        let again = match decide(tuple, None, &ctx(&chain, &store, &dns, &hash, &sessions), Some(&mut seen)) {
+        let again = match decide(
+            tuple,
+            None,
+            &ctx(&chain, &store, &dns, &hash, &sessions),
+            Some(&mut seen),
+        ) {
             Decision::Prompt(conn, _) => conn.first_seen,
             other => panic!("expected a prompt, got {other:?}"),
         };
-        assert_eq!(again, Some(hallpass_types::FirstSeen { app: false, dest: false }));
+        assert_eq!(
+            again,
+            Some(hallpass_types::FirstSeen {
+                app: false,
+                dest: false
+            })
+        );
 
         // Tracking off is not "seen before": the daemon has nothing to say.
-        match decide(tuple, None, &ctx(&chain, &store, &dns, &hash, &sessions), None) {
+        match decide(
+            tuple,
+            None,
+            &ctx(&chain, &store, &dns, &hash, &sessions),
+            None,
+        ) {
             Decision::Prompt(conn, _) => assert_eq!(conn.first_seen, None),
             other => panic!("expected a prompt, got {other:?}"),
         }
@@ -1242,7 +1351,10 @@ mod tests {
         let Decision::Prompt(conn, _) = decide(query, None, &ctx, Some(&mut seen)) else {
             panic!("expected a prompt for the query");
         };
-        assert_eq!(conn.first_seen, None, "a resolver query is not recorded at all");
+        assert_eq!(
+            conn.first_seen, None,
+            "a resolver query is not recorded at all"
+        );
 
         // Then connects, and *that* is where the annotation belongs.
         let real = tuple_of(&tcp_packet([1, 1, 1, 1], 443)).unwrap();
@@ -1251,7 +1363,10 @@ mod tests {
         };
         assert_eq!(
             conn.first_seen,
-            Some(hallpass_types::FirstSeen { app: true, dest: true })
+            Some(hallpass_types::FirstSeen {
+                app: true,
+                dest: true
+            })
         );
     }
 
@@ -1264,7 +1379,12 @@ mod tests {
             query_name: "example.com".into(),
             addrs: vec![("1.1.1.1".parse().unwrap(), 300)],
         });
-        match decide(tuple_of(&tcp_packet([1, 1, 1, 1], 443)).unwrap(), None, &ctx(&chain, &store, &dns, &hash, &sessions), None) {
+        match decide(
+            tuple_of(&tcp_packet([1, 1, 1, 1], 443)).unwrap(),
+            None,
+            &ctx(&chain, &store, &dns, &hash, &sessions),
+            None,
+        ) {
             Decision::Prompt(conn, _) => assert_eq!(conn.domain.as_deref(), Some("example.com")),
             _ => panic!("expected prompt"),
         }

@@ -24,12 +24,10 @@
 
 use std::collections::{BTreeMap, HashSet};
 
-use hallpass_types::{
-    format_ts, Action, ConnEvent, Proto, Rule, RuleDuration, RuleMatch, Verdict,
-};
+use hallpass_types::{format_ts, Action, ConnEvent, Proto, Rule, RuleDuration, RuleMatch, Verdict};
 
 use crate::args::{Filters, SuggestOpts};
-use crate::client::{Client, CliError};
+use crate::client::{CliError, Client};
 use crate::fmt::Output;
 use crate::{json, rules_file};
 
@@ -274,7 +272,13 @@ type Group = (String, Option<String>, Proto, u16, String);
 /// wildcard rule: an allow covering traffic from an application nobody
 /// reviewed.
 fn group_of(key: &Key, suffix: String) -> Group {
-    (key.exe.clone(), key.app_id.clone(), key.proto, key.port, suffix)
+    (
+        key.exe.clone(),
+        key.app_id.clone(),
+        key.proto,
+        key.port,
+        suffix,
+    )
 }
 
 /// The suffix a host would collapse under: its last two labels, only when
@@ -343,11 +347,7 @@ const HEADER: &str = "\
 ";
 
 /// Run the command: fetch history, fold it, print the proposal.
-pub async fn run(
-    client: &mut Client,
-    opts: SuggestOpts,
-    out: Output,
-) -> Result<(), CliError> {
+pub async fn run(client: &mut Client, opts: SuggestOpts, out: Output) -> Result<(), CliError> {
     use hallpass_types::{ClientMsg, DaemonMsg};
 
     let events = match client
@@ -451,9 +451,19 @@ mod tests {
     #[test]
     fn folds_allowed_events_per_exe_and_destination() {
         let events = vec![
-            event(Some("/usr/bin/curl"), Some("example.org"), "1.1.1.1:443", Verdict::Allow),
+            event(
+                Some("/usr/bin/curl"),
+                Some("example.org"),
+                "1.1.1.1:443",
+                Verdict::Allow,
+            ),
             // Repeat traffic folds into the same rule, not a second one.
-            event(Some("/usr/bin/curl"), Some("example.org"), "1.1.1.1:443", Verdict::Allow),
+            event(
+                Some("/usr/bin/curl"),
+                Some("example.org"),
+                "1.1.1.1:443",
+                Verdict::Allow,
+            ),
             // No domain: the literal address is the match.
             event(Some("/usr/bin/curl"), None, "9.9.9.9:53", Verdict::Allow),
             // Denied traffic proposes nothing.
@@ -467,10 +477,17 @@ mod tests {
         assert_eq!(p.span_ms, Some((1_720_000_000_000, 1_720_000_000_000)));
         assert_eq!(p.rules.len(), 2);
         assert!(p.rules.iter().all(|r| r.action == Action::Allow));
-        let domains: Vec<_> =
-            p.rules.iter().filter_map(|r| r.matcher.domain.clone()).collect();
+        let domains: Vec<_> = p
+            .rules
+            .iter()
+            .filter_map(|r| r.matcher.domain.clone())
+            .collect();
         assert_eq!(domains, vec!["example.org"]);
-        let dests: Vec<_> = p.rules.iter().filter_map(|r| r.matcher.dest.clone()).collect();
+        let dests: Vec<_> = p
+            .rules
+            .iter()
+            .filter_map(|r| r.matcher.dest.clone())
+            .collect();
         assert_eq!(dests, vec!["9.9.9.9"]);
         assert!(p.rules.iter().all(|r| r.matcher.exe.is_some()));
     }
@@ -496,26 +513,62 @@ mod tests {
         rule_deny.enforced = false;
         rule_deny.rule_name = Some("block-it".into());
         let p = suggest(&[would_deny, rule_deny], &Filters::default());
-        let domains: Vec<_> =
-            p.rules.iter().filter_map(|r| r.matcher.domain.clone()).collect();
+        let domains: Vec<_> = p
+            .rules
+            .iter()
+            .filter_map(|r| r.matcher.domain.clone())
+            .collect();
         assert_eq!(domains, vec!["example.org"]);
     }
 
     #[test]
     fn collapses_enough_subdomains_into_a_wildcard() {
         let events = vec![
-            event(Some("/usr/bin/ff"), Some("a.example.org"), "1.1.1.1:443", Verdict::Allow),
-            event(Some("/usr/bin/ff"), Some("b.example.org"), "1.1.1.2:443", Verdict::Allow),
-            event(Some("/usr/bin/ff"), Some("c.example.org"), "1.1.1.3:443", Verdict::Allow),
+            event(
+                Some("/usr/bin/ff"),
+                Some("a.example.org"),
+                "1.1.1.1:443",
+                Verdict::Allow,
+            ),
+            event(
+                Some("/usr/bin/ff"),
+                Some("b.example.org"),
+                "1.1.1.2:443",
+                Verdict::Allow,
+            ),
+            event(
+                Some("/usr/bin/ff"),
+                Some("c.example.org"),
+                "1.1.1.3:443",
+                Verdict::Allow,
+            ),
             // The apex stays exact even next to its own wildcard.
-            event(Some("/usr/bin/ff"), Some("example.org"), "1.1.1.4:443", Verdict::Allow),
+            event(
+                Some("/usr/bin/ff"),
+                Some("example.org"),
+                "1.1.1.4:443",
+                Verdict::Allow,
+            ),
             // Two hosts under another suffix stay exact: below the threshold.
-            event(Some("/usr/bin/ff"), Some("x.other.net"), "2.2.2.1:443", Verdict::Allow),
-            event(Some("/usr/bin/ff"), Some("y.other.net"), "2.2.2.2:443", Verdict::Allow),
+            event(
+                Some("/usr/bin/ff"),
+                Some("x.other.net"),
+                "2.2.2.1:443",
+                Verdict::Allow,
+            ),
+            event(
+                Some("/usr/bin/ff"),
+                Some("y.other.net"),
+                "2.2.2.2:443",
+                Verdict::Allow,
+            ),
         ];
         let p = suggest(&events, &Filters::default());
-        let mut domains: Vec<_> =
-            p.rules.iter().filter_map(|r| r.matcher.domain.clone()).collect();
+        let mut domains: Vec<_> = p
+            .rules
+            .iter()
+            .filter_map(|r| r.matcher.domain.clone())
+            .collect();
         domains.sort();
         assert_eq!(
             domains,
@@ -555,8 +608,14 @@ mod tests {
         assert_eq!(
             pairs,
             vec![
-                (Some("flatpak:com.example.Other".into()), Some("other.example".into())),
-                (Some("flatpak:org.mozilla.firefox".into()), Some("mozilla.example".into())),
+                (
+                    Some("flatpak:com.example.Other".into()),
+                    Some("other.example".into())
+                ),
+                (
+                    Some("flatpak:org.mozilla.firefox".into()),
+                    Some("mozilla.example".into())
+                ),
             ]
         );
         // And they are told apart by name, not by a collision counter: a
@@ -569,7 +628,12 @@ mod tests {
         // A connection with no application identity proposes what it always
         // did: an exe rule with no app_id operand.
         let plain = suggest(
-            &[event(Some("/usr/bin/curl"), Some("example.org"), "1.1.1.1:443", Verdict::Allow)],
+            &[event(
+                Some("/usr/bin/curl"),
+                Some("example.org"),
+                "1.1.1.1:443",
+                Verdict::Allow,
+            )],
             &Filters::default(),
         );
         assert_eq!(plain.rules[0].matcher.app_id, None);
@@ -580,16 +644,49 @@ mod tests {
     #[test]
     fn never_collapses_registry_suffixes() {
         let events = vec![
-            event(Some("/usr/bin/ff"), Some("a.co.uk"), "1.1.1.1:443", Verdict::Allow),
-            event(Some("/usr/bin/ff"), Some("b.co.uk"), "1.1.1.2:443", Verdict::Allow),
-            event(Some("/usr/bin/ff"), Some("c.co.uk"), "1.1.1.3:443", Verdict::Allow),
-            event(Some("/usr/bin/ff"), Some("d.amazonaws.com"), "2.1.1.1:443", Verdict::Allow),
-            event(Some("/usr/bin/ff"), Some("e.amazonaws.com"), "2.1.1.2:443", Verdict::Allow),
-            event(Some("/usr/bin/ff"), Some("f.amazonaws.com"), "2.1.1.3:443", Verdict::Allow),
+            event(
+                Some("/usr/bin/ff"),
+                Some("a.co.uk"),
+                "1.1.1.1:443",
+                Verdict::Allow,
+            ),
+            event(
+                Some("/usr/bin/ff"),
+                Some("b.co.uk"),
+                "1.1.1.2:443",
+                Verdict::Allow,
+            ),
+            event(
+                Some("/usr/bin/ff"),
+                Some("c.co.uk"),
+                "1.1.1.3:443",
+                Verdict::Allow,
+            ),
+            event(
+                Some("/usr/bin/ff"),
+                Some("d.amazonaws.com"),
+                "2.1.1.1:443",
+                Verdict::Allow,
+            ),
+            event(
+                Some("/usr/bin/ff"),
+                Some("e.amazonaws.com"),
+                "2.1.1.2:443",
+                Verdict::Allow,
+            ),
+            event(
+                Some("/usr/bin/ff"),
+                Some("f.amazonaws.com"),
+                "2.1.1.3:443",
+                Verdict::Allow,
+            ),
         ];
         let p = suggest(&events, &Filters::default());
-        let domains: Vec<_> =
-            p.rules.iter().filter_map(|r| r.matcher.domain.clone()).collect();
+        let domains: Vec<_> = p
+            .rules
+            .iter()
+            .filter_map(|r| r.matcher.domain.clone())
+            .collect();
         assert_eq!(p.rules.len(), 6);
         assert!(domains.iter().all(|d| !d.starts_with("*.")), "{domains:?}");
     }
@@ -597,9 +694,24 @@ mod tests {
     #[test]
     fn exe_filter_narrows_and_names_are_unique() {
         let events = vec![
-            event(Some("/usr/bin/curl"), Some("example.org"), "1.1.1.1:443", Verdict::Allow),
-            event(Some("/opt/other/curl"), Some("example.org"), "1.1.1.1:443", Verdict::Allow),
-            event(Some("/usr/bin/wget"), Some("example.org"), "1.1.1.1:443", Verdict::Allow),
+            event(
+                Some("/usr/bin/curl"),
+                Some("example.org"),
+                "1.1.1.1:443",
+                Verdict::Allow,
+            ),
+            event(
+                Some("/opt/other/curl"),
+                Some("example.org"),
+                "1.1.1.1:443",
+                Verdict::Allow,
+            ),
+            event(
+                Some("/usr/bin/wget"),
+                Some("example.org"),
+                "1.1.1.1:443",
+                Verdict::Allow,
+            ),
         ];
         let p = suggest(&events, &exe_filter("curl"));
         assert_eq!(p.rules.len(), 2);

@@ -15,8 +15,8 @@
 use std::path::PathBuf;
 
 use hallpass_types::{
-    sanitize_for_display, ConnEvent, Connection, Explanation, Rule, RuleHit, RuleMatch,
-    RuleTrace, RunSessionInfo, RuntimeConfig, Stats, TraceOutcome,
+    sanitize_for_display, ConnEvent, Connection, Explanation, Rule, RuleHit, RuleMatch, RuleTrace,
+    RunSessionInfo, RuntimeConfig, Stats, TraceOutcome,
 };
 use serde::Serialize;
 
@@ -304,9 +304,15 @@ mod tests {
     #[test]
     fn first_seen_survives_the_sanitizing_copy() {
         let mut ev = hostile_event();
-        ev.conn.first_seen = Some(hallpass_types::FirstSeen { app: true, dest: false });
+        ev.conn.first_seen = Some(hallpass_types::FirstSeen {
+            app: true,
+            dest: false,
+        });
         let line = event(&ev).expect("encode");
-        assert!(line.contains(r#""first_seen":{"app":true,"dest":false}"#), "{line}");
+        assert!(
+            line.contains(r#""first_seen":{"app":true,"dest":false}"#),
+            "{line}"
+        );
 
         ev.conn.first_seen = None;
         let line = event(&ev).expect("encode");

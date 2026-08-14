@@ -194,7 +194,10 @@ pub fn spawn(ctx: egui::Context) -> Tray {
             }
         })
         .expect("spawning the tray thread");
-    Tray { msgs: from_tray, state: to_tray }
+    Tray {
+        msgs: from_tray,
+        state: to_tray,
+    }
 }
 
 fn run(to_ui: Sender<TrayMsg>, from_ui: Receiver<TrayState>, ctx: egui::Context) {

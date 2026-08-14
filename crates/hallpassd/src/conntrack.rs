@@ -225,7 +225,9 @@ impl CtSocket {
                 }
             }
         }
-        Err(std::io::Error::other("no conntrack ack within the wait budget"))
+        Err(std::io::Error::other(
+            "no conntrack ack within the wait budget",
+        ))
     }
 }
 
@@ -261,9 +263,7 @@ pub fn flows_to_kill(ruleset: &RuleSet, history: &[Arc<ConnEvent>]) -> Vec<(Flow
         if ruleset.wants_exe_hash_for(&ev.conn) {
             continue;
         }
-        if let Some((rule, Verdict::Deny | Verdict::Reject)) =
-            ruleset.match_conn(&ev.conn, None)
-        {
+        if let Some((rule, Verdict::Deny | Verdict::Reject)) = ruleset.match_conn(&ev.conn, None) {
             kills.push((ev.conn.tuple, rule.name.clone()));
         }
     }
@@ -339,9 +339,7 @@ pub fn spawn_kill_sweeper(
             let ruleset = store.ruleset();
             let history = events.recent();
             let settings = Arc::clone(&settings);
-            match tokio::task::spawn_blocking(move || sweep(&ruleset, &history, &settings))
-                .await
-            {
+            match tokio::task::spawn_blocking(move || sweep(&ruleset, &history, &settings)).await {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => tracing::warn!(
                     "conntrack unavailable, established flows keep their old verdicts \
@@ -404,7 +402,10 @@ mod tests {
             u16::from_ne_bytes(msg[30..32].try_into().unwrap()),
             CTA_IP_V6_SRC
         );
-        let src: [u8; 16] = "2001:db8::1".parse::<std::net::Ipv6Addr>().unwrap().octets();
+        let src: [u8; 16] = "2001:db8::1"
+            .parse::<std::net::Ipv6Addr>()
+            .unwrap()
+            .octets();
         assert_eq!(&msg[32..48], &src);
     }
 
@@ -509,8 +510,7 @@ mod tests {
                 ..Default::default()
             },
         };
-        let ruleset =
-            RuleSet::compile(&[hash_allow, deny_rule("block-curl", "/usr/bin/curl")]);
+        let ruleset = RuleSet::compile(&[hash_allow, deny_rule("block-curl", "/usr/bin/curl")]);
         let t = tuple("10.0.0.1:1000", "1.1.1.1:443", Proto::Tcp);
         let history = vec![event(t, "/usr/bin/curl", Verdict::Allow, true)];
         assert!(flows_to_kill(&ruleset, &history).is_empty());

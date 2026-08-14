@@ -125,9 +125,7 @@ fn ack_kind(msg: &ClientMsg) -> Option<AckKind> {
         // same `Err` every other request's does. Left out of this table, an
         // unknown tag would pop the queue against somebody else's request
         // and blame the wrong one.
-        ClientMsg::RuleToggle { .. } | ClientMsg::RuleToggleTag { .. } => {
-            Some(AckKind::RuleToggle)
-        }
+        ClientMsg::RuleToggle { .. } | ClientMsg::RuleToggleTag { .. } => Some(AckKind::RuleToggle),
         ClientMsg::RuleDelete { .. } => Some(AckKind::RuleDelete),
         ClientMsg::ConfigSet(_) => Some(AckKind::ConfigSet),
         ClientMsg::Subscribe { .. } | ClientMsg::PromptReply { .. } => Some(AckKind::Other),
@@ -400,12 +398,24 @@ impl HallpassApp {
     /// have to spell out, and what they assert on is ids and kinds.
     #[cfg(test)]
     fn prompt_ids(&self) -> Vec<u64> {
-        self.prompts.lock().unwrap().pending.iter().map(|p| p.id).collect()
+        self.prompts
+            .lock()
+            .unwrap()
+            .pending
+            .iter()
+            .map(|p| p.id)
+            .collect()
     }
 
     #[cfg(test)]
     fn pending_ack_kinds(&self) -> Vec<AckKind> {
-        self.link.pending_acks.lock().unwrap().iter().copied().collect()
+        self.link
+            .pending_acks
+            .lock()
+            .unwrap()
+            .iter()
+            .copied()
+            .collect()
     }
 
     /// Drain messages from the network thread into UI state.
@@ -463,9 +473,7 @@ impl HallpassApp {
                         self.link.pending_acks.lock().unwrap().pop_front();
                     }
                     if matches!(msg, ClientMsg::RuleAdd(_)) {
-                        if let Some(editor) =
-                            self.editor.as_mut().filter(|e| e.awaiting_ack())
-                        {
+                        if let Some(editor) = self.editor.as_mut().filter(|e| e.awaiting_ack()) {
                             editor.ack_lost("connection lost; the rule was not saved");
                         }
                     }
@@ -474,8 +482,7 @@ impl HallpassApp {
                     // instead of failing silently.
                     let what = match &msg {
                         ClientMsg::PromptReply { .. } => {
-                            "your prompt answer; the daemon applies its default action"
-                                .to_string()
+                            "your prompt answer; the daemon applies its default action".to_string()
                         }
                         ClientMsg::RuleAdd(_) => "a rule change".to_string(),
                         ClientMsg::RuleDelete { .. } => "a rule deletion".to_string(),
@@ -489,8 +496,7 @@ impl HallpassApp {
                         ClientMsg::ConfigSet(_) => "a settings change".to_string(),
                         _ => "a request".to_string(),
                     };
-                    self.last_error =
-                        Some(format!("connection lost before delivering {what}"));
+                    self.last_error = Some(format!("connection lost before delivering {what}"));
                 }
                 UiEvent::Daemon(msg) => self.handle_daemon_msg(msg),
             }
@@ -568,8 +574,10 @@ impl HallpassApp {
                     // that retries it, like a refused rule save belongs in
                     // the editor.
                     (Some(AckKind::ConfigSet), _) => {
-                        self.settings_error =
-                            Some(format!("daemon rejected the change: {}", prompt::ui_text(&message)));
+                        self.settings_error = Some(format!(
+                            "daemon rejected the change: {}",
+                            prompt::ui_text(&message)
+                        ));
                     }
                     _ => self.last_error = Some(message),
                 }
@@ -861,8 +869,14 @@ impl HallpassApp {
     /// daemon's timeout still decides. Queuing them costs nothing and is
     /// right whenever it wins.
     fn abandon_open_prompts(&mut self) {
-        let pending: Vec<u64> =
-            self.prompts.lock().unwrap().pending.iter().map(|p| p.id).collect();
+        let pending: Vec<u64> = self
+            .prompts
+            .lock()
+            .unwrap()
+            .pending
+            .iter()
+            .map(|p| p.id)
+            .collect();
         self.dismiss_prompts(pending);
     }
 
@@ -952,7 +966,10 @@ impl HallpassApp {
                 }
                 if let Some(err) = &self.last_error {
                     ui.separator();
-                    ui.colored_label(DENY_COLOR, format!("daemon error: {}", prompt::ui_text(err)));
+                    ui.colored_label(
+                        DENY_COLOR,
+                        format!("daemon error: {}", prompt::ui_text(err)),
+                    );
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("Quit").clicked() {
@@ -1111,7 +1128,10 @@ impl HallpassApp {
         if agg.overflow > 0 {
             ui.colored_label(
                 REJECT_COLOR,
-                format!("{} connections not counted: too many distinct keys", agg.overflow),
+                format!(
+                    "{} connections not counted: too many distinct keys",
+                    agg.overflow
+                ),
             );
         }
         let rows = agg.top(TRAFFIC_ROWS);
@@ -1359,11 +1379,7 @@ impl HallpassApp {
             .show_ui(ui, |ui| {
                 ui.selectable_value(&mut self.rule_tag_filter, None, "(all)");
                 for tag in tags {
-                    ui.selectable_value(
-                        &mut self.rule_tag_filter,
-                        Some(tag.to_string()),
-                        tag,
-                    );
+                    ui.selectable_value(&mut self.rule_tag_filter, Some(tag.to_string()), tag);
                 }
             });
         if let Some(tag) = self.rule_tag_filter.clone() {
@@ -1450,9 +1466,7 @@ impl HallpassApp {
             let missed = match (s.verdict_queue_dropped, s.verdict_queue_user_dropped) {
                 // Saturating, as everywhere a stats reply is rendered: the
                 // sum must not be able to panic on socket input.
-                (Some(dropped), Some(undelivered)) => {
-                    Some(dropped.saturating_add(undelivered))
-                }
+                (Some(dropped), Some(undelivered)) => Some(dropped.saturating_add(undelivered)),
                 _ => None,
             };
             match missed {
@@ -1549,9 +1563,7 @@ impl HallpassApp {
             .show(ui, |ui| {
                 ui.label("Prompt timeout (seconds)")
                     .on_hover_text("How long a prompt waits before the default action applies");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.settings_timeout).desired_width(80.0),
-                );
+                ui.add(egui::TextEdit::singleline(&mut self.settings_timeout).desired_width(80.0));
                 ui.end_row();
 
                 ui.label("Default action").on_hover_text(
@@ -1660,7 +1672,11 @@ impl HallpassApp {
                 .collect()
         };
 
-        tracing::debug!(count = declared.len(), ?declared, "declaring prompt viewports");
+        tracing::debug!(
+            count = declared.len(),
+            ?declared,
+            "declaring prompt viewports"
+        );
         let mut surfaced = std::collections::HashSet::new();
         for (window, generation) in declared {
             let viewport_id = window.viewport_id(generation);
@@ -1690,9 +1706,7 @@ impl HallpassApp {
                 ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Focus);
                 ctx.send_viewport_cmd_to(
                     viewport_id,
-                    egui::ViewportCommand::RequestUserAttention(
-                        egui::UserAttentionType::Critical,
-                    ),
+                    egui::ViewportCommand::RequestUserAttention(egui::UserAttentionType::Critical),
                 );
             }
             surfaced.insert(viewport_id);
@@ -1860,8 +1874,10 @@ fn prompt_popup(
         // lets it paint; until then the window sits hidden or minimized,
         // not empty on screen.
         tracing::debug!(?window, generation, "prompt popup emptied; parking window");
-        ui.ctx().send_viewport_cmd(egui::ViewportCommand::Visible(false));
-        ui.ctx().send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+        ui.ctx()
+            .send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        ui.ctx()
+            .send_viewport_cmd(egui::ViewportCommand::Minimized(true));
         ui.ctx().request_repaint_of(egui::ViewportId::ROOT);
     } else {
         // Keep the countdown moving without leaning on the main window's
@@ -2010,13 +2026,20 @@ fn prompt_info_ui(ui: &mut egui::Ui, p: &PromptState, rest: &[String]) {
     if let Some(hash) = &p.context.exe_sha256 {
         ui.add_space(4.0);
         ui.label(RichText::new("Executable SHA-256").small());
-        ui.label(RichText::new(prompt::truncate(hash, 64)).small().monospace());
+        ui.label(
+            RichText::new(prompt::truncate(hash, 64))
+                .small()
+                .monospace(),
+        );
     }
     if !rest.is_empty() {
         ui.add_space(4.0);
         ui.label(
-            RichText::new(format!("{} more request(s) pending from this app:", rest.len()))
-                .small(),
+            RichText::new(format!(
+                "{} more request(s) pending from this app:",
+                rest.len()
+            ))
+            .small(),
         );
         // A handful is informative; a browser's full endpoint list is not.
         for dest in rest.iter().take(5) {
@@ -2026,8 +2049,10 @@ fn prompt_info_ui(ui: &mut egui::Ui, p: &PromptState, rest: &[String]) {
             ui.label(RichText::new(format!("  ...and {} more", rest.len() - 5)).small());
         }
         ui.label(
-            RichText::new("Answering \"This host\" or \"App anywhere\" also settles the covered ones.")
-                .small(),
+            RichText::new(
+                "Answering \"This host\" or \"App anywhere\" also settles the covered ones.",
+            )
+            .small(),
         );
     }
 }
@@ -2075,13 +2100,12 @@ fn prompt_actions_ui(
         // reply drops the flag on a deny (a deny keyed on the path should keep
         // blocking whatever is written there).
         if p.can_pin() && p.duration != RuleDuration::Once {
-            ui.checkbox(&mut p.pin_exe, "Pin binary")
-                .on_hover_text(
-                    "Allow only this exact executable: the rule stops matching if the \
+            ui.checkbox(&mut p.pin_exe, "Pin binary").on_hover_text(
+                "Allow only this exact executable: the rule stops matching if the \
                      file at that path is replaced. Worth it for anything you can write \
                      yourself, since a path is not an identity. The rule will need \
                      answering again after the program updates.",
-                );
+            );
         }
     });
     ui.add_space(6.0);
@@ -2142,10 +2166,10 @@ fn prompt_actions_ui(
     ui.add_space(6.0);
 
     let frac = p.remaining_fraction(now_ms);
-    ui.add(
-        egui::ProgressBar::new(frac)
-            .text(format!("{}s until default verdict", p.remaining_secs(now_ms))),
-    );
+    ui.add(egui::ProgressBar::new(frac).text(format!(
+        "{}s until default verdict",
+        p.remaining_secs(now_ms)
+    )));
 }
 
 impl eframe::App for HallpassApp {

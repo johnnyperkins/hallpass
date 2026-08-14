@@ -272,7 +272,10 @@ pub fn spawn_watchdog(
             // watching would stop with no trace. The blocking thread stays
             // parked either way, but the next tick still runs, and the lock
             // keeps the two from overlapping.
-            if tokio::time::timeout(WATCHDOG_CALL_TIMEOUT, check).await.is_err() {
+            if tokio::time::timeout(WATCHDOG_CALL_TIMEOUT, check)
+                .await
+                .is_err()
+            {
                 tracing::warn!("nft table check has not returned; still watching");
             }
         }
@@ -317,7 +320,11 @@ fn nft_binary() -> &'static str {
 fn run_nft(args: &[&str], stdin: Option<&str>) -> std::io::Result<()> {
     let mut cmd = Command::new(nft_binary());
     cmd.args(args)
-        .stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() })
+        .stdin(if stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
     let mut child = cmd.spawn()?;
@@ -348,7 +355,9 @@ mod tests {
         assert!(r.contains("table inet hallpass"));
         assert!(r.contains("type filter hook output priority mangle; policy accept;"));
         assert!(r.contains("ct state new queue num 3 bypass"));
-        assert!(r.contains(&format!("meta mark {REJECT_MARK} meta l4proto tcp reject with tcp reset")));
+        assert!(r.contains(&format!(
+            "meta mark {REJECT_MARK} meta l4proto tcp reject with tcp reset"
+        )));
         assert!(r.contains(&format!("meta mark {REJECT_MARK} reject")));
         assert!(r.contains("udp dport 53 ct state != new queue num 4 bypass"));
         assert!(r.contains("type filter hook input priority mangle; policy accept;"));
@@ -375,7 +384,9 @@ mod tests {
             .nth(1)
             .and_then(|s| s.split("\t}").next())
             .expect("reject chain body");
-        assert!(reject.contains(&format!("meta mark {REJECT_MARK} meta l4proto tcp reject with tcp reset")));
+        assert!(reject.contains(&format!(
+            "meta mark {REJECT_MARK} meta l4proto tcp reject with tcp reset"
+        )));
         assert!(reject.contains(&format!("meta mark {REJECT_MARK} reject")));
     }
 

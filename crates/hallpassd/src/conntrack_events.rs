@@ -47,10 +47,10 @@ use netlink_sys::protocols::NETLINK_NETFILTER;
 use netlink_sys::{Socket, SocketAddr as NlAddr};
 
 use crate::netlink::{
-    align4, Attrs, CTA_COUNTERS_BYTES, CTA_COUNTERS_ORIG, CTA_COUNTERS_PACKETS,
-    CTA_COUNTERS_REPLY, CTA_IP_V4_DST, CTA_IP_V4_SRC, CTA_IP_V6_DST, CTA_IP_V6_SRC,
-    CTA_PROTO_DST_PORT, CTA_PROTO_NUM, CTA_PROTO_SRC_PORT, CTA_TUPLE_IP, CTA_TUPLE_ORIG,
-    CTA_TUPLE_PROTO, IPPROTO_TCP, IPPROTO_UDP, NLMSG_HDRLEN,
+    align4, Attrs, CTA_COUNTERS_BYTES, CTA_COUNTERS_ORIG, CTA_COUNTERS_PACKETS, CTA_COUNTERS_REPLY,
+    CTA_IP_V4_DST, CTA_IP_V4_SRC, CTA_IP_V6_DST, CTA_IP_V6_SRC, CTA_PROTO_DST_PORT, CTA_PROTO_NUM,
+    CTA_PROTO_SRC_PORT, CTA_TUPLE_IP, CTA_TUPLE_ORIG, CTA_TUPLE_PROTO, IPPROTO_TCP, IPPROTO_UDP,
+    NLMSG_HDRLEN,
 };
 
 /// The conntrack multicast group that carries destroy notifications.
@@ -130,8 +130,14 @@ pub fn parse_destroy(msg: &[u8]) -> Option<FlowSummary> {
     // last-write of an accumulating loop are equivalent here.
     let attrs = Attrs::new(msg.get(NLMSG_HDRLEN + NFGENMSG_LEN..)?);
     let tuple = parse_tuple(attrs.get(CTA_TUPLE_ORIG)?)?;
-    let orig = attrs.get(CTA_COUNTERS_ORIG).map(parse_counters).unwrap_or((0, 0));
-    let reply = attrs.get(CTA_COUNTERS_REPLY).map(parse_counters).unwrap_or((0, 0));
+    let orig = attrs
+        .get(CTA_COUNTERS_ORIG)
+        .map(parse_counters)
+        .unwrap_or((0, 0));
+    let reply = attrs
+        .get(CTA_COUNTERS_REPLY)
+        .map(parse_counters)
+        .unwrap_or((0, 0));
     // A flow the kernel never accounted carries no counters; there is
     // nothing to record for it, and a zero-volume summary would only dilute
     // the totals with flows we cannot measure.
@@ -180,7 +186,10 @@ fn parse_tuple(value: &[u8]) -> Option<FlowTuple> {
 fn parse_counters(value: &[u8]) -> (u64, u64) {
     let attrs = Attrs::new(value);
     let bytes = attrs.get(CTA_COUNTERS_BYTES).and_then(be_u64).unwrap_or(0);
-    let packets = attrs.get(CTA_COUNTERS_PACKETS).and_then(be_u64).unwrap_or(0);
+    let packets = attrs
+        .get(CTA_COUNTERS_PACKETS)
+        .and_then(be_u64)
+        .unwrap_or(0);
     (bytes, packets)
 }
 
@@ -286,7 +295,11 @@ pub fn spawn(
 /// eternal zeros with no hint which prerequisite they missed. Both can be
 /// flipped live, so this warns rather than refusing to start.
 fn warn_if_prereqs_off() {
-    let off = |path: &str| std::fs::read_to_string(path).map(|v| v.trim() == "0").unwrap_or(false);
+    let off = |path: &str| {
+        std::fs::read_to_string(path)
+            .map(|v| v.trim() == "0")
+            .unwrap_or(false)
+    };
     if off(ACCT_SYSCTL) {
         tracing::warn!(
             "flow accounting is on but {ACCT_SYSCTL} is 0, so the kernel attaches no \

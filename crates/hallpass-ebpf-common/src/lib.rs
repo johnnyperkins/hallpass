@@ -16,7 +16,6 @@
 // future `unsafe` in this crate would have compiled silently while the
 // attributes suggested it was contained.
 #![deny(unsafe_code)]
-
 #![cfg_attr(not(test), no_std)]
 
 /// IPPROTO_TCP.

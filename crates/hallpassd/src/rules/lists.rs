@@ -25,7 +25,12 @@ use ipnet::IpNet;
 use crate::attribution::hash::FileId;
 
 /// Hosts-file noise entries that never name a real destination.
-const HOSTS_NOISE: &[&str] = &["localhost", "localhost.localdomain", "broadcasthost", "local"];
+const HOSTS_NOISE: &[&str] = &[
+    "localhost",
+    "localhost.localdomain",
+    "broadcasthost",
+    "local",
+];
 
 /// Validate and normalize a SHA-256 as 64 hex digits, lowercased. Shared
 /// by the `exe_sha256` rule field and hash list entries.
@@ -70,7 +75,9 @@ impl<T> ListCache<T> {
         // Identity and content both come from this fd: no window where the
         // trust-checked file and the parsed bytes could differ.
         let mut file = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
-        let meta = file.metadata().map_err(|e| format!("{}: {e}", path.display()))?;
+        let meta = file
+            .metadata()
+            .map_err(|e| format!("{}: {e}", path.display()))?;
         let self_uid = super::store::effective_uid().unwrap_or(u32::MAX);
         if !super::store::file_perms_ok(meta.uid(), meta.mode(), self_uid) {
             return Err(format!(
@@ -327,7 +334,11 @@ mod tests {
     #[test]
     fn hash_list_validation() {
         let dir = TestDir::new("lists-hash");
-        let good = write(&dir, "h.list", &format!("{}\n{}\n", "A".repeat(64), "b".repeat(64)));
+        let good = write(
+            &dir,
+            "h.list",
+            &format!("{}\n{}\n", "A".repeat(64), "b".repeat(64)),
+        );
         let set = HashSet256::load(&good).unwrap();
         assert!(set.contains(&"a".repeat(64)));
         assert!(set.contains(&"b".repeat(64)));

@@ -98,9 +98,7 @@ pub async fn run(argv: &[String]) -> i32 {
         Cmd::RulesToggle { name, enabled } => {
             expect_ok(&mut client, ClientMsg::RuleToggle { name, enabled }).await
         }
-        Cmd::RulesToggleTag { tag, enabled } => {
-            rules_toggle_tag(&mut client, tag, enabled).await
-        }
+        Cmd::RulesToggleTag { tag, enabled } => rules_toggle_tag(&mut client, tag, enabled).await,
         Cmd::RulesExport => rules_export(&mut client).await,
         Cmd::RulesImport { path } => rules_import(&mut client, &path).await,
         Cmd::Suggest(opts) => suggest::run(&mut client, opts, out).await,
@@ -173,11 +171,7 @@ async fn config_show(client: &mut Client, out: Output) -> Result<(), CliError> {
 /// changing settings at once can clobber each other; last write wins (the
 /// usage text says so), and what is printed afterwards is refetched rather
 /// than echoed, so it is what the daemon actually holds.
-async fn config_set(
-    client: &mut Client,
-    opts: ConfigSetOpts,
-    out: Output,
-) -> Result<(), CliError> {
+async fn config_set(client: &mut Client, opts: ConfigSetOpts, out: Output) -> Result<(), CliError> {
     let current = match client.request(ClientMsg::ConfigGet).await? {
         DaemonMsg::Config(cfg) => cfg,
         other => return Err(CliError::unexpected(&other)),
@@ -377,14 +371,19 @@ async fn print_lockdown(
     // Allows only. A deny rule on port 53 survives the posture like every
     // other deny, and counting it as "something covers DNS" would silence
     // this warning on exactly the hosts that block plaintext DNS.
-    let resolves = kept.iter().filter(|r| r.action == hallpass_types::Action::Allow).any(|r| {
-        r.matcher.port == Some(53)
-            || r.matcher.port_range.is_some_and(|(lo, hi)| lo <= 53 && 53 <= hi)
-    });
+    let resolves = kept
+        .iter()
+        .filter(|r| r.action == hallpass_types::Action::Allow)
+        .any(|r| {
+            r.matcher.port == Some(53)
+                || r.matcher
+                    .port_range
+                    .is_some_and(|(lo, hi)| lo <= 53 && 53 <= hi)
+        });
     if !resolves {
-        let pinned_domains = rules
-            .iter()
-            .any(|r| r.enabled && r.active_under_lockdown(&state.tags) && r.matcher.domain.is_some());
+        let pinned_domains = rules.iter().any(|r| {
+            r.enabled && r.active_under_lockdown(&state.tags) && r.matcher.domain.is_some()
+        });
         println!(
             "warning: nothing pinned covers DNS, so this host cannot resolve names{}",
             if pinned_domains {
@@ -404,11 +403,7 @@ async fn print_lockdown(
 /// the operator asked for is not the change the daemon made, and a bulk
 /// operation that reports success while part of it did not happen is how a
 /// disabled-everything posture ends up with a rule still enforcing.
-async fn rules_toggle_tag(
-    client: &mut Client,
-    tag: String,
-    enabled: bool,
-) -> Result<(), CliError> {
+async fn rules_toggle_tag(client: &mut Client, tag: String, enabled: bool) -> Result<(), CliError> {
     let (changed, failed) = match client
         .request(ClientMsg::RuleToggleTag {
             tag: tag.clone(),
@@ -488,11 +483,7 @@ async fn rules_import(client: &mut Client, path: &Path) -> Result<(), CliError> 
 }
 
 /// Ask what policy would do with a hypothetical connection.
-async fn explain(
-    client: &mut Client,
-    req: ExplainRequest,
-    out: Output,
-) -> Result<(), CliError> {
+async fn explain(client: &mut Client, req: ExplainRequest, out: Output) -> Result<(), CliError> {
     match client.request(ClientMsg::Explain(req)).await? {
         DaemonMsg::Explanation(exp) => {
             if out.json {
@@ -521,7 +512,10 @@ async fn events(mut client: Client, opts: EventsOpts, out: Output) -> Result<(),
     if let Some(last) = opts.last {
         // An older daemon has no history to give. That costs the replay, not
         // the command, so say so and carry on with the live stream.
-        match client.request(ClientMsg::EventHistory { limit: last }).await {
+        match client
+            .request(ClientMsg::EventHistory { limit: last })
+            .await
+        {
             Ok(DaemonMsg::Events(events)) => {
                 for ev in events.iter().filter(|ev| opts.filters.matches(ev)) {
                     print_event(ev, out)?;

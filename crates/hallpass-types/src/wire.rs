@@ -191,8 +191,7 @@ mod tests {
     {
         // Sync frame round-trip.
         let frame = encode(msg).unwrap();
-        let len =
-            u32::from_le_bytes(frame[..FRAME_PREFIX_BYTES].try_into().unwrap()) as usize;
+        let len = u32::from_le_bytes(frame[..FRAME_PREFIX_BYTES].try_into().unwrap()) as usize;
         assert_eq!(len, frame.len() - FRAME_PREFIX_BYTES);
         let decoded: T = decode(&frame[FRAME_PREFIX_BYTES..]).unwrap();
         assert_eq!(&decoded, msg);

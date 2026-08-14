@@ -26,9 +26,7 @@ impl CliError {
     pub fn exit_code(&self) -> i32 {
         match self {
             CliError::Connect(_) => crate::EXIT_CONN,
-            CliError::Daemon(_) | CliError::Protocol(_) | CliError::Input(_) => {
-                crate::EXIT_ERR
-            }
+            CliError::Daemon(_) | CliError::Protocol(_) | CliError::Input(_) => crate::EXIT_ERR,
         }
     }
 

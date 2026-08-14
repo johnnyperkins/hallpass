@@ -78,7 +78,10 @@ impl Aggregate {
     /// Rebuild from the whole feed. Called when the grouping changes or the
     /// feed is replaced; folding incrementally would need a second copy of
     /// the ring to stay consistent with it, and the feed is capped anyway.
-    pub fn rebuild<'a>(events: impl Iterator<Item = &'a ConnEvent>, group_by: GroupBy) -> Aggregate {
+    pub fn rebuild<'a>(
+        events: impl Iterator<Item = &'a ConnEvent>,
+        group_by: GroupBy,
+    ) -> Aggregate {
         let mut agg = Aggregate::default();
         for ev in events {
             agg.add(ev, group_by);
@@ -244,7 +247,10 @@ mod tests {
     fn rows_are_capped_and_overflow_counted() {
         let mut agg = Aggregate::default();
         for i in 0..(MAX_ROWS + 30) {
-            agg.add(&ev(&format!("/bin/p{i}"), "1.1.1.1:443", Verdict::Allow, true), GroupBy::Exe);
+            agg.add(
+                &ev(&format!("/bin/p{i}"), "1.1.1.1:443", Verdict::Allow, true),
+                GroupBy::Exe,
+            );
         }
         assert_eq!(agg.len(), MAX_ROWS);
         assert_eq!(agg.overflow, 30);
@@ -258,7 +264,12 @@ mod tests {
     fn hostile_keys_are_sanitized() {
         let mut agg = Aggregate::default();
         agg.add(
-            &ev("/tmp/evil\r\x1b[2K/usr/bin/firefox", "1.1.1.1:443", Verdict::Allow, true),
+            &ev(
+                "/tmp/evil\r\x1b[2K/usr/bin/firefox",
+                "1.1.1.1:443",
+                Verdict::Allow,
+                true,
+            ),
             GroupBy::Exe,
         );
         let rows = agg.top(1);
@@ -273,7 +284,10 @@ mod tests {
         e.rule_name = Some("allow-web".into());
         assert!(matches_filter(&e, ""), "empty filter keeps everything");
         assert!(matches_filter(&e, "curl"));
-        assert!(matches_filter(&e, "EXAMPLE"), "filtering is case-insensitive");
+        assert!(
+            matches_filter(&e, "EXAMPLE"),
+            "filtering is case-insensitive"
+        );
         assert!(matches_filter(&e, "allow-web"));
         assert!(matches_filter(&e, "93.184"));
         assert!(!matches_filter(&e, "firefox"));

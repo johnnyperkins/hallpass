@@ -5,18 +5,18 @@
 //! the compiled [`RuleSet`] and swaps it atomically, so the packet path
 //! reads rules lock-free.
 
+use std::collections::HashMap;
 use std::io::Read;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
+use hallpass_types::{wire, Rule};
 use notify::event::{AccessKind, AccessMode, EventKind};
 use notify::Watcher;
-use hallpass_types::{wire, Rule};
 
 use super::engine::RuleSet;
 use super::model::CompiledRule;
@@ -409,7 +409,11 @@ fn load_dir(dir: &Path) -> LoadResult {
         Ok(r) => r,
         Err(e) => {
             tracing::warn!(dir = %dir.display(), "cannot read rules dir: {e}");
-            return LoadResult { entries, skipped, complete: false };
+            return LoadResult {
+                entries,
+                skipped,
+                complete: false,
+            };
         }
     };
     for item in read {
@@ -555,7 +559,11 @@ fn load_dir(dir: &Path) -> LoadResult {
             origin: Origin::Disk(path),
         });
     }
-    LoadResult { entries, skipped, complete }
+    LoadResult {
+        entries,
+        skipped,
+        complete,
+    }
 }
 
 impl RuleStore {
@@ -609,7 +617,12 @@ impl RuleStore {
 
     /// All rules, for `RuleList` replies.
     pub fn list(&self) -> Vec<Rule> {
-        self.entries.lock().unwrap().iter().map(|e| e.rule.clone()).collect()
+        self.entries
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|e| e.rule.clone())
+            .collect()
     }
 
     /// Count one connection decided by the rule named `name`.
@@ -923,7 +936,8 @@ impl RuleStore {
             tracing::debug!("rules reload aborted: the rule files changed under the scan");
             return false;
         }
-        self.rules_skipped.fetch_add(fresh.skipped, Ordering::Relaxed);
+        self.rules_skipped
+            .fetch_add(fresh.skipped, Ordering::Relaxed);
         entries.retain(|e| e.origin == Origin::Session);
         for f in fresh.entries {
             if !entries.iter().any(|e| e.rule.name == f.rule.name) {
@@ -961,8 +975,10 @@ impl RuleStore {
         let rules: Vec<Rule> = self.list();
         self.prune_hits(&rules);
         let posture = self.lockdown_tags.lock().unwrap().clone();
-        self.active
-            .store(Arc::new(RuleSet::compile_with_lockdown(&rules, posture.as_deref())));
+        self.active.store(Arc::new(RuleSet::compile_with_lockdown(
+            &rules,
+            posture.as_deref(),
+        )));
         // After the swap, so a woken subscriber always sees the new set.
         // send_replace, not send: this must not depend on a receiver being
         // subscribed yet, and the startup rebuild has none.
@@ -988,8 +1004,7 @@ impl RuleStore {
     /// here and `entries` then `hits` in [`RuleStore::hits`] keeps one
     /// order everywhere.
     fn prune_hits(&self, rules: &[Rule]) {
-        let live: std::collections::HashSet<&str> =
-            rules.iter().map(|r| r.name.as_str()).collect();
+        let live: std::collections::HashSet<&str> = rules.iter().map(|r| r.name.as_str()).collect();
         let mut map = self.hits.write().unwrap_or_else(|e| e.into_inner());
         map.retain(|name, _| live.contains(name.as_str()));
     }
@@ -1286,7 +1301,9 @@ mod tests {
         let real_but_outside = write(dir.join("real.list"), "10.0.0.1\n");
         let missing = dir.join("definitely-absent.list");
 
-        let a = store.add(rule_with_ips_file(&real_but_outside)).unwrap_err();
+        let a = store
+            .add(rule_with_ips_file(&real_but_outside))
+            .unwrap_err();
         let b = store.add(rule_with_ips_file(&missing)).unwrap_err();
         assert_eq!(a, b, "existing and missing paths must be indistinguishable");
     }
@@ -1299,7 +1316,9 @@ mod tests {
         let list = write(rules_dir.join("ips.list"), "10.0.0.1\n");
 
         let store = RuleStore::new(rules_dir);
-        store.add(rule_with_ips_file(&list)).expect("in-dir list accepted");
+        store
+            .add(rule_with_ips_file(&list))
+            .expect("in-dir list accepted");
     }
 
     #[test]
@@ -1353,7 +1372,6 @@ mod tests {
         let listed = store2.list();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0], rule("keep-me", RuleDuration::Forever));
-
     }
 
     #[test]
@@ -1402,7 +1420,10 @@ mod tests {
             toml::from_str(&std::fs::read_to_string(dir.join("00-block.toml")).unwrap()).unwrap();
         assert!(!on_disk.enabled, "the original file carries the toggle");
         store.reload_disk();
-        assert!(!store.list()[0].enabled, "reload does not revert the toggle");
+        assert!(
+            !store.list()[0].enabled,
+            "reload does not revert the toggle"
+        );
     }
 
     fn tagged(name: &str, tags: &[&str], duration: RuleDuration) -> Rule {
@@ -1488,7 +1509,9 @@ mod tests {
             .add(tagged("dup", &["work", "work"], RuleDuration::Session))
             .is_err());
         assert!(store.list().is_empty(), "a refused add left a rule behind");
-        assert!(store.add(tagged("ok", &["work"], RuleDuration::Session)).is_ok());
+        assert!(store
+            .add(tagged("ok", &["work"], RuleDuration::Session))
+            .is_ok());
     }
 
     /// The three claims [`RuleStore::set_enabled`] makes about a rule whose
@@ -1500,8 +1523,12 @@ mod tests {
     fn a_rule_whose_file_cannot_be_written_keeps_its_state() {
         let (_td, dir) = tmpdir("toggle-fail");
         let store = RuleStore::new(dir.clone());
-        store.add(tagged("ok", &["work"], RuleDuration::Forever)).unwrap();
-        store.add(tagged("stuck", &["work"], RuleDuration::Forever)).unwrap();
+        store
+            .add(tagged("ok", &["work"], RuleDuration::Forever))
+            .unwrap();
+        store
+            .add(tagged("stuck", &["work"], RuleDuration::Forever))
+            .unwrap();
 
         // Unwritable in the one way `write_atomic` cannot work around: its
         // final rename lands on a directory. Read-only permissions would not
@@ -1660,7 +1687,10 @@ mod tests {
         assert_eq!(store.list().len(), 1);
         assert!(store.sweep_expired());
         assert!(store.list().is_empty());
-        assert!(!dir.join("stale.toml").exists(), "expired rule file should be deleted");
+        assert!(
+            !dir.join("stale.toml").exists(),
+            "expired rule file should be deleted"
+        );
     }
 
     #[test]
@@ -1733,13 +1763,18 @@ mod tests {
         let store = RuleStore::new(dir.clone());
         let mut r = rule("x", RuleDuration::Session);
         r.name = format!("{}42", hallpass_types::RUN_SESSION_RULE_PREFIX);
-        let err = store.add(r).expect_err("the reserved prefix must be refused");
+        let err = store
+            .add(r)
+            .expect_err("the reserved prefix must be refused");
         assert!(err.contains("reserved"), "{err}");
 
         // Only the prefix is reserved, not the word.
         let mut ok = rule("x", RuleDuration::Session);
         ok.name = "my-run-session:42".into();
-        assert!(store.add(ok).is_ok(), "the prefix is only reserved at the start");
+        assert!(
+            store.add(ok).is_ok(),
+            "the prefix is only reserved at the start"
+        );
     }
 
     /// The disk path never calls `add`, so a rule file is the way in that a
@@ -1774,9 +1809,16 @@ mod tests {
         assert_eq!(store.hits.read().unwrap().len(), 2);
 
         store.delete("drop").unwrap();
-        assert_eq!(store.hits.read().unwrap().len(), 1, "the gone rule's counter goes too");
+        assert_eq!(
+            store.hits.read().unwrap().len(),
+            1,
+            "the gone rule's counter goes too"
+        );
         // The surviving rule keeps its history.
-        assert_eq!(store.hits().iter().find(|h| h.name == "keep").unwrap().hits, 1);
+        assert_eq!(
+            store.hits().iter().find(|h| h.name == "keep").unwrap().hits,
+            1
+        );
     }
 
     /// The store refuses to grow past [`MAX_RULES`], while replacing an
@@ -1849,8 +1891,7 @@ mod tests {
             let mut r = rule(&format!("r{i}"), RuleDuration::Session);
             let base = wire::encode(&r).unwrap().len() - wire::FRAME_PREFIX_BYTES;
             // Padding leaves headroom for its own varint length bytes.
-            r.matcher.cmdline_contains =
-                Some("x".repeat(MAX_RULE_WIRE_BYTES - base - 8));
+            r.matcher.cmdline_contains = Some("x".repeat(MAX_RULE_WIRE_BYTES - base - 8));
             let padded = wire::encode(&r).unwrap().len() - wire::FRAME_PREFIX_BYTES;
             assert!(padded <= MAX_RULE_WIRE_BYTES, "test rule overshot the cap");
             rules.push(r);
@@ -1928,10 +1969,18 @@ mod tests {
             }
         }
         let t = Instant::now();
-        store.add(rule("one-session", RuleDuration::Session)).unwrap();
-        println!("session add at occupancy {}: {:?}", MAX_RULES - 2, t.elapsed());
+        store
+            .add(rule("one-session", RuleDuration::Session))
+            .unwrap();
+        println!(
+            "session add at occupancy {}: {:?}",
+            MAX_RULES - 2,
+            t.elapsed()
+        );
         let t = Instant::now();
-        store.add(rule("one-forever", RuleDuration::Forever)).unwrap();
+        store
+            .add(rule("one-forever", RuleDuration::Forever))
+            .unwrap();
         println!(
             "forever add at occupancy {}: {:?} (adds the rules.d write)",
             MAX_RULES - 1,
@@ -1949,7 +1998,9 @@ mod tests {
         }
         let (_td, dir) = tmpdir("partial-scan");
         let store = RuleStore::new(dir.clone());
-        store.add(rule("keep-on-disk", RuleDuration::Forever)).unwrap();
+        store
+            .add(rule("keep-on-disk", RuleDuration::Forever))
+            .unwrap();
         assert_eq!(store.list().len(), 1);
 
         let mode =
@@ -1993,13 +2044,21 @@ mod tests {
     fn read_side_events_are_not_reload_worthy() {
         use notify::event::{CreateKind, DataChange, ModifyKind, RemoveKind};
         // What a read-only directory scan emits.
-        assert!(!reload_worthy(&EventKind::Access(AccessKind::Open(AccessMode::Any))));
-        assert!(!reload_worthy(&EventKind::Access(AccessKind::Close(AccessMode::Read))));
+        assert!(!reload_worthy(&EventKind::Access(AccessKind::Open(
+            AccessMode::Any
+        ))));
+        assert!(!reload_worthy(&EventKind::Access(AccessKind::Close(
+            AccessMode::Read
+        ))));
         assert!(!reload_worthy(&EventKind::Access(AccessKind::Any)));
         // What writers emit, including a mapped write's only trace.
-        assert!(reload_worthy(&EventKind::Access(AccessKind::Close(AccessMode::Write))));
+        assert!(reload_worthy(&EventKind::Access(AccessKind::Close(
+            AccessMode::Write
+        ))));
         assert!(reload_worthy(&EventKind::Create(CreateKind::File)));
-        assert!(reload_worthy(&EventKind::Modify(ModifyKind::Data(DataChange::Any))));
+        assert!(reload_worthy(&EventKind::Modify(ModifyKind::Data(
+            DataChange::Any
+        ))));
         assert!(reload_worthy(&EventKind::Remove(RemoveKind::File)));
         // Unknown fails toward a spurious scan, never toward staleness.
         assert!(reload_worthy(&EventKind::Any));
@@ -2027,7 +2086,9 @@ mod tests {
                 }
             })
             .unwrap();
-        observer.watch(&dir, notify::RecursiveMode::NonRecursive).unwrap();
+        observer
+            .watch(&dir, notify::RecursiveMode::NonRecursive)
+            .unwrap();
 
         // The legitimate write that starts the cycle.
         let text = toml::to_string(&rule("quiesce", RuleDuration::Forever)).unwrap();

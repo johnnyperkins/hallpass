@@ -154,7 +154,9 @@ mod tests {
 
     #[test]
     fn ipv6_udp_dns_response() {
-        let src = "2606:4700:4700::1111".parse::<std::net::Ipv6Addr>().unwrap();
+        let src = "2606:4700:4700::1111"
+            .parse::<std::net::Ipv6Addr>()
+            .unwrap();
         let dst = "fd00::2".parse::<std::net::Ipv6Addr>().unwrap();
         let mut buf = Vec::new();
         PacketBuilder::ipv6(src.octets(), dst.octets(), 64)
@@ -193,7 +195,9 @@ mod tests {
     #[test]
     fn truncated_payload_still_yields_its_flow() {
         let src = "fd00::1".parse::<std::net::Ipv6Addr>().unwrap();
-        let dst = "2606:4700:4700::1111".parse::<std::net::Ipv6Addr>().unwrap();
+        let dst = "2606:4700:4700::1111"
+            .parse::<std::net::Ipv6Addr>()
+            .unwrap();
         let mut buf = Vec::new();
         PacketBuilder::ipv6(src.octets(), dst.octets(), 64)
             .udp(51000, 4444)

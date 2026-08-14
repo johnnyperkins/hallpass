@@ -4,9 +4,8 @@ use std::collections::HashMap;
 use std::fmt::Write;
 
 use hallpass_types::{
-    format_ts, human_bytes, sanitize_for_display, ConnEvent, Connection, Explanation,
-    PromptScope, Rule, RuleHit, RuleTrace, RunSessionInfo, RuntimeConfig, Stats, TraceOutcome,
-    Verdict,
+    format_ts, human_bytes, sanitize_for_display, ConnEvent, Connection, Explanation, PromptScope,
+    Rule, RuleHit, RuleTrace, RunSessionInfo, RuntimeConfig, Stats, TraceOutcome, Verdict,
 };
 
 use crate::args::ColorChoice;
@@ -232,11 +231,17 @@ pub fn format_stats(s: &Stats, pal: Palette) -> String {
             "snoop queue undelivered",
             kernel_count(s.snoop_queue_user_dropped),
         ),
-        ("snoop queue fail-open", kernel_flag(s.snoop_queue_fail_open)),
+        (
+            "snoop queue fail-open",
+            kernel_flag(s.snoop_queue_fail_open),
+        ),
         // Painted when nonzero: every detected flush is a window in which
         // this host was unfiltered. The watchdog repairs each one; whether
         // a repair failed is in the journal.
-        ("nft table flushes", warn_if_positive(pal, Some(s.nft_flushes))),
+        (
+            "nft table flushes",
+            warn_if_positive(pal, Some(s.nft_flushes)),
+        ),
         // "-" for never, like a rule that never hit.
         (
             "nft last flush",
@@ -247,7 +252,10 @@ pub fn format_stats(s: &Stats, pal: Palette) -> String {
         // flow_accounting is off, like any other counter the host is not
         // producing; the byte total reads as a human size.
         ("flows accounted", s.flows_accounted.to_string()),
-        ("flow bytes", format!("{} ({})", s.flow_bytes, human_bytes(s.flow_bytes))),
+        (
+            "flow bytes",
+            format!("{} ({})", s.flow_bytes, human_bytes(s.flow_bytes)),
+        ),
         ("flow packets", s.flow_packets.to_string()),
         ("uptime", format_uptime(s.uptime_secs)),
     ];
@@ -548,9 +556,7 @@ fn format_rule_table(
                 r.priority.to_string(),
                 match (r.enabled, lockdown) {
                     (false, _) => "no".to_string(),
-                    (true, Some(tags)) if !r.active_under_lockdown(tags) => {
-                        "lockdown".to_string()
-                    }
+                    (true, Some(tags)) if !r.active_under_lockdown(tags) => "lockdown".to_string(),
                     (true, _) => "yes".to_string(),
                 },
             ];
@@ -628,11 +634,7 @@ pub fn exe_display(conn: &Connection) -> String {
 /// The domain comes from snooped DNS, so it is attacker-chosen too.
 pub fn dst_display(conn: &Connection) -> String {
     match &conn.domain {
-        Some(domain) => format!(
-            "{}:{}",
-            sanitize_for_display(domain),
-            conn.tuple.dst.port()
-        ),
+        Some(domain) => format!("{}:{}", sanitize_for_display(domain), conn.tuple.dst.port()),
         None => conn.tuple.dst.to_string(),
     }
 }
@@ -663,7 +665,12 @@ pub fn format_event(ev: &ConnEvent, pal: Palette) -> String {
     let mut line = format!(
         "{} {} {} -> {} rule={}",
         format_ts(ev.unix_ms),
-        cell(pal, verdict_style(ev.verdict, ev.enforced), &label, VERDICT_WIDTH),
+        cell(
+            pal,
+            verdict_style(ev.verdict, ev.enforced),
+            &label,
+            VERDICT_WIDTH
+        ),
         exe_display(&ev.conn),
         dst_display(&ev.conn),
         sanitize_for_display(rule)
@@ -689,8 +696,7 @@ pub fn format_event(ev: &ConnEvent, pal: Palette) -> String {
 pub const MAX_TRACE_ROWS: usize = 200;
 
 /// Note printed by [`format_explanation`] when the daemon is not enforcing.
-pub const EXPLAIN_OBSERVE_NOTE: &str =
-    "OBSERVE MODE: this verdict would be recorded, not applied";
+pub const EXPLAIN_OBSERVE_NOTE: &str = "OBSERVE MODE: this verdict would be recorded, not applied";
 
 /// Human-readable outcome for one traced rule.
 ///
@@ -870,10 +876,28 @@ mod tests {
                 plain(),
             )
         };
-        assert!(mk(Some(FirstSeen { app: true, dest: true })).ends_with(" new=app,dest"));
-        assert!(mk(Some(FirstSeen { app: false, dest: true })).ends_with(" new=dest"));
-        assert!(mk(Some(FirstSeen { app: true, dest: false })).ends_with(" new=app"));
-        for quiet in [Some(FirstSeen { app: false, dest: false }), None] {
+        assert!(mk(Some(FirstSeen {
+            app: true,
+            dest: true
+        }))
+        .ends_with(" new=app,dest"));
+        assert!(mk(Some(FirstSeen {
+            app: false,
+            dest: true
+        }))
+        .ends_with(" new=dest"));
+        assert!(mk(Some(FirstSeen {
+            app: true,
+            dest: false
+        }))
+        .ends_with(" new=app"));
+        for quiet in [
+            Some(FirstSeen {
+                app: false,
+                dest: false,
+            }),
+            None,
+        ] {
             let line = mk(quiet);
             assert!(!line.contains("new="), "{line}");
             assert!(line.ends_with("rule=allow-curl"), "{line}");
@@ -1041,7 +1065,13 @@ mod tests {
         let mut s = stats(true);
         s.prompt_handler_connected = false;
         let out = format_stats(&s, plain());
-        assert!(out.contains(&row("prompt handler", "none (unmatched connections take the default)")), "{out}");
+        assert!(
+            out.contains(&row(
+                "prompt handler",
+                "none (unmatched connections take the default)"
+            )),
+            "{out}"
+        );
     }
 
     /// A status table that looks healthy while nothing is filtered is the
@@ -1050,7 +1080,10 @@ mod tests {
     #[test]
     fn stats_table_flags_observe_mode() {
         let out = format_stats(&stats(false), plain());
-        assert!(out.contains(&row("mode", "observe (not enforcing)")), "{out}");
+        assert!(
+            out.contains(&row("mode", "observe (not enforcing)")),
+            "{out}"
+        );
         assert!(out.contains(OBSERVE_WARNING), "{out}");
         assert!(out.contains("every packet is let through"), "{out}");
     }
@@ -1083,7 +1116,10 @@ mod tests {
         };
         let out = format_stats(&s, Palette::new(false));
         assert!(out.contains(&row("flows accounted", "41")), "{out}");
-        assert!(out.contains(&row("flow bytes", "9000000 (8.6 MiB)")), "{out}");
+        assert!(
+            out.contains(&row("flow bytes", "9000000 (8.6 MiB)")),
+            "{out}"
+        );
         assert!(out.contains(&row("flow packets", "7200")), "{out}");
     }
 
@@ -1091,10 +1127,19 @@ mod tests {
     fn stats_table_kernel_queue_rows() {
         let out = format_stats(&stats(true), plain());
         // Against the length in force, since a depth alone has no scale.
-        assert!(out.contains(&row("verdict queue depth", "3 / 4096")), "{out}");
+        assert!(
+            out.contains(&row("verdict queue depth", "3 / 4096")),
+            "{out}"
+        );
         assert!(out.contains(&row("verdict queue dropped", "0")), "{out}");
-        assert!(out.contains(&row("verdict queue undelivered", "0")), "{out}");
-        assert!(out.contains(&row("verdict queue fail-open", "yes")), "{out}");
+        assert!(
+            out.contains(&row("verdict queue undelivered", "0")),
+            "{out}"
+        );
+        assert!(
+            out.contains(&row("verdict queue fail-open", "yes")),
+            "{out}"
+        );
         assert!(out.contains(&row("snoop queue depth", "0")), "{out}");
         assert!(out.contains(&row("snoop queue dropped", "0")), "{out}");
         assert!(out.contains(&row("snoop queue undelivered", "0")), "{out}");
@@ -1133,9 +1178,18 @@ mod tests {
         s.verdict_queue_depth = None;
         s.verdict_queue_fail_open = None;
         let out = format_stats(&s, plain());
-        assert!(out.contains(&row("verdict queue dropped", "unavailable")), "{out}");
-        assert!(out.contains(&row("verdict queue depth", "unavailable")), "{out}");
-        assert!(out.contains(&row("verdict queue fail-open", "unavailable")), "{out}");
+        assert!(
+            out.contains(&row("verdict queue dropped", "unavailable")),
+            "{out}"
+        );
+        assert!(
+            out.contains(&row("verdict queue depth", "unavailable")),
+            "{out}"
+        );
+        assert!(
+            out.contains(&row("verdict queue fail-open", "unavailable")),
+            "{out}"
+        );
         assert!(!out.contains("dropped by the kernel"), "{out}");
     }
 
@@ -1189,7 +1243,10 @@ mod tests {
             },
             plain(),
         );
-        assert!(out.contains("mode            observe (not enforcing)\n"), "{out}");
+        assert!(
+            out.contains("mode            observe (not enforcing)\n"),
+            "{out}"
+        );
         assert!(out.contains(OBSERVE_WARNING), "{out}");
     }
 
@@ -1212,7 +1269,10 @@ mod tests {
             },
         }];
         let out = format_rules(&rules);
-        assert!(!out.contains('\x1b'), "escape reached the terminal: {out:?}");
+        assert!(
+            !out.contains('\x1b'),
+            "escape reached the terminal: {out:?}"
+        );
         assert!(!out.contains('\r'), "CR reached the terminal: {out:?}");
         // Header plus exactly one row: nothing smuggled in extra lines.
         assert_eq!(out.lines().count(), 2, "{out:?}");
@@ -1303,7 +1363,10 @@ mod tests {
         let out = format_rules(&rules);
         assert!(out.contains("TAGS"), "{out}");
         let lines: Vec<&str> = out.lines().collect();
-        assert!(lines[1].contains(" -  "), "untagged rule reads as a dash:\n{out}");
+        assert!(
+            lines[1].contains(" -  "),
+            "untagged rule reads as a dash:\n{out}"
+        );
         assert!(lines[2].contains("work,vpn"), "{out}");
     }
 
@@ -1348,9 +1411,8 @@ mod tests {
         assert!(lines[0].contains("LAST HIT"), "{out}");
         assert!(lines[1].contains("2024-07-03 09:46:40"), "{out}");
 
-        let fields = |line: &str| -> Vec<String> {
-            line.split_whitespace().map(str::to_string).collect()
-        };
+        let fields =
+            |line: &str| -> Vec<String> { line.split_whitespace().map(str::to_string).collect() };
         assert_eq!(fields(lines[1])[5], "7");
         for row in [lines[2], lines[3]] {
             let f = fields(row);
@@ -1375,7 +1437,10 @@ mod tests {
             }],
         );
         assert!(!out.contains('\x1b'), "{out:?}");
-        assert_eq!(out.lines().nth(1).unwrap().split_whitespace().nth(5), Some("3"));
+        assert_eq!(
+            out.lines().nth(1).unwrap().split_whitespace().nth(5),
+            Some("3")
+        );
     }
 
     fn tr(name: &str, priority: u32, outcome: TraceOutcome) -> RuleTrace {
@@ -1444,9 +1509,15 @@ mod tests {
             },
         )];
         let out = format_explanation(&exp, plain());
-        assert!(out.starts_with("verdict: PROMPT  (no rule matched)\n"), "{out}");
+        assert!(
+            out.starts_with("verdict: PROMPT  (no rule matched)\n"),
+            "{out}"
+        );
         assert!(out.contains("would raise a prompt"), "{out}");
-        assert!(out.contains("the default if nobody answers it is DENY"), "{out}");
+        assert!(
+            out.contains("the default if nobody answers it is DENY"),
+            "{out}"
+        );
     }
 
     /// Observe mode: the verdict would be recorded and the packet would go
@@ -1493,7 +1564,10 @@ mod tests {
             ],
         };
         let out = format_explanation(&exp, plain());
-        assert!(!out.contains('\x1b'), "escape reached the terminal: {out:?}");
+        assert!(
+            !out.contains('\x1b'),
+            "escape reached the terminal: {out:?}"
+        );
         assert!(!out.contains('\r'), "CR reached the terminal: {out:?}");
         // Verdict, blank, header, two rows: no smuggled extra line.
         assert_eq!(out.lines().count(), 5, "{out:?}");

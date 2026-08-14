@@ -71,7 +71,9 @@ impl Btf {
         let str_len = u32_at(&data, 20).ok_or("truncated header")? as usize;
 
         let type_start = hdr_len.checked_add(type_off).ok_or("type_off overflow")?;
-        let type_end = type_start.checked_add(type_len).ok_or("type_len overflow")?;
+        let type_end = type_start
+            .checked_add(type_len)
+            .ok_or("type_len overflow")?;
         let str_start = hdr_len.checked_add(str_off).ok_or("str_off overflow")?;
         if type_end > data.len() || str_start.saturating_add(str_len) > data.len() {
             return Err("sections exceed blob".into());
@@ -238,8 +240,20 @@ mod tests {
         }
 
         /// Append one type record; returns its 1-based id.
-        fn ty(&mut self, name: &str, kind: u32, vlen: u32, kind_flag: bool, size_or_type: u32, extra: &[u32]) -> u32 {
-            let name_off = if name.is_empty() { 0 } else { self.intern(name) };
+        fn ty(
+            &mut self,
+            name: &str,
+            kind: u32,
+            vlen: u32,
+            kind_flag: bool,
+            size_or_type: u32,
+            extra: &[u32],
+        ) -> u32 {
+            let name_off = if name.is_empty() {
+                0
+            } else {
+                self.intern(name)
+            };
             let info = (u32::from(kind_flag) << 31) | (kind << 24) | vlen;
             for w in [name_off, info, size_or_type] {
                 self.types.extend_from_slice(&w.to_le_bytes());
@@ -330,7 +344,10 @@ mod tests {
             return;
         };
         let sk_common = btf.struct_field_offset("sock", "__sk_common").unwrap();
-        assert_eq!(sk_common, 0, "__sk_common is documented as first in struct sock");
+        assert_eq!(
+            sk_common, 0,
+            "__sk_common is documented as first in struct sock"
+        );
         for field in [
             "skc_daddr",
             "skc_rcv_saddr",

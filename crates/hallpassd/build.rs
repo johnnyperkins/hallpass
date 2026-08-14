@@ -35,7 +35,12 @@ fn main() {
     let candidates = [
         std::env::var_os(OVERRIDE_VAR).map(PathBuf::from),
         Some(manifest.join("prebuilt").join(OBJ_NAME)),
-        Some(target_dir.join("bpfel-unknown-none").join("release").join(OBJ_NAME)),
+        Some(
+            target_dir
+                .join("bpfel-unknown-none")
+                .join("release")
+                .join(OBJ_NAME),
+        ),
     ];
 
     for path in candidates.into_iter().flatten() {

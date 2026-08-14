@@ -173,7 +173,12 @@ impl Seen {
             // An identity exists, and is unrecordable. Nothing can be looked
             // up or stored, so the honest answer is that everything about
             // this connection is unfamiliar, said every time.
-            ActorKey::TooLong => return Some(FirstSeen { app: true, dest: true }),
+            ActorKey::TooLong => {
+                return Some(FirstSeen {
+                    app: true,
+                    dest: true,
+                })
+            }
             ActorKey::None => return None,
         }
         let app = touch(&mut self.apps, key, now, &mut self.dirty);
@@ -206,7 +211,10 @@ impl Seen {
             None => write_dest(&ip, key, actor_len)
                 .map(|()| touch(&mut self.dests, key, now, &mut self.dirty)),
         };
-        Some(FirstSeen { app, dest: dest.unwrap_or(true) })
+        Some(FirstSeen {
+            app,
+            dest: dest.unwrap_or(true),
+        })
     }
 
     /// How many identities are held, as (applications, destinations).
@@ -414,7 +422,9 @@ impl From<Snapshot> for StateFile {
     /// keys are split and copied into owned strings.
     fn from(snap: Snapshot) -> StateFile {
         let entries = |v: Vec<(Arc<str>, u64)>| {
-            v.into_iter().map(|(key, ms)| Entry::from_key(&key, ms)).collect()
+            v.into_iter()
+                .map(|(key, ms)| Entry::from_key(&key, ms))
+                .collect()
         };
         StateFile {
             version: STATE_VERSION,
@@ -566,8 +576,7 @@ impl Tracker {
     /// recorded, or the last attempt to write did not land. A snapshot is
     /// the whole state, so re-sending one after a failure is idempotent.
     fn needs_write(&self) -> bool {
-        self.seen.dirty
-            || self.write_failed.load(std::sync::atomic::Ordering::Relaxed)
+        self.seen.dirty || self.write_failed.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Hand over a snapshot now. Called on the periodic path and once more
@@ -617,10 +626,9 @@ pub fn start(path: PathBuf) -> (Tracker, tokio::task::JoinHandle<()>) {
             // spawn_blocking: this splits every key, serializes, writes and
             // fsyncs a file, and the runtime workers it would otherwise sit
             // on are the ones serving IPC.
-            let result = tokio::task::spawn_blocking(move || {
-                write_state(&path, &StateFile::from(snapshot))
-            })
-            .await;
+            let result =
+                tokio::task::spawn_blocking(move || write_state(&path, &StateFile::from(snapshot)))
+                    .await;
             // The flag, not just the log line: the verdict thread cleared
             // `dirty` when it handed this over, so without it a write that
             // failed is one nothing ever retries.
@@ -669,7 +677,12 @@ mod tests {
     use hallpass_types::{FlowTuple, Proto};
     use std::path::PathBuf;
 
-    fn conn(exe: Option<&str>, app_id: Option<&str>, domain: Option<&str>, dst: &str) -> Connection {
+    fn conn(
+        exe: Option<&str>,
+        app_id: Option<&str>,
+        domain: Option<&str>,
+        dst: &str,
+    ) -> Connection {
         Connection {
             tuple: FlowTuple {
                 proto: Proto::Tcp,
@@ -691,9 +704,26 @@ mod tests {
     #[test]
     fn first_connection_is_new_and_the_second_is_not() {
         let mut seen = Seen::new();
-        let c = conn(Some("/usr/bin/curl"), None, Some("example.org"), "1.1.1.1:443");
-        assert_eq!(seen.observe(&c, &|| 1), Some(FirstSeen { app: true, dest: true }));
-        assert_eq!(seen.observe(&c, &|| 2), Some(FirstSeen { app: false, dest: false }));
+        let c = conn(
+            Some("/usr/bin/curl"),
+            None,
+            Some("example.org"),
+            "1.1.1.1:443",
+        );
+        assert_eq!(
+            seen.observe(&c, &|| 1),
+            Some(FirstSeen {
+                app: true,
+                dest: true
+            })
+        );
+        assert_eq!(
+            seen.observe(&c, &|| 2),
+            Some(FirstSeen {
+                app: false,
+                dest: false
+            })
+        );
     }
 
     /// The point of splitting the two flags: a familiar application going
@@ -702,10 +732,29 @@ mod tests {
     #[test]
     fn known_application_reaching_a_new_destination() {
         let mut seen = Seen::new();
-        seen.observe(&conn(Some("/usr/bin/curl"), None, Some("a.example"), "1.1.1.1:443"), &|| 1);
-        let second = conn(Some("/usr/bin/curl"), None, Some("b.example"), "1.1.1.1:443");
+        seen.observe(
+            &conn(
+                Some("/usr/bin/curl"),
+                None,
+                Some("a.example"),
+                "1.1.1.1:443",
+            ),
+            &|| 1,
+        );
+        let second = conn(
+            Some("/usr/bin/curl"),
+            None,
+            Some("b.example"),
+            "1.1.1.1:443",
+        );
         let out = seen.observe(&second, &|| 2);
-        assert_eq!(out, Some(FirstSeen { app: false, dest: true }));
+        assert_eq!(
+            out,
+            Some(FirstSeen {
+                app: false,
+                dest: true
+            })
+        );
     }
 
     /// Ports are not part of a destination: the same host on 80 after 443 is
@@ -714,9 +763,21 @@ mod tests {
     #[test]
     fn a_second_port_on_a_known_host_is_not_new() {
         let mut seen = Seen::new();
-        seen.observe(&conn(Some("/usr/bin/curl"), None, None, "1.1.1.1:443"), &|| 1);
-        let out = seen.observe(&conn(Some("/usr/bin/curl"), None, None, "1.1.1.1:80"), &|| 2);
-        assert_eq!(out, Some(FirstSeen { app: false, dest: false }));
+        seen.observe(
+            &conn(Some("/usr/bin/curl"), None, None, "1.1.1.1:443"),
+            &|| 1,
+        );
+        let out = seen.observe(
+            &conn(Some("/usr/bin/curl"), None, None, "1.1.1.1:80"),
+            &|| 2,
+        );
+        assert_eq!(
+            out,
+            Some(FirstSeen {
+                app: false,
+                dest: false
+            })
+        );
     }
 
     /// Two packaged applications can run from one sandbox path. They are
@@ -725,11 +786,39 @@ mod tests {
     #[test]
     fn packaged_applications_sharing_a_path_are_separate() {
         let mut seen = Seen::new();
-        let a = conn(Some("/app/bin/x"), Some("flatpak:org.a.A"), None, "1.1.1.1:443");
-        let b = conn(Some("/app/bin/x"), Some("flatpak:org.b.B"), None, "1.1.1.1:443");
-        assert_eq!(seen.observe(&a, &|| 1), Some(FirstSeen { app: true, dest: true }));
-        assert_eq!(seen.observe(&b, &|| 2), Some(FirstSeen { app: true, dest: true }));
-        assert_eq!(seen.observe(&a, &|| 3), Some(FirstSeen { app: false, dest: false }));
+        let a = conn(
+            Some("/app/bin/x"),
+            Some("flatpak:org.a.A"),
+            None,
+            "1.1.1.1:443",
+        );
+        let b = conn(
+            Some("/app/bin/x"),
+            Some("flatpak:org.b.B"),
+            None,
+            "1.1.1.1:443",
+        );
+        assert_eq!(
+            seen.observe(&a, &|| 1),
+            Some(FirstSeen {
+                app: true,
+                dest: true
+            })
+        );
+        assert_eq!(
+            seen.observe(&b, &|| 2),
+            Some(FirstSeen {
+                app: true,
+                dest: true
+            })
+        );
+        assert_eq!(
+            seen.observe(&a, &|| 3),
+            Some(FirstSeen {
+                app: false,
+                dest: false
+            })
+        );
     }
 
     /// Nothing to be the same as next time, so the honest answer is "not
@@ -737,7 +826,10 @@ mod tests {
     #[test]
     fn unattributed_connections_are_not_tracked() {
         let mut seen = Seen::new();
-        assert_eq!(seen.observe(&conn(None, None, None, "1.1.1.1:443"), &|| 1), None);
+        assert_eq!(
+            seen.observe(&conn(None, None, None, "1.1.1.1:443"), &|| 1),
+            None
+        );
     }
 
     /// An identity too long to record reports new every time rather than
@@ -751,7 +843,13 @@ mod tests {
         let long = format!("/usr/bin/{}", "a".repeat(MAX_ACTOR_BYTES));
         let c = conn(Some(&long), None, None, "1.1.1.1:443");
         for _ in 0..3 {
-            assert_eq!(seen.observe(&c, &|| 1), Some(FirstSeen { app: true, dest: true }));
+            assert_eq!(
+                seen.observe(&c, &|| 1),
+                Some(FirstSeen {
+                    app: true,
+                    dest: true
+                })
+            );
         }
         assert_eq!(seen.len(), (0, 0), "nothing over the bound is stored");
 
@@ -759,8 +857,20 @@ mod tests {
         // the application half working.
         let domain = "d".repeat(MAX_DEST_BYTES + 1);
         let c = conn(Some("/usr/bin/curl"), None, Some(&domain), "1.1.1.1:443");
-        assert_eq!(seen.observe(&c, &|| 1), Some(FirstSeen { app: true, dest: true }));
-        assert_eq!(seen.observe(&c, &|| 2), Some(FirstSeen { app: false, dest: true }));
+        assert_eq!(
+            seen.observe(&c, &|| 1),
+            Some(FirstSeen {
+                app: true,
+                dest: true
+            })
+        );
+        assert_eq!(
+            seen.observe(&c, &|| 2),
+            Some(FirstSeen {
+                app: false,
+                dest: true
+            })
+        );
     }
 
     /// The destination gets its own byte budget. Sharing one bound with the
@@ -773,10 +883,19 @@ mod tests {
         let mut seen = Seen::new();
         let exe = format!("/app/{}/bin/x", "a".repeat(MAX_ACTOR_BYTES - 20));
         let c = conn(Some(&exe), None, Some("cdn.example.org"), "1.1.1.1:443");
-        assert_eq!(seen.observe(&c, &|| 1), Some(FirstSeen { app: true, dest: true }));
+        assert_eq!(
+            seen.observe(&c, &|| 1),
+            Some(FirstSeen {
+                app: true,
+                dest: true
+            })
+        );
         assert_eq!(
             seen.observe(&c, &|| 2),
-            Some(FirstSeen { app: false, dest: false }),
+            Some(FirstSeen {
+                app: false,
+                dest: false
+            }),
             "the destination must converge, not report new for ever"
         );
     }
@@ -788,31 +907,62 @@ mod tests {
     #[test]
     fn a_destination_stays_familiar_after_its_domain_expires() {
         let mut seen = Seen::new();
-        let named = conn(Some("/usr/bin/curl"), None, Some("cdn.example.org"), "1.1.1.1:443");
-        assert_eq!(seen.observe(&named, &|| 1), Some(FirstSeen { app: true, dest: true }));
+        let named = conn(
+            Some("/usr/bin/curl"),
+            None,
+            Some("cdn.example.org"),
+            "1.1.1.1:443",
+        );
+        assert_eq!(
+            seen.observe(&named, &|| 1),
+            Some(FirstSeen {
+                app: true,
+                dest: true
+            })
+        );
 
         let unnamed = conn(Some("/usr/bin/curl"), None, None, "1.1.1.1:443");
         assert_eq!(
             seen.observe(&unnamed, &|| 2),
-            Some(FirstSeen { app: false, dest: false }),
+            Some(FirstSeen {
+                app: false,
+                dest: false
+            }),
             "the address behind a known name must be known too"
         );
 
         // A genuinely new name is still loud, even resolving to that address.
-        let other = conn(Some("/usr/bin/curl"), None, Some("other.example"), "1.1.1.1:443");
-        assert_eq!(seen.observe(&other, &|| 3), Some(FirstSeen { app: false, dest: true }));
+        let other = conn(
+            Some("/usr/bin/curl"),
+            None,
+            Some("other.example"),
+            "1.1.1.1:443",
+        );
+        assert_eq!(
+            seen.observe(&other, &|| 3),
+            Some(FirstSeen {
+                app: false,
+                dest: true
+            })
+        );
     }
 
     #[test]
     fn the_least_recently_seen_is_forgotten_when_full() {
         let mut seen = Seen::new();
         for i in 0..MAX_APPS {
-            seen.observe(&conn(Some(&format!("/usr/bin/p{i}")), None, None, "1.1.1.1:443"), &|| 1);
+            seen.observe(
+                &conn(Some(&format!("/usr/bin/p{i}")), None, None, "1.1.1.1:443"),
+                &|| 1,
+            );
         }
         // Keep the first one warm, then overflow by one.
         let first = conn(Some("/usr/bin/p0"), None, None, "1.1.1.1:443");
         assert_eq!(seen.observe(&first, &|| 2).map(|f| f.app), Some(false));
-        seen.observe(&conn(Some("/usr/bin/new"), None, None, "1.1.1.1:443"), &|| 3);
+        seen.observe(
+            &conn(Some("/usr/bin/new"), None, None, "1.1.1.1:443"),
+            &|| 3,
+        );
         assert_eq!(seen.len().0, MAX_APPS);
         // The touched entry survived; the one after it did not.
         assert_eq!(seen.observe(&first, &|| 4).map(|f| f.app), Some(false));
@@ -825,8 +975,18 @@ mod tests {
         let dir = TestDir::new("firstseen-roundtrip");
         let path = dir.path().join("seen.toml");
         let mut seen = Seen::new();
-        let a = conn(Some("/usr/bin/curl"), None, Some("example.org"), "1.1.1.1:443");
-        let b = conn(Some("/app/bin/x"), Some("snap:firefox"), None, "9.9.9.9:443");
+        let a = conn(
+            Some("/usr/bin/curl"),
+            None,
+            Some("example.org"),
+            "1.1.1.1:443",
+        );
+        let b = conn(
+            Some("/app/bin/x"),
+            Some("snap:firefox"),
+            None,
+            "9.9.9.9:443",
+        );
         seen.observe(&a, &|| 1);
         seen.observe(&b, &|| 2);
         write_state(&path, &StateFile::from(seen.snapshot())).expect("write state");
@@ -836,11 +996,29 @@ mod tests {
         // recorded its address as well, which is what keeps it familiar once
         // the name expires from the domain cache.
         assert_eq!(loaded.len(), (2, 3));
-        assert_eq!(loaded.observe(&a, &|| 3), Some(FirstSeen { app: false, dest: false }));
-        assert_eq!(loaded.observe(&b, &|| 4), Some(FirstSeen { app: false, dest: false }));
+        assert_eq!(
+            loaded.observe(&a, &|| 3),
+            Some(FirstSeen {
+                app: false,
+                dest: false
+            })
+        );
+        assert_eq!(
+            loaded.observe(&b, &|| 4),
+            Some(FirstSeen {
+                app: false,
+                dest: false
+            })
+        );
         // Something it never saw is still new after a reload.
         let c = conn(Some("/usr/bin/nc"), None, None, "1.1.1.1:443");
-        assert_eq!(loaded.observe(&c, &|| 5), Some(FirstSeen { app: true, dest: true }));
+        assert_eq!(
+            loaded.observe(&c, &|| 5),
+            Some(FirstSeen {
+                app: true,
+                dest: true
+            })
+        );
     }
 
     /// A path may contain any byte but NUL, newlines included, so the daemon
@@ -853,12 +1031,24 @@ mod tests {
         let path = dir.path().join("seen.toml");
         let mut seen = Seen::new();
         let c = conn(Some("/tmp/a\nb/evil"), None, None, "1.1.1.1:443");
-        assert_eq!(seen.observe(&c, &|| 1), Some(FirstSeen { app: true, dest: true }));
+        assert_eq!(
+            seen.observe(&c, &|| 1),
+            Some(FirstSeen {
+                app: true,
+                dest: true
+            })
+        );
         write_state(&path, &StateFile::from(seen.snapshot())).expect("write state");
 
         let mut loaded = load(&path);
         assert_eq!(loaded.len(), (1, 1), "the entry survived the file");
-        assert_eq!(loaded.observe(&c, &|| 2), Some(FirstSeen { app: false, dest: false }));
+        assert_eq!(
+            loaded.observe(&c, &|| 2),
+            Some(FirstSeen {
+                app: false,
+                dest: false
+            })
+        );
     }
 
     /// A file holding more than the caps keeps its *newest* entries. A
@@ -871,13 +1061,20 @@ mod tests {
         let dir = TestDir::new("firstseen-overlong");
         let mut text = String::from("version = 1\n");
         for i in 0..MAX_APPS + 3 {
-            text.push_str(&format!("[[app]]\nexe = \"/usr/bin/p{i}\"\nfirst_ms = {i}\n"));
+            text.push_str(&format!(
+                "[[app]]\nexe = \"/usr/bin/p{i}\"\nfirst_ms = {i}\n"
+            ));
         }
         let path = dir.write("seen.toml", text);
 
         let mut seen = load(&path);
         assert_eq!(seen.len().0, MAX_APPS);
-        let newest = conn(Some(&format!("/usr/bin/p{}", MAX_APPS + 2)), None, None, "1.1.1.1:443");
+        let newest = conn(
+            Some(&format!("/usr/bin/p{}", MAX_APPS + 2)),
+            None,
+            None,
+            "1.1.1.1:443",
+        );
         assert_eq!(seen.observe(&newest, &|| 1).map(|f| f.app), Some(false));
         let oldest = conn(Some("/usr/bin/p0"), None, None, "1.1.1.1:443");
         assert_eq!(seen.observe(&oldest, &|| 2).map(|f| f.app), Some(true));

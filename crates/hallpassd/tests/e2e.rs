@@ -244,18 +244,29 @@ impl TestEnv {
         assert_ok(
             &run(
                 "ip",
-                &["link", "add", DEV_CLI, "type", "veth", "peer", "name", DEV_SRV],
+                &[
+                    "link", "add", DEV_CLI, "type", "veth", "peer", "name", DEV_SRV,
+                ],
             ),
             "veth create",
         );
-        assert_ok(&run("ip", &["link", "set", DEV_CLI, "netns", &ns_cli]), "veth to cli");
-        assert_ok(&run("ip", &["link", "set", DEV_SRV, "netns", &ns_srv]), "veth to srv");
+        assert_ok(
+            &run("ip", &["link", "set", DEV_CLI, "netns", &ns_cli]),
+            "veth to cli",
+        );
+        assert_ok(
+            &run("ip", &["link", "set", DEV_SRV, "netns", &ns_srv]),
+            "veth to srv",
+        );
         for (ns, dev, ip, ip6) in [
             (&ns_cli, DEV_CLI, CLI_IP, CLI_IP6),
             (&ns_srv, DEV_SRV, SRV_IP, SRV_IP6),
         ] {
             assert_ok(
-                &run("ip", &["-n", ns, "addr", "add", &format!("{ip}/24"), "dev", dev]),
+                &run(
+                    "ip",
+                    &["-n", ns, "addr", "add", &format!("{ip}/24"), "dev", dev],
+                ),
                 "addr add",
             );
             // nodad: duplicate address detection would otherwise hold the
@@ -265,7 +276,14 @@ impl TestEnv {
                 &run(
                     "ip",
                     &[
-                        "-n", ns, "addr", "add", &format!("{ip6}/64"), "dev", dev, "nodad",
+                        "-n",
+                        ns,
+                        "addr",
+                        "add",
+                        &format!("{ip6}/64"),
+                        "dev",
+                        dev,
+                        "nodad",
                     ],
                 ),
                 "addr add v6",
@@ -341,7 +359,11 @@ impl TestEnv {
             // with it and every connection is then allowed, so the only
             // symptom otherwise is that assertions expecting a block fail
             // one by one with nothing pointing at the cause.
-            if let Some(status) = self.daemon.as_mut().and_then(|d| d.try_wait().ok().flatten()) {
+            if let Some(status) = self
+                .daemon
+                .as_mut()
+                .and_then(|d| d.try_wait().ok().flatten())
+            {
                 panic!(
                     "daemon exited during startup ({status}); log:\n{}",
                     self.daemon_log()
@@ -364,7 +386,11 @@ impl TestEnv {
     /// a connection to be blocked otherwise report the block failing
     /// rather than the daemon being gone.
     fn assert_daemon_alive(&mut self) {
-        if let Some(status) = self.daemon.as_mut().and_then(|d| d.try_wait().ok().flatten()) {
+        if let Some(status) = self
+            .daemon
+            .as_mut()
+            .and_then(|d| d.try_wait().ok().flatten())
+        {
             panic!(
                 "daemon is no longer running ({status}); log:\n{}",
                 self.daemon_log()
@@ -432,7 +458,10 @@ impl TestEnv {
         static FORM: OnceLock<usize> = OnceLock::new();
         let port_s = port.to_string();
         let all: [&[&str]; 2] = if v6 {
-            [&["nc", "-6", "-l", "-p", &port_s], &["nc", "-6", "-l", &port_s]]
+            [
+                &["nc", "-6", "-l", "-p", &port_s],
+                &["nc", "-6", "-l", &port_s],
+            ]
         } else {
             [&["nc", "-l", "-p", &port_s], &["nc", "-l", &port_s]]
         };
@@ -570,8 +599,11 @@ impl TestEnv {
     fn set_resolv_conf(&self, nameserver: &str) {
         let dir = netns_etc(&self.ns_cli);
         std::fs::create_dir_all(&dir).expect("create /etc/netns dir");
-        std::fs::write(dir.join("resolv.conf"), format!("nameserver {nameserver}\n"))
-            .expect("write resolv.conf");
+        std::fs::write(
+            dir.join("resolv.conf"),
+            format!("nameserver {nameserver}\n"),
+        )
+        .expect("write resolv.conf");
     }
 
     /// Write an auxiliary file (a match list) into the temp dir and
@@ -658,11 +690,21 @@ impl TestEnv {
             let mut sock = tokio::net::UnixStream::connect(&self.socket_path)
                 .await
                 .expect("connect IPC socket");
-            wire::write_msg(&mut sock, &ClientMsg::Hello { version: PROTOCOL_VERSION })
-                .await
-                .expect("send hello");
+            wire::write_msg(
+                &mut sock,
+                &ClientMsg::Hello {
+                    version: PROTOCOL_VERSION,
+                },
+            )
+            .await
+            .expect("send hello");
             let ack: DaemonMsg = wire::read_msg(&mut sock).await.expect("read ack");
-            assert_eq!(ack, DaemonMsg::HelloAck { version: PROTOCOL_VERSION });
+            assert_eq!(
+                ack,
+                DaemonMsg::HelloAck {
+                    version: PROTOCOL_VERSION
+                }
+            );
             wire::write_msg(&mut sock, &ClientMsg::Stats)
                 .await
                 .expect("send stats request");
@@ -776,7 +818,9 @@ impl TestEnv {
 /// A missing binary is a skip rather than a failure locally, and CI builds
 /// it explicitly so the skip guard turns a missing one into a failed job.
 fn cli_binary() -> Option<PathBuf> {
-    let path = Path::new(env!("CARGO_BIN_EXE_hallpassd")).parent()?.join("hallpass-cli");
+    let path = Path::new(env!("CARGO_BIN_EXE_hallpassd"))
+        .parent()?
+        .join("hallpass-cli");
     path.exists().then_some(path)
 }
 
@@ -803,7 +847,10 @@ impl Drop for TestEnv {
         self.kill_daemon_hard();
         // Deleting the namespaces removes the veth pair and any nft table
         // inside them; explicit nft cleanup first as belt and braces.
-        let _ = ns_run(&self.ns_cli, &["nft", "delete", "table", "inet", "hallpass"]);
+        let _ = ns_run(
+            &self.ns_cli,
+            &["nft", "delete", "table", "inet", "hallpass"],
+        );
         let _ = run("ip", &["netns", "del", &self.ns_cli]);
         let _ = run("ip", &["netns", "del", &self.ns_srv]);
         // Keep the evidence when the test that owned this environment
@@ -838,12 +885,7 @@ impl Drop for TestEnv {
 /// that quietly asserts nothing. [`RuleMatch`] now also rejects unknown keys
 /// at parse time, which covers hand-written rule files on disk; keeping the
 /// tests typed keeps the failure at build time instead of run time.
-fn rule_with(
-    name: &str,
-    action: Action,
-    port: u16,
-    extra: impl FnOnce(&mut RuleMatch),
-) -> String {
+fn rule_with(name: &str, action: Action, port: u16, extra: impl FnOnce(&mut RuleMatch)) -> String {
     let mut matcher = RuleMatch {
         port: Some(port),
         ..Default::default()
@@ -938,7 +980,9 @@ fn timed_rule_serializes_to_loadable_toml() {
 #[test]
 #[ignore = "requires root and network namespaces"]
 fn deny_rule_blocks_connection() {
-    let Some(mut env) = TestEnv::setup("deny") else { return };
+    let Some(mut env) = TestEnv::setup("deny") else {
+        return;
+    };
     env.start_listener(19001);
     env.start_daemon("allow", &[&rule("e2e-deny", Action::Deny, 19001)]);
     env.assert_daemon_alive();
@@ -959,7 +1003,9 @@ fn deny_rule_blocks_connection() {
 #[test]
 #[ignore = "requires root and network namespaces"]
 fn observe_mode_records_but_does_not_block() {
-    let Some(mut env) = TestEnv::setup("observe") else { return };
+    let Some(mut env) = TestEnv::setup("observe") else {
+        return;
+    };
     env.start_listener(19031);
     env.start_daemon_with(
         "allow",
@@ -987,7 +1033,9 @@ fn observe_mode_records_but_does_not_block() {
 #[test]
 #[ignore = "requires root and network namespaces"]
 fn allow_rule_permits_connection() {
-    let Some(mut env) = TestEnv::setup("allow") else { return };
+    let Some(mut env) = TestEnv::setup("allow") else {
+        return;
+    };
     env.start_listener(19002);
     env.start_daemon("deny", &[&rule("e2e-allow", Action::Allow, 19002)]);
     assert!(
@@ -1005,7 +1053,9 @@ fn allow_rule_permits_connection() {
 #[test]
 #[ignore = "requires root and network namespaces"]
 fn reject_rule_refuses_connection_promptly() {
-    let Some(mut env) = TestEnv::setup("reject") else { return };
+    let Some(mut env) = TestEnv::setup("reject") else {
+        return;
+    };
     env.start_listener(19015);
     env.start_daemon("allow", &[&rule("e2e-reject", Action::Reject, 19015)]);
     env.assert_daemon_alive();
@@ -1039,7 +1089,9 @@ fn reject_rule_refuses_connection_promptly() {
 #[test]
 #[ignore = "requires root and network namespaces"]
 fn rules_apply_to_ipv6_connections() {
-    let Some(mut env) = TestEnv::setup("ipv6") else { return };
+    let Some(mut env) = TestEnv::setup("ipv6") else {
+        return;
+    };
     const OPEN: u16 = 19016;
     const BLOCKED: u16 = 19017;
     env.start_listener6(OPEN);
@@ -1064,7 +1116,9 @@ fn rules_apply_to_ipv6_connections() {
 #[test]
 #[ignore = "requires root and network namespaces"]
 fn unhandled_proto_verdict_denies_icmpv6() {
-    let Some(mut env) = TestEnv::setup("icmp6") else { return };
+    let Some(mut env) = TestEnv::setup("icmp6") else {
+        return;
+    };
     env.start_daemon_with("allow", &[], "unhandled_proto_verdict = \"deny\"\n");
     env.assert_daemon_alive();
     assert!(
@@ -1077,7 +1131,9 @@ fn unhandled_proto_verdict_denies_icmpv6() {
 #[test]
 #[ignore = "requires root and network namespaces"]
 fn no_rule_default_allow_permits() {
-    let Some(mut env) = TestEnv::setup("defallow") else { return };
+    let Some(mut env) = TestEnv::setup("defallow") else {
+        return;
+    };
     env.start_listener(19003);
     env.start_daemon("allow", &[]);
     assert!(
@@ -1090,7 +1146,9 @@ fn no_rule_default_allow_permits() {
 #[test]
 #[ignore = "requires root and network namespaces"]
 fn no_rule_default_deny_blocks() {
-    let Some(mut env) = TestEnv::setup("defdeny") else { return };
+    let Some(mut env) = TestEnv::setup("defdeny") else {
+        return;
+    };
     env.start_listener(19004);
     env.start_daemon("deny", &[]);
     env.assert_daemon_alive();
@@ -1111,7 +1169,9 @@ fn no_rule_default_deny_blocks() {
 #[test]
 #[ignore = "requires root and network namespaces"]
 fn a_flushed_ruleset_is_detected_and_reinstalled() {
-    let Some(mut env) = TestEnv::setup("flushed") else { return };
+    let Some(mut env) = TestEnv::setup("flushed") else {
+        return;
+    };
     env.start_listener(19009);
     env.start_daemon("deny", &[]);
     env.assert_daemon_alive();
@@ -1157,7 +1217,9 @@ fn a_flushed_ruleset_is_detected_and_reinstalled() {
 #[test]
 #[ignore = "requires root and network namespaces"]
 fn queue_bypass_keeps_traffic_flowing_after_daemon_crash() {
-    let Some(mut env) = TestEnv::setup("bypass") else { return };
+    let Some(mut env) = TestEnv::setup("bypass") else {
+        return;
+    };
     env.start_listener(19005);
     env.start_daemon("deny", &[]);
     env.assert_daemon_alive();
@@ -1175,7 +1237,9 @@ fn queue_bypass_keeps_traffic_flowing_after_daemon_crash() {
 #[test]
 #[ignore = "requires root and network namespaces"]
 fn fail_closed_queue_blocks_after_daemon_crash() {
-    let Some(mut env) = TestEnv::setup("failclosed") else { return };
+    let Some(mut env) = TestEnv::setup("failclosed") else {
+        return;
+    };
     env.start_listener(19007);
     env.start_daemon_with("allow", &[], "queue_bypass = false\n");
     assert!(
@@ -1197,7 +1261,9 @@ fn fail_closed_queue_blocks_after_daemon_crash() {
 #[ignore = "requires root and network namespaces"]
 fn attribution_event_reports_exe_path() {
     const PORT: u16 = 19006;
-    let Some(mut env) = TestEnv::setup("attr") else { return };
+    let Some(mut env) = TestEnv::setup("attr") else {
+        return;
+    };
     env.start_listener(PORT);
     env.start_daemon("allow", &[]);
 
@@ -1209,14 +1275,30 @@ fn attribution_event_reports_exe_path() {
         let mut sock = tokio::net::UnixStream::connect(&env.socket_path)
             .await
             .expect("connect IPC socket");
-        wire::write_msg(&mut sock, &ClientMsg::Hello { version: PROTOCOL_VERSION })
-            .await
-            .expect("send hello");
+        wire::write_msg(
+            &mut sock,
+            &ClientMsg::Hello {
+                version: PROTOCOL_VERSION,
+            },
+        )
+        .await
+        .expect("send hello");
         let ack: DaemonMsg = wire::read_msg(&mut sock).await.expect("read ack");
-        assert_eq!(ack, DaemonMsg::HelloAck { version: PROTOCOL_VERSION });
-        wire::write_msg(&mut sock, &ClientMsg::Subscribe { events: true, prompts: false })
-            .await
-            .expect("send subscribe");
+        assert_eq!(
+            ack,
+            DaemonMsg::HelloAck {
+                version: PROTOCOL_VERSION
+            }
+        );
+        wire::write_msg(
+            &mut sock,
+            &ClientMsg::Subscribe {
+                events: true,
+                prompts: false,
+            },
+        )
+        .await
+        .expect("send subscribe");
         let ok: DaemonMsg = wire::read_msg(&mut sock).await.expect("read subscribe ack");
         assert_eq!(ok, DaemonMsg::Ok);
 
@@ -1243,10 +1325,12 @@ fn attribution_event_reports_exe_path() {
         }
     });
 
-    let exe = event
-        .conn
-        .exe_path
-        .unwrap_or_else(|| panic!("event carried no exe path; daemon log:\n{}", env.daemon_log()));
+    let exe = event.conn.exe_path.unwrap_or_else(|| {
+        panic!(
+            "event carried no exe path; daemon log:\n{}",
+            env.daemon_log()
+        )
+    });
     let name = exe.file_name().expect("exe file name").to_string_lossy();
     assert!(
         name.contains("nc"),
@@ -1292,7 +1376,9 @@ async fn next_event_on_port(
 fn first_connection_is_flagged_new_on_the_event_stream() {
     const PORT: u16 = 19012;
     const PORT_AGAIN: u16 = 19013;
-    let Some(mut env) = TestEnv::setup("firstseen") else { return };
+    let Some(mut env) = TestEnv::setup("firstseen") else {
+        return;
+    };
     // Listeners so the probes complete rather than being refused: an nc that
     // exits the moment it gets an RST can be gone before procfs attribution
     // reads /proc, and an unattributed connection is deliberately not
@@ -1309,14 +1395,30 @@ fn first_connection_is_flagged_new_on_the_event_stream() {
         let mut sock = tokio::net::UnixStream::connect(&env.socket_path)
             .await
             .expect("connect IPC socket");
-        wire::write_msg(&mut sock, &ClientMsg::Hello { version: PROTOCOL_VERSION })
-            .await
-            .expect("send hello");
+        wire::write_msg(
+            &mut sock,
+            &ClientMsg::Hello {
+                version: PROTOCOL_VERSION,
+            },
+        )
+        .await
+        .expect("send hello");
         let ack: DaemonMsg = wire::read_msg(&mut sock).await.expect("read ack");
-        assert_eq!(ack, DaemonMsg::HelloAck { version: PROTOCOL_VERSION });
-        wire::write_msg(&mut sock, &ClientMsg::Subscribe { events: true, prompts: false })
-            .await
-            .expect("send subscribe");
+        assert_eq!(
+            ack,
+            DaemonMsg::HelloAck {
+                version: PROTOCOL_VERSION
+            }
+        );
+        wire::write_msg(
+            &mut sock,
+            &ClientMsg::Subscribe {
+                events: true,
+                prompts: false,
+            },
+        )
+        .await
+        .expect("send subscribe");
         let ok: DaemonMsg = wire::read_msg(&mut sock).await.expect("read subscribe ack");
         assert_eq!(ok, DaemonMsg::Ok);
 
@@ -1337,12 +1439,18 @@ fn first_connection_is_flagged_new_on_the_event_stream() {
     let log = env.daemon_log();
     assert_eq!(
         first.conn.first_seen,
-        Some(hallpass_types::FirstSeen { app: true, dest: true }),
+        Some(hallpass_types::FirstSeen {
+            app: true,
+            dest: true
+        }),
         "the first connection from this binary must be flagged new; log:\n{log}"
     );
     assert_eq!(
         second.conn.first_seen,
-        Some(hallpass_types::FirstSeen { app: false, dest: false }),
+        Some(hallpass_types::FirstSeen {
+            app: false,
+            dest: false
+        }),
         "a repeat of the same connection must not be flagged; log:\n{log}"
     );
 }
@@ -1352,7 +1460,9 @@ fn first_connection_is_flagged_new_on_the_event_stream() {
 fn domain_rule_blocks_after_dns_snoop() {
     const PORT: u16 = 19007;
     const NAME: &str = "blocked.test";
-    let Some(mut env) = TestEnv::setup("dns") else { return };
+    let Some(mut env) = TestEnv::setup("dns") else {
+        return;
+    };
     if !tool_available("python3", "--version") {
         eprintln!("SKIP e2e dns: python3 not found");
         return;
@@ -1393,7 +1503,6 @@ fn domain_rule_blocks_after_dns_snoop() {
     );
 }
 
-
 /// One expected outcome for a port, so a test that exercises several
 /// operands at once keeps each port's expectation next to its reason.
 struct Case {
@@ -1432,7 +1541,9 @@ fn hash_rules_match_only_the_real_binary() {
     const HIT: u16 = 19008;
     const MISS: u16 = 19009;
     const LIST: u16 = 19010;
-    let Some(mut env) = TestEnv::setup("hash") else { return };
+    let Some(mut env) = TestEnv::setup("hash") else {
+        return;
+    };
     let Some(nc) = tool_path("nc") else {
         eprintln!("SKIP e2e hash: cannot resolve the nc binary");
         return;
@@ -1442,9 +1553,21 @@ fn hash_rules_match_only_the_real_binary() {
     let wrong = "0".repeat(64);
 
     let cases = [
-        Case { port: HIT, allowed: false, why: "exe_sha256 pinned to the real nc hash should block" },
-        Case { port: MISS, allowed: true, why: "exe_sha256 pinned to another hash must not match nc" },
-        Case { port: LIST, allowed: false, why: "hashes_file listing the real nc hash should block" },
+        Case {
+            port: HIT,
+            allowed: false,
+            why: "exe_sha256 pinned to the real nc hash should block",
+        },
+        Case {
+            port: MISS,
+            allowed: true,
+            why: "exe_sha256 pinned to another hash must not match nc",
+        },
+        Case {
+            port: LIST,
+            allowed: false,
+            why: "hashes_file listing the real nc hash should block",
+        },
     ];
     env.start_listeners(&cases);
     let hashes = env.write_aux("blocked.sha256", &format!("# blocklist\n{real}\n"));
@@ -1470,11 +1593,21 @@ fn hash_rules_match_only_the_real_binary() {
 fn ips_file_rule_blocks_a_listed_destination() {
     const LISTED: u16 = 19011;
     const UNLISTED: u16 = 19012;
-    let Some(mut env) = TestEnv::setup("ipslist") else { return };
+    let Some(mut env) = TestEnv::setup("ipslist") else {
+        return;
+    };
 
     let cases = [
-        Case { port: LISTED, allowed: false, why: "ips_file covering the destination should block" },
-        Case { port: UNLISTED, allowed: true, why: "ips_file not covering the destination must not match" },
+        Case {
+            port: LISTED,
+            allowed: false,
+            why: "ips_file covering the destination should block",
+        },
+        Case {
+            port: UNLISTED,
+            allowed: true,
+            why: "ips_file not covering the destination must not match",
+        },
     ];
     env.start_listeners(&cases);
 
@@ -1501,7 +1634,9 @@ fn ips_file_rule_blocks_a_listed_destination() {
 fn domains_file_rule_blocks_after_dns_snoop() {
     const PORT: u16 = 19013;
     const NAME: &str = "listed.test";
-    let Some(mut env) = TestEnv::setup("domlist") else { return };
+    let Some(mut env) = TestEnv::setup("domlist") else {
+        return;
+    };
     if !tool_available("python3", "--version") {
         eprintln!("SKIP e2e domlist: python3 not found");
         return;
@@ -1544,7 +1679,9 @@ fn timed_rule_stops_applying_after_its_deadline() {
     /// anomaly worth failing on rather than racing against.
     const RELOAD_WAIT: Duration = Duration::from_secs(6);
     const LEAD: Duration = Duration::from_secs(10);
-    let Some(mut env) = TestEnv::setup("timed") else { return };
+    let Some(mut env) = TestEnv::setup("timed") else {
+        return;
+    };
     env.start_listener(PORT);
 
     // Start with no rules, then drop the timed rule in and let the
@@ -1616,13 +1753,31 @@ fn source_and_interface_operands_match() {
     const SRC: u16 = 19016;
     const CMDLINE: u16 = 19017;
     const WRONG_IFACE: u16 = 19018;
-    let Some(mut env) = TestEnv::setup("operands") else { return };
+    let Some(mut env) = TestEnv::setup("operands") else {
+        return;
+    };
 
     let cases = [
-        Case { port: IFACE, allowed: false, why: "iface should match the veth the packet leaves by" },
-        Case { port: SRC, allowed: false, why: "src should match the client namespace address" },
-        Case { port: CMDLINE, allowed: false, why: "cmdline_contains should match the port in nc's argv" },
-        Case { port: WRONG_IFACE, allowed: true, why: "iface naming another device must not match" },
+        Case {
+            port: IFACE,
+            allowed: false,
+            why: "iface should match the veth the packet leaves by",
+        },
+        Case {
+            port: SRC,
+            allowed: false,
+            why: "src should match the client namespace address",
+        },
+        Case {
+            port: CMDLINE,
+            allowed: false,
+            why: "cmdline_contains should match the port in nc's argv",
+        },
+        Case {
+            port: WRONG_IFACE,
+            allowed: true,
+            why: "iface naming another device must not match",
+        },
     ];
     env.start_listeners(&cases);
 
@@ -1650,7 +1805,9 @@ fn source_and_interface_operands_match() {
 #[test]
 #[ignore = "requires root and network namespaces"]
 fn unhandled_proto_verdict_denies_icmp() {
-    let Some(mut env) = TestEnv::setup("unhandled-deny") else { return };
+    let Some(mut env) = TestEnv::setup("unhandled-deny") else {
+        return;
+    };
     if !tool_available("ping", "-V") {
         eprintln!("SKIP e2e unhandled-deny: ping not found");
         return;
@@ -1670,7 +1827,9 @@ fn unhandled_proto_verdict_denies_icmp() {
 #[test]
 #[ignore = "requires root and network namespaces"]
 fn unhandled_proto_verdict_allows_icmp_under_default_deny() {
-    let Some(mut env) = TestEnv::setup("unhandled-allow") else { return };
+    let Some(mut env) = TestEnv::setup("unhandled-allow") else {
+        return;
+    };
     if !tool_available("ping", "-V") {
         eprintln!("SKIP e2e unhandled-allow: ping not found");
         return;
@@ -1689,7 +1848,9 @@ fn unhandled_proto_verdict_allows_icmp_under_default_deny() {
 #[ignore = "requires root and network namespaces"]
 fn syslog_export_writes_a_record_per_decision() {
     const PORT: u16 = 19019;
-    let Some(mut env) = TestEnv::setup("syslog") else { return };
+    let Some(mut env) = TestEnv::setup("syslog") else {
+        return;
+    };
     let Some(nc) = tool_path("nc") else {
         eprintln!("SKIP e2e syslog: cannot resolve the nc binary");
         return;
@@ -1767,7 +1928,9 @@ fn libc_resolver_uprobes_feed_the_domain_cache() {
         eprintln!("SKIP e2e uprobe: built without the ebpf feature");
         return;
     }
-    let Some(mut env) = TestEnv::setup("uprobe") else { return };
+    let Some(mut env) = TestEnv::setup("uprobe") else {
+        return;
+    };
     for tool in [("python3", "--version"), ("getent", "--version")] {
         if !tool_available(tool.0, tool.1) {
             eprintln!("SKIP e2e uprobe: {} not found", tool.0);
@@ -2148,7 +2311,16 @@ fn a_wrapped_command_is_covered_only_while_the_wrapper_runs() {
     env.start_listener(PORT_AFTER);
     env.start_daemon("deny", &[]);
 
-    let wrapped = env.run_cli(&["run", "--", "nc", "-z", "-w", "3", SRV_IP, &PORT.to_string()]);
+    let wrapped = env.run_cli(&[
+        "run",
+        "--",
+        "nc",
+        "-z",
+        "-w",
+        "3",
+        SRV_IP,
+        &PORT.to_string(),
+    ]);
     assert!(
         wrapped.status.success(),
         "the wrapped command should connect and exit 0; stderr: {}\ndaemon log:\n{}",
@@ -2191,7 +2363,16 @@ fn an_explicit_deny_still_blocks_inside_a_session() {
     env.start_listener(PORT);
     env.start_daemon("allow", &[&rule("e2e-session-deny", Action::Deny, PORT)]);
 
-    let wrapped = env.run_cli(&["run", "--", "nc", "-z", "-w", "3", SRV_IP, &PORT.to_string()]);
+    let wrapped = env.run_cli(&[
+        "run",
+        "--",
+        "nc",
+        "-z",
+        "-w",
+        "3",
+        SRV_IP,
+        &PORT.to_string(),
+    ]);
     assert!(
         !wrapped.status.success(),
         "a deny rule must still deny inside a session; daemon log:\n{}",
@@ -2247,14 +2428,30 @@ fn a_reparented_descendant_stays_covered() {
         let mut sock = tokio::net::UnixStream::connect(&env.socket_path)
             .await
             .expect("connect IPC socket");
-        wire::write_msg(&mut sock, &ClientMsg::Hello { version: PROTOCOL_VERSION })
-            .await
-            .expect("send hello");
+        wire::write_msg(
+            &mut sock,
+            &ClientMsg::Hello {
+                version: PROTOCOL_VERSION,
+            },
+        )
+        .await
+        .expect("send hello");
         let ack: DaemonMsg = wire::read_msg(&mut sock).await.expect("read ack");
-        assert_eq!(ack, DaemonMsg::HelloAck { version: PROTOCOL_VERSION });
-        wire::write_msg(&mut sock, &ClientMsg::Subscribe { events: true, prompts: false })
-            .await
-            .expect("send subscribe");
+        assert_eq!(
+            ack,
+            DaemonMsg::HelloAck {
+                version: PROTOCOL_VERSION
+            }
+        );
+        wire::write_msg(
+            &mut sock,
+            &ClientMsg::Subscribe {
+                events: true,
+                prompts: false,
+            },
+        )
+        .await
+        .expect("send subscribe");
         let ok: DaemonMsg = wire::read_msg(&mut sock).await.expect("read subscribe ack");
         assert_eq!(ok, DaemonMsg::Ok);
 
@@ -2331,7 +2528,10 @@ fn lockdown_suppresses_untagged_allows_against_a_real_queue() {
         ],
     );
     env.assert_daemon_alive();
-    assert!(env.connect(PINNED), "the pinned rule must work before the posture");
+    assert!(
+        env.connect(PINNED),
+        "the pinned rule must work before the posture"
+    );
     assert!(
         env.connect(UNPINNED),
         "the untagged rule must work before the posture; daemon log:\n{}",
@@ -2402,7 +2602,9 @@ fn an_exec_after_connect_does_not_inherit_the_new_binarys_rule() {
         eprintln!("SKIP e2e execrace: built without the ebpf feature");
         return;
     }
-    let Some(mut env) = TestEnv::setup("execrace") else { return };
+    let Some(mut env) = TestEnv::setup("execrace") else {
+        return;
+    };
     if !tool_available("python3", "--version") {
         eprintln!("SKIP e2e execrace: python3 not found");
         return;

@@ -514,9 +514,7 @@ async fn message_loop(
     loop {
         let msg = match wire::read_msg::<ClientMsg, _>(reader).await {
             Ok(m) => m,
-            Err(wire::WireError::Io(e))
-                if e.kind() == std::io::ErrorKind::UnexpectedEof =>
-            {
+            Err(wire::WireError::Io(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
                 return Ok(()); // clean disconnect
             }
             Err(e) => return Err(e),
@@ -594,7 +592,10 @@ async fn message_loop(
                 pin_exe,
             } => {
                 tracing::info!(?peer_uid, id, ?verdict, pin_exe, "prompt reply");
-                match deps.prompts.reply(out_tx, id, verdict, duration, scope, pin_exe) {
+                match deps
+                    .prompts
+                    .reply(out_tx, id, verdict, duration, scope, pin_exe)
+                {
                     Ok(()) => DaemonMsg::Ok,
                     Err(message) => DaemonMsg::Err { message },
                 }
@@ -628,9 +629,7 @@ async fn message_loop(
                     Err(message) => DaemonMsg::Err { message },
                 }
             }
-            ClientMsg::LockdownGet => {
-                DaemonMsg::LockdownState(deps.lockdown.snapshot(&deps.store))
-            }
+            ClientMsg::LockdownGet => DaemonMsg::LockdownState(deps.lockdown.snapshot(&deps.store)),
             ClientMsg::LockdownSet { tags, on, force } => {
                 // Warn, not info, and with the peer on it: this is the one
                 // change that decides every unmatched connection on the
@@ -754,7 +753,7 @@ async fn message_loop(
 mod tests {
     use super::*;
     use hallpass_types::{Action, Rule, RuleDuration, RuleMatch, Verdict};
-        use std::time::Duration;
+    use std::time::Duration;
 
     fn parse(line: &str) -> Option<u32> {
         parse_group_line(line, "hallpass")
@@ -889,15 +888,30 @@ mod tests {
         });
 
         let mut c = client(&sock).await;
-        wire::write_msg(&mut c, &ClientMsg::Hello { version: PROTOCOL_VERSION })
-            .await
-            .unwrap();
+        wire::write_msg(
+            &mut c,
+            &ClientMsg::Hello {
+                version: PROTOCOL_VERSION,
+            },
+        )
+        .await
+        .unwrap();
         let ack: DaemonMsg = wire::read_msg(&mut c).await.unwrap();
-        assert_eq!(ack, DaemonMsg::HelloAck { version: PROTOCOL_VERSION });
+        assert_eq!(
+            ack,
+            DaemonMsg::HelloAck {
+                version: PROTOCOL_VERSION
+            }
+        );
 
-        wire::write_msg(&mut c, &ClientMsg::RunSessionStart { label: "curl".into() })
-            .await
-            .unwrap();
+        wire::write_msg(
+            &mut c,
+            &ClientMsg::RunSessionStart {
+                label: "curl".into(),
+            },
+        )
+        .await
+        .unwrap();
         let id = match wire::read_msg::<DaemonMsg, _>(&mut c).await.unwrap() {
             DaemonMsg::RunSessionStarted { id } => id,
             other => panic!("expected the session to open, got {other:?}"),
@@ -911,15 +925,22 @@ mod tests {
 
         // A second request is refused rather than replacing the first: the
         // wrapper's child is already running under the first one.
-        wire::write_msg(&mut c, &ClientMsg::RunSessionStart { label: "again".into() })
-            .await
-            .unwrap();
+        wire::write_msg(
+            &mut c,
+            &ClientMsg::RunSessionStart {
+                label: "again".into(),
+            },
+        )
+        .await
+        .unwrap();
         assert!(matches!(
             wire::read_msg::<DaemonMsg, _>(&mut c).await.unwrap(),
             DaemonMsg::Err { .. }
         ));
 
-        wire::write_msg(&mut c, &ClientMsg::RunSessionList).await.unwrap();
+        wire::write_msg(&mut c, &ClientMsg::RunSessionList)
+            .await
+            .unwrap();
         match wire::read_msg::<DaemonMsg, _>(&mut c).await.unwrap() {
             DaemonMsg::RunSessions(v) => assert_eq!(v.len(), 1),
             other => panic!("expected the session list, got {other:?}"),
@@ -966,15 +987,30 @@ mod tests {
         });
 
         let mut c = client(&sock).await;
-        wire::write_msg(&mut c, &ClientMsg::Hello { version: PROTOCOL_VERSION })
-            .await
-            .unwrap();
+        wire::write_msg(
+            &mut c,
+            &ClientMsg::Hello {
+                version: PROTOCOL_VERSION,
+            },
+        )
+        .await
+        .unwrap();
         let ack: DaemonMsg = wire::read_msg(&mut c).await.unwrap();
-        assert_eq!(ack, DaemonMsg::HelloAck { version: PROTOCOL_VERSION });
+        assert_eq!(
+            ack,
+            DaemonMsg::HelloAck {
+                version: PROTOCOL_VERSION
+            }
+        );
 
         let rule = ipc_rule("via-ipc", Vec::new());
-        wire::write_msg(&mut c, &ClientMsg::RuleAdd(rule.clone())).await.unwrap();
-        assert_eq!(wire::read_msg::<DaemonMsg, _>(&mut c).await.unwrap(), DaemonMsg::Ok);
+        wire::write_msg(&mut c, &ClientMsg::RuleAdd(rule.clone()))
+            .await
+            .unwrap();
+        assert_eq!(
+            wire::read_msg::<DaemonMsg, _>(&mut c).await.unwrap(),
+            DaemonMsg::Ok
+        );
 
         wire::write_msg(&mut c, &ClientMsg::RuleList).await.unwrap();
         assert_eq!(
@@ -982,7 +1018,14 @@ mod tests {
             DaemonMsg::Rules(vec![rule])
         );
 
-        wire::write_msg(&mut c, &ClientMsg::RuleDelete { name: "nope".into() }).await.unwrap();
+        wire::write_msg(
+            &mut c,
+            &ClientMsg::RuleDelete {
+                name: "nope".into(),
+            },
+        )
+        .await
+        .unwrap();
         assert!(matches!(
             wire::read_msg::<DaemonMsg, _>(&mut c).await.unwrap(),
             DaemonMsg::Err { .. }
@@ -1010,16 +1053,24 @@ mod tests {
         });
 
         let mut c = client(&sock).await;
-        wire::write_msg(&mut c, &ClientMsg::Hello { version: PROTOCOL_VERSION })
-            .await
-            .unwrap();
+        wire::write_msg(
+            &mut c,
+            &ClientMsg::Hello {
+                version: PROTOCOL_VERSION,
+            },
+        )
+        .await
+        .unwrap();
         let _: DaemonMsg = wire::read_msg(&mut c).await.unwrap();
 
         for (name, tags) in [("t1", vec!["work".to_string()]), ("t2", Vec::new())] {
             wire::write_msg(&mut c, &ClientMsg::RuleAdd(ipc_rule(name, tags)))
                 .await
                 .unwrap();
-            assert_eq!(wire::read_msg::<DaemonMsg, _>(&mut c).await.unwrap(), DaemonMsg::Ok);
+            assert_eq!(
+                wire::read_msg::<DaemonMsg, _>(&mut c).await.unwrap(),
+                DaemonMsg::Ok
+            );
         }
 
         wire::write_msg(
@@ -1079,12 +1130,19 @@ mod tests {
         });
 
         let mut c = client(&sock).await;
-        wire::write_msg(&mut c, &ClientMsg::Hello { version: PROTOCOL_VERSION })
-            .await
-            .unwrap();
+        wire::write_msg(
+            &mut c,
+            &ClientMsg::Hello {
+                version: PROTOCOL_VERSION,
+            },
+        )
+        .await
+        .unwrap();
         let _: DaemonMsg = wire::read_msg(&mut c).await.unwrap();
 
-        wire::write_msg(&mut c, &ClientMsg::ConfigGet).await.unwrap();
+        wire::write_msg(&mut c, &ClientMsg::ConfigGet)
+            .await
+            .unwrap();
         assert_eq!(
             wire::read_msg::<DaemonMsg, _>(&mut c).await.unwrap(),
             DaemonMsg::Config(crate::testutil::runtime_config(5, Verdict::Allow))
@@ -1095,9 +1153,16 @@ mod tests {
             enforce: false,
             ..crate::testutil::runtime_config(30, Verdict::Deny)
         };
-        wire::write_msg(&mut c, &ClientMsg::ConfigSet(new)).await.unwrap();
-        assert_eq!(wire::read_msg::<DaemonMsg, _>(&mut c).await.unwrap(), DaemonMsg::Ok);
-        wire::write_msg(&mut c, &ClientMsg::ConfigGet).await.unwrap();
+        wire::write_msg(&mut c, &ClientMsg::ConfigSet(new))
+            .await
+            .unwrap();
+        assert_eq!(
+            wire::read_msg::<DaemonMsg, _>(&mut c).await.unwrap(),
+            DaemonMsg::Ok
+        );
+        wire::write_msg(&mut c, &ClientMsg::ConfigGet)
+            .await
+            .unwrap();
         assert_eq!(
             wire::read_msg::<DaemonMsg, _>(&mut c).await.unwrap(),
             DaemonMsg::Config(new)
@@ -1115,7 +1180,9 @@ mod tests {
             wire::read_msg::<DaemonMsg, _>(&mut c).await.unwrap(),
             DaemonMsg::Err { .. }
         ));
-        wire::write_msg(&mut c, &ClientMsg::ConfigGet).await.unwrap();
+        wire::write_msg(&mut c, &ClientMsg::ConfigGet)
+            .await
+            .unwrap();
         assert_eq!(
             wire::read_msg::<DaemonMsg, _>(&mut c).await.unwrap(),
             DaemonMsg::Config(new)
@@ -1133,7 +1200,9 @@ mod tests {
     fn the_read_only_tier_allows_exactly_the_non_mutating_messages() {
         let rule = ipc_rule("r", Vec::new());
         let allowed: Vec<ClientMsg> = vec![
-            ClientMsg::Hello { version: PROTOCOL_VERSION },
+            ClientMsg::Hello {
+                version: PROTOCOL_VERSION,
+            },
             ClientMsg::Stats,
             ClientMsg::EventHistory { limit: 10 },
             ClientMsg::RuleList,
@@ -1159,12 +1228,18 @@ mod tests {
             }),
             ClientMsg::LockdownGet,
             ClientMsg::ConfigGet,
-            ClientMsg::Subscribe { events: true, prompts: false },
+            ClientMsg::Subscribe {
+                events: true,
+                prompts: false,
+            },
         ];
         let refused: Vec<ClientMsg> = vec![
             // A subscription is a read only while it does not claim the
             // prompt slot: answering prompts is deciding policy.
-            ClientMsg::Subscribe { events: true, prompts: true },
+            ClientMsg::Subscribe {
+                events: true,
+                prompts: true,
+            },
             ClientMsg::PromptReply {
                 id: 1,
                 verdict: Verdict::Allow,
@@ -1174,11 +1249,23 @@ mod tests {
             },
             ClientMsg::RuleAdd(rule.clone()),
             ClientMsg::RuleDelete { name: "r".into() },
-            ClientMsg::RuleToggle { name: "r".into(), enabled: false },
-            ClientMsg::RuleToggleTag { tag: "t".into(), enabled: false },
-            ClientMsg::LockdownSet { tags: Vec::new(), on: true, force: false },
+            ClientMsg::RuleToggle {
+                name: "r".into(),
+                enabled: false,
+            },
+            ClientMsg::RuleToggleTag {
+                tag: "t".into(),
+                enabled: false,
+            },
+            ClientMsg::LockdownSet {
+                tags: Vec::new(),
+                on: true,
+                force: false,
+            },
             ClientMsg::ConfigSet(crate::testutil::runtime_config(30, Verdict::Deny)),
-            ClientMsg::RunSessionStart { label: "curl".into() },
+            ClientMsg::RunSessionStart {
+                label: "curl".into(),
+            },
             ClientMsg::RunSessionList,
         ];
 
@@ -1234,9 +1321,14 @@ mod tests {
         });
 
         let mut c = client(&sock).await;
-        wire::write_msg(&mut c, &ClientMsg::Hello { version: PROTOCOL_VERSION })
-            .await
-            .unwrap();
+        wire::write_msg(
+            &mut c,
+            &ClientMsg::Hello {
+                version: PROTOCOL_VERSION,
+            },
+        )
+        .await
+        .unwrap();
         assert!(matches!(
             wire::read_msg::<DaemonMsg, _>(&mut c).await.unwrap(),
             DaemonMsg::HelloAck { .. }
@@ -1289,14 +1381,25 @@ mod tests {
         });
 
         let mut c = client(&sock).await;
-        wire::write_msg(&mut c, &ClientMsg::Hello { version: PROTOCOL_VERSION })
-            .await
-            .unwrap();
+        wire::write_msg(
+            &mut c,
+            &ClientMsg::Hello {
+                version: PROTOCOL_VERSION,
+            },
+        )
+        .await
+        .unwrap();
         let _ = wire::read_msg::<DaemonMsg, _>(&mut c).await.unwrap();
 
-        wire::write_msg(&mut c, &ClientMsg::Subscribe { events: true, prompts: true })
-            .await
-            .unwrap();
+        wire::write_msg(
+            &mut c,
+            &ClientMsg::Subscribe {
+                events: true,
+                prompts: true,
+            },
+        )
+        .await
+        .unwrap();
         assert!(matches!(
             wire::read_msg::<DaemonMsg, _>(&mut c).await.unwrap(),
             DaemonMsg::Err { .. }
@@ -1307,9 +1410,15 @@ mod tests {
         );
 
         // Events alone are fine, and the reply is an ordinary Ok.
-        wire::write_msg(&mut c, &ClientMsg::Subscribe { events: true, prompts: false })
-            .await
-            .unwrap();
+        wire::write_msg(
+            &mut c,
+            &ClientMsg::Subscribe {
+                events: true,
+                prompts: false,
+            },
+        )
+        .await
+        .unwrap();
         assert!(matches!(
             wire::read_msg::<DaemonMsg, _>(&mut c).await.unwrap(),
             DaemonMsg::Ok
@@ -1334,7 +1443,9 @@ mod tests {
         });
 
         let mut c = client(&sock).await;
-        wire::write_msg(&mut c, &ClientMsg::Hello { version: 9999 }).await.unwrap();
+        wire::write_msg(&mut c, &ClientMsg::Hello { version: 9999 })
+            .await
+            .unwrap();
         assert!(matches!(
             wire::read_msg::<DaemonMsg, _>(&mut c).await.unwrap(),
             DaemonMsg::Err { .. }
@@ -1364,14 +1475,22 @@ mod tests {
             }
         });
 
-        let hello = ClientMsg::Hello { version: PROTOCOL_VERSION };
-        let sub = ClientMsg::Subscribe { events: false, prompts: true };
+        let hello = ClientMsg::Hello {
+            version: PROTOCOL_VERSION,
+        };
+        let sub = ClientMsg::Subscribe {
+            events: false,
+            prompts: true,
+        };
 
         let mut c1 = client(&sock).await;
         wire::write_msg(&mut c1, &hello).await.unwrap();
         let _: DaemonMsg = wire::read_msg(&mut c1).await.unwrap();
         wire::write_msg(&mut c1, &sub).await.unwrap();
-        assert_eq!(wire::read_msg::<DaemonMsg, _>(&mut c1).await.unwrap(), DaemonMsg::Ok);
+        assert_eq!(
+            wire::read_msg::<DaemonMsg, _>(&mut c1).await.unwrap(),
+            DaemonMsg::Ok
+        );
 
         let mut c2 = client(&sock).await;
         wire::write_msg(&mut c2, &hello).await.unwrap();
@@ -1386,6 +1505,9 @@ mod tests {
         drop(c1);
         tokio::time::sleep(Duration::from_millis(100)).await;
         wire::write_msg(&mut c2, &sub).await.unwrap();
-        assert_eq!(wire::read_msg::<DaemonMsg, _>(&mut c2).await.unwrap(), DaemonMsg::Ok);
+        assert_eq!(
+            wire::read_msg::<DaemonMsg, _>(&mut c2).await.unwrap(),
+            DaemonMsg::Ok
+        );
     }
 }

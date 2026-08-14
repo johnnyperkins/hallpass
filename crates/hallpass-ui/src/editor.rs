@@ -167,9 +167,7 @@ impl RuleEditor {
         // many a name resolves to today, so a rule pinned to it silently
         // stops covering the thing the operator meant.
         match &conn.domain {
-            Some(domain) => {
-                e.domain = hallpass_types::sanitize_for_display(domain).into_owned()
-            }
+            Some(domain) => e.domain = hallpass_types::sanitize_for_display(domain).into_owned(),
             None => e.dest = conn.tuple.dst.ip().to_string(),
         }
         e
@@ -179,7 +177,9 @@ impl RuleEditor {
     pub fn edit(rule: &Rule) -> Self {
         let m = &rule.matcher;
         let path = |p: &Option<std::path::PathBuf>| {
-            p.as_ref().map(|p| p.display().to_string()).unwrap_or_default()
+            p.as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default()
         };
         let text = |s: &Option<String>| s.clone().unwrap_or_default();
         let num = |n: Option<u16>| n.map(|n| n.to_string()).unwrap_or_default();
@@ -255,7 +255,10 @@ impl RuleEditor {
         let opt_path = |s: &str| opt(s).map(std::path::PathBuf::from);
         let opt_u16 = |s: &str, what: &str| -> Result<Option<u16>, String> {
             opt(s)
-                .map(|t| t.parse().map_err(|_| format!("{what} must be a port number")))
+                .map(|t| {
+                    t.parse()
+                        .map_err(|_| format!("{what} must be a port number"))
+                })
                 .transpose()
         };
 
@@ -266,8 +269,12 @@ impl RuleEditor {
                     .split_once('-')
                     .ok_or("port range must be like 6000-6100")?;
                 Some((
-                    a.trim().parse().map_err(|_| "bad port range start".to_string())?,
-                    b.trim().parse().map_err(|_| "bad port range end".to_string())?,
+                    a.trim()
+                        .parse()
+                        .map_err(|_| "bad port range start".to_string())?,
+                    b.trim()
+                        .parse()
+                        .map_err(|_| "bad port range end".to_string())?,
                 ))
             }
         };
@@ -281,7 +288,10 @@ impl RuleEditor {
             port_range,
             domain: opt(&self.domain),
             user: opt(&self.user)
-                .map(|t| t.parse().map_err(|_| "user must be a numeric uid".to_string()))
+                .map(|t| {
+                    t.parse()
+                        .map_err(|_| "user must be a numeric uid".to_string())
+                })
                 .transpose()?,
             proto: self.proto,
             domains_file: opt_path(&self.domains_file),
@@ -517,10 +527,18 @@ impl RuleEditor {
                 ui.end_row();
 
                 for (label, field, hint) in [
-                    ("Domains file", &mut self.domains_file, "/etc/hallpass/rules.d/ads.list"),
+                    (
+                        "Domains file",
+                        &mut self.domains_file,
+                        "/etc/hallpass/rules.d/ads.list",
+                    ),
                     ("IPs file", &mut self.ips_file, "one IP/CIDR per line"),
                     ("Hashes file", &mut self.hashes_file, "one SHA-256 per line"),
-                    ("Cmdline contains", &mut self.cmdline_contains, "substring of argv"),
+                    (
+                        "Cmdline contains",
+                        &mut self.cmdline_contains,
+                        "substring of argv",
+                    ),
                     ("Parent exe", &mut self.parent_exe, "/usr/bin/bash"),
                     ("Source", &mut self.src, "IP or CIDR"),
                     ("Source port", &mut self.src_port, ""),

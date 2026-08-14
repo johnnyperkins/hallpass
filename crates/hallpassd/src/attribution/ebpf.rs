@@ -18,12 +18,14 @@ use aya::maps::{HashMap as FlowMap, MapData, RingBuf};
 use aya::programs::uprobe::UProbeScope;
 use aya::programs::{KProbe, TracePoint, UProbe};
 use aya::{Ebpf, EbpfLoader};
+use hallpass_ebpf_common::{
+    DnsEvent, ExecEvent, FlowKey, FlowVal, EVENT_EXEC, PROTO_TCP, PROTO_UDP,
+};
+use hallpass_types::{FlowTuple, Proto};
 use lru::LruCache;
 use tokio::io::unix::AsyncFd;
 use tokio::io::Interest;
 use tokio::sync::watch;
-use hallpass_ebpf_common::{DnsEvent, ExecEvent, FlowKey, FlowVal, EVENT_EXEC, PROTO_TCP, PROTO_UDP};
-use hallpass_types::{FlowTuple, Proto};
 
 use crate::dns::{IpDomainCache, SnoopedResponse};
 
@@ -131,8 +133,16 @@ impl EbpfAttributor {
             .load(EBPF_OBJ)
             .map_err(|e| format!("load object: {e}"))?;
 
-        attach_kprobe(&mut ebpf, "tcp_connect_enter", &["tcp_v4_connect", "tcp_v6_connect"])?;
-        attach_kprobe(&mut ebpf, "tcp_connect_ret", &["tcp_v4_connect", "tcp_v6_connect"])?;
+        attach_kprobe(
+            &mut ebpf,
+            "tcp_connect_enter",
+            &["tcp_v4_connect", "tcp_v6_connect"],
+        )?;
+        attach_kprobe(
+            &mut ebpf,
+            "tcp_connect_ret",
+            &["tcp_v4_connect", "tcp_v6_connect"],
+        )?;
         attach_kprobe(&mut ebpf, "udp_sendmsg", &["udp_sendmsg"])?;
         attach_kprobe(&mut ebpf, "udpv6_sendmsg", &["udpv6_sendmsg"])?;
         attach_tracepoint(&mut ebpf, "sched_process_exec")?;
@@ -153,7 +163,8 @@ impl EbpfAttributor {
         )
         .map_err(|e| format!("EXEC_GEN: {e}"))?;
         let ring = RingBuf::try_from(
-            ebpf.take_map("EVENTS").ok_or("EVENTS missing from object")?,
+            ebpf.take_map("EVENTS")
+                .ok_or("EVENTS missing from object")?,
         )
         .map_err(|e| format!("EVENTS: {e}"))?;
 
@@ -293,8 +304,7 @@ impl EbpfAttributor {
         // Without this check, a process holding an `exe` allow rule that
         // execs into something else keeps handing that rule to the new
         // image for as long as the stale entry lives.
-        let now_exe =
-            std::fs::read_link(Path::new("/proc").join(pid.to_string()).join("exe")).ok();
+        let now_exe = std::fs::read_link(Path::new("/proc").join(pid.to_string()).join("exe")).ok();
         if let Some((d, cached_start)) = self.cache.lock().unwrap().get(&pid) {
             if now_start.is_some() && *cached_start == now_start && d.0 == now_exe {
                 return (d.clone(), now_start);
@@ -427,11 +437,17 @@ fn resolve_offsets() -> Vec<(&'static str, u32)> {
         ("OFF_SKC_FAMILY", sc("skc_family")),
         ("OFF_SKC_V6_DADDR", sc("skc_v6_daddr")),
         ("OFF_SKC_V6_RCV_SADDR", sc("skc_v6_rcv_saddr")),
-        ("OFF_MSG_NAME", btf.struct_field_offset("msghdr", "msg_name")),
+        (
+            "OFF_MSG_NAME",
+            btf.struct_field_offset("msghdr", "msg_name"),
+        ),
     ] {
         match offset {
             Some(o) => resolved.push((symbol, o)),
-            None => tracing::warn!(symbol, "BTF offset unresolved; compiled-in x86_64 default applies"),
+            None => tracing::warn!(
+                symbol,
+                "BTF offset unresolved; compiled-in x86_64 default applies"
+            ),
         }
     }
     resolved
@@ -448,7 +464,13 @@ fn flow_key(t: &FlowTuple) -> FlowKey {
         (IpAddr::V4(s), IpAddr::V4(d)) => {
             FlowKey::v4(proto, s.octets(), t.src.port(), d.octets(), t.dst.port())
         }
-        (s, d) => FlowKey::v6(proto, v6_octets(s), t.src.port(), v6_octets(d), t.dst.port()),
+        (s, d) => FlowKey::v6(
+            proto,
+            v6_octets(s),
+            t.src.port(),
+            v6_octets(d),
+            t.dst.port(),
+        ),
     }
 }
 
@@ -510,11 +532,7 @@ fn attach_dns_uprobes(ebpf: &mut Ebpf) -> Result<(), String> {
 /// Load an entry/return program pair and attach both to every symbol in
 /// `symbols`. Symbols missing from this libc are skipped; the pair fails
 /// only when none of them resolved.
-fn attach_uprobe_pair(
-    ebpf: &mut Ebpf,
-    progs: [&str; 2],
-    symbols: &[&str],
-) -> Result<(), String> {
+fn attach_uprobe_pair(ebpf: &mut Ebpf, progs: [&str; 2], symbols: &[&str]) -> Result<(), String> {
     // Load both halves before attaching either. An entry probe attached
     // next to a return probe that failed to load would trap every call in
     // every process and stash scratch entries nothing ever consumes.
@@ -598,9 +616,7 @@ fn spawn_dns_reader(ring: RingBuf<MapData>, dns: Arc<IpDomainCache>, stop: StopR
 /// cached domain is the exact name a rule would carry.
 fn normalize_domain(raw: &str) -> Option<String> {
     let trimmed = raw.strip_suffix('.').unwrap_or(raw);
-    if trimmed.is_empty()
-        || trimmed.len() > 253
-        || trimmed.bytes().any(|b| b <= b' ' || b == 0x7f)
+    if trimmed.is_empty() || trimmed.len() > 253 || trimmed.bytes().any(|b| b <= b' ' || b == 0x7f)
     {
         return None;
     }
@@ -707,8 +723,14 @@ mod tests {
 
     #[test]
     fn domain_normalization() {
-        assert_eq!(normalize_domain("Example.COM").as_deref(), Some("example.com"));
-        assert_eq!(normalize_domain("example.com.").as_deref(), Some("example.com"));
+        assert_eq!(
+            normalize_domain("Example.COM").as_deref(),
+            Some("example.com")
+        );
+        assert_eq!(
+            normalize_domain("example.com.").as_deref(),
+            Some("example.com")
+        );
         assert_eq!(normalize_domain(""), None);
         assert_eq!(normalize_domain("."), None);
         // Control char / whitespace / injection guard.

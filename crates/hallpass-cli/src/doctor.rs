@@ -25,7 +25,7 @@ use std::time::Duration;
 use hallpass_types::{sanitize_for_display, ClientMsg, DaemonMsg, Stats, PROTOCOL_VERSION};
 use serde::Serialize;
 
-use crate::client::{Client, CliError};
+use crate::client::{CliError, Client};
 use crate::fmt::{Output, Palette, Style};
 use crate::{EXIT_ERR, EXIT_OK};
 
@@ -193,7 +193,9 @@ fn unit_hint() -> String {
         .ok()
         .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string());
     match state.as_deref() {
-        Some("active") => "the unit is active, so the socket path may be wrong; pass --socket".into(),
+        Some("active") => {
+            "the unit is active, so the socket path may be wrong; pass --socket".into()
+        }
         Some("") | None => "is hallpassd running? `systemctl status hallpassd`".into(),
         Some(s) => format!("systemctl reports hallpassd {s}; `sudo systemctl start hallpassd`"),
     }
@@ -307,8 +309,11 @@ fn stats_checks(s: &Stats, checks: &mut Vec<Check>) {
                  failed is in the journal",
                 s.nft_flushes
             ),
-            Some("something on this host flushes rulesets (firewalld, nftables.service, \
-                  container tooling); the journal has the details".into()),
+            Some(
+                "something on this host flushes rulesets (firewalld, nftables.service, \
+                  container tooling); the journal has the details"
+                    .into(),
+            ),
         ));
     }
 
@@ -376,7 +381,11 @@ fn queue_check(
         ));
         return;
     };
-    let posture = if fail_open { "fail-open" } else { "fail-closed" };
+    let posture = if fail_open {
+        "fail-open"
+    } else {
+        "fail-closed"
+    };
     let depth = match (depth, max_len) {
         (Some(d), Some(max)) => format!("depth {d}/{max}"),
         (Some(d), None) => format!("depth {d}"),
@@ -481,10 +490,10 @@ fn one_socket_check(
         return;
     }
     let mode = md.mode() & 0o7777;
-    let owner = name_for_id(env.etc_passwd.as_deref(), md.uid())
-        .unwrap_or_else(|| md.uid().to_string());
-    let group = name_for_id(env.etc_group.as_deref(), md.gid())
-        .unwrap_or_else(|| md.gid().to_string());
+    let owner =
+        name_for_id(env.etc_passwd.as_deref(), md.uid()).unwrap_or_else(|| md.uid().to_string());
+    let group =
+        name_for_id(env.etc_group.as_deref(), md.gid()).unwrap_or_else(|| md.gid().to_string());
     let mut detail = format!("{} mode {mode:04o} {owner}:{group}", socket.display());
     let mut warn = mode != 0o660 || md.uid() != 0 || group != want_group;
     if let Some(dir) = socket.parent() {
@@ -602,7 +611,10 @@ fn dir_trust(dir: &Path, env: &Env) -> DirTrust {
     if owner_ok && (mode & 0o022 == 0 || mode & 0o1000 != 0) {
         DirTrust::Ok(mode)
     } else {
-        DirTrust::Writable { uid: md.uid(), mode }
+        DirTrust::Writable {
+            uid: md.uid(),
+            mode,
+        }
     }
 }
 
@@ -665,7 +677,10 @@ fn group_check(env: &Env, checks: &mut Vec<Check>) {
             checks.push(Check::ok("group", held.into()));
             return;
         }
-        if me.as_deref().is_some_and(|name| members.iter().any(|m| m == name)) {
+        if me
+            .as_deref()
+            .is_some_and(|name| members.iter().any(|m| m == name))
+        {
             checks.push(Check::warn(
                 "group",
                 format!("in the {group} group on disk, but not in this session"),
@@ -908,7 +923,9 @@ fn forwarding_verdict(state: &ForwardingState, bridges: &[String]) -> Check {
 
 /// A procfs `0`/`1` flag. `None` when it cannot be read.
 fn sysctl_flag(path: &Path) -> Option<bool> {
-    std::fs::read_to_string(path).ok().map(|text| text.trim() == "1")
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|text| text.trim() == "1")
 }
 
 /// This host's bridge interfaces, from sysfs: an interface is a bridge
@@ -984,7 +1001,11 @@ fn ids_from_status(status: &str, key: &str) -> Vec<u32> {
     status
         .lines()
         .find_map(|l| l.strip_prefix(key))
-        .map(|rest| rest.split_whitespace().filter_map(|f| f.parse().ok()).collect())
+        .map(|rest| {
+            rest.split_whitespace()
+                .filter_map(|f| f.parse().ok())
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -1341,7 +1362,10 @@ mod tests {
     fn status_ids_parse_uid_and_groups() {
         let status = "Name:\tx\nUid:\t1000\t1001\t1000\t1000\nGid:\t100\t100\t100\t100\n\
                       Groups:\t4 27 100 972\n";
-        assert_eq!(ids_from_status(status, "Uid:"), vec![1000, 1001, 1000, 1000]);
+        assert_eq!(
+            ids_from_status(status, "Uid:"),
+            vec![1000, 1001, 1000, 1000]
+        );
         assert_eq!(ids_from_status(status, "Groups:"), vec![4, 27, 100, 972]);
         assert_eq!(ids_from_status(status, "Missing:"), Vec::<u32>::new());
     }

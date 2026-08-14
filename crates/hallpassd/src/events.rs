@@ -68,7 +68,13 @@ impl EventBus {
     /// `enforced` is whether it was applied to the packet, supplied by the
     /// caller so the stamp comes from the same mode read that governed the
     /// application, never a second read a toggle could land between.
-    pub fn emit(&self, conn: Connection, verdict: Verdict, rule_name: Option<String>, enforced: bool) {
+    pub fn emit(
+        &self,
+        conn: Connection,
+        verdict: Verdict,
+        rule_name: Option<String>,
+        enforced: bool,
+    ) {
         let ev = ConnEvent {
             conn,
             verdict,
@@ -98,7 +104,11 @@ impl EventBus {
     /// after the guard drops.
     pub fn latest_for_tuple(&self, tuple: &FlowTuple) -> Option<Arc<ConnEvent>> {
         let guard = self.lock_history();
-        guard.iter().rev().find(|ev| ev.conn.tuple == *tuple).cloned()
+        guard
+            .iter()
+            .rev()
+            .find(|ev| ev.conn.tuple == *tuple)
+            .cloned()
     }
 
     /// How many decisions still in the ring said no to this same
@@ -315,11 +325,26 @@ mod tests {
         };
 
         bus.emit(with(Some("/usr/bin/curl"), None), Verdict::Deny, None, true);
-        bus.emit(with(Some("/usr/bin/curl"), None), Verdict::Reject, None, true);
+        bus.emit(
+            with(Some("/usr/bin/curl"), None),
+            Verdict::Reject,
+            None,
+            true,
+        );
         // Observed but not enforced still counts: what policy decided is the
         // answer to "have I been saying no to this".
-        bus.emit(with(Some("/usr/bin/curl"), None), Verdict::Deny, None, false);
-        bus.emit(with(Some("/usr/bin/curl"), None), Verdict::Allow, None, true);
+        bus.emit(
+            with(Some("/usr/bin/curl"), None),
+            Verdict::Deny,
+            None,
+            false,
+        );
+        bus.emit(
+            with(Some("/usr/bin/curl"), None),
+            Verdict::Allow,
+            None,
+            true,
+        );
         bus.emit(with(Some("/usr/bin/wget"), None), Verdict::Deny, None, true);
         // Same executable, different packaged application: two sandboxed
         // applications share one path, and one of them being refused says
@@ -359,7 +384,11 @@ mod tests {
         bus.emit(conn(), Verdict::Allow, Some("after".into()), true);
 
         let out = bus.history(10);
-        assert_eq!(out.len(), 2, "the oversized event must be the only one lost");
+        assert_eq!(
+            out.len(),
+            2,
+            "the oversized event must be the only one lost"
+        );
         assert_eq!(out[0].rule_name.as_deref(), Some("before"));
         assert_eq!(out[1].rule_name.as_deref(), Some("after"));
         hallpass_types::wire::encode(&hallpass_types::DaemonMsg::Events(out))

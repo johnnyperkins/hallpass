@@ -144,8 +144,7 @@ pub const LOCKDOWN_LOOPBACK_RULE: &str = "lockdown:loopback";
 
 /// Every prefix a rule may not be named after, because the daemon reports
 /// decisions of its own under them.
-pub const RESERVED_RULE_PREFIXES: [&str; 2] =
-    [RUN_SESSION_RULE_PREFIX, LOCKDOWN_RULE_PREFIX];
+pub const RESERVED_RULE_PREFIXES: [&str; 2] = [RUN_SESSION_RULE_PREFIX, LOCKDOWN_RULE_PREFIX];
 
 /// One live session grant, for [`ClientMsg::RunSessionList`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -879,7 +878,10 @@ pub const MAX_TAGS_PER_RULE: usize = 8;
 /// empty set with a success exit code.
 pub fn valid_tag(tag: &str) -> bool {
     tag.len() <= MAX_TAG_BYTES
-        && tag.bytes().next().is_some_and(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+        && tag
+            .bytes()
+            .next()
+            .is_some_and(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
         && tag
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'-' | b'_'))
@@ -1055,7 +1057,10 @@ mod display_tests {
     #[test]
     fn clean_text_is_borrowed_unchanged() {
         let s = "/usr/bin/curl https://example.org";
-        assert!(matches!(sanitize_for_display(s), std::borrow::Cow::Borrowed(_)));
+        assert!(matches!(
+            sanitize_for_display(s),
+            std::borrow::Cow::Borrowed(_)
+        ));
         assert_eq!(sanitize_for_display(s), s);
     }
 
@@ -1076,10 +1081,10 @@ mod display_tests {
     #[test]
     fn bidi_and_zero_width_are_neutralized() {
         for hostile in [
-            "gpj.\u{202e}exe.evil",   // RTL override
-            "curl\u{200b}\u{200b}x",  // zero width space
-            "a\u{feff}b",             // BOM
-            "a\u{2066}b\u{2069}c",    // bidi isolates
+            "gpj.\u{202e}exe.evil",  // RTL override
+            "curl\u{200b}\u{200b}x", // zero width space
+            "a\u{feff}b",            // BOM
+            "a\u{2066}b\u{2069}c",   // bidi isolates
         ] {
             let out = sanitize_for_display(hostile);
             assert!(
@@ -1146,7 +1151,10 @@ mod time_tests {
         assert_eq!(format_rfc3339(0), "1970-01-01T00:00:00.000Z");
         // 2024-07-03 09:46:40.123 UTC.
         assert_eq!(format_ts(1_720_000_000_123), "2024-07-03 09:46:40");
-        assert_eq!(format_rfc3339(1_720_000_000_123), "2024-07-03T09:46:40.123Z");
+        assert_eq!(
+            format_rfc3339(1_720_000_000_123),
+            "2024-07-03T09:46:40.123Z"
+        );
     }
 
     #[test]
@@ -1228,13 +1236,13 @@ mod tag_tests {
     #[test]
     fn malformed_tags_are_rejected() {
         for tag in [
-            "",             // a tag names a set; nothing names nothing
-            "Work",         // case is refused, not folded
-            "work lab",     // whitespace would split one selector into two
-            "work,lab",     // the CLI's own separator
-            "work.lab",     // reserved for nothing, so not admitted for now
+            "",              // a tag names a set; nothing names nothing
+            "Work",          // case is refused, not folded
+            "work lab",      // whitespace would split one selector into two
+            "work,lab",      // the CLI's own separator
+            "work.lab",      // reserved for nothing, so not admitted for now
             "work\u{1b}[2K", // terminal escape
-            "wörk",         // non-ASCII: two spellings of one word
+            "wörk",          // non-ASCII: two spellings of one word
             // Every rule listing prints `-` for "no tags", so these render
             // as untagged and the GUI picker offers them as "(all)"'s twin.
             "-",

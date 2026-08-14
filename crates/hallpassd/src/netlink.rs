@@ -84,7 +84,9 @@ impl<'a> Attrs<'a> {
     /// lookup at a nesting level (`Attrs` is an iterator, so it is not
     /// `Copy` - a copied iterator silently resets its walk).
     pub fn get(&self, kind: u16) -> Option<&'a [u8]> {
-        Attrs::new(self.buf).find(|(k, _)| *k == kind).map(|(_, v)| v)
+        Attrs::new(self.buf)
+            .find(|(k, _)| *k == kind)
+            .map(|(_, v)| v)
     }
 }
 
@@ -120,15 +122,20 @@ mod tests {
         // type 2 with a 4-byte value.
         let mut buf = nla(1, &[0xaa, 0xbb, 0xcc]);
         buf.extend_from_slice(&nla(2, &[1, 2, 3, 4]));
-        let got: Vec<(u16, Vec<u8>)> =
-            Attrs::new(&buf).map(|(k, v)| (k, v.to_vec())).collect();
-        assert_eq!(got, vec![(1, vec![0xaa, 0xbb, 0xcc]), (2, vec![1, 2, 3, 4])]);
+        let got: Vec<(u16, Vec<u8>)> = Attrs::new(&buf).map(|(k, v)| (k, v.to_vec())).collect();
+        assert_eq!(
+            got,
+            vec![(1, vec![0xaa, 0xbb, 0xcc]), (2, vec![1, 2, 3, 4])]
+        );
     }
 
     #[test]
     fn get_masks_the_nested_flag() {
         let buf = nla(CTA_TUPLE_ORIG | NLA_F_NESTED, &[9, 9, 9, 9]);
-        assert_eq!(Attrs::new(&buf).get(CTA_TUPLE_ORIG), Some(&[9, 9, 9, 9][..]));
+        assert_eq!(
+            Attrs::new(&buf).get(CTA_TUPLE_ORIG),
+            Some(&[9, 9, 9, 9][..])
+        );
     }
 
     #[test]

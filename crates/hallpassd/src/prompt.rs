@@ -242,7 +242,11 @@ impl PromptTable {
     /// Release the handler slot if `tx` currently holds it.
     pub fn clear_handler(&self, tx: &Sender<DaemonMsg>) {
         let mut inner = self.inner.lock().unwrap();
-        if inner.handler.as_ref().is_some_and(|h| h.tx.same_channel(tx)) {
+        if inner
+            .handler
+            .as_ref()
+            .is_some_and(|h| h.tx.same_channel(tx))
+        {
             inner.handler = None;
             self.handler_present.store(false, Ordering::Relaxed);
         }
@@ -314,9 +318,7 @@ impl PromptTable {
             // kernel gets its queue slot back rather than at the deadline.
             self.stats.record_prompt_overflow();
             tracing::debug!("prompt packet budget full, applying default verdict");
-            let _ = self
-                .verdict_tx
-                .send((seq, self.settings.default_verdict()));
+            let _ = self.verdict_tx.send((seq, self.settings.default_verdict()));
             return;
         }
 
@@ -517,7 +519,15 @@ impl PromptTable {
         let mut rule_name = None;
         let mut added_rule = None;
         if duration != RuleDuration::Once {
-            match rule_from_reply(&self.run_tag, id, &pending.conn, verdict, duration, scope, pin) {
+            match rule_from_reply(
+                &self.run_tag,
+                id,
+                &pending.conn,
+                verdict,
+                duration,
+                scope,
+                pin,
+            ) {
                 Some(rule) => {
                     rule_name = Some(rule.name.clone());
                     if let Err(e) = self.store.add(rule.clone()) {
@@ -699,7 +709,9 @@ impl PromptTable {
         let Some(mut handler) = inner.handler.take() else {
             return;
         };
-        let _ = handler.tx.try_send(DaemonMsg::PromptExpired { id: expired_id });
+        let _ = handler
+            .tx
+            .try_send(DaemonMsg::PromptExpired { id: expired_id });
         handler.unanswered += 1;
         if handler.unanswered < MAX_UNANSWERED_EXPIRIES {
             inner.handler = Some(handler);
@@ -736,7 +748,11 @@ impl PromptTable {
     /// client cannot pass the check and then have the slot change under it.
     fn take_as_handler(&self, tx: &Sender<DaemonMsg>, id: u64) -> Result<Pending, String> {
         let mut inner = self.inner.lock().unwrap();
-        if !inner.handler.as_ref().is_some_and(|h| h.tx.same_channel(tx)) {
+        if !inner
+            .handler
+            .as_ref()
+            .is_some_and(|h| h.tx.same_channel(tx))
+        {
             return Err("not the registered prompt handler".to_string());
         }
         let pending = inner
@@ -773,7 +789,8 @@ impl PromptTable {
         // packets are handed back under (the queue thread re-reads at
         // hand-back, so a toggle in between can still straddle, but never
         // by more than the one packet already in flight).
-        self.events.emit(conn, verdict, rule, self.settings.enforcing());
+        self.events
+            .emit(conn, verdict, rule, self.settings.enforcing());
     }
 
     /// Resolve packets with the configured default verdict (no handler,
@@ -920,8 +937,14 @@ mod tests {
         /// The stats snapshot a client would read, with the table's own
         /// handler state in it.
         fn snapshot(&self) -> hallpass_types::Stats {
-            self.stats
-                .snapshot(0, 0, self.table.has_handler(), true, None, Default::default())
+            self.stats.snapshot(
+                0,
+                0,
+                self.table.has_handler(),
+                true,
+                None,
+                Default::default(),
+            )
         }
     }
 
@@ -1032,20 +1055,31 @@ mod tests {
         let mut h = harness("lockdown-reply", 8, Verdict::Allow);
         let (tx, mut prompt_rx) = mpsc::channel(64);
         assert!(h.table.set_handler(tx.clone()));
-        h.table.handle_new(conn("/bin/curl", "1.1.1.1:443"), 1, None);
+        h.table
+            .handle_new(conn("/bin/curl", "1.1.1.1:443"), 1, None);
         let DaemonMsg::PromptRequest { id, .. } = prompt_rx.recv().await.unwrap() else {
             panic!("expected PromptRequest");
         };
 
         h.settings.set_locked_down(true);
         h.table
-            .reply(&tx, id, Verdict::Allow, RuleDuration::Forever, PromptScope::ThisPort, false)
+            .reply(
+                &tx,
+                id,
+                Verdict::Allow,
+                RuleDuration::Forever,
+                PromptScope::ThisPort,
+                false,
+            )
             .expect("the reply is accepted, the answer is not");
         assert_eq!(h.verdict_rx.recv().await, Some((1, Verdict::Deny)));
         // And no rule is written: it would carry no pinned tag, so it would
         // be suppressed the instant it existed, leaving an allow rule in the
         // listing that permits nothing.
-        assert!(h.store.list().is_empty(), "an answer wrote policy through the posture");
+        assert!(
+            h.store.list().is_empty(),
+            "an answer wrote policy through the posture"
+        );
     }
 
     /// A rule the posture suppresses must not sweep live prompts either.
@@ -1058,7 +1092,8 @@ mod tests {
         let mut h = harness("lockdown-sweep", 8, Verdict::Deny);
         let (tx, mut prompt_rx) = mpsc::channel(64);
         assert!(h.table.set_handler(tx.clone()));
-        h.table.handle_new(conn("/bin/curl", "1.1.1.1:443"), 1, None);
+        h.table
+            .handle_new(conn("/bin/curl", "1.1.1.1:443"), 1, None);
         let DaemonMsg::PromptRequest { .. } = prompt_rx.recv().await.unwrap() else {
             panic!("expected PromptRequest");
         };
@@ -1077,7 +1112,9 @@ mod tests {
                 ..Default::default()
             },
         };
-        h.store.add(untagged.clone()).expect("adds are not refused under a posture");
+        h.store
+            .add(untagged.clone())
+            .expect("adds are not refused under a posture");
         h.table.resolve_covered_by(&untagged);
         assert!(
             h.verdict_rx.try_recv().is_err(),
@@ -1187,7 +1224,14 @@ mod tests {
                 panic!("expected PromptRequest");
             };
             h.table
-                .reply(&tx, id, Verdict::Deny, RuleDuration::Once, PromptScope::ThisPort, false)
+                .reply(
+                    &tx,
+                    id,
+                    Verdict::Deny,
+                    RuleDuration::Once,
+                    PromptScope::ThisPort,
+                    false,
+                )
                 .expect("the handler answers");
             assert_eq!(h.verdict_rx.recv().await, Some((seq, Verdict::Deny)));
         }
@@ -1218,8 +1262,9 @@ mod tests {
         assert!(!rule.name.contains('\x1b'), "{:?}", rule.name);
         assert!(!rule.name.contains('\r'), "{:?}", rule.name);
         assert!(
-            rule.name.chars().all(|ch| ch.is_ascii_alphanumeric()
-                || matches!(ch, '.' | '_' | '-')),
+            rule.name
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-')),
             "{:?}",
             rule.name
         );
@@ -1292,7 +1337,14 @@ mod tests {
         };
 
         h.table
-            .reply(&tx, id, Verdict::Allow, RuleDuration::Forever, PromptScope::ThisPort, true)
+            .reply(
+                &tx,
+                id,
+                Verdict::Allow,
+                RuleDuration::Forever,
+                PromptScope::ThisPort,
+                true,
+            )
             .expect("the reply is accepted");
 
         // The verdict still reached the held packet: refusing to remember a
@@ -1357,17 +1409,31 @@ mod tests {
         let mut c = conn("/app/bin/firefox", "1.1.1.1:443");
         c.app_id = Some("flatpak:org.mozilla.firefox".into());
         let generated = |verdict| {
-            rule_from_reply("abc", 7, &c, verdict, RuleDuration::Forever, PromptScope::AppAnywhere, None)
-                .expect("a rule is generated")
+            rule_from_reply(
+                "abc",
+                7,
+                &c,
+                verdict,
+                RuleDuration::Forever,
+                PromptScope::AppAnywhere,
+                None,
+            )
+            .expect("a rule is generated")
         };
 
         let allow = generated(Verdict::Allow);
         assert_eq!(allow.matcher.exe, Some(PathBuf::from("/app/bin/firefox")));
-        assert_eq!(allow.matcher.app_id.as_deref(), Some("flatpak:org.mozilla.firefox"));
+        assert_eq!(
+            allow.matcher.app_id.as_deref(),
+            Some("flatpak:org.mozilla.firefox")
+        );
 
         for verdict in [Verdict::Deny, Verdict::Reject] {
             let rule = generated(verdict);
-            assert_eq!(rule.matcher.app_id, None, "{verdict:?} must not be narrowed");
+            assert_eq!(
+                rule.matcher.app_id, None,
+                "{verdict:?} must not be narrowed"
+            );
             assert_eq!(rule.matcher.exe, Some(PathBuf::from("/app/bin/firefox")));
         }
 
@@ -1481,14 +1547,28 @@ mod tests {
 
         let err = h
             .table
-            .reply(&other, id, Verdict::Allow, RuleDuration::Once, PromptScope::ThisPort, false)
+            .reply(
+                &other,
+                id,
+                Verdict::Allow,
+                RuleDuration::Once,
+                PromptScope::ThisPort,
+                false,
+            )
             .expect_err("a non-handler must not answer");
         assert!(err.contains("prompt handler"), "{err}");
         // The prompt is untouched: no verdict released, still answerable.
         assert!(h.verdict_rx.try_recv().is_err());
 
         h.table
-            .reply(&tx, id, Verdict::Deny, RuleDuration::Once, PromptScope::ThisPort, false)
+            .reply(
+                &tx,
+                id,
+                Verdict::Deny,
+                RuleDuration::Once,
+                PromptScope::ThisPort,
+                false,
+            )
             .expect("the handler may answer");
         assert_eq!(h.verdict_rx.recv().await, Some((1, Verdict::Deny)));
     }
@@ -1509,13 +1589,30 @@ mod tests {
         assert!(prompt_rx.try_recv().is_err(), "second packet coalesced");
 
         h.table
-            .reply(&tx, id, Verdict::Deny, RuleDuration::Once, PromptScope::ThisPort, false)
+            .reply(
+                &tx,
+                id,
+                Verdict::Deny,
+                RuleDuration::Once,
+                PromptScope::ThisPort,
+                false,
+            )
             .unwrap();
         assert_eq!(h.verdict_rx.recv().await, Some((1, Verdict::Deny)));
         assert_eq!(h.verdict_rx.recv().await, Some((2, Verdict::Deny)));
         // Once: no rule created.
         assert!(h.store.list().is_empty());
-        assert!(h.table.reply(&tx, id, Verdict::Allow, RuleDuration::Once, PromptScope::ThisPort, false).is_err());
+        assert!(h
+            .table
+            .reply(
+                &tx,
+                id,
+                Verdict::Allow,
+                RuleDuration::Once,
+                PromptScope::ThisPort,
+                false
+            )
+            .is_err());
     }
 
     #[tokio::test]
@@ -1535,10 +1632,20 @@ mod tests {
             panic!("expected PromptRequest");
         };
         h.table
-            .reply(&tx, id, Verdict::Allow, RuleDuration::Once, PromptScope::ThisHost, false)
+            .reply(
+                &tx,
+                id,
+                Verdict::Allow,
+                RuleDuration::Once,
+                PromptScope::ThisHost,
+                false,
+            )
             .unwrap();
         assert_eq!(h.verdict_rx.recv().await, Some((1, Verdict::Allow)));
-        assert!(h.store.list().is_empty(), "Once creates no rule for UDP either");
+        assert!(
+            h.store.list().is_empty(),
+            "Once creates no rule for UDP either"
+        );
     }
 
     /// An app-wide (or host-wide) answer resolves the other prompts the
@@ -1551,10 +1658,14 @@ mod tests {
         assert!(h.table.set_handler(tx.clone()));
 
         // One app, three endpoints; another app, one endpoint.
-        h.table.handle_new(conn("/usr/bin/chrome", "1.1.1.1:443"), 1, None);
-        h.table.handle_new(conn("/usr/bin/chrome", "2.2.2.2:443"), 2, None);
-        h.table.handle_new(conn("/usr/bin/chrome", "3.3.3.3:80"), 3, None);
-        h.table.handle_new(conn("/bin/other", "4.4.4.4:443"), 4, None);
+        h.table
+            .handle_new(conn("/usr/bin/chrome", "1.1.1.1:443"), 1, None);
+        h.table
+            .handle_new(conn("/usr/bin/chrome", "2.2.2.2:443"), 2, None);
+        h.table
+            .handle_new(conn("/usr/bin/chrome", "3.3.3.3:80"), 3, None);
+        h.table
+            .handle_new(conn("/bin/other", "4.4.4.4:443"), 4, None);
         let DaemonMsg::PromptRequest { id: first, .. } = prompt_rx.recv().await.unwrap() else {
             panic!("expected PromptRequest");
         };
@@ -1564,7 +1675,14 @@ mod tests {
 
         // Allow the app anywhere: every chrome prompt resolves allow.
         h.table
-            .reply(&tx, first, Verdict::Allow, RuleDuration::Session, PromptScope::AppAnywhere, false)
+            .reply(
+                &tx,
+                first,
+                Verdict::Allow,
+                RuleDuration::Session,
+                PromptScope::AppAnywhere,
+                false,
+            )
             .unwrap();
         let mut released = std::collections::HashMap::new();
         for _ in 0..3 {
@@ -1573,7 +1691,12 @@ mod tests {
         }
         assert_eq!(
             released,
-            [(1, Verdict::Allow), (2, Verdict::Allow), (3, Verdict::Allow)].into(),
+            [
+                (1, Verdict::Allow),
+                (2, Verdict::Allow),
+                (3, Verdict::Allow)
+            ]
+            .into(),
             "all three chrome endpoints released with the replied verdict"
         );
 
@@ -1590,7 +1713,14 @@ mod tests {
         assert!(h.verdict_rx.try_recv().is_err());
         let other_id = first + 3;
         h.table
-            .reply(&tx, other_id, Verdict::Deny, RuleDuration::Once, PromptScope::ThisPort, false)
+            .reply(
+                &tx,
+                other_id,
+                Verdict::Deny,
+                RuleDuration::Once,
+                PromptScope::ThisPort,
+                false,
+            )
             .unwrap();
         assert_eq!(h.verdict_rx.recv().await, Some((4, Verdict::Deny)));
     }
@@ -1602,15 +1732,24 @@ mod tests {
         let mut h = harness("narrow", 8, Verdict::Deny);
         let (tx, mut prompt_rx) = mpsc::channel(16);
         assert!(h.table.set_handler(tx.clone()));
-        h.table.handle_new(conn("/usr/bin/chrome", "1.1.1.1:443"), 1, None);
-        h.table.handle_new(conn("/usr/bin/chrome", "2.2.2.2:443"), 2, None);
+        h.table
+            .handle_new(conn("/usr/bin/chrome", "1.1.1.1:443"), 1, None);
+        h.table
+            .handle_new(conn("/usr/bin/chrome", "2.2.2.2:443"), 2, None);
         let DaemonMsg::PromptRequest { id: first, .. } = prompt_rx.recv().await.unwrap() else {
             panic!("expected PromptRequest");
         };
         let _ = prompt_rx.recv().await.unwrap();
 
         h.table
-            .reply(&tx, first, Verdict::Allow, RuleDuration::Session, PromptScope::ThisPort, false)
+            .reply(
+                &tx,
+                first,
+                Verdict::Allow,
+                RuleDuration::Session,
+                PromptScope::ThisPort,
+                false,
+            )
             .unwrap();
         assert_eq!(h.verdict_rx.recv().await, Some((1, Verdict::Allow)));
         // The second endpoint's prompt is still pending: no verdict, no
@@ -1640,13 +1779,27 @@ mod tests {
         assert_ne!(tcp_id, udp_id);
 
         h.table
-            .reply(&tx, tcp_id, Verdict::Deny, RuleDuration::Once, PromptScope::ThisPort, false)
+            .reply(
+                &tx,
+                tcp_id,
+                Verdict::Deny,
+                RuleDuration::Once,
+                PromptScope::ThisPort,
+                false,
+            )
             .unwrap();
         assert_eq!(h.verdict_rx.recv().await, Some((1, Verdict::Deny)));
         // The UDP prompt is untouched and still answerable.
         assert!(h.verdict_rx.try_recv().is_err());
         h.table
-            .reply(&tx, udp_id, Verdict::Allow, RuleDuration::Once, PromptScope::ThisPort, false)
+            .reply(
+                &tx,
+                udp_id,
+                Verdict::Allow,
+                RuleDuration::Once,
+                PromptScope::ThisPort,
+                false,
+            )
             .unwrap();
         assert_eq!(h.verdict_rx.recv().await, Some((2, Verdict::Allow)));
     }
@@ -1668,14 +1821,24 @@ mod tests {
         drop(rx1);
         let (tx2, mut rx2) = mpsc::channel(16);
         assert!(h.table.set_handler(tx2.clone()));
-        let DaemonMsg::PromptRequest { id: redelivered, .. } = rx2.recv().await.unwrap() else {
+        let DaemonMsg::PromptRequest {
+            id: redelivered, ..
+        } = rx2.recv().await.unwrap()
+        else {
             panic!("expected the pending prompt to be re-delivered");
         };
         assert_eq!(redelivered, id);
 
         // The new handler owns the slot now, so it is the one that may answer.
         h.table
-            .reply(&tx2, id, Verdict::Deny, RuleDuration::Once, PromptScope::ThisPort, false)
+            .reply(
+                &tx2,
+                id,
+                Verdict::Deny,
+                RuleDuration::Once,
+                PromptScope::ThisPort,
+                false,
+            )
             .unwrap();
         assert_eq!(h.verdict_rx.recv().await, Some((1, Verdict::Deny)));
     }
@@ -1723,7 +1886,14 @@ mod tests {
         // The prompt is untouched: still one popup, still answerable, and
         // its answer still governs every packet it did hold.
         h.table
-            .reply(&tx, id, Verdict::Allow, RuleDuration::Once, PromptScope::ThisPort, false)
+            .reply(
+                &tx,
+                id,
+                Verdict::Allow,
+                RuleDuration::Once,
+                PromptScope::ThisPort,
+                false,
+            )
             .expect("the prompt survives the packet budget");
         assert_eq!(h.verdict_rx.recv().await, Some((0, Verdict::Allow)));
     }
@@ -1744,8 +1914,11 @@ mod tests {
         // MAX_PACKETS_PER_EXE packets, none of them a repeat.
         let mut seq = 0u64;
         for port in 0..(MAX_PACKETS_PER_EXE as u16) {
-            h.table
-                .handle_new(conn("/bin/loud", &format!("1.1.1.1:{}", 1000 + port)), seq, None);
+            h.table.handle_new(
+                conn("/bin/loud", &format!("1.1.1.1:{}", 1000 + port)),
+                seq,
+                None,
+            );
             seq += 1;
         }
         assert!(
@@ -1755,14 +1928,16 @@ mod tests {
 
         // One more from the same executable, to a fresh destination: over
         // budget, released immediately rather than holding another slot.
-        h.table.handle_new(conn("/bin/loud", "1.1.1.1:9999"), seq, None);
+        h.table
+            .handle_new(conn("/bin/loud", "1.1.1.1:9999"), seq, None);
         assert_eq!(h.verdict_rx.recv().await, Some((seq, Verdict::Deny)));
         assert_eq!(h.snapshot().prompts_overflowed, 1);
 
         // A different executable is unaffected: this is a per-exe share, not
         // a global stop.
         seq += 1;
-        h.table.handle_new(conn("/bin/quiet", "2.2.2.2:443"), seq, None);
+        h.table
+            .handle_new(conn("/bin/quiet", "2.2.2.2:443"), seq, None);
         assert!(
             h.verdict_rx.try_recv().is_err(),
             "one loud executable must not deny everyone else a prompt"
@@ -1790,15 +1965,18 @@ mod tests {
         // The first application spends its whole share.
         let mut seq = 0u64;
         for port in 0..(MAX_PACKETS_PER_EXE as u16) {
-            h.table.handle_new(from("flatpak:com.example.First", 1000 + port), seq, None);
+            h.table
+                .handle_new(from("flatpak:com.example.First", 1000 + port), seq, None);
             seq += 1;
         }
-        h.table.handle_new(from("flatpak:com.example.First", 9999), seq, None);
+        h.table
+            .handle_new(from("flatpak:com.example.First", 9999), seq, None);
         assert_eq!(h.verdict_rx.recv().await, Some((seq, Verdict::Deny)));
 
         // The second is still asked about, though it runs from the same path.
         seq += 1;
-        h.table.handle_new(from("flatpak:com.example.Second", 443), seq, None);
+        h.table
+            .handle_new(from("flatpak:com.example.Second", 443), seq, None);
         assert!(
             h.verdict_rx.try_recv().is_err(),
             "a second application must not inherit the first's spent budget"
@@ -1822,12 +2000,22 @@ mod tests {
         h.table.resolve_pending_for_observe();
 
         assert_eq!(h.verdict_rx.recv().await, Some((11, Verdict::Allow)));
-        assert_eq!(prompt_rx.recv().await, Some(DaemonMsg::PromptExpired { id }));
+        assert_eq!(
+            prompt_rx.recv().await,
+            Some(DaemonMsg::PromptExpired { id })
+        );
         // The prompt is gone from the table, so a late answer is refused
         // rather than resolving a flow that was already released.
         assert!(h
             .table
-            .reply(&tx, id, Verdict::Deny, RuleDuration::Once, PromptScope::ThisPort, false)
+            .reply(
+                &tx,
+                id,
+                Verdict::Deny,
+                RuleDuration::Once,
+                PromptScope::ThisPort,
+                false
+            )
             .is_err());
     }
 
@@ -1947,7 +2135,10 @@ mod tests {
         };
         tokio::time::advance(Duration::from_secs(6)).await;
         assert_eq!(h.verdict_rx.recv().await, Some((9, Verdict::Deny)));
-        assert_eq!(prompt_rx.recv().await, Some(DaemonMsg::PromptExpired { id }));
+        assert_eq!(
+            prompt_rx.recv().await,
+            Some(DaemonMsg::PromptExpired { id })
+        );
     }
 
     /// A runtime settings change: the new timeout arms prompts created
@@ -1962,8 +2153,10 @@ mod tests {
 
         // Armed under timeout=5s.
         h.table.handle_new(conn("/bin/a", "1.1.1.1:443"), 1, None);
-        let DaemonMsg::PromptRequest { deadline_ms: first_deadline, .. } =
-            prompt_rx.recv().await.unwrap()
+        let DaemonMsg::PromptRequest {
+            deadline_ms: first_deadline,
+            ..
+        } = prompt_rx.recv().await.unwrap()
         else {
             panic!("expected PromptRequest");
         };
@@ -1974,8 +2167,10 @@ mod tests {
 
         // A prompt created after the change carries the longer deadline.
         h.table.handle_new(conn("/bin/b", "2.2.2.2:443"), 2, None);
-        let DaemonMsg::PromptRequest { deadline_ms: second_deadline, .. } =
-            prompt_rx.recv().await.unwrap()
+        let DaemonMsg::PromptRequest {
+            deadline_ms: second_deadline,
+            ..
+        } = prompt_rx.recv().await.unwrap()
         else {
             panic!("expected PromptRequest");
         };
@@ -2004,19 +2199,30 @@ mod tests {
         let mut h = harness("rule", 4, Verdict::Allow);
         let (tx, mut prompt_rx) = mpsc::channel(16);
         assert!(h.table.set_handler(tx.clone()));
-        h.table.handle_new(conn("/usr/bin/curl", "9.9.9.9:853"), 1, None);
+        h.table
+            .handle_new(conn("/usr/bin/curl", "9.9.9.9:853"), 1, None);
         let DaemonMsg::PromptRequest { id, .. } = prompt_rx.recv().await.unwrap() else {
             panic!("expected PromptRequest");
         };
         h.table
-            .reply(&tx, id, Verdict::Allow, RuleDuration::Session, PromptScope::ThisHost, false)
+            .reply(
+                &tx,
+                id,
+                Verdict::Allow,
+                RuleDuration::Session,
+                PromptScope::ThisHost,
+                false,
+            )
             .unwrap();
         assert_eq!(h.verdict_rx.recv().await, Some((1, Verdict::Allow)));
 
         let rules = h.store.list();
         assert_eq!(rules.len(), 1);
         let r = &rules[0];
-        assert_eq!(r.matcher.exe.as_deref(), Some(std::path::Path::new("/usr/bin/curl")));
+        assert_eq!(
+            r.matcher.exe.as_deref(),
+            Some(std::path::Path::new("/usr/bin/curl"))
+        );
         assert_eq!(r.matcher.dest.as_deref(), Some("9.9.9.9"));
         assert_eq!(r.matcher.port, None, "ThisHost scope has no port");
         assert_eq!(r.duration, RuleDuration::Session);
@@ -2025,20 +2231,45 @@ mod tests {
     #[test]
     fn scope_matchers() {
         let c = conn("/usr/bin/curl", "9.9.9.9:853");
-        let r = rule_from_reply("abc", 1, &c, Verdict::Deny, RuleDuration::Session, PromptScope::ThisPort, None)
-            .unwrap();
+        let r = rule_from_reply(
+            "abc",
+            1,
+            &c,
+            Verdict::Deny,
+            RuleDuration::Session,
+            PromptScope::ThisPort,
+            None,
+        )
+        .unwrap();
         assert_eq!(r.matcher.dest.as_deref(), Some("9.9.9.9"));
         assert_eq!(r.matcher.port, Some(853));
         assert_eq!(r.action, hallpass_types::Action::Deny);
 
-        let r = rule_from_reply("abc", 2, &c, Verdict::Allow, RuleDuration::Forever, PromptScope::AppAnywhere, None)
-            .unwrap();
+        let r = rule_from_reply(
+            "abc",
+            2,
+            &c,
+            Verdict::Allow,
+            RuleDuration::Forever,
+            PromptScope::AppAnywhere,
+            None,
+        )
+        .unwrap();
         assert_eq!(r.matcher.dest, None);
         assert_eq!(r.matcher.port, None);
         assert!(r.matcher.exe.is_some());
 
         let mut anon = c.clone();
         anon.exe_path = None;
-        assert!(rule_from_reply("abc", 3, &anon, Verdict::Allow, RuleDuration::Session, PromptScope::AppAnywhere, None).is_none());
+        assert!(rule_from_reply(
+            "abc",
+            3,
+            &anon,
+            Verdict::Allow,
+            RuleDuration::Session,
+            PromptScope::AppAnywhere,
+            None
+        )
+        .is_none());
     }
 }

@@ -123,7 +123,9 @@ async fn config_show_roundtrip() {
             default_verdict: Verdict::Deny,
             enforce: true,
         });
-        wire::write_msg(&mut stream, &reply).await.expect("write config");
+        wire::write_msg(&mut stream, &reply)
+            .await
+            .expect("write config");
         // `config` asks about the posture too: the settings reply carries
         // what the operator set, so a locked-down host needs the extra line
         // to explain why it is not what is in force.
@@ -174,7 +176,9 @@ async fn config_set_carries_unnamed_settings_forward() {
                 ..current
             }
         );
-        wire::write_msg(&mut stream, &DaemonMsg::Ok).await.expect("write ok");
+        wire::write_msg(&mut stream, &DaemonMsg::Ok)
+            .await
+            .expect("write ok");
 
         let req: ClientMsg = wire::read_msg(&mut stream).await.expect("read refetch");
         assert_eq!(req, ClientMsg::ConfigGet);
@@ -213,7 +217,9 @@ async fn config_set_surfaces_daemon_rejection() {
             default_verdict: Verdict::Deny,
             enforce: true,
         });
-        wire::write_msg(&mut stream, &reply).await.expect("write current");
+        wire::write_msg(&mut stream, &reply)
+            .await
+            .expect("write current");
 
         let req: ClientMsg = wire::read_msg(&mut stream).await.expect("read set");
         assert!(matches!(req, ClientMsg::ConfigSet(_)));
@@ -250,7 +256,9 @@ async fn daemon_err_is_surfaced() {
 
     let mut client = Client::connect(&path).await.expect("connect");
     let err = client
-        .request(ClientMsg::RuleDelete { name: "nope".into() })
+        .request(ClientMsg::RuleDelete {
+            name: "nope".into(),
+        })
         .await
         .expect_err("should fail");
     assert_eq!(err.exit_code(), hallpass_cli::EXIT_ERR);
@@ -298,16 +306,30 @@ async fn explain_roundtrip() {
                 },
             ],
         });
-        wire::write_msg(&mut stream, &reply).await.expect("write explanation");
+        wire::write_msg(&mut stream, &reply)
+            .await
+            .expect("write explanation");
     }));
 
     let hash = "ab".repeat(32);
     let args = argv(
         &path,
         &[
-            "explain", "--exe", "/usr/bin/curl", "--dest", "93.184.216.34", "--port",
-            "443", "--proto", "udp", "--domain", "example.org", "--user", "1000",
-            "--exe-sha256", &hash,
+            "explain",
+            "--exe",
+            "/usr/bin/curl",
+            "--dest",
+            "93.184.216.34",
+            "--port",
+            "443",
+            "--proto",
+            "udp",
+            "--domain",
+            "example.org",
+            "--user",
+            "1000",
+            "--exe-sha256",
+            &hash,
         ],
     );
     assert_eq!(hallpass_cli::run(&args).await, hallpass_cli::EXIT_OK);
@@ -323,8 +345,7 @@ async fn import_reports_each_rule_and_exits_non_zero() {
     let path = temp_sock("import");
     let listener = UnixListener::bind(&path).expect("bind");
 
-    let doc = std::env::temp_dir()
-        .join(format!("hallpass-cli-test-{}.toml", std::process::id()));
+    let doc = std::env::temp_dir().join(format!("hallpass-cli-test-{}.toml", std::process::id()));
     // Written by hand rather than exported, so the documented shape is what
     // is being tested and not just this build's serializer.
     std::fs::write(
@@ -368,7 +389,9 @@ async fn import_reports_each_rule_and_exits_non_zero() {
         };
         assert_eq!(rule.name, "second");
         assert_eq!(rule.matcher.domain.as_deref(), Some("example.org"));
-        wire::write_msg(&mut stream, &DaemonMsg::Ok).await.expect("write ok");
+        wire::write_msg(&mut stream, &DaemonMsg::Ok)
+            .await
+            .expect("write ok");
     }));
 
     let args = argv(&path, &["rules", "import", &doc.display().to_string()]);

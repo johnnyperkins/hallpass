@@ -114,9 +114,15 @@ mod tests {
     #[test]
     fn socket_arg_separate_and_equals() {
         let args = vec!["--socket".to_string(), "/tmp/s.sock".to_string()];
-        assert_eq!(parse_args(args).unwrap().socket, PathBuf::from("/tmp/s.sock"));
+        assert_eq!(
+            parse_args(args).unwrap().socket,
+            PathBuf::from("/tmp/s.sock")
+        );
         let args = vec!["--socket=/tmp/t.sock".to_string()];
-        assert_eq!(parse_args(args).unwrap().socket, PathBuf::from("/tmp/t.sock"));
+        assert_eq!(
+            parse_args(args).unwrap().socket,
+            PathBuf::from("/tmp/t.sock")
+        );
     }
 
     #[test]

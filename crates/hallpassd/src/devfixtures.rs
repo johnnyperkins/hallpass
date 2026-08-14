@@ -55,20 +55,55 @@ struct Scenario {
 /// (allowed, denied, rejected, and matched by no rule at all). Editing that
 /// policy, or adding to it from a client, changes what these are decided by.
 const SCENARIOS: &[Scenario] = &[
-    Scenario { exe: "/usr/bin/curl", cmdline: "curl https://example.org",
-        domain: "example.org", port: 443, app_id: "" },
-    Scenario { exe: "/app/bin/firefox", cmdline: "firefox",
-        domain: "cdn.example.net", port: 443, app_id: "flatpak:org.mozilla.firefox" },
-    Scenario { exe: "/usr/lib/firefox/firefox", cmdline: "firefox",
-        domain: "telemetry.example.com", port: 443, app_id: "" },
-    Scenario { exe: "/usr/bin/ssh", cmdline: "ssh build@10.0.0.9",
-        domain: "", port: 22, app_id: "" },
-    Scenario { exe: "/usr/bin/apt", cmdline: "apt update",
-        domain: "deb.example.org", port: 80, app_id: "" },
-    Scenario { exe: "/tmp/.cache/miner", cmdline: "./miner --pool",
-        domain: "pool.example.biz", port: 3333, app_id: "" },
-    Scenario { exe: "/usr/bin/python3", cmdline: "python3 backup.py",
-        domain: "backup.example.org", port: 8443, app_id: "" },
+    Scenario {
+        exe: "/usr/bin/curl",
+        cmdline: "curl https://example.org",
+        domain: "example.org",
+        port: 443,
+        app_id: "",
+    },
+    Scenario {
+        exe: "/app/bin/firefox",
+        cmdline: "firefox",
+        domain: "cdn.example.net",
+        port: 443,
+        app_id: "flatpak:org.mozilla.firefox",
+    },
+    Scenario {
+        exe: "/usr/lib/firefox/firefox",
+        cmdline: "firefox",
+        domain: "telemetry.example.com",
+        port: 443,
+        app_id: "",
+    },
+    Scenario {
+        exe: "/usr/bin/ssh",
+        cmdline: "ssh build@10.0.0.9",
+        domain: "",
+        port: 22,
+        app_id: "",
+    },
+    Scenario {
+        exe: "/usr/bin/apt",
+        cmdline: "apt update",
+        domain: "deb.example.org",
+        port: 80,
+        app_id: "",
+    },
+    Scenario {
+        exe: "/tmp/.cache/miner",
+        cmdline: "./miner --pool",
+        domain: "pool.example.biz",
+        port: 3333,
+        app_id: "",
+    },
+    Scenario {
+        exe: "/usr/bin/python3",
+        cmdline: "python3 backup.py",
+        domain: "backup.example.org",
+        port: 8443,
+        app_id: "",
+    },
 ];
 
 /// Start the generator. One task, stopped only by the process exiting.
@@ -107,7 +142,9 @@ pub fn spawn(
             let mut conn = Connection {
                 tuple: FlowTuple {
                     proto: Proto::Tcp,
-                    src: format!("10.0.0.2:{src_port}").parse().expect("static src addr"),
+                    src: format!("10.0.0.2:{src_port}")
+                        .parse()
+                        .expect("static src addr"),
                     dst: format!("93.184.216.{last_octet}:{}", s.port)
                         .parse()
                         .expect("static dst addr"),

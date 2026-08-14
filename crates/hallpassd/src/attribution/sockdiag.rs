@@ -259,7 +259,9 @@ impl DiagSocket {
                 let Ok(l) = std::net::TcpListener::bind("127.0.0.1:0") else {
                     return false;
                 };
-                let Ok(local) = l.local_addr() else { return false };
+                let Ok(local) = l.local_addr() else {
+                    return false;
+                };
                 self.probe_finds(proto, local, "0.0.0.0:0".parse().unwrap())
             }
             // connect() on UDP sends nothing; it pins the remote side so
@@ -273,7 +275,9 @@ impl DiagSocket {
                 if s.connect(dst).is_err() {
                     return false;
                 }
-                let Ok(local) = s.local_addr() else { return false };
+                let Ok(local) = s.local_addr() else {
+                    return false;
+                };
                 self.probe_finds(proto, local, dst)
             }
         }
@@ -549,4 +553,3 @@ mod tests {
         }
     }
 }
-

@@ -59,7 +59,13 @@ fn ctx() -> PromptContext {
 /// it.
 fn prompt_harness() -> Harness<'static, PromptFixture> {
     let state = PromptFixture {
-        prompt: PromptState::new(1, conn(EXE, "93.184.216.34:443"), NOW_MS + 30_000, NOW_MS, ctx()),
+        prompt: PromptState::new(
+            1,
+            conn(EXE, "93.184.216.34:443"),
+            NOW_MS + 30_000,
+            NOW_MS,
+            ctx(),
+        ),
         answered: Vec::new(),
     };
     Harness::builder()
@@ -82,7 +88,15 @@ fn app_with_prompts(count: u64) -> (HallpassApp, tokio::sync::mpsc::UnboundedRec
     // out, and it reads the clock to do it.
     let now = hallpass_types::unix_ms_now();
     app.prompts.lock().unwrap().pending = (1..=count)
-        .map(|id| PromptState::new(id, conn(EXE, &format!("1.1.1.{id}:443")), now + 30_000, now, ctx()))
+        .map(|id| {
+            PromptState::new(
+                id,
+                conn(EXE, &format!("1.1.1.{id}:443")),
+                now + 30_000,
+                now,
+                ctx(),
+            )
+        })
         .collect();
     (app, from_ui)
 }
@@ -100,7 +114,10 @@ fn buttons_survive_worst_case_content() {
     let mut state = PromptFixture {
         prompt: PromptState::new(
             1,
-            conn(&format!("/very/long/{}/curl", "x".repeat(180)), "93.184.216.34:443"),
+            conn(
+                &format!("/very/long/{}/curl", "x".repeat(180)),
+                "93.184.216.34:443",
+            ),
             NOW_MS + 30_000,
             NOW_MS,
             ctx(),
@@ -139,10 +156,19 @@ fn buttons_survive_worst_case_content() {
 #[test]
 fn a_new_application_is_announced_in_the_prompt_window() {
     let mut fixture = PromptFixture {
-        prompt: PromptState::new(1, conn(EXE, "93.184.216.34:443"), NOW_MS + 30_000, NOW_MS, ctx()),
+        prompt: PromptState::new(
+            1,
+            conn(EXE, "93.184.216.34:443"),
+            NOW_MS + 30_000,
+            NOW_MS,
+            ctx(),
+        ),
         answered: Vec::new(),
     };
-    fixture.prompt.conn.first_seen = Some(hallpass_types::FirstSeen { app: true, dest: true });
+    fixture.prompt.conn.first_seen = Some(hallpass_types::FirstSeen {
+        app: true,
+        dest: true,
+    });
     let mut harness = Harness::builder()
         .with_size(egui::vec2(440.0, 330.0))
         .build_ui_state(
@@ -157,7 +183,13 @@ fn a_new_application_is_announced_in_the_prompt_window() {
     // Nothing new, and tracking off, both render as an ordinary prompt: a
     // window that said "seen before" would be making a claim the daemon may
     // have no basis for.
-    for quiet in [Some(hallpass_types::FirstSeen { app: false, dest: false }), None] {
+    for quiet in [
+        Some(hallpass_types::FirstSeen {
+            app: false,
+            dest: false,
+        }),
+        None,
+    ] {
         harness.state_mut().prompt.conn.first_seen = quiet;
         harness.run();
         assert!(
@@ -264,7 +296,10 @@ fn closing_the_window_dismisses_every_prompt_it_covers() {
     let (app, mut from_ui) = app_with_prompts(3);
     let mut harness = Harness::builder()
         .with_size(egui::vec2(600.0, 500.0))
-        .build_ui_state(|ui, app: &mut HallpassApp| app.prompt_windows(ui.ctx()), app);
+        .build_ui_state(
+            |ui, app: &mut HallpassApp| app.prompt_windows(ui.ctx()),
+            app,
+        );
     // One window, really on screen, for all three: the front prompt names
     // the application and the other two are listed as pending.
     harness.get_by_label(EXE);
@@ -524,9 +559,7 @@ fn toggling_a_rule_asks_the_daemon_instead_of_editing_the_row() {
         .with_size(egui::vec2(820.0, 520.0))
         .build_ui_state(|ui, app: &mut HallpassApp| app.main_window(ui), app);
 
-    harness
-        .get_by_role(egui::accesskit::Role::CheckBox)
-        .click();
+    harness.get_by_role(egui::accesskit::Role::CheckBox).click();
     harness.run();
 
     assert_eq!(
@@ -622,5 +655,8 @@ fn a_filter_whose_tag_stopped_existing_resets() {
     harness.run();
 
     assert_eq!(harness.state().rule_tag_filter, None);
-    assert!(drain(&mut from_ui).is_empty(), "resetting a filter asks nothing");
+    assert!(
+        drain(&mut from_ui).is_empty(),
+        "resetting a filter asks nothing"
+    );
 }

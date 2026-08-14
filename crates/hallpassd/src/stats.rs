@@ -375,8 +375,14 @@ mod tests {
     #[test]
     fn prompt_handler_flag_is_passed_through() {
         let c = Counters::default();
-        assert!(!c.snapshot(0, 0, false, true, None, QueueStats::default()).prompt_handler_connected);
-        assert!(c.snapshot(0, 0, true, true, None, QueueStats::default()).prompt_handler_connected);
+        assert!(
+            !c.snapshot(0, 0, false, true, None, QueueStats::default())
+                .prompt_handler_connected
+        );
+        assert!(
+            c.snapshot(0, 0, true, true, None, QueueStats::default())
+                .prompt_handler_connected
+        );
     }
 
     /// Observe mode has to be visible in the snapshot: `denied` counts what

@@ -422,16 +422,15 @@ impl Config {
     pub fn load(arg: &ConfigArg) -> Result<Config, String> {
         let path = arg.path.as_path();
         let cfg: Config = match read_trusted(path) {
-            Ok(text) => {
-                toml::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?
-            }
+            Ok(text) => toml::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound && !arg.explicit => {
                 tracing::warn!(path = %path.display(), "config file not found, using defaults");
                 Config::default()
             }
             Err(e) => return Err(format!("{}: {e}", path.display())),
         };
-        cfg.validate().map_err(|e| format!("{}: {e}", path.display()))?;
+        cfg.validate()
+            .map_err(|e| format!("{}: {e}", path.display()))?;
         Ok(cfg)
     }
 
@@ -501,7 +500,9 @@ pub fn parse_args<I: Iterator<Item = String>>(mut args: I) -> Result<ConfigArg, 
                 arg_out.synthetic_events = true;
             }
         } else {
-            return Err(format!("unknown argument: {arg} (usage: hallpassd [--config <path>])"));
+            return Err(format!(
+                "unknown argument: {arg} (usage: hallpassd [--config <path>])"
+            ));
         }
     }
     Ok(arg_out)
@@ -690,13 +691,19 @@ mod tests {
         let rx = s.enforce_signal();
         assert!(!rx.has_changed().expect("sender alive"));
 
-        s.apply(&RuntimeConfig { enforce: true, ..s.snapshot() })
-            .expect("valid settings");
+        s.apply(&RuntimeConfig {
+            enforce: true,
+            ..s.snapshot()
+        })
+        .expect("valid settings");
         assert!(rx.has_changed().expect("sender alive"));
 
         let rx = s.enforce_signal();
-        s.apply(&RuntimeConfig { enforce: false, ..s.snapshot() })
-            .expect("valid settings");
+        s.apply(&RuntimeConfig {
+            enforce: false,
+            ..s.snapshot()
+        })
+        .expect("valid settings");
         assert!(!rx.has_changed().expect("sender alive"));
     }
 
@@ -708,8 +715,11 @@ mod tests {
         let s = RuntimeSettings::new(parse(r#"mode = "observe""#).runtime());
         assert!(!s.enforcing());
 
-        s.apply(&RuntimeConfig { enforce: true, ..s.snapshot() })
-            .expect("valid settings");
+        s.apply(&RuntimeConfig {
+            enforce: true,
+            ..s.snapshot()
+        })
+        .expect("valid settings");
         assert!(s.enforcing());
         assert_eq!(s.snapshot().prompt_timeout_secs, 15);
 

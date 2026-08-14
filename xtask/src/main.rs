@@ -85,9 +85,14 @@ fn workspace_root() -> PathBuf {
 /// and the shared target dir come from the crate's own .cargo/config.toml;
 /// nightly + rust-src come from its rust-toolchain.toml.
 fn build_ebpf() -> Result<(), String> {
-    if Command::new("bpf-linker").arg("--version").output().is_err() {
-        return Err("bpf-linker not found in PATH; install it with: cargo install bpf-linker"
-            .to_string());
+    if Command::new("bpf-linker")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        return Err(
+            "bpf-linker not found in PATH; install it with: cargo install bpf-linker".to_string(),
+        );
     }
     let dir = workspace_root().join("crates/hallpass-ebpf");
     run(Command::new("cargo")
@@ -116,7 +121,13 @@ fn clippy_ebpf() -> Result<(), String> {
 
 fn build_workspace() -> Result<(), String> {
     run(Command::new(cargo())
-        .args(["build", "--release", "--workspace", "--features", "hallpassd/ebpf"])
+        .args([
+            "build",
+            "--release",
+            "--workspace",
+            "--features",
+            "hallpassd/ebpf",
+        ])
         .current_dir(workspace_root()))
 }
 
@@ -128,7 +139,13 @@ fn check() -> Result<(), String> {
         .args(["check", "--workspace", "--all-targets"])
         .current_dir(workspace_root()))?;
     run(Command::new(cargo())
-        .args(["check", "-p", "hallpassd", "--features", "ebpf,dev-fixtures"])
+        .args([
+            "check",
+            "-p",
+            "hallpassd",
+            "--features",
+            "ebpf,dev-fixtures",
+        ])
         .current_dir(workspace_root()))
 }
 
@@ -155,7 +172,14 @@ fn test_ebpf_feature() -> Result<(), String> {
 /// code that rots, and this is the feature that fabricates events.
 fn lint() -> Result<(), String> {
     run(Command::new(cargo())
-        .args(["clippy", "--workspace", "--all-targets", "--", "-D", "warnings"])
+        .args([
+            "clippy",
+            "--workspace",
+            "--all-targets",
+            "--",
+            "-D",
+            "warnings",
+        ])
         .current_dir(workspace_root()))?;
     run(Command::new(cargo())
         .args([
@@ -521,7 +545,12 @@ mod tests {
             .collect();
         assert_eq!(
             keys,
-            vec!["socket_path", "rules_dir", "first_seen_state", "lockdown_state"]
+            vec![
+                "socket_path",
+                "rules_dir",
+                "first_seen_state",
+                "lockdown_state"
+            ]
         );
     }
 

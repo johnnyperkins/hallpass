@@ -225,7 +225,10 @@ pub fn parse_response(msg: &[u8]) -> Option<SnoopedResponse> {
     // stops matching is worse than the work of following both.
     let mut index: HashMap<&str, Vec<&str>> = HashMap::new();
     for (owner, target) in &cnames {
-        index.entry(owner.as_str()).or_default().push(target.as_str());
+        index
+            .entry(owner.as_str())
+            .or_default()
+            .push(target.as_str());
     }
     let mut aliases: HashSet<&str> = HashSet::from([query_name.as_str()]);
     let mut queue = vec![query_name.as_str()];
@@ -334,9 +337,7 @@ pub struct IpDomainCache {
 impl IpDomainCache {
     pub fn new(capacity: usize) -> Self {
         IpDomainCache {
-            inner: Mutex::new(LruCache::new(
-                NonZeroUsize::new(capacity.max(1)).unwrap(),
-            )),
+            inner: Mutex::new(LruCache::new(NonZeroUsize::new(capacity.max(1)).unwrap())),
         }
     }
 
@@ -432,7 +433,11 @@ mod tests {
     /// a line of `hallpass-cli watch` output.
     #[test]
     fn control_bytes_in_a_label_reject_the_name() {
-        for hostile in ["ev\nil.example.com", "ev\x1b[2Kil.example.com", "a\rb.example.com"] {
+        for hostile in [
+            "ev\nil.example.com",
+            "ev\x1b[2Kil.example.com",
+            "a\rb.example.com",
+        ] {
             let mut msg = header(0x8180, 1, 1);
             msg.extend(question(hostile));
             msg.extend(record(ptr_to_question(), TYPE_A, 300, &[93, 184, 216, 34]));
@@ -552,8 +557,18 @@ mod tests {
         // www.site.io -> CNAME edge.cdn.net -> CNAME lb1.cdn.net -> A + A
         let mut msg = header(0x8180, 1, 4);
         msg.extend(question("www.site.io"));
-        msg.extend(record(ptr_to_question(), TYPE_CNAME, 300, &wire_name("edge.cdn.net")));
-        msg.extend(record(wire_name("edge.cdn.net"), TYPE_CNAME, 300, &wire_name("lb1.cdn.net")));
+        msg.extend(record(
+            ptr_to_question(),
+            TYPE_CNAME,
+            300,
+            &wire_name("edge.cdn.net"),
+        ));
+        msg.extend(record(
+            wire_name("edge.cdn.net"),
+            TYPE_CNAME,
+            300,
+            &wire_name("lb1.cdn.net"),
+        ));
         msg.extend(record(wire_name("lb1.cdn.net"), TYPE_A, 30, &[1, 2, 3, 4]));
         msg.extend(record(wire_name("lb1.cdn.net"), TYPE_A, 30, &[1, 2, 3, 5]));
         let resp = parse_response(&msg).unwrap();
@@ -581,9 +596,19 @@ mod tests {
         let mut msg = header(0x8180, 1, (LINKS + 1) as u16);
         msg.extend(question("start.example.org"));
         for i in (1..LINKS).rev() {
-            msg.extend(record(wire_name(&name(i)), TYPE_CNAME, 300, &wire_name(&name(i + 1))));
+            msg.extend(record(
+                wire_name(&name(i)),
+                TYPE_CNAME,
+                300,
+                &wire_name(&name(i + 1)),
+            ));
         }
-        msg.extend(record(wire_name("start.example.org"), TYPE_CNAME, 300, &wire_name(&name(1))));
+        msg.extend(record(
+            wire_name("start.example.org"),
+            TYPE_CNAME,
+            300,
+            &wire_name(&name(1)),
+        ));
         msg.extend(record(wire_name(&name(LINKS)), TYPE_A, 30, &[7, 7, 7, 7]));
 
         let start = std::time::Instant::now();
@@ -607,10 +632,30 @@ mod tests {
     fn both_branches_of_a_duplicated_cname_owner_are_followed() {
         let mut msg = header(0x8180, 1, 4);
         msg.extend(question("split.example.org"));
-        msg.extend(record(wire_name("split.example.org"), TYPE_CNAME, 300, &wire_name("a.example.org")));
-        msg.extend(record(wire_name("split.example.org"), TYPE_CNAME, 300, &wire_name("b.example.org")));
-        msg.extend(record(wire_name("a.example.org"), TYPE_A, 30, &[1, 1, 1, 1]));
-        msg.extend(record(wire_name("b.example.org"), TYPE_A, 30, &[2, 2, 2, 2]));
+        msg.extend(record(
+            wire_name("split.example.org"),
+            TYPE_CNAME,
+            300,
+            &wire_name("a.example.org"),
+        ));
+        msg.extend(record(
+            wire_name("split.example.org"),
+            TYPE_CNAME,
+            300,
+            &wire_name("b.example.org"),
+        ));
+        msg.extend(record(
+            wire_name("a.example.org"),
+            TYPE_A,
+            30,
+            &[1, 1, 1, 1],
+        ));
+        msg.extend(record(
+            wire_name("b.example.org"),
+            TYPE_A,
+            30,
+            &[2, 2, 2, 2],
+        ));
         let resp = parse_response(&msg).unwrap();
         let mut addrs: Vec<IpAddr> = resp.addrs.iter().map(|(ip, _)| *ip).collect();
         addrs.sort();
@@ -628,9 +673,24 @@ mod tests {
     fn a_looping_cname_chain_terminates() {
         let mut msg = header(0x8180, 1, 3);
         msg.extend(question("a.example.org"));
-        msg.extend(record(wire_name("a.example.org"), TYPE_CNAME, 300, &wire_name("b.example.org")));
-        msg.extend(record(wire_name("b.example.org"), TYPE_CNAME, 300, &wire_name("a.example.org")));
-        msg.extend(record(wire_name("b.example.org"), TYPE_A, 30, &[5, 5, 5, 5]));
+        msg.extend(record(
+            wire_name("a.example.org"),
+            TYPE_CNAME,
+            300,
+            &wire_name("b.example.org"),
+        ));
+        msg.extend(record(
+            wire_name("b.example.org"),
+            TYPE_CNAME,
+            300,
+            &wire_name("a.example.org"),
+        ));
+        msg.extend(record(
+            wire_name("b.example.org"),
+            TYPE_A,
+            30,
+            &[5, 5, 5, 5],
+        ));
         let resp = parse_response(&msg).expect("the loop still yields its address");
         assert_eq!(resp.addrs, vec![("5.5.5.5".parse().unwrap(), 30)]);
     }

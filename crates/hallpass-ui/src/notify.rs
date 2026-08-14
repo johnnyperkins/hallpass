@@ -108,7 +108,9 @@ struct Tracker<S: Sink> {
 /// Escaped after sanitization: `sanitize_for_display` strips control and
 /// bidi hazards but deliberately leaves printable ASCII alone.
 fn escape_markup(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 /// Banner text for a group: newest last, the front prompt named, the
@@ -382,8 +384,15 @@ mod tests {
             deadline_ms: 40_000,
         };
         let mut fresh = routine.conn.clone();
-        fresh.first_seen = Some(hallpass_types::FirstSeen { app: false, dest: true });
-        let fresh = Entry { id: 2, conn: fresh, deadline_ms: 40_000 };
+        fresh.first_seen = Some(hallpass_types::FirstSeen {
+            app: false,
+            dest: true,
+        });
+        let fresh = Entry {
+            id: 2,
+            conn: fresh,
+            deadline_ms: 40_000,
+        };
 
         let (summary, _) = banner_text(&[routine, fresh]);
         assert_eq!(summary, "Connection request (NEW)");
@@ -393,10 +402,20 @@ mod tests {
     /// banner claiming NEW for a feature that is off would be a lie.
     #[test]
     fn an_ordinary_group_is_not_marked() {
-        for quiet in [Some(hallpass_types::FirstSeen { app: false, dest: false }), None] {
+        for quiet in [
+            Some(hallpass_types::FirstSeen {
+                app: false,
+                dest: false,
+            }),
+            None,
+        ] {
             let mut c = conn(Some("/usr/bin/curl"), None);
             c.first_seen = quiet;
-            let (summary, _) = banner_text(&[Entry { id: 1, conn: c, deadline_ms: 40_000 }]);
+            let (summary, _) = banner_text(&[Entry {
+                id: 1,
+                conn: c,
+                deadline_ms: 40_000,
+            }]);
             assert_eq!(summary, "Connection request", "{quiet:?}");
         }
     }
@@ -452,7 +471,12 @@ mod tests {
         t.handle(request(1, Some("/usr/bin/curl")), 10_000);
         t.handle(request(2, Some("/usr/bin/wget")), 10_000);
         t.handle(NotifyEvent::Disconnected, 10_000);
-        let closes = t.sink.calls.iter().filter(|c| matches!(c, Call::Close(_))).count();
+        let closes = t
+            .sink
+            .calls
+            .iter()
+            .filter(|c| matches!(c, Call::Close(_)))
+            .count();
         assert_eq!(closes, 2, "{:?}", t.sink.calls);
         assert!(t.groups.is_empty());
     }
@@ -464,7 +488,12 @@ mod tests {
         let mut t = tracker();
         t.handle(request(1, None), 10_000);
         t.handle(request(2, None), 10_000);
-        let shows = t.sink.calls.iter().filter(|c| matches!(c, Call::Show(..))).count();
+        let shows = t
+            .sink
+            .calls
+            .iter()
+            .filter(|c| matches!(c, Call::Show(..)))
+            .count();
         assert_eq!(shows, 2, "{:?}", t.sink.calls);
     }
 

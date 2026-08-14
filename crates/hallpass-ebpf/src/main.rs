@@ -23,16 +23,16 @@
 
 use aya_ebpf::{
     helpers::{
-        bpf_get_current_pid_tgid, bpf_get_current_uid_gid, bpf_ktime_get_ns,
-        bpf_probe_read_kernel, bpf_probe_read_user, bpf_probe_read_user_str_bytes,
+        bpf_get_current_pid_tgid, bpf_get_current_uid_gid, bpf_ktime_get_ns, bpf_probe_read_kernel,
+        bpf_probe_read_user, bpf_probe_read_user_str_bytes,
     },
     macros::{kprobe, kretprobe, map, tracepoint, uprobe, uretprobe},
     maps::{LruHashMap, PerCpuArray, RingBuf},
     programs::{ProbeContext, RetProbeContext, TracePointContext},
 };
 use hallpass_ebpf_common::{
-    DnsEvent, ExecEvent, AF_INET, AF_INET6, DNS_NAME_CAP, EVENT_EXEC, EVENT_EXIT, FlowKey,
-    FlowVal, PROTO_TCP, PROTO_UDP,
+    DnsEvent, ExecEvent, FlowKey, FlowVal, AF_INET, AF_INET6, DNS_NAME_CAP, EVENT_EXEC, EVENT_EXIT,
+    PROTO_TCP, PROTO_UDP,
 };
 
 // struct sock_common / msghdr field offsets. Loader-patched globals
@@ -211,7 +211,10 @@ unsafe fn sock_flow_key(sk: u64, proto: u8, dest: Option<(&[u8], u16)>) -> Resul
                 }
                 _ => {
                     let d: u32 = read(sk, off(&OFF_SKC_DADDR))?;
-                    (d.to_ne_bytes(), u16::from_be(read::<u16>(sk, off(&OFF_SKC_DPORT))?))
+                    (
+                        d.to_ne_bytes(),
+                        u16::from_be(read::<u16>(sk, off(&OFF_SKC_DPORT))?),
+                    )
                 }
             };
             Ok(FlowKey::v4(proto, saddr.to_ne_bytes(), sport, daddr, dport))

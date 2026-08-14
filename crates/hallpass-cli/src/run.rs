@@ -236,9 +236,7 @@ async fn next_signal(stream: Option<&mut tokio::signal::unix::Signal>) {
 /// Losing signal forwarding is worth a degraded run rather than a refusal:
 /// a terminal sends SIGINT to the whole foreground process group, so the
 /// child usually receives it directly anyway.
-fn signal_stream(
-    kind: tokio::signal::unix::SignalKind,
-) -> Option<tokio::signal::unix::Signal> {
+fn signal_stream(kind: tokio::signal::unix::SignalKind) -> Option<tokio::signal::unix::Signal> {
     match tokio::signal::unix::signal(kind) {
         Ok(s) => Some(s),
         Err(e) => {

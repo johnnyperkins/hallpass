@@ -189,9 +189,7 @@ impl ProcfsAttributor {
                     );
                     *a.diag.lock().unwrap() = Some((diag, MAX_DIAG_ERRORS));
                 } else {
-                    tracing::warn!(
-                        "sock_diag answered for no protocol; reading /proc/net tables"
-                    );
+                    tracing::warn!("sock_diag answered for no protocol; reading /proc/net tables");
                 }
             }
             Err(e) => {
@@ -305,12 +303,8 @@ impl ProcfsAttributor {
                 return (Some(pid), spent);
             }
         }
-        let (pid, walked) = find_pid_for_inode_within(
-            proc_root,
-            inode,
-            MAX_FDS_PER_PID,
-            MAX_FDS_PER_SCAN - spent,
-        );
+        let (pid, walked) =
+            find_pid_for_inode_within(proc_root, inode, MAX_FDS_PER_PID, MAX_FDS_PER_SCAN - spent);
         (pid, spent + walked)
     }
 
@@ -470,8 +464,8 @@ fn scan_pid_fds(proc_root: &Path, pid: u32, inode: u64, limit: usize) -> (bool, 
     for fd in fds.take(limit) {
         scanned += 1;
         let Ok(fd) = fd else { continue };
-        let holds = std::fs::read_link(fd.path())
-            .is_ok_and(|link| link.as_os_str() == target.as_str());
+        let holds =
+            std::fs::read_link(fd.path()).is_ok_and(|link| link.as_os_str() == target.as_str());
         if holds {
             return (true, scanned);
         }
@@ -493,7 +487,11 @@ fn verified_proc_details(
     if pid_holds_inode(proc_root, pid, inode) {
         Some((pid, exe, cmdline))
     } else {
-        tracing::debug!(pid, inode, "attribution discarded: PID no longer holds socket");
+        tracing::debug!(
+            pid,
+            inode,
+            "attribution discarded: PID no longer holds socket"
+        );
         None
     }
 }
@@ -522,8 +520,8 @@ fn parent_step(proc_root: &Path, pid: u32) -> Option<(u32, PathBuf, u64)> {
     let exe = std::fs::read_link(proc_root.join(ppid.to_string()).join("exe")).ok()?;
     // Re-checked after the readlink as well as inside `parent_of`: the exe
     // just read has to belong to the incarnation being returned.
-    let stable = ppid_of(proc_root, pid) == Some(ppid)
-        && starttime_of(proc_root, ppid) == Some(started);
+    let stable =
+        ppid_of(proc_root, pid) == Some(ppid) && starttime_of(proc_root, ppid) == Some(started);
     stable.then_some((ppid, exe, started))
 }
 
@@ -549,8 +547,8 @@ fn parent_of(proc_root: &Path, pid: u32) -> Option<(u32, u64)> {
         return None;
     }
     let started = starttime_of(proc_root, ppid)?;
-    let stable = ppid_of(proc_root, pid) == Some(ppid)
-        && starttime_of(proc_root, ppid) == Some(started);
+    let stable =
+        ppid_of(proc_root, pid) == Some(ppid) && starttime_of(proc_root, ppid) == Some(started);
     stable.then_some((ppid, started))
 }
 
@@ -935,7 +933,10 @@ mod tests {
             let padding = "0 ".repeat(17);
             std::fs::write(
                 dir.join(pid.to_string()).join("stat"),
-                format!("{pid} (proc{pid}) S {ppid} {padding}{}", u64::from(pid) * 100),
+                format!(
+                    "{pid} (proc{pid}) S {ppid} {padding}{}",
+                    u64::from(pid) * 100
+                ),
             )
             .unwrap();
             std::os::unix::fs::symlink(
@@ -962,7 +963,10 @@ mod tests {
             ],
             "the cap truncates from the far end, keeping the near parents"
         );
-        assert!(ancestry_of(&dir, 9, 0).is_empty(), "a zero cap walks nothing");
+        assert!(
+            ancestry_of(&dir, 9, 0).is_empty(),
+            "a zero cap walks nothing"
+        );
         assert!(
             ancestry_of(&dir, 4242, 8).is_empty(),
             "a process that is already gone has no ancestry"
@@ -1033,7 +1037,11 @@ mod tests {
             None,
             "the depth cap stops the walk short rather than guessing"
         );
-        assert_eq!(covering_root(&dir, 9, &[], 32), None, "no sessions, no coverage");
+        assert_eq!(
+            covering_root(&dir, 9, &[], 32),
+            None,
+            "no sessions, no coverage"
+        );
         assert_eq!(
             covering_root(&dir, 4242, &[(7, started(7))], 32),
             None,
@@ -1273,7 +1281,9 @@ mod tests {
             eprintln!("SKIP sockdiag: /proc walk budget exhausted on this host");
             return;
         }
-        let via_diag = probed.attribute(&tuple).expect("diag path finds our socket");
+        let via_diag = probed
+            .attribute(&tuple)
+            .expect("diag path finds our socket");
         assert_eq!(via_diag.pid, Some(std::process::id()));
         assert_eq!(via_diag, via_file, "the two address halves agree");
     }
@@ -1443,11 +1453,9 @@ mod tests {
             let (min, median) = timed(20, || {
                 read_proc_net();
             });
-            let (diag_min, diag_median) = timed(100, || {
-                match diag.lookup(&tuple) {
-                    Ok(DiagReply::Found(_)) => {}
-                    other => panic!("sock_diag lookup failed mid-sweep: {other:?}"),
-                }
+            let (diag_min, diag_median) = timed(100, || match diag.lookup(&tuple) {
+                Ok(DiagReply::Found(_)) => {}
+                other => panic!("sock_diag lookup failed mid-sweep: {other:?}"),
             });
             if extra == 0 {
                 idle_read = min;
@@ -1473,7 +1481,11 @@ mod tests {
         println!("\n-- half 2: /proc/*/fd walk, socket nobody holds --");
         let (mut pids, mut readable, mut fds) = (0usize, 0usize, 0usize);
         for entry in std::fs::read_dir("/proc").unwrap().flatten() {
-            let Some(pid) = entry.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) else {
+            let Some(pid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|s| s.parse::<u32>().ok())
+            else {
                 continue;
             };
             pids += 1;
@@ -1574,7 +1586,10 @@ mod tests {
             cmdline.len()
         );
         assert!(cmdline.starts_with("prog "), "the real prefix survives");
-        assert!(cmdline.ends_with("...[truncated]"), "the cut must be visible");
+        assert!(
+            cmdline.ends_with("...[truncated]"),
+            "the cut must be visible"
+        );
     }
 
     /// Cutting by bytes would split a multi-byte character and panic, and
@@ -1584,7 +1599,11 @@ mod tests {
         let wide = "\u{5206}".repeat(MAX_CMDLINE_BYTES);
         let out = truncate_cmdline(wide);
         assert!(out.ends_with("...[truncated]"));
-        assert!(out.len() <= MAX_CMDLINE_BYTES + 16, "kept {} bytes", out.len());
+        assert!(
+            out.len() <= MAX_CMDLINE_BYTES + 16,
+            "kept {} bytes",
+            out.len()
+        );
         // Short input is returned untouched, no marker.
         assert_eq!(truncate_cmdline("curl x".to_string()), "curl x");
     }
@@ -1670,7 +1689,10 @@ mod tests {
         // prefix of a real one, and matching an allow rule on a prefix is
         // the direction that fails open.
         let long = "a".repeat(hallpass_types::MAX_APP_ID_NAME_BYTES + 1);
-        assert_eq!(app_id_from_cgroup(&v2(&format!("app-flatpak-{long}-1.scope"))), None);
+        assert_eq!(
+            app_id_from_cgroup(&v2(&format!("app-flatpak-{long}-1.scope"))),
+            None
+        );
         let ok = "a".repeat(hallpass_types::MAX_APP_ID_NAME_BYTES);
         assert_eq!(
             app_id_from_cgroup(&v2(&format!("app-flatpak-{ok}-1.scope"))),

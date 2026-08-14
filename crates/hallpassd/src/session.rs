@@ -130,9 +130,11 @@ impl SessionRegistry {
     /// rooted at whatever pid 0 would walk into.
     pub fn register(&self, peer: PeerProcess, peer_uid: u32, label: String) -> Result<u64, String> {
         let Some(pid) = peer.pid.filter(|p| *p != 0) else {
-            return Err("the daemon cannot see this client's process id, so it cannot \
+            return Err(
+                "the daemon cannot see this client's process id, so it cannot \
                         tell which processes the session would cover"
-                .into());
+                    .into(),
+            );
         };
         // The start time read when this connection was accepted, and the one
         // now. They must agree, and that is the whole defence against a
@@ -299,7 +301,12 @@ pub fn covering(
     if roots.is_empty() {
         return None;
     }
-    let root = roots.get(covering_root(proc_root, pid, &roots, MAX_SESSION_WALK_DEPTH)?)?;
+    let root = roots.get(covering_root(
+        proc_root,
+        pid,
+        &roots,
+        MAX_SESSION_WALK_DEPTH,
+    )?)?;
     let session = sessions.iter().find(|s| s.uid == uid && s.root == *root)?;
     session.allowed.fetch_add(1, Ordering::Relaxed);
     Some(session.id)
@@ -346,8 +353,12 @@ mod tests {
     #[test]
     fn a_peer_the_daemon_cannot_name_is_refused() {
         let reg = registry();
-        assert!(reg.register(PeerProcess::default(), 1000, "curl".into()).is_err());
-        assert!(reg.register(PeerProcess::resolve(Some(0)), 1000, "curl".into()).is_err());
+        assert!(reg
+            .register(PeerProcess::default(), 1000, "curl".into())
+            .is_err());
+        assert!(reg
+            .register(PeerProcess::resolve(Some(0)), 1000, "curl".into())
+            .is_err());
         assert!(reg.snapshot().is_empty());
     }
 
@@ -384,7 +395,10 @@ mod tests {
         let first = reg.register(peer(), 1000, "a".into()).expect("register");
         reg.unregister(first);
         let second = reg.register(peer(), 1000, "b".into()).expect("register");
-        assert_ne!(first, second, "a closed session's id must not be handed out again");
+        assert_ne!(
+            first, second,
+            "a closed session's id must not be handed out again"
+        );
     }
 
     #[test]
@@ -471,7 +485,10 @@ mod tests {
         let err = reg
             .register(stale, 1000, "curl".into())
             .expect_err("a mismatched start time must be refused");
-        assert!(err.contains("not the process that opened this connection"), "{err}");
+        assert!(
+            err.contains("not the process that opened this connection"),
+            "{err}"
+        );
         assert!(reg.snapshot().is_empty());
     }
 }

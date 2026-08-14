@@ -6,8 +6,8 @@ use std::num::NonZeroUsize;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use lru::LruCache;
 use hallpass_types::FlowTuple;
+use lru::LruCache;
 
 use super::ProcInfo;
 

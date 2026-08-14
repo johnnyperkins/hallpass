@@ -356,9 +356,15 @@ mod tests {
     #[test]
     fn a_posture_suppresses_untagged_allows_only() {
         let f = fixture("suppress");
-        f.store.add(rule("allow-work", Action::Allow, &["work"])).unwrap();
-        f.store.add(rule("allow-other", Action::Allow, &[])).unwrap();
-        f.store.add(rule("deny-tracker", Action::Deny, &[])).unwrap();
+        f.store
+            .add(rule("allow-work", Action::Allow, &["work"]))
+            .unwrap();
+        f.store
+            .add(rule("allow-other", Action::Allow, &[]))
+            .unwrap();
+        f.store
+            .add(rule("deny-tracker", Action::Deny, &[]))
+            .unwrap();
 
         let state = apply(
             &f.posture,
@@ -386,12 +392,25 @@ mod tests {
     #[test]
     fn a_posture_forces_enforcement_and_restores_it() {
         let f = fixture("settings");
-        f.store.add(rule("allow-work", Action::Allow, &["work"])).unwrap();
+        f.store
+            .add(rule("allow-work", Action::Allow, &["work"]))
+            .unwrap();
         assert!(!f.settings.enforcing(), "observe to begin with");
         assert_eq!(f.settings.default_verdict(), hallpass_types::Verdict::Allow);
 
-        apply(&f.posture, &f.store, &f.settings, vec!["work".into()], true, false).unwrap();
-        assert!(f.settings.enforcing(), "a posture that records nothing is theatre");
+        apply(
+            &f.posture,
+            &f.store,
+            &f.settings,
+            vec!["work".into()],
+            true,
+            false,
+        )
+        .unwrap();
+        assert!(
+            f.settings.enforcing(),
+            "a posture that records nothing is theatre"
+        );
         assert_eq!(f.settings.default_verdict(), hallpass_types::Verdict::Deny);
         // `snapshot` reports what the operator set, not what the posture is
         // forcing: every client changes settings by reading it, editing one
@@ -399,7 +418,10 @@ mod tests {
         // posture's values here would have a timeout change quietly persist
         // them - and lifting the posture would leave the host denying by
         // default forever with nothing that ever said so.
-        assert!(!f.settings.snapshot().enforce, "the stored mode is the operator's");
+        assert!(
+            !f.settings.snapshot().enforce,
+            "the stored mode is the operator's"
+        );
         assert_eq!(
             f.settings.snapshot().default_verdict,
             hallpass_types::Verdict::Allow
@@ -430,8 +452,18 @@ mod tests {
     #[test]
     fn a_posture_survives_a_restart() {
         let f = fixture("persist");
-        f.store.add(rule("allow-work", Action::Allow, &["work"])).unwrap();
-        apply(&f.posture, &f.store, &f.settings, vec!["work".into()], true, false).unwrap();
+        f.store
+            .add(rule("allow-work", Action::Allow, &["work"]))
+            .unwrap();
+        apply(
+            &f.posture,
+            &f.store,
+            &f.settings,
+            vec!["work".into()],
+            true,
+            false,
+        )
+        .unwrap();
         let since = f.posture.snapshot(&f.store).unwrap().since_ms;
 
         let reloaded = Posture::load(&f.path);
@@ -454,7 +486,9 @@ mod tests {
     #[test]
     fn a_posture_that_keeps_nothing_needs_force() {
         let f = fixture("force");
-        f.store.add(rule("allow-work", Action::Allow, &["work"])).unwrap();
+        f.store
+            .add(rule("allow-work", Action::Allow, &["work"]))
+            .unwrap();
 
         let err = apply(
             &f.posture,
@@ -466,12 +500,25 @@ mod tests {
         )
         .expect_err("a posture keeping nothing must not engage quietly");
         assert!(err.contains("force"), "{err}");
-        assert!(!f.posture.is_on(), "the refused posture must not be in force");
-        assert!(!f.settings.enforcing(), "a refused posture changed the mode");
+        assert!(
+            !f.posture.is_on(),
+            "the refused posture must not be in force"
+        );
+        assert!(
+            !f.settings.enforcing(),
+            "a refused posture changed the mode"
+        );
 
         // Deliberate is still expressible.
-        apply(&f.posture, &f.store, &f.settings, vec!["wrok".into()], true, true)
-            .expect("--force says the operator means it");
+        apply(
+            &f.posture,
+            &f.store,
+            &f.settings,
+            vec!["wrok".into()],
+            true,
+            true,
+        )
+        .expect("--force says the operator means it");
         assert!(f.posture.is_on());
     }
 
@@ -487,7 +534,10 @@ mod tests {
         assert!(!Posture::load(&path).is_on());
 
         std::fs::write(&path, "version = 999\non = true\ntags = [\"work\"]\n").unwrap();
-        assert!(!Posture::load(&path).is_on(), "a future version is not guessed at");
+        assert!(
+            !Posture::load(&path).is_on(),
+            "a future version is not guessed at"
+        );
     }
 
     /// An unusable tag pins nothing, so a posture that kept one would report

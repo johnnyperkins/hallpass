@@ -218,7 +218,11 @@ mod tests {
         let after = std::fs::metadata(&path).unwrap();
         assert_eq!(after.len(), before.len(), "the rewrite kept the size");
         assert_eq!(after.mtime(), before.mtime(), "the rewrite restored mtime");
-        assert_eq!(after.mtime_nsec(), before.mtime_nsec(), "including nanoseconds");
+        assert_eq!(
+            after.mtime_nsec(),
+            before.mtime_nsec(),
+            "including nanoseconds"
+        );
 
         assert_ne!(
             cache.sha256(&path).unwrap(),

@@ -91,7 +91,11 @@ impl Scratch {
 
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
-            if let Some(status) = self.daemon.as_mut().and_then(|d| d.try_wait().ok().flatten()) {
+            if let Some(status) = self
+                .daemon
+                .as_mut()
+                .and_then(|d| d.try_wait().ok().flatten())
+            {
                 panic!(
                     "daemon exited during startup ({status}); log:\n{}",
                     self.log()
@@ -231,7 +235,10 @@ fn rules_can_be_managed_without_privileges() {
         },
     };
     assert_eq!(
-        request(&env.socket(), &hallpass_types::ClientMsg::RuleAdd(rule.clone())),
+        request(
+            &env.socket(),
+            &hallpass_types::ClientMsg::RuleAdd(rule.clone())
+        ),
         hallpass_types::DaemonMsg::Ok,
         "log:\n{}",
         env.log()

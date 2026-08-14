@@ -265,7 +265,11 @@ mod tests {
         assert!((p.remaining_fraction(20_000) - 1.0 / 3.0).abs() < 1e-6);
         p.fronted_ms = Some(20_000);
         assert_eq!(p.remaining_fraction(20_000), 1.0, "bar restarts full");
-        assert_eq!(p.remaining_fraction(25_000), 0.5, "drains over what is left");
+        assert_eq!(
+            p.remaining_fraction(25_000),
+            0.5,
+            "drains over what is left"
+        );
         assert_eq!(p.remaining_fraction(30_000), 0.0, "deadline unchanged");
         assert_eq!(p.remaining_secs(20_000), 10, "seconds stay honest");
     }

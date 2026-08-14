@@ -62,7 +62,9 @@ impl TestApp {
 
 /// Everything queued on the app's outgoing channel, in send order. Shared
 /// with the widget tests, which hold the receiver directly.
-pub(super) fn drain(from_ui: &mut tokio::sync::mpsc::UnboundedReceiver<ClientMsg>) -> Vec<ClientMsg> {
+pub(super) fn drain(
+    from_ui: &mut tokio::sync::mpsc::UnboundedReceiver<ClientMsg>,
+) -> Vec<ClientMsg> {
     let mut out = Vec::new();
     while let Ok(msg) = from_ui.try_recv() {
         out.push(msg);
@@ -165,7 +167,10 @@ fn a_refused_toggle_sends_the_screen_back_to_the_daemon() {
 
     t.daemon(err("rules.d is read-only"));
     assert_eq!(t.sent(), vec![ClientMsg::RuleList]);
-    assert!(t.app.rules[0].enabled, "a refused toggle changed the screen");
+    assert!(
+        t.app.rules[0].enabled,
+        "a refused toggle changed the screen"
+    );
 }
 
 /// An accepted toggle refetches too: nothing on this side can tell the two
@@ -212,14 +217,20 @@ fn a_refused_delete_leaves_the_rule_on_screen() {
 /// request reconciles the wrong thing.
 #[test]
 fn ack_kinds_are_distinct_per_request() {
-    let toggle = ClientMsg::RuleToggle { name: "r".into(), enabled: false };
+    let toggle = ClientMsg::RuleToggle {
+        name: "r".into(),
+        enabled: false,
+    };
     let delete = ClientMsg::RuleDelete { name: "r".into() };
     assert_eq!(ack_kind(&toggle), Some(AckKind::RuleToggle));
     // The bulk toggle is answered with `RulesToggled`, but a refusal is the
     // same `Err` as everyone else's: left out of the FIFO, an unknown tag
     // would pop somebody else's slot and reconcile the wrong request.
     assert_eq!(
-        ack_kind(&ClientMsg::RuleToggleTag { tag: "work".into(), enabled: false }),
+        ack_kind(&ClientMsg::RuleToggleTag {
+            tag: "work".into(),
+            enabled: false
+        }),
         Some(AckKind::RuleToggle)
     );
     assert_eq!(ack_kind(&delete), Some(AckKind::RuleDelete));
@@ -228,16 +239,22 @@ fn ack_kinds_are_distinct_per_request() {
         Some(AckKind::ConfigSet)
     );
     assert_eq!(
-        ack_kind(&ClientMsg::Subscribe { events: true, prompts: true }),
+        ack_kind(&ClientMsg::Subscribe {
+            events: true,
+            prompts: true
+        }),
         Some(AckKind::Other)
     );
-    assert_eq!(ack_kind(&ClientMsg::PromptReply {
-        id: 1,
-        verdict: Verdict::Deny,
-        duration: RuleDuration::Once,
-        scope: PromptScope::ThisPort,
-        pin_exe: false,
-    }), Some(AckKind::Other));
+    assert_eq!(
+        ack_kind(&ClientMsg::PromptReply {
+            id: 1,
+            verdict: Verdict::Deny,
+            duration: RuleDuration::Once,
+            scope: PromptScope::ThisPort,
+            pin_exe: false,
+        }),
+        Some(AckKind::Other)
+    );
     // Requests answered with data, not an ack, must not enter the FIFO
     // at all or every later reply is matched to the wrong request.
     assert_eq!(ack_kind(&ClientMsg::RuleList), None);
@@ -267,7 +284,11 @@ fn a_rejected_save_keeps_the_form_open() {
     let mut t = TestApp::new();
     t.editor_awaiting_ack();
     t.daemon(err("dest: invalid CIDR"));
-    let editor = t.app.editor.as_ref().expect("the form survives a rejection");
+    let editor = t
+        .app
+        .editor
+        .as_ref()
+        .expect("the form survives a rejection");
     assert!(!editor.awaiting_ack(), "the form is editable again");
     assert!(
         t.app.last_error.is_none(),
@@ -285,13 +306,24 @@ fn a_rejected_save_keeps_the_form_open() {
 fn every_ack_kind_crossed_with_ok_and_err() {
     let refetch = [
         (
-            ClientMsg::RuleToggle { name: "r".to_string(), enabled: true },
+            ClientMsg::RuleToggle {
+                name: "r".to_string(),
+                enabled: true,
+            },
             true,
         ),
-        (ClientMsg::RuleDelete { name: "r".to_string() }, true),
+        (
+            ClientMsg::RuleDelete {
+                name: "r".to_string(),
+            },
+            true,
+        ),
         (ClientMsg::RuleAdd(rule("r", true)), false),
         (
-            ClientMsg::Subscribe { events: true, prompts: true },
+            ClientMsg::Subscribe {
+                events: true,
+                prompts: true,
+            },
             false,
         ),
     ];
@@ -303,7 +335,10 @@ fn every_ack_kind_crossed_with_ok_and_err() {
             let is_err = matches!(outcome, DaemonMsg::Err { .. });
             t.daemon(outcome);
             let refetched = t.sent() == vec![ClientMsg::RuleList];
-            assert_eq!(refetched, expected, "{request:?} refetch after err={is_err}");
+            assert_eq!(
+                refetched, expected,
+                "{request:?} refetch after err={is_err}"
+            );
             assert!(
                 t.app.pending_ack_kinds().is_empty(),
                 "{request:?} left an ack in the FIFO"
@@ -320,12 +355,22 @@ fn every_ack_kind_crossed_with_ok_and_err() {
 #[test]
 fn a_bulk_toggle_reply_reconciles_and_reports_failures() {
     let mut t = TestApp::new();
-    t.app.send(ClientMsg::RuleToggleTag { tag: "work".into(), enabled: false });
+    t.app.send(ClientMsg::RuleToggleTag {
+        tag: "work".into(),
+        enabled: false,
+    });
     t.sent();
     assert_eq!(t.app.pending_ack_kinds(), vec![AckKind::RuleToggle]);
 
-    t.daemon(DaemonMsg::RulesToggled { changed: 2, failed: Vec::new() });
-    assert_eq!(t.sent(), vec![ClientMsg::RuleList], "the screen is refetched");
+    t.daemon(DaemonMsg::RulesToggled {
+        changed: 2,
+        failed: Vec::new(),
+    });
+    assert_eq!(
+        t.sent(),
+        vec![ClientMsg::RuleList],
+        "the screen is refetched"
+    );
     assert!(t.app.pending_ack_kinds().is_empty(), "the slot is freed");
     assert!(t.app.last_error.is_none(), "a clean batch raises no error");
     // The count is always reported: the daemon acts on its own live tag
@@ -333,7 +378,10 @@ fn a_bulk_toggle_reply_reconciles_and_reports_failures() {
     // from, and the refetch alone says nothing about how much moved.
     assert_eq!(t.app.rules_notice.as_deref(), Some("2 rule(s) changed"));
 
-    t.app.send(ClientMsg::RuleToggleTag { tag: "work".into(), enabled: false });
+    t.app.send(ClientMsg::RuleToggleTag {
+        tag: "work".into(),
+        enabled: false,
+    });
     t.sent();
     t.daemon(DaemonMsg::RulesToggled {
         changed: 1,
@@ -346,10 +394,19 @@ fn a_bulk_toggle_reply_reconciles_and_reports_failures() {
     // And the banner is cleared by a batch that succeeds. Left standing, it
     // keeps naming a rule as still enforcing after the retry that fixed it,
     // and the next real failure cannot be told from the stale one.
-    t.app.send(ClientMsg::RuleToggleTag { tag: "work".into(), enabled: false });
+    t.app.send(ClientMsg::RuleToggleTag {
+        tag: "work".into(),
+        enabled: false,
+    });
     t.sent();
-    t.daemon(DaemonMsg::RulesToggled { changed: 1, failed: Vec::new() });
-    assert!(t.app.last_error.is_none(), "a fixed failure kept its banner");
+    t.daemon(DaemonMsg::RulesToggled {
+        changed: 1,
+        failed: Vec::new(),
+    });
+    assert!(
+        t.app.last_error.is_none(),
+        "a fixed failure kept its banner"
+    );
 }
 
 /// A refused bulk toggle is an ordinary `Err`, so it must consume exactly
@@ -358,7 +415,10 @@ fn a_bulk_toggle_reply_reconciles_and_reports_failures() {
 #[test]
 fn a_refused_bulk_toggle_consumes_one_slot() {
     let mut t = TestApp::new();
-    t.app.send(ClientMsg::RuleToggleTag { tag: "wrok".into(), enabled: false });
+    t.app.send(ClientMsg::RuleToggleTag {
+        tag: "wrok".into(),
+        enabled: false,
+    });
     t.editor_awaiting_ack();
     assert_eq!(
         t.app.pending_ack_kinds(),
@@ -377,7 +437,10 @@ fn a_refused_bulk_toggle_consumes_one_slot() {
 #[test]
 fn acks_are_matched_to_requests_in_send_order() {
     let mut t = TestApp::new();
-    t.app.send(ClientMsg::RuleToggle { name: "first".to_string(), enabled: false });
+    t.app.send(ClientMsg::RuleToggle {
+        name: "first".to_string(),
+        enabled: false,
+    });
     t.editor_awaiting_ack();
     assert_eq!(
         t.app.pending_ack_kinds(),
@@ -412,7 +475,10 @@ fn an_ack_with_an_empty_queue_reconciles_nothing() {
 #[test]
 fn a_dropped_message_keeps_the_queue_aligned() {
     let mut t = TestApp::new();
-    t.app.send(ClientMsg::RuleToggle { name: "gone".to_string(), enabled: false });
+    t.app.send(ClientMsg::RuleToggle {
+        name: "gone".to_string(),
+        enabled: false,
+    });
     t.sent();
     assert_eq!(t.app.pending_ack_kinds().len(), 1);
 
@@ -422,7 +488,10 @@ fn a_dropped_message_keeps_the_queue_aligned() {
             enabled: false,
         },
     });
-    assert!(t.app.pending_ack_kinds().is_empty(), "the dead ack was left queued");
+    assert!(
+        t.app.pending_ack_kinds().is_empty(),
+        "the dead ack was left queued"
+    );
     assert!(
         t.app
             .last_error
@@ -463,8 +532,15 @@ fn a_dropped_bulk_toggle_names_the_set_and_keeps_the_queue_aligned() {
     assert_eq!(t.app.pending_ack_kinds().len(), 1);
 
     t.feed(UiEvent::SendFailed { msg });
-    assert!(t.app.pending_ack_kinds().is_empty(), "the dead ack was left queued");
-    let shown = t.app.last_error.clone().expect("a lost bulk toggle is visible");
+    assert!(
+        t.app.pending_ack_kinds().is_empty(),
+        "the dead ack was left queued"
+    );
+    let shown = t
+        .app
+        .last_error
+        .clone()
+        .expect("a lost bulk toggle is visible");
     assert!(shown.contains("work"), "the set is named: {shown}");
 }
 
@@ -474,12 +550,16 @@ fn a_dropped_bulk_toggle_names_the_set_and_keeps_the_queue_aligned() {
 #[test]
 fn a_dropped_settings_change_is_reported_and_keeps_the_queue_aligned() {
     let mut t = TestApp::new();
-    t.app.send(ClientMsg::ConfigSet(runtime_config(30, Verdict::Deny)));
+    t.app
+        .send(ClientMsg::ConfigSet(runtime_config(30, Verdict::Deny)));
     t.sent();
     t.feed(UiEvent::SendFailed {
         msg: ClientMsg::ConfigSet(runtime_config(30, Verdict::Deny)),
     });
-    assert!(t.app.pending_ack_kinds().is_empty(), "the dead ack was left queued");
+    assert!(
+        t.app.pending_ack_kinds().is_empty(),
+        "the dead ack was left queued"
+    );
     assert!(
         t.app
             .last_error
@@ -684,7 +764,11 @@ fn the_filter_selects_across_exe_domain_rule_and_destination() {
         by_rule,
     ]));
 
-    assert_eq!(t.app.filtered().count(), 3, "an empty filter keeps everything");
+    assert_eq!(
+        t.app.filtered().count(),
+        3,
+        "an empty filter keeps everything"
+    );
     for (needle, expected) in [
         ("curl", 1),
         ("EXAMPLE.ORG", 1),
@@ -732,7 +816,10 @@ fn observe_mode_is_not_announced_before_the_daemon_says_so() {
     assert!(!t.app.observe_banner(), "the daemon is enforcing");
 
     t.daemon(DaemonMsg::Stats(stats(false)));
-    assert!(t.app.observe_banner(), "the daemon said it is not enforcing");
+    assert!(
+        t.app.observe_banner(),
+        "the daemon said it is not enforcing"
+    );
 
     // And it goes away again with the connection it was said on, rather than
     // describing a daemon this window can no longer reach.
@@ -923,7 +1010,10 @@ fn opening_a_data_tab_refetches_it() {
 #[test]
 fn a_config_reply_fills_the_settings_form() {
     let mut t = TestApp::new();
-    assert!(t.app.daemon_config.is_none(), "no values before the daemon speaks");
+    assert!(
+        t.app.daemon_config.is_none(),
+        "no values before the daemon speaks"
+    );
     t.daemon(DaemonMsg::Config(runtime_config(30, Verdict::Deny)));
     assert_eq!(t.app.daemon_config, Some(runtime_config(30, Verdict::Deny)));
     assert_eq!(t.app.settings_timeout, "30");
@@ -938,7 +1028,8 @@ fn a_config_reply_fills_the_settings_form() {
 fn a_settings_ack_reconciles_by_refetching() {
     for (outcome, expect_err) in [(DaemonMsg::Ok, false), (err("out of range"), true)] {
         let mut t = TestApp::new();
-        t.app.send(ClientMsg::ConfigSet(runtime_config(30, Verdict::Deny)));
+        t.app
+            .send(ClientMsg::ConfigSet(runtime_config(30, Verdict::Deny)));
         t.sent();
         t.daemon(outcome);
         assert_eq!(t.sent(), vec![ClientMsg::ConfigGet], "err={expect_err}");
@@ -974,10 +1065,7 @@ fn an_expired_prompt_is_dropped() {
     t.daemon(prompt_request(1, "/usr/bin/curl"));
     t.daemon(prompt_request(2, "/usr/bin/curl"));
     t.daemon(DaemonMsg::PromptExpired { id: 1 });
-    assert_eq!(
-        t.app.prompt_ids(),
-        vec![2]
-    );
+    assert_eq!(t.app.prompt_ids(), vec![2]);
 }
 
 /// Giving up a prompt denies, and denies once: it settles the connection on
@@ -1009,7 +1097,10 @@ fn dismissing_prompts_answers_every_one_of_them() {
     }
     t.app.dismiss_prompts([1, 3]);
 
-    assert_eq!(t.sent(), vec![prompt::close_reply(1), prompt::close_reply(3)]);
+    assert_eq!(
+        t.sent(),
+        vec![prompt::close_reply(1), prompt::close_reply(3)]
+    );
     assert_eq!(
         t.app.prompt_ids(),
         vec![2],

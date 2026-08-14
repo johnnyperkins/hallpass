@@ -30,8 +30,13 @@ struct Pending {
 /// Where we are in the dialog for the current prompt.
 enum Stage {
     Verdict,
-    Duration { verdict: Verdict },
-    Scope { verdict: Verdict, duration: RuleDuration },
+    Duration {
+        verdict: Verdict,
+    },
+    Scope {
+        verdict: Verdict,
+        duration: RuleDuration,
+    },
     /// Asked only when pinning could actually change the rule: an allow, a
     /// duration that creates one, and a prompt the daemon computed a hash
     /// for. Skipping it otherwise keeps the dialog from asking a question
@@ -362,7 +367,11 @@ async fn step<W: tokio::io::AsyncWrite + Unpin>(
                 // before this stage existed.
                 if can_pin(&pending, verdict, duration) {
                     println!("{PIN_HINT}");
-                    Stage::Pin { verdict, duration, scope }
+                    Stage::Pin {
+                        verdict,
+                        duration,
+                        scope,
+                    }
                 } else {
                     return send_reply(w, queue, &pending, verdict, duration, scope, false).await;
                 }
@@ -372,13 +381,21 @@ async fn step<W: tokio::io::AsyncWrite + Unpin>(
                 Stage::Scope { verdict, duration }
             }
         },
-        Stage::Pin { verdict, duration, scope } => match parse_pin(line) {
+        Stage::Pin {
+            verdict,
+            duration,
+            scope,
+        } => match parse_pin(line) {
             Some(pin_exe) => {
                 return send_reply(w, queue, &pending, verdict, duration, scope, pin_exe).await;
             }
             None => {
                 println!("{PIN_HINT}");
-                Stage::Pin { verdict, duration, scope }
+                Stage::Pin {
+                    verdict,
+                    duration,
+                    scope,
+                }
             }
         },
     };
@@ -471,8 +488,7 @@ mod tests {
     #[test]
     fn promote_skips_prompts_the_daemon_has_already_decided() {
         let live = unix_ms_now() + 60_000;
-        let mut queue: VecDeque<Pending> =
-            [pending(1, 0), pending(2, 0), pending(3, live)].into();
+        let mut queue: VecDeque<Pending> = [pending(1, 0), pending(2, 0), pending(3, live)].into();
         let (p, _) = promote(&mut queue).expect("the live prompt is promoted");
         assert_eq!(p.id, 3, "the two expired ones were skipped");
         assert!(queue.is_empty());
@@ -613,7 +629,10 @@ mod tests {
                 domain: Some("example.org".into()),
                 iface: None,
                 app_id: None,
-                first_seen: Some(hallpass_types::FirstSeen { app: true, dest: true }),
+                first_seen: Some(hallpass_types::FirstSeen {
+                    app: true,
+                    dest: true,
+                }),
             },
             deadline_ms: 30_000,
             context: PromptContext::default(),
@@ -624,10 +643,19 @@ mod tests {
             format_prompt(&p, 5_000)
         );
 
-        p.conn.first_seen = Some(hallpass_types::FirstSeen { app: false, dest: true });
+        p.conn.first_seen = Some(hallpass_types::FirstSeen {
+            app: false,
+            dest: true,
+        });
         assert!(format_prompt(&p, 5_000).contains("has not reached this destination before"));
 
-        for quiet in [Some(hallpass_types::FirstSeen { app: false, dest: false }), None] {
+        for quiet in [
+            Some(hallpass_types::FirstSeen {
+                app: false,
+                dest: false,
+            }),
+            None,
+        ] {
             p.conn.first_seen = quiet;
             let out = format_prompt(&p, 5_000);
             assert!(!out.contains("new:"), "{out:?}");
@@ -652,7 +680,10 @@ mod tests {
         };
         let out = format_prompt(&p, 5_000);
         assert!(out.contains("started: /bin/bash <- /sbin/init"), "{out:?}");
-        assert!(out.contains(&format!("sha256:  {}", "ab".repeat(32))), "{out:?}");
+        assert!(
+            out.contains(&format!("sha256:  {}", "ab".repeat(32))),
+            "{out:?}"
+        );
         assert!(
             out.contains("WARNING: does not have the executable hash pinned by: curl-pinned"),
             "{out:?}"
@@ -673,7 +704,9 @@ mod tests {
         let mut p = pending(7, 30_000);
         p.conn.cmdline = None;
         p.context = PromptContext {
-            ancestors: vec![PathBuf::from("/tmp/evil\r\x1b[2Kdest:    bank.example:443 (1.2.3.4)")],
+            ancestors: vec![PathBuf::from(
+                "/tmp/evil\r\x1b[2Kdest:    bank.example:443 (1.2.3.4)",
+            )],
             exe_sha256: None,
             hash_mismatch_rules: vec!["a\u{202e}b".into()],
             recent_denials: 0,
@@ -709,9 +742,15 @@ mod tests {
         let out = format_prompt(&p, 5_000);
         // 80 columns, 24 rows, and the block has to leave room for the answer
         // prompt under it.
-        let rows: usize = out.lines().map(|l| l.chars().count().div_ceil(80).max(1)).sum();
+        let rows: usize = out
+            .lines()
+            .map(|l| l.chars().count().div_ceil(80).max(1))
+            .sum();
         assert!(rows <= 20, "the block wrapped to {rows} rows:\n{out}");
         assert!(out.contains("dest:"), "the destination survived: {out}");
-        assert!(out.contains("respond within"), "the countdown survived: {out}");
+        assert!(
+            out.contains("respond within"),
+            "the countdown survived: {out}"
+        );
     }
 }

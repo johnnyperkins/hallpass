@@ -254,7 +254,12 @@ fn push_cell(out: &mut String, text: &str, width: usize, last: bool) {
 }
 
 /// Run the live view until Ctrl-C.
-pub async fn top(mut client: Client, opts: TopOpts, json: bool, pal: Palette) -> Result<(), CliError> {
+pub async fn top(
+    mut client: Client,
+    opts: TopOpts,
+    json: bool,
+    pal: Palette,
+) -> Result<(), CliError> {
     let mut agg = Aggregate::default();
 
     // Seed from history. An older daemon answers Err; that costs the
@@ -368,10 +373,22 @@ mod tests {
     #[test]
     fn groups_and_counts_by_class() {
         let mut agg = Aggregate::default();
-        agg.add(&ev("/usr/bin/curl", "1.1.1.1:443", Verdict::Allow, true), GroupBy::Exe);
-        agg.add(&ev("/usr/bin/curl", "1.1.1.2:443", Verdict::Deny, true), GroupBy::Exe);
-        agg.add(&ev("/usr/bin/curl", "1.1.1.3:443", Verdict::Deny, false), GroupBy::Exe);
-        agg.add(&ev("/usr/bin/wget", "1.1.1.1:80", Verdict::Allow, true), GroupBy::Exe);
+        agg.add(
+            &ev("/usr/bin/curl", "1.1.1.1:443", Verdict::Allow, true),
+            GroupBy::Exe,
+        );
+        agg.add(
+            &ev("/usr/bin/curl", "1.1.1.2:443", Verdict::Deny, true),
+            GroupBy::Exe,
+        );
+        agg.add(
+            &ev("/usr/bin/curl", "1.1.1.3:443", Verdict::Deny, false),
+            GroupBy::Exe,
+        );
+        agg.add(
+            &ev("/usr/bin/wget", "1.1.1.1:80", Verdict::Allow, true),
+            GroupBy::Exe,
+        );
 
         let rows = agg.top(10);
         assert_eq!(rows.len(), 2);
@@ -405,7 +422,10 @@ mod tests {
     fn row_count_is_capped_and_overflow_is_reported() {
         let mut agg = Aggregate::default();
         for i in 0..(MAX_ROWS + 25) {
-            agg.add(&ev(&format!("/bin/p{i}"), "1.1.1.1:443", Verdict::Allow, true), GroupBy::Exe);
+            agg.add(
+                &ev(&format!("/bin/p{i}"), "1.1.1.1:443", Verdict::Allow, true),
+                GroupBy::Exe,
+            );
         }
         assert_eq!(agg.rows.len(), MAX_ROWS);
         assert_eq!(agg.overflow, 25);
@@ -422,11 +442,19 @@ mod tests {
     fn hostile_keys_cannot_rewrite_the_screen() {
         let mut agg = Aggregate::default();
         agg.add(
-            &ev("/tmp/evil\r\x1b[A\x1b[2K/usr/bin/firefox", "1.1.1.1:443", Verdict::Allow, true),
+            &ev(
+                "/tmp/evil\r\x1b[A\x1b[2K/usr/bin/firefox",
+                "1.1.1.1:443",
+                Verdict::Allow,
+                true,
+            ),
             GroupBy::Exe,
         );
         let out = render(&agg, TopOpts::default(), Palette::new(false));
-        assert!(!out.contains('\x1b'), "escape reached the terminal: {out:?}");
+        assert!(
+            !out.contains('\x1b'),
+            "escape reached the terminal: {out:?}"
+        );
         assert!(!out.contains('\r'), "CR reached the terminal: {out:?}");
         // Totals line, header, one row: nothing smuggled in extra lines.
         assert_eq!(out.lines().count(), 3, "{out:?}");
@@ -435,10 +463,16 @@ mod tests {
     #[test]
     fn observe_banner_only_when_unenforced() {
         let mut agg = Aggregate::default();
-        agg.add(&ev("/usr/bin/curl", "1.1.1.1:443", Verdict::Deny, true), GroupBy::Exe);
+        agg.add(
+            &ev("/usr/bin/curl", "1.1.1.1:443", Verdict::Deny, true),
+            GroupBy::Exe,
+        );
         let out = render(&agg, TopOpts::default(), Palette::new(false));
         assert!(!out.contains("OBSERVE MODE"), "{out}");
-        agg.add(&ev("/usr/bin/curl", "1.1.1.1:443", Verdict::Deny, false), GroupBy::Exe);
+        agg.add(
+            &ev("/usr/bin/curl", "1.1.1.1:443", Verdict::Deny, false),
+            GroupBy::Exe,
+        );
         let out = render(&agg, TopOpts::default(), Palette::new(false));
         assert!(out.contains("OBSERVE MODE"), "{out}");
     }

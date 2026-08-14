@@ -4,8 +4,8 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 
 use hallpass_types::{
-    Action, ConnEvent, Connection, ExplainRequest, FlowTuple, Proto, Rule, RuleDuration,
-    RuleMatch, Verdict,
+    Action, ConnEvent, Connection, ExplainRequest, FlowTuple, Proto, Rule, RuleDuration, RuleMatch,
+    Verdict,
 };
 
 /// Default daemon socket path.
@@ -221,7 +221,6 @@ impl GroupBy {
             GroupBy::Rule => "rule",
         }
     }
-
 }
 
 /// Client-side event filters for `events`.
@@ -263,7 +262,11 @@ impl Filters {
         }
         if !self.domain.is_empty() {
             let domain = ev.conn.domain.as_deref().unwrap_or("");
-            if !self.domain.iter().any(|want| domain.contains(want.as_str())) {
+            if !self
+                .domain
+                .iter()
+                .any(|want| domain.contains(want.as_str()))
+            {
                 return false;
             }
         }
@@ -482,7 +485,8 @@ pub fn parse(argv: &[String]) -> Result<Parsed, String> {
             "--json" => json = true,
             "--socket" => {
                 socket = PathBuf::from(
-                    it.next().ok_or_else(|| "--socket requires a value".to_string())?,
+                    it.next()
+                        .ok_or_else(|| "--socket requires a value".to_string())?,
                 );
             }
             "--color" => {
@@ -514,11 +518,13 @@ pub fn parse(argv: &[String]) -> Result<Parsed, String> {
         Some((&"rules", sub)) => parse_rules(sub)?,
         Some((&"lockdown", sub)) => parse_lockdown(sub)?,
         Some((&cmd, extra)) => {
-            return Err(if matches!(cmd, "status" | "watch" | "doctor" | "sessions") {
-                format!("unexpected arguments after '{cmd}': {extra:?}")
-            } else {
-                format!("unknown command '{cmd}'")
-            });
+            return Err(
+                if matches!(cmd, "status" | "watch" | "doctor" | "sessions") {
+                    format!("unexpected arguments after '{cmd}': {extra:?}")
+                } else {
+                    format!("unknown command '{cmd}'")
+                },
+            );
         }
     };
 
@@ -590,8 +596,7 @@ fn parse_config_set(flags: &[&str]) -> Result<Cmd, String> {
     // blocking anything on the whole host.
     if opts.enforce == Some(false) && !yes {
         return Err(
-            "--observe stops the firewall blocking anything host-wide; add --yes to confirm"
-                .into(),
+            "--observe stops the firewall blocking anything host-wide; add --yes to confirm".into(),
         );
     }
     Ok(Cmd::ConfigSet(opts))
@@ -741,7 +746,9 @@ fn parse_explain(flags: &[&str]) -> Result<ExplainRequest, String> {
             "--dest" => dest = Some(parse_addr("--dest", value)?),
             "--port" => {
                 port = Some(
-                    value.parse::<u16>().map_err(|_| format!("invalid port '{value}'"))?,
+                    value
+                        .parse::<u16>()
+                        .map_err(|_| format!("invalid port '{value}'"))?,
                 );
             }
             "--proto" => {
@@ -763,7 +770,9 @@ fn parse_explain(flags: &[&str]) -> Result<ExplainRequest, String> {
             "--domain" => domain = Some(value.to_string()),
             "--user" => {
                 user = Some(
-                    value.parse::<u32>().map_err(|_| format!("invalid uid '{value}'"))?,
+                    value
+                        .parse::<u32>()
+                        .map_err(|_| format!("invalid uid '{value}'"))?,
                 );
             }
             "--iface" => iface = Some(value.to_string()),
@@ -842,7 +851,9 @@ fn parse_app_id(value: &str) -> Result<String, String> {
 /// Validate a SHA-256 operand and return it unchanged.
 fn parse_sha256(value: &str) -> Result<String, String> {
     if value.len() != 64 || !value.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err(format!("invalid exe-sha256 '{value}': expected 64 hex digits"));
+        return Err(format!(
+            "invalid exe-sha256 '{value}': expected 64 hex digits"
+        ));
     }
     Ok(value.to_string())
 }
@@ -991,8 +1002,11 @@ fn parse_rule_add(flags: &[&str]) -> Result<Rule, String> {
                 matcher.dest = Some(value.to_string());
             }
             "--port" => {
-                matcher.port =
-                    Some(value.parse::<u16>().map_err(|_| format!("invalid port '{value}'"))?);
+                matcher.port = Some(
+                    value
+                        .parse::<u16>()
+                        .map_err(|_| format!("invalid port '{value}'"))?,
+                );
             }
             "--domain" => matcher.domain = Some(value.to_string()),
             "--cmdline-contains" => matcher.cmdline_contains = Some(value.to_string()),
@@ -1002,8 +1016,11 @@ fn parse_rule_add(flags: &[&str]) -> Result<Rule, String> {
                 matcher.src = Some(value.to_string());
             }
             "--src-port" => {
-                matcher.src_port =
-                    Some(value.parse::<u16>().map_err(|_| format!("invalid src-port '{value}'"))?);
+                matcher.src_port = Some(
+                    value
+                        .parse::<u16>()
+                        .map_err(|_| format!("invalid src-port '{value}'"))?,
+                );
             }
             // Repeatable; the list as a whole is checked below, through the
             // same gate the daemon applies.
@@ -1014,8 +1031,11 @@ fn parse_rule_add(flags: &[&str]) -> Result<Rule, String> {
             "--ips-file" => matcher.ips_file = Some(PathBuf::from(value)),
             "--hashes-file" => matcher.hashes_file = Some(PathBuf::from(value)),
             "--user" => {
-                matcher.user =
-                    Some(value.parse::<u32>().map_err(|_| format!("invalid uid '{value}'"))?);
+                matcher.user = Some(
+                    value
+                        .parse::<u32>()
+                        .map_err(|_| format!("invalid uid '{value}'"))?,
+                );
             }
             "--proto" => {
                 matcher.proto = Some(match value {
@@ -1041,7 +1061,9 @@ fn parse_rule_add(flags: &[&str]) -> Result<Rule, String> {
                 enabled = match value {
                     "true" => true,
                     "false" => false,
-                    other => return Err(format!("invalid enabled '{other}': expected true or false")),
+                    other => {
+                        return Err(format!("invalid enabled '{other}': expected true or false"))
+                    }
                 };
             }
             other => return Err(format!("unknown flag '{other}'")),
@@ -1114,25 +1136,39 @@ mod tests {
         );
         assert_eq!(
             parse_ok(&["run", "curl"]).cmd,
-            Cmd::Run { argv: vec!["curl".into()] },
+            Cmd::Run {
+                argv: vec!["curl".into()]
+            },
             "the separator is conventional, not required"
         );
         // Global options still work, as long as they precede `run`.
         let cli = parse_ok(&["--socket", "/tmp/s.sock", "run", "--", "curl"]);
         assert_eq!(cli.socket, std::path::PathBuf::from("/tmp/s.sock"));
-        assert_eq!(cli.cmd, Cmd::Run { argv: vec!["curl".into()] });
+        assert_eq!(
+            cli.cmd,
+            Cmd::Run {
+                argv: vec!["curl".into()]
+            }
+        );
 
         assert!(parse_err(&["run"]).contains("needs a command"));
         // `run --help` is a question about `run`, not a program to execute.
-        assert_eq!(parse(&["run".to_string(), "--help".to_string()]).unwrap(), Parsed::Help);
+        assert_eq!(
+            parse(&["run".to_string(), "--help".to_string()]).unwrap(),
+            Parsed::Help
+        );
         assert_eq!(
             parse_ok(&["run", "--", "--help"]).cmd,
-            Cmd::Run { argv: vec!["--help".into()] },
+            Cmd::Run {
+                argv: vec!["--help".into()]
+            },
             "after the separator it is the wrapped command's argument"
         );
         assert_eq!(
             parse_ok(&["run", "curl", "--help"]).cmd,
-            Cmd::Run { argv: vec!["curl".into(), "--help".into()] },
+            Cmd::Run {
+                argv: vec!["curl".into(), "--help".into()]
+            },
             "and later in the line it is always the command's"
         );
         // `run` is only a command in command position; elsewhere it is
@@ -1173,7 +1209,10 @@ mod tests {
         assert_eq!(parse_ok(&["watch"]).cmd, Cmd::Watch);
         assert_eq!(
             parse_ok(&["rules"]).cmd,
-            Cmd::RulesList { stats: false, tag: None }
+            Cmd::RulesList {
+                stats: false,
+                tag: None
+            }
         );
         assert_eq!(
             parse_ok(&["events"]).cmd,
@@ -1195,7 +1234,10 @@ mod tests {
         let cli = parse_ok(&["--json", "top", "--color", "never"]);
         assert!(cli.json);
         assert_eq!(cli.color, ColorChoice::Never);
-        assert_eq!(parse_ok(&["status", "--color", "always"]).color, ColorChoice::Always);
+        assert_eq!(
+            parse_ok(&["status", "--color", "always"]).color,
+            ColorChoice::Always
+        );
         assert!(parse_err(&["status", "--color", "maybe"]).contains("invalid --color"));
         assert!(parse_err(&["status", "--color"]).contains("requires a value"));
     }
@@ -1215,9 +1257,7 @@ mod tests {
         assert!(parse_err(&["config", "set"]).contains("nothing to change"));
         assert!(parse_err(&["config", "set", "--timeout", "x"]).contains("invalid --timeout"));
         assert!(parse_err(&["config", "set", "--default", "maybe"]).contains("invalid --default"));
-        assert!(
-            parse_err(&["config", "set", "--observe", "--enforce"]).contains("at most one")
-        );
+        assert!(parse_err(&["config", "set", "--observe", "--enforce"]).contains("at most one"));
     }
 
     /// `--observe` alone is refused: it stops enforcement host-wide, and in
@@ -1247,8 +1287,18 @@ mod tests {
     #[test]
     fn events_flags() {
         let Cmd::Events(opts) = parse_ok(&[
-            "events", "--last", "50", "--no-follow", "--exe", "curl", "--exe", "wget",
-            "--domain", "example.org", "--verdict", "blocked",
+            "events",
+            "--last",
+            "50",
+            "--no-follow",
+            "--exe",
+            "curl",
+            "--exe",
+            "wget",
+            "--domain",
+            "example.org",
+            "--verdict",
+            "blocked",
         ])
         .cmd
         else {
@@ -1256,7 +1306,10 @@ mod tests {
         };
         assert_eq!(opts.last, Some(50));
         assert!(!opts.follow);
-        assert_eq!(opts.filters.exe, vec!["curl".to_string(), "wget".to_string()]);
+        assert_eq!(
+            opts.filters.exe,
+            vec!["curl".to_string(), "wget".to_string()]
+        );
         assert_eq!(opts.filters.domain, vec!["example.org".to_string()]);
         assert_eq!(opts.filters.verdict, vec![Verdict::Deny, Verdict::Reject]);
     }
@@ -1280,21 +1333,42 @@ mod tests {
     fn top_flags_and_clamps() {
         let cases: [(&[&str], TopOpts); 4] = [
             (
-                &["top", "--group-by", "domain", "--interval", "5", "--top", "3"],
-                TopOpts { group_by: GroupBy::Domain, interval_secs: 5, top_n: 3 },
+                &[
+                    "top",
+                    "--group-by",
+                    "domain",
+                    "--interval",
+                    "5",
+                    "--top",
+                    "3",
+                ],
+                TopOpts {
+                    group_by: GroupBy::Domain,
+                    interval_secs: 5,
+                    top_n: 3,
+                },
             ),
             // Interval floor: 0 would be a redraw loop with no sleep.
             (
                 &["top", "--interval", "0"],
-                TopOpts { interval_secs: MIN_INTERVAL_SECS, ..TopOpts::default() },
+                TopOpts {
+                    interval_secs: MIN_INTERVAL_SECS,
+                    ..TopOpts::default()
+                },
             ),
             (
                 &["top", "--top", "99999"],
-                TopOpts { top_n: MAX_TOP_ROWS, ..TopOpts::default() },
+                TopOpts {
+                    top_n: MAX_TOP_ROWS,
+                    ..TopOpts::default()
+                },
             ),
             (
                 &["top", "--top", "0"],
-                TopOpts { top_n: 1, ..TopOpts::default() },
+                TopOpts {
+                    top_n: 1,
+                    ..TopOpts::default()
+                },
             ),
         ];
         for (argv, want) in cases {
@@ -1341,7 +1415,10 @@ mod tests {
         // Empty filters keep everything.
         assert!(Filters::default().matches(&curl));
 
-        let exe_only = Filters { exe: vec!["curl".into()], ..Default::default() };
+        let exe_only = Filters {
+            exe: vec!["curl".into()],
+            ..Default::default()
+        };
         assert!(exe_only.matches(&curl));
         assert!(!exe_only.matches(&nc));
 
@@ -1466,7 +1543,9 @@ mod tests {
         assert!(parse_err(&["rules", "--tag", "--stats"]).contains("bad tag"));
         // And a second `--tag` is an error, not an overwrite: printing only
         // the last one's rules reads as the first set being gone.
-        assert!(parse_err(&["rules", "--tag", "work", "--tag", "vpn"]).contains("only be given once"));
+        assert!(
+            parse_err(&["rules", "--tag", "work", "--tag", "vpn"]).contains("only be given once")
+        );
     }
 
     /// An add replaces any rule of the same name outright, so the flag that
@@ -1474,7 +1553,9 @@ mod tests {
     /// are changed, and without it that silently re-enables the rule.
     #[test]
     fn rules_add_enabled_flag() {
-        let base = ["rules", "add", "--name", "r", "--action", "deny", "--port", "443"];
+        let base = [
+            "rules", "add", "--name", "r", "--action", "deny", "--port", "443",
+        ];
         let rule_of = |extra: &[&str]| {
             let mut argv: Vec<&str> = base.to_vec();
             argv.extend_from_slice(extra);
@@ -1538,7 +1619,9 @@ mod tests {
         };
         assert_eq!(rule.tags, vec!["work".to_string(), "vpn".to_string()]);
 
-        let base = ["rules", "add", "--name", "r", "--action", "deny", "--port", "443"];
+        let base = [
+            "rules", "add", "--name", "r", "--action", "deny", "--port", "443",
+        ];
         let with = |extra: &[&str]| {
             let mut argv: Vec<&str> = base.to_vec();
             argv.extend_from_slice(extra);
@@ -1559,7 +1642,10 @@ mod tests {
     fn rules_list_stats_export_import() {
         assert_eq!(
             parse_ok(&["rules", "--stats"]).cmd,
-            Cmd::RulesList { stats: true, tag: None }
+            Cmd::RulesList {
+                stats: true,
+                tag: None
+            }
         );
         assert_eq!(parse_ok(&["rules", "export"]).cmd, Cmd::RulesExport);
         assert_eq!(
@@ -1578,11 +1664,33 @@ mod tests {
     fn explain_full() {
         let hash = "ab".repeat(32);
         let Cmd::Explain(req) = parse_ok(&[
-            "explain", "--exe", "/usr/bin/curl", "--cmdline", "curl https://example.org",
-            "--parent-exe", "/bin/bash", "--dest", "93.184.216.34", "--port", "443",
-            "--proto", "udp", "--domain", "example.org", "--user", "1000", "--src",
-            "10.0.0.5", "--src-port", "51000", "--iface", "wg0", "--app-id",
-            "flatpak:org.mozilla.firefox", "--exe-sha256", &hash,
+            "explain",
+            "--exe",
+            "/usr/bin/curl",
+            "--cmdline",
+            "curl https://example.org",
+            "--parent-exe",
+            "/bin/bash",
+            "--dest",
+            "93.184.216.34",
+            "--port",
+            "443",
+            "--proto",
+            "udp",
+            "--domain",
+            "example.org",
+            "--user",
+            "1000",
+            "--src",
+            "10.0.0.5",
+            "--src-port",
+            "51000",
+            "--iface",
+            "wg0",
+            "--app-id",
+            "flatpak:org.mozilla.firefox",
+            "--exe-sha256",
+            &hash,
         ])
         .cmd
         else {
@@ -1602,7 +1710,9 @@ mod tests {
         // A value no connection could carry is named as the error it is,
         // not passed through to an explanation that matches nothing.
         for bad in ["firefox", "snap:Firefox", "docker:nginx"] {
-            let err = parse_err(&["explain", "--dest", "1.2.3.4", "--port", "1", "--app-id", bad]);
+            let err = parse_err(&[
+                "explain", "--dest", "1.2.3.4", "--port", "1", "--app-id", bad,
+            ]);
             assert!(err.contains("invalid --app-id"), "{bad}: {err}");
         }
         // The hash rides beside the connection: it is what the daemon should
@@ -1640,13 +1750,36 @@ mod tests {
             (&["explain", "--dest", "1.2.3.4"], "--port is required"),
             // A block has no single address to send to; explain describes one
             // connection, not a range.
-            (&["explain", "--dest", "10.0.0.0/8", "--port", "1"], "invalid --dest"),
-            (&["explain", "--dest", "example.org", "--port", "1"], "invalid --dest"),
-            (&["explain", "--dest", "1.2.3.4", "--port", "99999"], "invalid port"),
-            (&["explain", "--dest", "1.2.3.4", "--port", "1", "--proto", "icmp"],
-             "invalid proto"),
-            (&["explain", "--dest", "1.2.3.4", "--port", "1", "--exe-sha256", "beef"],
-             "64 hex digits"),
+            (
+                &["explain", "--dest", "10.0.0.0/8", "--port", "1"],
+                "invalid --dest",
+            ),
+            (
+                &["explain", "--dest", "example.org", "--port", "1"],
+                "invalid --dest",
+            ),
+            (
+                &["explain", "--dest", "1.2.3.4", "--port", "99999"],
+                "invalid port",
+            ),
+            (
+                &[
+                    "explain", "--dest", "1.2.3.4", "--port", "1", "--proto", "icmp",
+                ],
+                "invalid proto",
+            ),
+            (
+                &[
+                    "explain",
+                    "--dest",
+                    "1.2.3.4",
+                    "--port",
+                    "1",
+                    "--exe-sha256",
+                    "beef",
+                ],
+                "64 hex digits",
+            ),
             (&["explain", "--dest"], "requires a value"),
         ];
         for (argv, want) in cases {
@@ -1659,10 +1792,30 @@ mod tests {
     #[test]
     fn rules_add_full() {
         let cli = parse_ok(&[
-            "rules", "add", "--name", "curl-https", "--action", "allow", "--exe",
-            "/usr/bin/curl", "--exe-glob", "/usr/bin/*", "--dest", "10.0.0.0/8", "--port",
-            "443", "--domain", "*.example.org", "--user", "1000", "--proto", "tcp",
-            "--duration", "session", "--priority", "7",
+            "rules",
+            "add",
+            "--name",
+            "curl-https",
+            "--action",
+            "allow",
+            "--exe",
+            "/usr/bin/curl",
+            "--exe-glob",
+            "/usr/bin/*",
+            "--dest",
+            "10.0.0.0/8",
+            "--port",
+            "443",
+            "--domain",
+            "*.example.org",
+            "--user",
+            "1000",
+            "--proto",
+            "tcp",
+            "--duration",
+            "session",
+            "--priority",
+            "7",
         ]);
         let Cmd::RulesAdd(rule) = cli.cmd else {
             panic!("expected RulesAdd");
@@ -1684,16 +1837,32 @@ mod tests {
     #[test]
     fn rules_add_timed_duration() {
         let timed = parse_ok(&[
-            "rules", "add", "--name", "t", "--action", "allow", "--duration", "5m",
+            "rules",
+            "add",
+            "--name",
+            "t",
+            "--action",
+            "allow",
+            "--duration",
+            "5m",
         ]);
-        let Cmd::RulesAdd(rule) = timed.cmd else { panic!("expected RulesAdd") };
+        let Cmd::RulesAdd(rule) = timed.cmd else {
+            panic!("expected RulesAdd")
+        };
         let RuleDuration::Until { deadline_ms } = rule.duration else {
             panic!("expected Until, got {:?}", rule.duration)
         };
         let now = hallpass_types::unix_ms_now();
         assert!(deadline_ms > now + 290_000 && deadline_ms <= now + 300_000);
         assert!(parse_err(&[
-            "rules", "add", "--name", "t", "--action", "allow", "--duration", "5w"
+            "rules",
+            "add",
+            "--name",
+            "t",
+            "--action",
+            "allow",
+            "--duration",
+            "5w"
         ])
         .contains("invalid duration"));
     }
@@ -1718,8 +1887,10 @@ mod tests {
 
     #[test]
     fn rules_add_bad_values() {
-        assert!(parse_err(&["rules", "add", "--name", "n", "--action", "drop"])
-            .contains("invalid action"));
+        assert!(
+            parse_err(&["rules", "add", "--name", "n", "--action", "drop"])
+                .contains("invalid action")
+        );
         assert!(
             parse_err(&["rules", "add", "--name", "n", "--action", "deny", "--port", "70000"])
                 .contains("invalid port")
@@ -1729,7 +1900,14 @@ mod tests {
                 .contains("invalid proto")
         );
         assert!(parse_err(&[
-            "rules", "add", "--name", "n", "--action", "deny", "--duration", "once"
+            "rules",
+            "add",
+            "--name",
+            "n",
+            "--action",
+            "deny",
+            "--duration",
+            "once"
         ])
         .contains("invalid duration"));
     }

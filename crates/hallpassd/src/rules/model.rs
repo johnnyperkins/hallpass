@@ -3,8 +3,8 @@
 use std::path::PathBuf;
 
 use globset::GlobMatcher;
-use ipnet::IpNet;
 use hallpass_types::{Action, Connection, Proto, Rule};
+use ipnet::IpNet;
 
 /// Domain pattern from a rule's `domain` field.
 #[derive(Debug, Clone)]
@@ -132,7 +132,11 @@ impl CompiledRule {
                 "rule has no match criteria and will match every connection"
             );
         }
-        let dest = m.dest.as_deref().map(|s| parse_net("dest", s)).transpose()?;
+        let dest = m
+            .dest
+            .as_deref()
+            .map(|s| parse_net("dest", s))
+            .transpose()?;
         let src = m.src.as_deref().map(|s| parse_net("src", s)).transpose()?;
         let exe_glob = match &m.exe_glob {
             None => None,
@@ -196,7 +200,11 @@ impl CompiledRule {
             .as_deref()
             .map(super::lists::DomainSet::load)
             .transpose()?;
-        let ips_file = m.ips_file.as_deref().map(super::lists::IpSet::load).transpose()?;
+        let ips_file = m
+            .ips_file
+            .as_deref()
+            .map(super::lists::IpSet::load)
+            .transpose()?;
         let hashes_file = m
             .hashes_file
             .as_deref()
@@ -452,20 +460,29 @@ mod tests {
             compiled.matches(&c, None)
         };
 
-        assert!(matches("/usr/bin/*", "/usr/bin/curl"), "one level still matches");
+        assert!(
+            matches("/usr/bin/*", "/usr/bin/curl"),
+            "one level still matches"
+        );
         assert!(
             !matches("/usr/bin/*", "/usr/bin/nested/evil"),
             "* must not cross a separator"
         );
         assert!(
-            !matches("/usr/lib/firefox/*", "/usr/lib/firefox/plugins/writable/evil"),
+            !matches(
+                "/usr/lib/firefox/*",
+                "/usr/lib/firefox/plugins/writable/evil"
+            ),
             "the README's own example must not carry a whole subtree"
         );
         assert!(
             matches("/opt/app/**", "/opt/app/deep/nested/bin"),
             "** is how a subtree is asked for"
         );
-        assert!(!matches("/usr/bin/?", "/usr/bin//"), "? must not cross either");
+        assert!(
+            !matches("/usr/bin/?", "/usr/bin//"),
+            "? must not cross either"
+        );
     }
 
     #[test]
@@ -613,21 +630,99 @@ mod tests {
             assert_eq!(compiled.matches(&conn, None), expect);
         };
 
-        check(RuleMatch { cmdline_contains: Some("backup.py".into()), ..Default::default() }, true);
-        check(RuleMatch { cmdline_contains: Some("restore.py".into()), ..Default::default() }, false);
-        check(RuleMatch { parent_exe: Some("/usr/bin/bash".into()), ..Default::default() }, true);
-        check(RuleMatch { parent_exe: Some("/usr/bin/zsh".into()), ..Default::default() }, false);
-        check(RuleMatch { src: Some("192.168.1.0/24".into()), ..Default::default() }, true);
-        check(RuleMatch { src: Some("10.0.0.0/8".into()), ..Default::default() }, false);
-        check(RuleMatch { src_port: Some(40000), ..Default::default() }, true);
-        check(RuleMatch { src_port: Some(40001), ..Default::default() }, false);
-        check(RuleMatch { iface: Some("wg0".into()), ..Default::default() }, true);
-        check(RuleMatch { iface: Some("eth0".into()), ..Default::default() }, false);
-        check(RuleMatch { app_id: Some("flatpak:org.mozilla.firefox".into()), ..Default::default() }, true);
+        check(
+            RuleMatch {
+                cmdline_contains: Some("backup.py".into()),
+                ..Default::default()
+            },
+            true,
+        );
+        check(
+            RuleMatch {
+                cmdline_contains: Some("restore.py".into()),
+                ..Default::default()
+            },
+            false,
+        );
+        check(
+            RuleMatch {
+                parent_exe: Some("/usr/bin/bash".into()),
+                ..Default::default()
+            },
+            true,
+        );
+        check(
+            RuleMatch {
+                parent_exe: Some("/usr/bin/zsh".into()),
+                ..Default::default()
+            },
+            false,
+        );
+        check(
+            RuleMatch {
+                src: Some("192.168.1.0/24".into()),
+                ..Default::default()
+            },
+            true,
+        );
+        check(
+            RuleMatch {
+                src: Some("10.0.0.0/8".into()),
+                ..Default::default()
+            },
+            false,
+        );
+        check(
+            RuleMatch {
+                src_port: Some(40000),
+                ..Default::default()
+            },
+            true,
+        );
+        check(
+            RuleMatch {
+                src_port: Some(40001),
+                ..Default::default()
+            },
+            false,
+        );
+        check(
+            RuleMatch {
+                iface: Some("wg0".into()),
+                ..Default::default()
+            },
+            true,
+        );
+        check(
+            RuleMatch {
+                iface: Some("eth0".into()),
+                ..Default::default()
+            },
+            false,
+        );
+        check(
+            RuleMatch {
+                app_id: Some("flatpak:org.mozilla.firefox".into()),
+                ..Default::default()
+            },
+            true,
+        );
         // The scheme prefix is part of the value: the same application
         // packaged the other way is a different identity.
-        check(RuleMatch { app_id: Some("snap:firefox".into()), ..Default::default() }, false);
-        check(RuleMatch { app_id: Some("flatpak:org.mozilla".into()), ..Default::default() }, false);
+        check(
+            RuleMatch {
+                app_id: Some("snap:firefox".into()),
+                ..Default::default()
+            },
+            false,
+        );
+        check(
+            RuleMatch {
+                app_id: Some("flatpak:org.mozilla".into()),
+                ..Default::default()
+            },
+            false,
+        );
 
         // Absent connection data never matches a present criterion.
         let mut bare = conn.clone();
@@ -680,80 +775,129 @@ mod tests {
         }
         let m = RuleMatch::default;
         let cases = vec![
-            Case { name: "no criteria matches", matcher: m(), expect: None },
+            Case {
+                name: "no criteria matches",
+                matcher: m(),
+                expect: None,
+            },
             Case {
                 name: "exe",
-                matcher: RuleMatch { exe: Some("/usr/bin/wget".into()), ..m() },
+                matcher: RuleMatch {
+                    exe: Some("/usr/bin/wget".into()),
+                    ..m()
+                },
                 expect: Some("exe"),
             },
             Case {
                 name: "exe_glob",
-                matcher: RuleMatch { exe_glob: Some("/opt/*".into()), ..m() },
+                matcher: RuleMatch {
+                    exe_glob: Some("/opt/*".into()),
+                    ..m()
+                },
                 expect: Some("exe_glob"),
             },
             Case {
                 name: "exe_sha256",
-                matcher: RuleMatch { exe_sha256: Some("ab".repeat(32)), ..m() },
+                matcher: RuleMatch {
+                    exe_sha256: Some("ab".repeat(32)),
+                    ..m()
+                },
                 expect: Some("exe_sha256"),
             },
             Case {
                 name: "dest",
-                matcher: RuleMatch { dest: Some("10.0.0.0/8".into()), ..m() },
+                matcher: RuleMatch {
+                    dest: Some("10.0.0.0/8".into()),
+                    ..m()
+                },
                 expect: Some("dest"),
             },
             Case {
                 name: "port",
-                matcher: RuleMatch { port: Some(80), ..m() },
+                matcher: RuleMatch {
+                    port: Some(80),
+                    ..m()
+                },
                 expect: Some("port"),
             },
             Case {
                 name: "port_range",
-                matcher: RuleMatch { port_range: Some((1, 100)), ..m() },
+                matcher: RuleMatch {
+                    port_range: Some((1, 100)),
+                    ..m()
+                },
                 expect: Some("port_range"),
             },
             Case {
                 name: "domain",
-                matcher: RuleMatch { domain: Some("*.example.com".into()), ..m() },
+                matcher: RuleMatch {
+                    domain: Some("*.example.com".into()),
+                    ..m()
+                },
                 expect: Some("domain"),
             },
             Case {
                 name: "user",
-                matcher: RuleMatch { user: Some(0), ..m() },
+                matcher: RuleMatch {
+                    user: Some(0),
+                    ..m()
+                },
                 expect: Some("user"),
             },
             Case {
                 name: "proto",
-                matcher: RuleMatch { proto: Some(Proto::Udp), ..m() },
+                matcher: RuleMatch {
+                    proto: Some(Proto::Udp),
+                    ..m()
+                },
                 expect: Some("proto"),
             },
             Case {
                 name: "cmdline_contains",
-                matcher: RuleMatch { cmdline_contains: Some("wget".into()), ..m() },
+                matcher: RuleMatch {
+                    cmdline_contains: Some("wget".into()),
+                    ..m()
+                },
                 expect: Some("cmdline_contains"),
             },
             Case {
                 name: "parent_exe",
-                matcher: RuleMatch { parent_exe: Some("/usr/bin/zsh".into()), ..m() },
+                matcher: RuleMatch {
+                    parent_exe: Some("/usr/bin/zsh".into()),
+                    ..m()
+                },
                 expect: Some("parent_exe"),
             },
             Case {
                 name: "src",
-                matcher: RuleMatch { src: Some("10.0.0.0/8".into()), ..m() },
+                matcher: RuleMatch {
+                    src: Some("10.0.0.0/8".into()),
+                    ..m()
+                },
                 expect: Some("src"),
             },
             Case {
                 name: "src_port",
-                matcher: RuleMatch { src_port: Some(1234), ..m() },
+                matcher: RuleMatch {
+                    src_port: Some(1234),
+                    ..m()
+                },
                 expect: Some("src_port"),
             },
             Case {
                 name: "iface",
-                matcher: RuleMatch { iface: Some("eth0".into()), ..m() },
+                matcher: RuleMatch {
+                    iface: Some("eth0".into()),
+                    ..m()
+                },
                 expect: Some("iface"),
             },
             Case {
                 name: "app_id",
-                matcher: RuleMatch { app_id: Some("snap:chromium".into()), ..m() },
+                matcher: RuleMatch {
+                    app_id: Some("snap:chromium".into()),
+                    ..m()
+                },
                 expect: Some("app_id"),
             },
             Case {
@@ -768,7 +912,11 @@ mod tests {
             },
             Case {
                 name: "a satisfied operand is not blamed",
-                matcher: RuleMatch { port: Some(443), user: Some(0), ..m() },
+                matcher: RuleMatch {
+                    port: Some(443),
+                    user: Some(0),
+                    ..m()
+                },
                 expect: Some("user"),
             },
         ];
@@ -820,7 +968,10 @@ mod tests {
             ..Default::default()
         }))
         .unwrap();
-        assert_eq!(compiled.first_failing_field(&conn, None), Some("domains_file"));
+        assert_eq!(
+            compiled.first_failing_field(&conn, None),
+            Some("domains_file")
+        );
 
         let compiled = CompiledRule::compile(&rule_with(RuleMatch {
             ips_file: Some(ips),
@@ -844,8 +995,14 @@ mod tests {
             ..Default::default()
         }))
         .unwrap();
-        assert_eq!(compiled.first_failing_field(&conn, None), Some("hashes_file"));
-        assert_eq!(compiled.first_failing_field(&conn, Some(&"ab".repeat(32))), None);
+        assert_eq!(
+            compiled.first_failing_field(&conn, None),
+            Some("hashes_file")
+        );
+        assert_eq!(
+            compiled.first_failing_field(&conn, Some(&"ab".repeat(32))),
+            None
+        );
     }
 
     /// An app_id no connection could ever carry is refused at compile,

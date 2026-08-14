@@ -17,8 +17,8 @@
 //! Fully automated (~40s); just watch. A ticker thread hard-exits at 50s
 //! in case the window ends up unmappable and the frame loop never runs.
 
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::OnceLock;
 use std::time::Instant;
 
 use eframe::egui;
@@ -37,7 +37,11 @@ fn log(msg: &str) {
 /// (end_second, name, what the operator should see)
 const PHASES: &[(f32, &str, &str)] = &[
     (4.0, "baseline", "window visible, painting normally"),
-    (10.0, "Visible(false)", "window should VANISH (no taskbar entry)"),
+    (
+        10.0,
+        "Visible(false)",
+        "window should VANISH (no taskbar entry)",
+    ),
     (
         18.0,
         "popup while hidden",
@@ -172,7 +176,10 @@ impl eframe::App for Probe {
 
         self.frames[self.phase] += 1;
         if self.frames[self.phase] <= 3 {
-            log(&format!("frame in phase {} ({})", self.phase, PHASES[self.phase].1));
+            log(&format!(
+                "frame in phase {} ({})",
+                self.phase, PHASES[self.phase].1
+            ));
         }
 
         let flags = ctx.input(|i| (i.viewport().minimized, i.viewport().focused));

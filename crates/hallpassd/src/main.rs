@@ -15,7 +15,6 @@ mod attribution;
 mod config;
 mod conntrack;
 mod conntrack_events;
-mod netlink;
 #[cfg(feature = "dev-fixtures")]
 mod devfixtures;
 mod dns;
@@ -24,6 +23,7 @@ mod firstseen;
 mod iface;
 mod ipc;
 mod lockdown;
+mod netlink;
 mod nfqueue;
 mod nft;
 mod packet;
@@ -66,7 +66,10 @@ use crate::stats::Counters;
 fn policy_dirs_trusted(config_path: &std::path::Path, rules_dir: &std::path::Path) -> bool {
     let mut ok = true;
     let config_dir = config_path.parent().unwrap_or(std::path::Path::new("."));
-    for (what, dir) in [("config directory", config_dir), ("rules directory", rules_dir)] {
+    for (what, dir) in [
+        ("config directory", config_dir),
+        ("rules directory", rules_dir),
+    ] {
         if let Err(e) = rules::store::check_policy_dir(dir) {
             tracing::error!("{what} is not trustworthy: {e}");
             ok = false;
@@ -74,7 +77,6 @@ fn policy_dirs_trusted(config_path: &std::path::Path, rules_dir: &std::path::Pat
     }
     ok
 }
-
 
 #[tokio::main]
 async fn main() {
@@ -281,8 +283,7 @@ async fn main() {
     }
 
     // Channels between the queue thread and the async side.
-    let (prompt_tx, mut prompt_rx) =
-        tokio::sync::mpsc::unbounded_channel::<nfqueue::PromptTask>();
+    let (prompt_tx, mut prompt_rx) = tokio::sync::mpsc::unbounded_channel::<nfqueue::PromptTask>();
     let (verdict_tx, verdict_rx) = tokio::sync::mpsc::unbounded_channel();
     // Bounded, unlike the two above. Those carry one item per packet the
     // daemon is already holding, so the kernel queue length bounds them. This
@@ -478,8 +479,7 @@ async fn main() {
     });
     let observe_deps = Arc::clone(&ipc_deps);
     let ipc_task = tokio::spawn(async move {
-        if let Err(e) =
-            ipc::server::serve(ipc_listener, ipc_deps, ipc::server::Tier::Control).await
+        if let Err(e) = ipc::server::serve(ipc_listener, ipc_deps, ipc::server::Tier::Control).await
         {
             tracing::error!("IPC server failed: {e}");
         }
@@ -595,4 +595,3 @@ async fn main() {
         std::process::exit(1);
     }
 }
-

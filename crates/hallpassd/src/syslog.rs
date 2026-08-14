@@ -312,7 +312,11 @@ impl Sink {
                 let addr: SocketAddr = addr
                     .parse()
                     .map_err(|e| format!("bad syslog address {addr:?}: {e}"))?;
-                let bind = if addr.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
+                let bind = if addr.is_ipv4() {
+                    "0.0.0.0:0"
+                } else {
+                    "[::]:0"
+                };
                 let sock = UdpSocket::bind(bind)
                     .await
                     .map_err(|e| format!("udp socket: {e}"))?;
@@ -375,8 +379,8 @@ pub fn spawn(events: Arc<EventBus>, cfg: SyslogConfig) {
                         }
                         Err(e) => {
                             dropped += 1;
-                            let due = last_report
-                                .is_none_or(|t| t.elapsed() >= FAILURE_REPORT_INTERVAL);
+                            let due =
+                                last_report.is_none_or(|t| t.elapsed() >= FAILURE_REPORT_INTERVAL);
                             if due {
                                 last_report = Some(Instant::now());
                                 tracing::warn!(dropped, "syslog send failing: {e}");
@@ -485,7 +489,10 @@ mod tests {
             // The frame separator is what matters: a record that cannot
             // be split cannot be forged, whatever the payload spells.
             assert!(!line.contains('\n'), "newline survived into {format:?}");
-            assert!(!line.contains('\r'), "carriage return survived into {format:?}");
+            assert!(
+                !line.contains('\r'),
+                "carriage return survived into {format:?}"
+            );
             // The forged text survives as inert payload inside the quoted
             // value; without a separator no parser can read it as its own
             // record, and the real frame header appears exactly once.
@@ -504,7 +511,11 @@ mod tests {
             assert!(!line.contains(&"A".repeat(MAX_FIELD_CHARS + 1)));
             assert!(line.contains("..."));
             // Comfortably inside what a UDP collector must accept.
-            assert!(line.len() < 2048, "{format:?} frame too large: {}", line.len());
+            assert!(
+                line.len() < 2048,
+                "{format:?} frame too large: {}",
+                line.len()
+            );
         }
     }
 

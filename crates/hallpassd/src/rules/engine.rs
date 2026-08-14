@@ -83,7 +83,10 @@ impl RuleSet {
     /// full of old disabled rules report a posture far wider than the one it
     /// actually applied.
     pub fn suppressed_count(&self) -> u32 {
-        self.rules.iter().filter(|r| r.enabled && r.suppressed).count() as u32
+        self.rules
+            .iter()
+            .filter(|r| r.enabled && r.suppressed)
+            .count() as u32
     }
 
     /// First enabled rule matching `conn`, with its verdict. `exe_sha256`
@@ -156,7 +159,9 @@ impl RuleSet {
         // Cheap insurance in tests and debug builds against a future edit
         // that splits the two walks apart again.
         debug_assert_eq!(
-            matched.as_ref().map(|(name, verdict)| (name.as_str(), *verdict)),
+            matched
+                .as_ref()
+                .map(|(name, verdict)| (name.as_str(), *verdict)),
             self.match_conn(conn, exe_sha256)
                 .map(|(rule, verdict)| (rule.name.as_str(), verdict)),
             "explain disagreed with match_conn"
@@ -223,9 +228,9 @@ impl RuleSet {
         // it costs neither path a scan to find that out.
         self.has_hash_rules
             .then(|| {
-                self.rules
-                    .iter()
-                    .filter(move |r| r.enabled && r.wants_exe_hash() && r.matches_ignoring_hash(conn))
+                self.rules.iter().filter(move |r| {
+                    r.enabled && r.wants_exe_hash() && r.matches_ignoring_hash(conn)
+                })
             })
             .into_iter()
             .flatten()
@@ -789,7 +794,8 @@ mod tests {
         // decided rather than prompted, but a lower-priority deny can prompt
         // it anyway, and either way the sentence would be a lie.
         assert!(
-            set.hash_mismatch_rules(&curl(), Some(&pinned_hash), 4).is_empty(),
+            set.hash_mismatch_rules(&curl(), Some(&pinned_hash), 4)
+                .is_empty(),
             "a binary that has the pinned hash mismatches nothing"
         );
 
