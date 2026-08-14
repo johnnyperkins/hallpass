@@ -1162,6 +1162,54 @@ mod tests {
     use hallpass_types::{Action, RuleDuration, RuleMatch};
     use std::os::unix::fs::PermissionsExt;
 
+    /// Every rule file `install.sh` puts in `/etc/hallpass/rules.d` has to
+    /// survive the same load path a daemon puts it through.
+    ///
+    /// `load_dir` skips a file it cannot parse or compile and carries on
+    /// with a warning, which is right for an operator's own rules and
+    /// dangerous for these: the baseline exists so the daemons that run
+    /// before anyone can answer a prompt are not denied, so a typo in one
+    /// of them costs a booting host its DNS or its clock and says so only
+    /// in the journal. Nothing else reads these files before a release.
+    ///
+    /// The rule *name* is checked too, because `load_dir` drops a second
+    /// file claiming a name it has already seen. Two baseline files that
+    /// disagree about which one loads is the same outage as a typo, and it
+    /// is the mistake copying an existing file to cover a new daemon makes.
+    ///
+    /// Reads the directory rather than naming the files, so a baseline rule
+    /// added later is covered without anyone remembering this test.
+    #[test]
+    fn the_shipped_rule_files_parse_and_compile() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../etc/rules.d");
+        let mut names: Vec<(String, String)> = Vec::new();
+        for entry in std::fs::read_dir(&dir).expect("etc/rules.d is missing") {
+            let path = entry.expect("unreadable directory entry").path();
+            if path.extension().is_none_or(|e| e != "toml") {
+                continue;
+            }
+            let file = path.file_name().unwrap_or_default().to_string_lossy();
+            let text = std::fs::read_to_string(&path).expect("unreadable rule file");
+            let rule: Rule = toml::from_str(&text)
+                .unwrap_or_else(|e| panic!("etc/rules.d/{file} does not parse: {e}"));
+            CompiledRule::compile(&rule)
+                .unwrap_or_else(|e| panic!("etc/rules.d/{file} does not compile: {e}"));
+            if let Some((other, _)) = names.iter().find(|(_, n)| *n == rule.name) {
+                panic!(
+                    "etc/rules.d/{file} and etc/rules.d/{other} both name a rule \
+                     {:?}; load_dir would skip whichever it read second",
+                    rule.name
+                );
+            }
+            names.push((file.into_owned(), rule.name));
+        }
+        assert!(
+            !names.is_empty(),
+            "no rule files found in {}",
+            dir.display()
+        );
+    }
+
     fn rule(name: &str, duration: RuleDuration) -> Rule {
         Rule {
             name: name.into(),

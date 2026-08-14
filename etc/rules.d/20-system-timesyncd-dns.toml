@@ -1,0 +1,29 @@
+# systemd-timesyncd resolving its NTP server's name.
+#
+# Separate from 20-system-timesyncd.toml because a rule matches one port and
+# 53 is not adjacent to 123. Both are needed: the other file lets timesyncd
+# speak NTP, this one lets it find out where to.
+#
+# Only reached on a host with no systemd-resolved. Where resolved is running
+# timesyncd asks the stub over loopback, which is exempt before any rule is
+# consulted, and this rule never matches. Where it is not, timesyncd talks to
+# whatever /etc/resolv.conf names, and without this the lookup is denied, the
+# clock silently never syncs, and the symptom is TLS failing against
+# certificates the host should accept.
+#
+# Scoped to the binary, like every other rule here. A port-53 rule matching
+# any process is the exfiltration channel example-allow-dns.toml exists to
+# warn about.
+#
+# Priority 20 sits below the 50 that answering a prompt writes, so a rule
+# you create later overrides this one rather than losing to it.
+
+name = "system-timesyncd-dns"
+action = "allow"
+duration = "forever"
+priority = 20
+enabled = true
+
+[match]
+exe = "/usr/lib/systemd/systemd-timesyncd"
+port = 53

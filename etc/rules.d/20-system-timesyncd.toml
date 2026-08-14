@@ -1,0 +1,28 @@
+# systemd-timesyncd reaching an NTP server.
+#
+# Runs before anyone can answer a prompt, and a host whose clock never
+# syncs fails TLS against certificates it should accept, which surfaces as
+# unrelated breakage the operator has no reason to connect back to a
+# firewall decision.
+#
+# Scoped to the binary and to the NTP port. A port-only rule would let any
+# local process speak UDP/123 to any host, and NTP is a usable covert
+# channel like any other unauthenticated datagram protocol.
+#
+# Hosts running chrony or ntpd instead have no timesyncd to match; the
+# installer only writes this file when the binary is present, and a host
+# that switches later can copy it and change the path.
+#
+# Priority 20 sits below the 50 that answering a prompt writes, so a rule
+# you create later overrides this one rather than losing to it.
+
+name = "system-timesyncd"
+action = "allow"
+duration = "forever"
+priority = 20
+enabled = true
+
+[match]
+exe = "/usr/lib/systemd/systemd-timesyncd"
+port = 123
+proto = "udp"
