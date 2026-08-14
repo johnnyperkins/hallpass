@@ -11,6 +11,7 @@ fn main() -> ExitCode {
     let task = std::env::args().nth(1);
     let result = match task.as_deref() {
         Some("check") => check(),
+        Some("fmt") => fmt_check(),
         Some("test") => test_workspace(),
         Some("lint") => lint(),
         Some("doc") => doc(),
@@ -43,6 +44,7 @@ fn print_usage() {
     eprintln!("usage: cargo xtask <task>");
     eprintln!();
     eprintln!("verification (cheapest first):");
+    eprintln!("  fmt           cargo fmt --check over the workspace and hallpass-ebpf");
     eprintln!("  check         cargo check over the workspace and the ebpf feature");
     eprintln!("  test          run the workspace unit/integration tests (no privileges)");
     eprintln!("  lint          clippy in both feature configurations, plus clippy-ebpf;");
@@ -197,6 +199,28 @@ fn lint() -> Result<(), String> {
     clippy_ebpf()
 }
 
+/// Check formatting, workspace and eBPF crate alike.
+///
+/// Gated in CI rather than left to habit, because the alternative is what this
+/// project had: no `rustfmt.toml`, no `fmt` stage, and a tree that had drifted
+/// far enough from rustfmt's output that running the standard formatter once
+/// rewrote 56 files. A formatter nothing enforces is not a convention, it is a
+/// trap for the next person who runs it.
+///
+/// `hallpass-ebpf` is not a workspace member, so `--all` does not reach it -
+/// the same gap [`clippy_ebpf`] exists to close, with the same toolchain
+/// juggling.
+fn fmt_check() -> Result<(), String> {
+    run(Command::new(cargo())
+        .args(["fmt", "--all", "--check"])
+        .current_dir(workspace_root()))?;
+    run(Command::new("cargo")
+        .args(["fmt", "--check"])
+        .current_dir(workspace_root().join("crates/hallpass-ebpf"))
+        .env_remove("RUSTUP_TOOLCHAIN")
+        .env_remove("CARGO"))
+}
+
 /// Build the rustdoc, treating warnings as errors.
 ///
 /// The project documents public items heavily and leans on intra-doc links to
@@ -233,7 +257,11 @@ fn ci() -> Result<(), String> {
     // build-ebpf first, because every later stage that enables the `ebpf`
     // feature needs an object to embed, and without one the failure surfaces
     // from a build script deep inside a long compile rather than up front.
-    let stages: [Stage; 6] = [
+    // fmt first of all: it is the cheapest stage by a wide margin and it needs
+    // nothing built, so a badly formatted branch fails in a second rather than
+    // after the eBPF object and two test runs.
+    let stages: [Stage; 7] = [
+        ("fmt", fmt_check),
         ("build-ebpf", build_ebpf),
         ("check", check),
         ("test", test_workspace),

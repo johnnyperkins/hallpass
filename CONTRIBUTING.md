@@ -49,6 +49,7 @@ its own.
 
 | Task | Raw equivalent | What it is for |
 | --- | --- | --- |
+| `cargo xtask fmt` | `cargo fmt --all --check`, plus the same inside `crates/hallpass-ebpf` | Formatting, on rustfmt defaults |
 | `cargo xtask check` | `cargo check --workspace --all-targets` and `cargo check -p hallpassd --features ebpf` | Fastest answer to "does this compile", in both feature configurations |
 | `cargo xtask test` | `cargo test --workspace` | The unprivileged suite |
 | (part of `ci`) | `cargo test -p hallpassd --features ebpf` | The eBPF attribution unit tests |
@@ -96,7 +97,22 @@ operation reaches the state logic at all. Its `snapshot` and `wgpu` features
 are deliberately left off: pixel diffing is the flaky part and proves nothing
 these tests do not.
 
-There is no `cargo fmt` gate. The tree is hand-formatted.
+Formatting is rustfmt on its defaults, and `cargo xtask ci` gates on it as its
+first stage (it is the cheapest and needs nothing built). Run `cargo fmt --all`
+before committing; there is deliberately no `rustfmt.toml`, so there is nothing
+to configure and nothing to argue about.
+
+`crates/hallpass-ebpf` is not a workspace member, so `cargo fmt --all` does not
+reach it. `cargo xtask fmt` covers both, the same gap `clippy-ebpf` exists to
+close.
+
+The tree was hand-formatted until 2026-08-13, so `git log` contains one
+tree-wide reformat. It is listed in `.git-blame-ignore-revs`; enable it once
+per clone so `git blame` skips it:
+
+```sh
+git config blame.ignoreRevsFile .git-blame-ignore-revs
+```
 
 `cargo deny check` is separate because cargo-deny is a separate install. The
 `ci` task skips it with a loud note when it is missing rather than letting an

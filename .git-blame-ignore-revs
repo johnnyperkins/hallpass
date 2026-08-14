@@ -1,0 +1,14 @@
+# Revisions to skip when running `git blame`. Formatting-only commits belong
+# here: without this, a tree-wide reformat becomes the last author of every
+# line it touched and blame stops answering the question it is asked.
+#
+# Enable it once per clone (it is not automatic, and it cannot be committed
+# into config):
+#
+#     git config blame.ignoreRevsFile .git-blame-ignore-revs
+#
+# Only add commits that change no tokens. A commit listed here is invisible to
+# blame, so anything with real changes in it would hide them.
+
+# style: format the whole tree with rustfmt
+65180c0973d83d7f9fe3a05578962df7f6437ee4
