@@ -44,6 +44,18 @@ The daemon installs one nftables table, `inet hallpass`, with three chains:
 The snoop queue number is the verdict queue number plus one. Only `ct state
 new` is judged, so established flows are never re-checked.
 
+There is deliberately no chain on the `forward` hook, so a packet this host
+routes for a container, a VM or a bridged namespace never enters the path
+below. The constraint is attribution, not effort: step 4 resolves a local
+process for every packet, and a forwarded one has none, so the entire
+`RuleMatch` identity surface (`exe`, `exe_glob`, `exe_sha256`, `app_id`,
+`cmdline_contains`, `user`) is inapplicable rather than merely unpopulated.
+Filtering forwarded traffic means a tuple-only rule model that reports that
+inapplicability instead of quietly not matching, plus its own default verdict
+- a `forward` chain queuing under `default_verdict = "deny"` would black out
+every container on the host and could not even prompt. `hallpass-cli doctor`
+warns when this host has forwarding enabled; the README states the scope.
+
 A new outbound connection then travels like this:
 
 1. **Queued.** The kernel hands the packet to NFQUEUE. The whole table is

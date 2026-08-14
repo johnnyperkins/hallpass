@@ -8,12 +8,15 @@
 //! privileges this invocation does not have reports `skip` with the reason
 //! rather than guessing.
 //!
+//! One check is about coverage rather than health: `forwarding` names traffic
+//! this host carries that hallpass does not filter at all.
+//!
 //! Severity policy: `fail` means enforcement or reachability is not what the
 //! operator asked for (daemon unreachable, no queue bound, packets dropped
 //! without policy, table missing); `warn` is something to look at that does
 //! not by itself mean the firewall is off (observe mode, no prompt handler,
-//! odd socket mode, missing BTF); `skip` is a check that could not run. The
-//! exit code is non-zero exactly when something failed.
+//! odd socket mode, missing BTF, a forwarding host); `skip` is a check that
+//! could not run. The exit code is non-zero exactly when something failed.
 
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -139,6 +142,7 @@ pub async fn run(socket: &Path, out: Output) -> i32 {
     policy_dirs_check(&env, &mut checks);
     group_check(&env, &mut checks);
     nft_checks(env.euid, &mut checks);
+    forwarding_check(&mut checks);
     btf_check(&mut checks);
 
     if out.json {
@@ -696,6 +700,158 @@ fn chain_order(listing: &str) -> Result<(), &'static str> {
     }
 }
 
+/// Whether this host routes packets for anyone else, which hallpass does not
+/// filter.
+///
+/// **This is a coverage check, not a health check.** `nft::ruleset` installs
+/// base chains on `output` and `input` only, so a packet this host *forwards*
+/// (what containers, VMs, and bridged namespaces produce) never reaches a
+/// verdict queue and is not matched against any rule. That is deliberate and
+/// not a gap in the install: every attributor resolves a local process
+/// (`/proc/<pid>`, socket inodes, the eBPF connect kprobes) and a forwarded
+/// packet has none, so a `forward` chain would be a different product with a
+/// rule model of its own. The README says so; a host that is actually
+/// forwarding should not have to find out by reading it.
+///
+/// `warn`, not `fail`, and by the same rule [`policy_dirs_check`] states in
+/// reverse: enabling forwarding is a deployment choice someone made on
+/// purpose. Nothing here is broken. The operator is told what is not covered.
+fn forwarding_check(checks: &mut Vec<Check>) {
+    checks.push(forwarding_verdict(
+        &read_forwarding_state(),
+        &bridge_interfaces(),
+    ));
+}
+
+/// The per-interface forwarding trees. `net.ipv4.ip_forward` is only an alias
+/// for `conf/all/forwarding`, and it is not what the kernel consults: an IPv4
+/// packet is forwarded when the knob of the interface it *arrived on* is set,
+/// which can be turned on after the global one was cleared. Reading the whole
+/// tree is the difference between a coverage report and a guess.
+const IPV4_CONF: &str = "/proc/sys/net/ipv4/conf";
+const IPV6_CONF: &str = "/proc/sys/net/ipv6/conf";
+
+/// What this host's forwarding knobs say, as one answer.
+struct ForwardingState {
+    /// Families and interfaces with forwarding on, ready to print.
+    on: Vec<String>,
+    /// A knob that decides the answer could not be read, so reporting "off"
+    /// would be a guess rather than a finding.
+    blind: bool,
+}
+
+/// Read both trees.
+///
+/// Only IPv4 counts towards `blind`, and the asymmetry is deliberate: a
+/// kernel built without IPv6 has no IPv6 tree at all, and nothing here can
+/// tell that apart from one that is masked, so treating an absent IPv6 tree
+/// as unknown would report `skip` on ordinary hosts forever. Every kernel
+/// that can route IPv4 has the IPv4 tree.
+fn read_forwarding_state() -> ForwardingState {
+    let (v4, blind) = forwarding_ifaces(Path::new(IPV4_CONF));
+    let (v6, _) = forwarding_ifaces(Path::new(IPV6_CONF));
+    let on = v4
+        .into_iter()
+        .map(|iface| format!("IPv4 {iface}"))
+        .chain(v6.into_iter().map(|iface| format!("IPv6 {iface}")))
+        .collect();
+    ForwardingState { on, blind }
+}
+
+/// The interfaces under a `conf` tree whose `forwarding` knob is on, and
+/// whether any knob there could not be read.
+///
+/// `default` is skipped: it is the template a newly created interface
+/// inherits, not a live one, so it describes the future rather than what this
+/// host is carrying now. `all` is kept and short-circuits the rest, because
+/// setting it turns every interface on - listing the other twelve after it
+/// would be noise rather than information.
+fn forwarding_ifaces(root: &Path) -> (Vec<String>, bool) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return (Vec::new(), true);
+    };
+    let mut on = Vec::new();
+    let mut blind = false;
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name == "default" {
+            continue;
+        }
+        match sysctl_flag(&entry.path().join("forwarding")) {
+            Some(true) => on.push(name),
+            Some(false) => {}
+            None => blind = true,
+        }
+    }
+    if on.iter().any(|iface| iface == "all") {
+        return (vec!["all".to_string()], blind);
+    }
+    on.sort();
+    (on, blind)
+}
+
+/// The check [`forwarding_check`] reports, split out so the decision is
+/// testable without a host that forwards.
+fn forwarding_verdict(state: &ForwardingState, bridges: &[String]) -> Check {
+    if state.on.is_empty() {
+        // Unreadable is not the same as off, and this check exists precisely
+        // for hosts where it might be on. A clean bill drawn from a knob
+        // nobody read is worse than no line at all.
+        return if state.blind {
+            Check::skip(
+                "forwarding",
+                "cannot read the forwarding sysctls, so coverage is unknown".into(),
+            )
+        } else {
+            Check::ok(
+                "forwarding",
+                "this host does not forward, so nothing bypasses the filtered hooks".into(),
+            )
+        };
+    }
+
+    let mut detail = format!("forwarding is on: {}", state.on.join(", "));
+    if !bridges.is_empty() {
+        detail.push_str(&format!(" (bridges: {})", bridges.join(" ")));
+    }
+    Check::warn(
+        "forwarding",
+        detail,
+        Some(
+            "hallpass filters the output and input hooks only, so traffic this host \
+             routes for containers, VMs or other namespaces is not seen and not \
+             matched against any rule; policy it with a forward chain of your own"
+                .into(),
+        ),
+    )
+}
+
+/// A procfs `0`/`1` flag. `None` when it cannot be read.
+fn sysctl_flag(path: &Path) -> Option<bool> {
+    std::fs::read_to_string(path).ok().map(|text| text.trim() == "1")
+}
+
+/// This host's bridge interfaces, from sysfs: an interface is a bridge
+/// exactly when it has a `bridge/` directory.
+///
+/// Evidence for the warning, never a trigger for it. A bridge forwards at L2
+/// whether or not the routing knob is set and hallpass would not see that
+/// traffic either way, so a bridge alone would be a warning the operator
+/// could do nothing about. Naming `docker0` next to the sysctl is what turns
+/// an abstract limitation into a recognizable one.
+fn bridge_interfaces() -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir("/sys/class/net") else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .flatten()
+        .filter(|entry| entry.path().join("bridge").is_dir())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
 /// Kernel BTF availability, which decides how eBPF struct offsets resolve.
 fn btf_check(checks: &mut Vec<Check>) {
     if Path::new("/sys/kernel/btf/vmlinux").exists() {
@@ -946,6 +1102,112 @@ mod tests {
         assert!(chain_order(swapped).is_err());
         let no_queue = "chain output {\n\tmeta skuid 0 meta mark 1 accept\n}\n";
         assert!(chain_order(no_queue).is_err());
+    }
+
+    fn forwarding(on: &[&str], blind: bool) -> ForwardingState {
+        ForwardingState {
+            on: on.iter().map(|s| s.to_string()).collect(),
+            blind,
+        }
+    }
+
+    /// The forwarding check exists to be seen on exactly the hosts it applies
+    /// to, so the cases that matter are its two ways of being wrong: silent
+    /// on a router, or noisy on a desktop.
+    #[test]
+    fn forwarding_warns_only_when_the_host_actually_forwards() {
+        let none: &[String] = &[];
+
+        let off = forwarding_verdict(&forwarding(&[], false), none);
+        assert_eq!(
+            off.status,
+            Status::Ok,
+            "a non-forwarding host is not a finding"
+        );
+
+        let on = forwarding_verdict(&forwarding(&["IPv4 all"], false), none);
+        assert_eq!(on.status, Status::Warn);
+        assert!(
+            on.hint.is_some(),
+            "a warning the operator cannot act on is noise"
+        );
+    }
+
+    /// A clean bill drawn from a knob nobody could read is worse than no line
+    /// at all, and a masked `/proc/sys` is exactly the kind of host most
+    /// likely to be forwarding.
+    #[test]
+    fn forwarding_skips_rather_than_vouching_for_a_knob_it_cannot_read() {
+        let none: &[String] = &[];
+        let blind = forwarding_verdict(&forwarding(&[], true), none);
+        assert_eq!(blind.status, Status::Skip);
+
+        // Blind about one knob while another says yes is still a warning:
+        // what is known already answers the question.
+        let partial = forwarding_verdict(&forwarding(&["IPv6 all"], true), none);
+        assert_eq!(partial.status, Status::Warn);
+    }
+
+    /// `net.ipv4.ip_forward` aliases `conf/all/forwarding` and is not what the
+    /// kernel consults - the arrival interface's own knob is - so a host with
+    /// the global cleared and one interface set forwards, and must not read
+    /// as covered.
+    #[test]
+    fn per_interface_forwarding_is_a_finding_on_its_own() {
+        let none: &[String] = &[];
+        let check = forwarding_verdict(&forwarding(&["IPv4 docker0"], false), none);
+        assert_eq!(check.status, Status::Warn);
+        assert!(check.detail.contains("docker0"), "{}", check.detail);
+    }
+
+    /// `all` turns every interface on, so naming the other twelve after it is
+    /// noise; `default` is a template for interfaces that do not exist yet.
+    #[test]
+    fn the_global_knob_subsumes_the_per_interface_ones() {
+        let dir = std::env::temp_dir().join(format!("hallpass-doctor-fwd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for (iface, flag) in [("all", "1"), ("eth0", "1"), ("lo", "0"), ("default", "1")] {
+            std::fs::create_dir_all(dir.join(iface)).unwrap();
+            std::fs::write(dir.join(iface).join("forwarding"), flag).unwrap();
+        }
+
+        let (on, blind) = forwarding_ifaces(&dir);
+        assert_eq!(on, vec!["all".to_string()], "eth0 is implied by all");
+        assert!(!blind);
+
+        // With the global cleared, the interface that is actually set is the
+        // whole answer, and the template is still not part of it.
+        std::fs::write(dir.join("all").join("forwarding"), "0").unwrap();
+        let (on, _) = forwarding_ifaces(&dir);
+        assert_eq!(on, vec!["eth0".to_string()]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A tree that cannot be read at all is the `blind` signal, not an empty
+    /// answer.
+    #[test]
+    fn an_unreadable_conf_tree_reports_blind() {
+        let (on, blind) = forwarding_ifaces(Path::new("/proc/sys/net/definitely-not-here"));
+        assert!(on.is_empty());
+        assert!(blind);
+    }
+
+    /// Bridges are evidence, never the trigger: a bridged host that does not
+    /// route still forwards nothing hallpass could have filtered, and a
+    /// warning it cannot act on would train the operator to skip the line.
+    #[test]
+    fn bridges_name_the_finding_but_do_not_raise_one() {
+        let bridges = vec!["docker0".to_string(), "virbr0".to_string()];
+
+        let quiet = forwarding_verdict(&forwarding(&[], false), &bridges);
+        assert_eq!(quiet.status, Status::Ok);
+        assert!(!quiet.detail.contains("docker0"));
+
+        let loud = forwarding_verdict(&forwarding(&["IPv4 all"], false), &bridges);
+        assert_eq!(loud.status, Status::Warn);
+        assert!(loud.detail.contains("docker0"), "{}", loud.detail);
+        assert!(loud.detail.contains("virbr0"), "{}", loud.detail);
     }
 
     #[test]

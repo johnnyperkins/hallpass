@@ -690,11 +690,33 @@ attacker with root, who can delete the nftables table outright.
   path resolves inside its sandbox: it names neither a file on this host nor
   the application uniquely, which is what left those connections hard to
   scope at all.
-- **Only the `output` and `input` hooks are filtered.** Traffic that is
-  *forwarded* rather than locally generated, which is what containers, VMs,
-  and other network namespaces bridged to the host produce, traverses the
-  `forward` hook and is not seen at all. Hallpass polices what this host
-  originates.
+- **Only the `output` and `input` hooks are filtered, so a container host is
+  unfiltered for everything inside it.** Traffic this machine *forwards*
+  rather than originates - which is what containers, VMs, and other network
+  namespaces bridged to the host produce - traverses the `forward` hook,
+  reaches no verdict queue, and is not matched against any rule. Not a
+  weakened check: those packets are never seen. A Docker host running
+  hallpass polices the daemon and the CLI on the host itself and nothing in
+  any container.
+
+  This is a scope decision rather than an unfinished one, and the reason is
+  attribution. Every attributor here resolves a *local process* - `/proc/<pid>`,
+  socket inodes, the eBPF connect kprobes - and a forwarded packet has no
+  local process at all, so every `exe`, `exe_glob`, `exe_sha256`, `app_id`,
+  `cmdline_contains` and `user` operand is inapplicable to it. What is left is
+  tuple matching, which is a different product with a rule model of its own,
+  and it cannot ship on by default either: a `forward` base chain feeding the
+  verdict queue under the hardened config's `default_verdict = "deny"` would
+  black out every container on the host, with no prompt possible because
+  there is no process to name in one. Filter forwarded traffic with an
+  nftables `forward` chain of your own; hallpass will not fight you for it.
+
+  `hallpass-cli doctor` reports `forwarding` as a warning on any host that has
+  it enabled, naming the interfaces and this host's bridges, so the limitation
+  is delivered to the operators it applies to instead of waiting to be read
+  here. It reads the whole `conf/<iface>/forwarding` tree rather than
+  `net.ipv4.ip_forward` alone, because the global knob is only an alias for
+  `conf/all` and the kernel consults the arrival interface's own.
 - Rules only model TCP and UDP. Other transports (SCTP, ICMP, ...) are not
   matched against rules; they are counted and resolved by the
   `unhandled_proto_verdict` policy (`allow` by default, `deny` in the
