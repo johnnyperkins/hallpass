@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -18,7 +18,7 @@ use crate::editor::RuleEditor;
 use crate::net::{self, UiEvent};
 use crate::prompt::{self, PromptState};
 use crate::traffic;
-use crate::tray::TrayMsg;
+use crate::tray::{TrayMsg, TrayState};
 
 /// Maximum number of events kept in the scrollback.
 /// How often the window refetches `Stats`.
@@ -258,6 +258,22 @@ pub struct HallpassApp {
     /// Tray activation channel; None when no tray service was started
     /// (no X11-capable display, or tests).
     from_tray: Option<Receiver<TrayMsg>>,
+    /// Whether the daemon on the *current* connection has reported its mode.
+    ///
+    /// `enforcing` and `stats` survive a disconnect so the tabs keep showing
+    /// the last known numbers while reconnecting, which is right for a
+    /// display and wrong for a claim: without this, the moment the socket
+    /// came back the window re-asserted the dead daemon's mode, before the
+    /// new one had said anything. A daemon that restarts into observe mode,
+    /// or one that accepts the connection and then wedges before answering,
+    /// would be drawn as enforcing for as long as that lasted.
+    mode_reported: bool,
+    /// Enforcement state channel to the tray icon, paired with `from_tray`.
+    to_tray: Option<Sender<TrayState>>,
+    /// The last state pushed, so the icon is redrawn on change rather than
+    /// on every frame: a DBus round trip at 60fps for a fact that moves
+    /// every few seconds at most.
+    tray_state: TrayState,
     /// Whether the close button parks the window in the tray instead of
     /// quitting. Starts true only where a tray can exist, and drops back
     /// to false if the tray service finds no StatusNotifier host:
@@ -284,7 +300,9 @@ impl HallpassApp {
         net::spawn(socket, to_ui, from_ui, cc.egui_ctx.clone(), to_notify);
         let mut app = Self::with_channels(to_daemon, from_net);
         if tray {
-            app.from_tray = Some(crate::tray::spawn(cc.egui_ctx.clone()));
+            let tray = crate::tray::spawn(cc.egui_ctx.clone());
+            app.from_tray = Some(tray.msgs);
+            app.to_tray = Some(tray.state);
             app.park_on_close = true;
         }
         app
@@ -325,6 +343,9 @@ impl HallpassApp {
             settings_error: None,
             surfaced_popups: std::collections::HashSet::new(),
             from_tray: None,
+            mode_reported: false,
+            to_tray: None,
+            tray_state: TrayState::Unknown,
             park_on_close: false,
             quitting: false,
         }
@@ -397,6 +418,12 @@ impl HallpassApp {
                     // A count from before the reconnect describes a daemon
                     // this one has not spoken to.
                     self.rules_notice = None;
+                    // And so does a mode. Cleared here rather than on
+                    // disconnect so the tabs keep rendering the last known
+                    // numbers while reconnecting, but nothing *claims* the
+                    // mode until this daemon has said what it is: the one it
+                    // restarted into may not be the one it died in.
+                    self.mode_reported = false;
                     // Register as prompt handler + event subscriber and prime
                     // the rule/stat views (net.rs only does the handshake).
                     self.send(ClientMsg::Subscribe {
@@ -515,6 +542,7 @@ impl HallpassApp {
             DaemonMsg::Rules(rules) => self.rules = rules,
             DaemonMsg::Stats(stats) => {
                 self.enforcing = Some(stats.enforcing);
+                self.mode_reported = true;
                 self.stats = Some(stats);
             }
             // The settings form always settles on what the daemon actually
@@ -522,6 +550,7 @@ impl HallpassApp {
             // the form cannot keep displaying an edit the daemon refused.
             DaemonMsg::Config(cfg) => {
                 self.enforcing = Some(cfg.enforce);
+                self.mode_reported = true;
                 self.daemon_config = Some(cfg);
                 self.settings_timeout = cfg.prompt_timeout_secs.to_string();
                 self.settings_verdict = cfg.default_verdict;
@@ -655,10 +684,15 @@ impl HallpassApp {
 
     /// Whether the observe-mode banner belongs on screen.
     ///
-    /// Only once the daemon has said so: before the first reply there is
-    /// nothing to report, and reporting it anyway would announce that
-    /// nothing is being blocked on a daemon that is blocking.
+    /// Only once the daemon on this connection has said so: before the first
+    /// reply there is nothing to report, and reporting it anyway would
+    /// announce that nothing is being blocked on a daemon that is blocking.
+    /// Behind [`Self::mode_is_known`] with the tray, so the two cannot make
+    /// different claims about one host.
     fn observe_banner(&self) -> bool {
+        if !self.mode_is_known() {
+            return false;
+        }
         // Never under a posture. `enforcing` is fed by both the Stats reply
         // (the effective mode) and the Config reply (the operator's stored
         // one, which a posture deliberately overrides), and the Config reply
@@ -667,6 +701,55 @@ impl HallpassApp {
         // above the banner saying everything is. The posture's banner is the
         // true statement of the two.
         self.enforcing == Some(false) && self.lockdown_banner().is_none()
+    }
+
+    /// What the tray icon should be showing.
+    ///
+    /// Ordered the same way the banners are, and for the same reason: a
+    /// posture overrides the stored mode, so a locked-down host with a stored
+    /// observe mode is locked down and must not be drawn as blocking nothing.
+    /// Nothing is claimed before the daemon has said - `enforcing` is `None`
+    /// until the first reply, and a disconnected window knows nothing at all,
+    /// including whether the state it last saw still holds.
+    fn tray_state(&self) -> TrayState {
+        if !self.mode_is_known() {
+            return TrayState::Unknown;
+        }
+        if self.lockdown_banner().is_some() {
+            return TrayState::Lockdown;
+        }
+        match self.enforcing {
+            Some(true) => TrayState::Enforcing,
+            Some(false) => TrayState::Observing,
+            None => TrayState::Unknown,
+        }
+    }
+
+    /// Whether anything may be claimed about what this host is enforcing.
+    ///
+    /// The single gate the tray and both banners sit behind, so they cannot
+    /// disagree about the same host: connected, and the daemon on *this*
+    /// connection has answered. Either half alone is not enough - `enforcing`
+    /// outlives the connection it came from, and a connection outlives
+    /// nothing but says nothing on its own.
+    fn mode_is_known(&self) -> bool {
+        matches!(self.status, ConnStatus::Connected) && self.mode_reported
+    }
+
+    /// Push the state to the tray when it changes.
+    ///
+    /// On change only: the icon is a DBus round trip and this runs every
+    /// frame. A send failure means the tray thread is gone, which
+    /// [`TrayMsg::Unavailable`] already reports through the other channel.
+    fn sync_tray(&mut self) {
+        let state = self.tray_state();
+        if state == self.tray_state {
+            return;
+        }
+        self.tray_state = state;
+        if let Some(to_tray) = &self.to_tray {
+            let _ = to_tray.send(state);
+        }
     }
 
     /// Ask for stats again when the last answer is old enough, whatever tab
@@ -687,8 +770,14 @@ impl HallpassApp {
     /// The lockdown banner's text, when a posture is in force.
     ///
     /// From `Stats`, which is the daemon's own statement about the posture,
-    /// so this cannot claim one that has been lifted.
+    /// so this cannot claim one that has been lifted - except across a
+    /// reconnect, where the `Stats` in hand describe the daemon that died.
+    /// Hence the same gate the other two use: a posture lifted while this
+    /// window was away must not come back with it.
     fn lockdown_banner(&self) -> Option<String> {
+        if !self.mode_is_known() {
+            return None;
+        }
         let l = self.stats.as_ref()?.lockdown.as_ref()?;
         Some(format!(
             "LOCKDOWN: only the allow rules tagged {} decide connections; \
@@ -2071,6 +2160,12 @@ impl eframe::App for HallpassApp {
         // denying everything. One small request every few seconds is what
         // makes a whole-host state visible from whatever tab is open.
         self.poll_stats(&ctx);
+        // After the drain and the poll, so the icon reflects what this frame
+        // knows rather than what the last one did. A window parked in the
+        // tray still reaches here: the net thread pairs every event with a
+        // repaint request, so a mode changed by another client updates the
+        // icon of a window nobody has opened, which is the whole point.
+        self.sync_tray();
         self.main_window(ui);
         self.editor_window(&ctx);
         self.prompt_windows(&ctx);

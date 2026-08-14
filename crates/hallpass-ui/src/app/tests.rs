@@ -725,11 +725,175 @@ fn observe_mode_is_not_announced_before_the_daemon_says_so() {
         "announced observe mode on a daemon it never reached"
     );
 
+    // A reply only ever arrives on a live connection, so the connect comes
+    // first here as it does on the wire.
+    t.feed(UiEvent::Connected);
     t.daemon(DaemonMsg::Stats(stats(true)));
     assert!(!t.app.observe_banner(), "the daemon is enforcing");
 
     t.daemon(DaemonMsg::Stats(stats(false)));
     assert!(t.app.observe_banner(), "the daemon said it is not enforcing");
+
+    // And it goes away again with the connection it was said on, rather than
+    // describing a daemon this window can no longer reach.
+    t.feed(UiEvent::Disconnected {
+        retry_in: Duration::from_secs(1),
+    });
+    assert!(
+        !t.app.observe_banner(),
+        "kept announcing observe mode after losing the daemon that said it"
+    );
+}
+
+/// The autostart entry passes `--hidden`, so the icon is usually the only
+/// thing hallpass shows. It must never claim enforcement the window cannot
+/// vouch for: before the first stats reply nothing has been said, and a
+/// window that has lost the socket does not know whether what it last saw
+/// still holds.
+#[test]
+fn the_tray_never_claims_enforcement_it_cannot_vouch_for() {
+    let mut t = TestApp::new();
+    assert_eq!(
+        t.app.tray_state(),
+        TrayState::Unknown,
+        "claimed a state with no answer from the daemon"
+    );
+
+    t.feed(UiEvent::Connected);
+    assert_eq!(
+        t.app.tray_state(),
+        TrayState::Unknown,
+        "connected is not the same as having been told"
+    );
+
+    t.daemon(DaemonMsg::Stats(stats(true)));
+    assert_eq!(t.app.tray_state(), TrayState::Enforcing);
+
+    t.daemon(DaemonMsg::Stats(stats(false)));
+    assert_eq!(t.app.tray_state(), TrayState::Observing);
+
+    // The mode it last saw is not evidence about a daemon it can no longer
+    // reach: the posture may have changed, or the daemon may be gone.
+    t.feed(UiEvent::Disconnected {
+        retry_in: Duration::from_secs(1),
+    });
+    assert_eq!(
+        t.app.tray_state(),
+        TrayState::Unknown,
+        "vouched for a daemon it cannot reach"
+    );
+}
+
+/// A reconnect must not restore the dead daemon's claim.
+///
+/// `enforcing` and `stats` deliberately survive a disconnect so the tabs keep
+/// rendering the last known numbers, which is right for a display and wrong
+/// for a claim. Gating on `ConnStatus` alone stopped covering them the
+/// instant the socket came back, so the window re-asserted the previous
+/// daemon's mode before the new one had said anything - and a daemon that
+/// restarts into observe mode, or one that accepts the connection then wedges
+/// before answering, would be drawn as enforcing for as long as that lasted.
+#[test]
+fn a_reconnect_does_not_restore_the_previous_daemons_mode() {
+    let mut t = TestApp::new();
+    t.feed(UiEvent::Connected);
+    t.daemon(DaemonMsg::Stats(stats(true)));
+    assert_eq!(t.app.tray_state(), TrayState::Enforcing);
+
+    t.feed(UiEvent::Disconnected {
+        retry_in: Duration::from_secs(1),
+    });
+    assert_eq!(t.app.tray_state(), TrayState::Unknown);
+
+    // Connected again, and nothing has answered yet.
+    t.feed(UiEvent::Connected);
+    assert_eq!(
+        t.app.tray_state(),
+        TrayState::Unknown,
+        "claimed the dead daemon's mode the moment the socket came back"
+    );
+
+    // This daemon came up in observe mode, and that is what is shown.
+    t.daemon(DaemonMsg::Stats(stats(false)));
+    assert_eq!(t.app.tray_state(), TrayState::Observing);
+}
+
+/// The banners sit behind the same gate as the tray, so a posture that was
+/// lifted while the window was away cannot come back with the connection.
+#[test]
+fn a_stale_posture_does_not_survive_a_reconnect() {
+    let mut t = TestApp::new();
+    t.feed(UiEvent::Connected);
+
+    let mut locked = stats(true);
+    locked.lockdown = Some(hallpass_types::Lockdown {
+        tags: vec!["prod".into()],
+        since_ms: hallpass_types::unix_ms_now(),
+        rules_suppressed: 3,
+    });
+    t.daemon(DaemonMsg::Stats(locked));
+    assert!(t.app.lockdown_banner().is_some());
+
+    t.feed(UiEvent::Disconnected {
+        retry_in: Duration::from_secs(1),
+    });
+    t.feed(UiEvent::Connected);
+    assert!(
+        t.app.lockdown_banner().is_none(),
+        "a posture from the previous daemon came back with the connection"
+    );
+    assert_eq!(t.app.tray_state(), TrayState::Unknown);
+}
+
+/// The same ordering the banners use, for the same reason: a posture
+/// overrides the stored mode, so a locked-down host with a stored observe
+/// mode is locked down. Drawing it as "nothing is being blocked" would be
+/// the exact inversion of what that host is doing.
+#[test]
+fn a_posture_outranks_the_stored_mode_in_the_tray() {
+    let mut t = TestApp::new();
+    t.feed(UiEvent::Connected);
+
+    let mut locked = stats(false);
+    locked.lockdown = Some(hallpass_types::Lockdown {
+        tags: vec!["prod".into()],
+        since_ms: hallpass_types::unix_ms_now(),
+        rules_suppressed: 3,
+    });
+    t.daemon(DaemonMsg::Stats(locked));
+
+    assert_eq!(t.app.tray_state(), TrayState::Lockdown);
+    assert!(
+        !t.app.observe_banner(),
+        "the tray and the banner must not disagree about the same host"
+    );
+}
+
+/// The icon is a DBus round trip and the frame loop runs at display rate, so
+/// a state that has not moved must not be resent.
+#[test]
+fn the_tray_is_updated_on_change_rather_than_every_frame() {
+    let mut t = TestApp::new();
+    let (to_tray, from_tray) = std::sync::mpsc::channel();
+    t.app.to_tray = Some(to_tray);
+
+    t.feed(UiEvent::Connected);
+    t.daemon(DaemonMsg::Stats(stats(true)));
+    t.app.sync_tray();
+    t.app.sync_tray();
+    t.app.sync_tray();
+    assert_eq!(
+        from_tray.try_iter().collect::<Vec<_>>(),
+        vec![TrayState::Enforcing],
+        "one push for one change"
+    );
+
+    t.daemon(DaemonMsg::Stats(stats(false)));
+    t.app.sync_tray();
+    assert_eq!(
+        from_tray.try_iter().collect::<Vec<_>>(),
+        vec![TrayState::Observing]
+    );
 }
 
 /// Opening a data tab refreshes what it shows, rather than rendering
