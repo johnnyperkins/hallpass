@@ -116,6 +116,13 @@ pub struct Config {
     /// Verdict applied when no rule matches and no prompt reply arrives.
     pub default_verdict: Verdict,
     /// Seconds to wait for an interactive prompt reply.
+    ///
+    /// Long enough to read the connection and set the duration and scope
+    /// pickers before answering, since the default verdict landing under an
+    /// operator who was still deciding is the outcome the prompt exists to
+    /// avoid. Bounded by the packet being held the whole time: an unanswered
+    /// prompt occupies its queue slot until this elapses, so raising it costs
+    /// every prompt nobody is there to answer.
     pub prompt_timeout_secs: u64,
     /// NFQUEUE queue number.
     pub queue_num: u16,
@@ -171,7 +178,7 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             default_verdict: Verdict::Allow,
-            prompt_timeout_secs: 15,
+            prompt_timeout_secs: 30,
             queue_num: 0,
             socket_path: PathBuf::from("/run/hallpass/hallpass.sock"),
             max_pending_prompts: 64,
@@ -520,7 +527,7 @@ mod tests {
     fn defaults() {
         let c = parse("");
         assert_eq!(c.default_verdict, Verdict::Allow);
-        assert_eq!(c.prompt_timeout_secs, 15);
+        assert_eq!(c.prompt_timeout_secs, 30);
         assert_eq!(c.queue_num, 0);
         assert_eq!(c.socket_path, PathBuf::from("/run/hallpass/hallpass.sock"));
         assert_eq!(c.max_pending_prompts, 64);
@@ -721,7 +728,7 @@ mod tests {
         })
         .expect("valid settings");
         assert!(s.enforcing());
-        assert_eq!(s.snapshot().prompt_timeout_secs, 15);
+        assert_eq!(s.snapshot().prompt_timeout_secs, 30);
 
         let refused = RuntimeConfig {
             prompt_timeout_secs: 0,

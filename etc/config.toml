@@ -20,8 +20,10 @@ mode = "enforce"
 default_verdict = "allow"
 
 # Seconds to wait for an interactive prompt reply before applying the
-# default verdict.
-prompt_timeout_secs = 15
+# default verdict. Long enough to read the connection and set the duration
+# and scope before answering; the packet is held for the whole wait, so
+# every prompt nobody answers costs this long.
+prompt_timeout_secs = 30
 
 # NFQUEUE queue number the daemon binds to.
 queue_num = 0

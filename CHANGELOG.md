@@ -346,6 +346,24 @@ carries what an upgrade changes on a running host.
 
 ### Changed
 
+- **A prompt now waits 30 seconds by default, up from 15.** The window asks
+  for a duration and a scope as well as a verdict, and 15 seconds was short
+  enough that reading an unfamiliar executable path and then setting those
+  pickers could run out the clock - the default verdict landing under an
+  operator who was still deciding, which is the outcome the prompt exists to
+  avoid. The cost is paid by prompts nobody answers: the packet is held for
+  the whole wait, so an unattended connection now sits twice as long before
+  the default verdict resolves it. Hosts that want the old behaviour set
+  `prompt_timeout_secs` in `/etc/hallpass/config.toml` or change it at
+  runtime in the GUI's Settings tab or with `hallpass-cli config set
+  --timeout-secs`. The hardened profile is unchanged at 10 seconds, where a
+  stalled prompt handler blocking quickly is the point.
+
+  **Upgrade notes.** This is the built-in default and the value in the
+  shipped `etc/config.toml`. An existing install keeps whatever is already
+  in `/etc/hallpass/config.toml`; the new default reaches a host only where
+  that file is absent or leaves the key unset.
+
 - **The GUI has one palette and reads as a status surface.** Everything the
   window says about a connection is now said in colour first: verdicts are
   chips in a fixed green/red/amber, an activity strip above the event feed
