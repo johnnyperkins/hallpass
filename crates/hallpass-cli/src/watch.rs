@@ -1,8 +1,10 @@
 //! Interactive prompt handler: `hallpass-cli watch`.
 //!
-//! Subscribes to prompt requests and walks the user through a three-step,
-//! line-based dialog per prompt: verdict, duration, scope. Prompts arriving
-//! while one is being answered are queued.
+//! Subscribes to prompt requests and walks the user through a line-based
+//! dialog per prompt: verdict, duration, scope, and then whether to pin the
+//! executable's hash. The fourth stage is asked only when the answer could
+//! change the rule, so it is skipped for a deny, for `Once`, and for a prompt
+//! carrying no hash. Prompts arriving while one is being answered are queued.
 
 use std::collections::VecDeque;
 

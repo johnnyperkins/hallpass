@@ -373,6 +373,7 @@ async fn main() {
                 dns_tx,
                 dns_cache,
                 exe_hash: Arc::new(attribution::hash::ExeHashCache::default()),
+                prompt_handler: prompts.handler_flag(),
                 unhandled_verdict: cfg.unhandled_proto_verdict,
                 settings: Arc::clone(&settings),
                 shutdown: Arc::clone(&shutdown),

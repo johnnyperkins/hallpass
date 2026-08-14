@@ -62,8 +62,15 @@ pub struct QueueDeps {
     pub dns_tx: Sender<(FlowTuple, Vec<u8>)>,
     /// IP -> domain cache filled by the DNS snoop consumer.
     pub dns_cache: Arc<IpDomainCache>,
-    /// Executable hash cache, consulted only when a rule pins a hash.
+    /// Executable hash cache. Consulted when a rule pins a hash, and again
+    /// for a connection on its way to a prompt so the operator can pin the
+    /// bytes they were shown.
     pub exe_hash: Arc<ExeHashCache>,
+    /// Whether a client currently holds the prompt-handler slot, from
+    /// `PromptTable::handler_flag`. Read before the prompt-path hash above:
+    /// with nobody to ask, `handle_new` resolves with the default verdict and
+    /// that whole-binary read is spent on a value nothing will show.
+    pub prompt_handler: Arc<AtomicBool>,
     /// Verdict for packets rules cannot model (SCTP, ICMP, malformed).
     pub unhandled_verdict: Verdict,
     /// Source of the mode (enforce/observe) and of the default verdict
@@ -295,25 +302,17 @@ fn decide(
         },
         None => match session_grant(&conn, ctx) {
             Some(id) => Decision::Verdict(Verdict::Allow, crate::session::rule_name(id), conn),
-            // A connection on its way to a prompt gets its executable hashed
-            // even when no rule asked for one, because the operator may answer
-            // "allow, and pin this binary" - and the value pinned has to be
-            // the value the prompt showed them, not one computed behind them
-            // when the reply arrives. Computing it there would also mean a
-            // whole-binary read on a runtime thread at reply time, and a hash
-            // the operator never saw.
-            //
-            // Paid only here, on the path that is already about to wait for a
-            // human, and once per distinct binary: `ExeHashCache` keys on
-            // (dev, ino, mtime, ctime, size), so a program that prompts often
-            // is read once. Oversized and unreadable binaries stay `None` and
-            // are remembered as such; the prompt then offers no pin, which is
-            // the honest answer rather than an unpinned rule that looks
-            // pinned.
-            None => {
-                let exe_sha256 = exe_sha256.or_else(|| ctx.exe_hash.for_connection(&conn));
-                Decision::Prompt(conn, exe_sha256)
-            }
+            // Carries whatever a rule already asked to be hashed, and nothing
+            // more. A connection on its way to a prompt does need its
+            // executable hashed even when no rule wanted one - the operator
+            // may answer "allow, and pin this binary", and the value pinned
+            // has to be the value the prompt showed them - but the caller
+            // pays for that, not this function. Two of the three arms
+            // consuming `Decision::Prompt` never raise a prompt at all, so
+            // hashing here charged them a whole-binary read on the verdict
+            // thread for a value they discard. See the prompting arm in
+            // `run_queue`.
+            None => Decision::Prompt(conn, exe_sha256),
         },
     }
 }
@@ -695,9 +694,57 @@ pub fn run(mut queue: Queue, queue_num: u16, mut deps: QueueDeps) -> std::io::Re
                         let verdict = deps.settings.default_verdict();
                         commit(&mut queue, msg, verdict, None, conn, &deps, enforcing);
                     }
+                    // The arm that hands a connection to the prompt path, and
+                    // the only one that pays for a hash no rule asked for. The
+                    // operator may answer "allow, and pin this binary", and
+                    // the value pinned has to be the value the prompt showed
+                    // them rather than one computed behind them at reply time.
+                    //
+                    // Still a whole-binary read on the verdict thread, which
+                    // is the accepted cost: this connection is already about
+                    // to wait for a human, and `ExeHashCache` keys on (dev,
+                    // ino, mtime, ctime, size) so a program that prompts often
+                    // is read once. What is not accepted is charging it to
+                    // connections nobody will ever be asked about. The two
+                    // arms above resolve with `default_verdict` and never show
+                    // anyone a hash - observe mode, the low-risk rollout mode,
+                    // paid it on every unmatched connection - and the handler
+                    // check here covers the other permanent case, a host with
+                    // no GUI and no `hallpass-cli watch` attached, where
+                    // `handle_new` takes the default verdict for the same
+                    // reason.
+                    //
+                    // Not exhaustive, deliberately: `handle_new` also declines
+                    // to prompt when its packet budget is spent, when the
+                    // pending table is full, and when this connection
+                    // coalesces into an open prompt. Those are bounded
+                    // load-shedding paths rather than steady states, and the
+                    // cache makes the second hash of a binary free, so they
+                    // are not worth another cross-thread signal. Do not read
+                    // this as "the hash is now only paid for prompts".
+                    //
+                    // Racing a handler that connects between this load and
+                    // `handle_new` costs that one prompt its pin control, the
+                    // same outcome as an unreadable binary, and the next
+                    // connection has it.
+                    //
+                    // A `None` result means the prompt offers no pin, which is
+                    // the honest answer rather than an unpinned rule that
+                    // looks pinned. Only the size-cap refusal is remembered
+                    // (`ExeHashCache::sha256` caches `None` there and nowhere
+                    // else), so a binary that cannot be opened at all is
+                    // re-attempted per connection - two failed syscalls, not a
+                    // read, and not worth negative-caching a file that may
+                    // become readable.
                     Decision::Prompt(conn, exe_sha256) => {
                         let seq = next_seq;
                         next_seq += 1;
+                        let exe_sha256 = exe_sha256.or_else(|| {
+                            deps.prompt_handler
+                                .load(std::sync::atomic::Ordering::Relaxed)
+                                .then(|| deps.exe_hash.for_connection(&conn))
+                                .flatten()
+                        });
                         if deps
                             .prompt_tx
                             .send(PromptTask { seq, conn, exe_sha256 })

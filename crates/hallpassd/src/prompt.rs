@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -142,6 +142,22 @@ pub struct PromptTable {
     /// decision is actually applied.
     settings: Arc<crate::config::RuntimeSettings>,
     max_pending: usize,
+    /// Mirror of `inner.handler` being occupied, readable without the lock.
+    ///
+    /// Exists for one caller: the nfqueue verdict thread, which hashes a
+    /// binary for every connection on its way to a prompt so the operator can
+    /// pin the bytes they were shown. With no handler connected there is no
+    /// operator and `handle_new` resolves with the default verdict instead, so
+    /// that whole-binary read buys nothing - and a headless host, or a desktop
+    /// before login, sits in that state permanently.
+    ///
+    /// An atomic rather than [`PromptTable::has_handler`] because the caller is
+    /// the thread whose stalls are every other connection's stalls, and it
+    /// should not queue behind the prompt path's mutex to ask. Kept in step by
+    /// hand at the three sites that change the slot, which is a shape that
+    /// drifts, so `the_handler_flag_tracks_the_slot` asserts the two agree
+    /// across every transition.
+    handler_present: Arc<AtomicBool>,
     /// Distinguishes this daemon run in the names of rules generated from
     /// prompt replies. Prompt ids restart at 1 every run while `Forever`
     /// rules persist, so `prompt-<exe>-<id>` alone collided across restarts,
@@ -169,6 +185,7 @@ impl PromptTable {
             store,
             settings,
             max_pending,
+            handler_present: Arc::new(AtomicBool::new(false)),
             // Milliseconds and the pid, hex. Seconds alone were not enough:
             // `Restart=on-failure` restarts within the same second by
             // default, and a crash loop is exactly when prompt ids restart
@@ -194,6 +211,12 @@ impl PromptTable {
         inner.handler.as_ref().is_some_and(|h| !h.tx.is_closed())
     }
 
+    /// The lock-free view of the handler slot, for the nfqueue verdict
+    /// thread. See [`PromptTable::handler_present`].
+    pub fn handler_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.handler_present)
+    }
+
     /// Claim the prompt-handler slot. Returns false if already claimed.
     pub fn set_handler(&self, tx: Sender<DaemonMsg>) -> bool {
         let mut inner = self.inner.lock().unwrap();
@@ -210,6 +233,7 @@ impl PromptTable {
                     let _ = tx.try_send(p.request(id));
                 }
                 inner.handler = Some(Handler { tx, unanswered: 0 });
+                self.handler_present.store(true, Ordering::Relaxed);
                 true
             }
         }
@@ -220,6 +244,7 @@ impl PromptTable {
         let mut inner = self.inner.lock().unwrap();
         if inner.handler.as_ref().is_some_and(|h| h.tx.same_channel(tx)) {
             inner.handler = None;
+            self.handler_present.store(false, Ordering::Relaxed);
         }
     }
 
@@ -460,7 +485,18 @@ impl PromptTable {
             true => pending.context.exe_sha256.as_deref(),
             false => None,
         };
-        if pin_exe && verdict == Verdict::Allow && pin.is_none() {
+        // `duration` is part of the condition because this branch is about a
+        // rule that will not be written: with `Once` there was never going to
+        // be one, so the warning would tell an operator their answer was not
+        // remembered when nothing about it asked to be, and a security line
+        // that fires when nothing is wrong is the one people learn to skip.
+        //
+        // Live code, not a backstop. The GUI's `PromptState::pin_exe` is
+        // sticky and its `reply` gates only on the verdict, while the duration
+        // check lives in the render path - which *hides* the checkbox without
+        // clearing the field. So ticking Pin under Forever and then switching
+        // the combo to Once sends exactly this combination.
+        if pin_exe && verdict == Verdict::Allow && duration != RuleDuration::Once && pin.is_none() {
             // No rule at all, rather than the unpinned one that would
             // otherwise be written. The operator asked to remember a set of
             // bytes; remembering a path instead is broader than what they
@@ -549,12 +585,19 @@ impl PromptTable {
         };
         let verdict = Verdict::from(rule.action);
         let mut inner = self.inner.lock().unwrap();
-        // Prompt rules never carry a hash criterion, so no hash is
-        // computed for the match.
+        // Each prompt's own hash, not `None`. A pinned rule carries
+        // `exe_sha256`, and `first_failing_field` reports that criterion as
+        // failing whenever the caller supplies no hash - so passing `None`
+        // here meant a pinned rule swept nothing at all, and the sibling
+        // prompts an operator had just answered "allow, forever, this app
+        // anywhere, pinned" sat open until the timeout resolved them with
+        // `default_verdict`, possibly the opposite one. Nothing is computed
+        // for this: the value was hashed on the prompt path and `Pending`
+        // has carried it in its `PromptContext` ever since.
         let covered: Vec<u64> = inner
             .by_id
             .iter()
-            .filter(|(_, p)| compiled.matches(&p.conn, None))
+            .filter(|(_, p)| compiled.matches(&p.conn, p.context.exe_sha256.as_deref()))
             .map(|(&id, _)| id)
             .collect();
         let mut resolved = Vec::new();
@@ -662,6 +705,11 @@ impl PromptTable {
             inner.handler = Some(handler);
             return;
         }
+        // Out of strikes: the slot stays empty, so the flag has to follow it
+        // before the lock goes. Set under the lock for the same reason the
+        // take-and-put-back above is one decision: a reader must never see
+        // the slot empty and the flag still claiming an operator.
+        self.handler_present.store(false, Ordering::Relaxed);
         drop(inner);
 
         self.stats.record_prompt_handler_evicted();
@@ -816,10 +864,17 @@ fn rule_from_reply(
     // The operator approved these bytes rather than this name. An exe path is
     // not an identity: an allow granted to something under a home directory or
     // a build tree keeps matching after anything else is written there, and a
-    // remembered allow must not widen on its own. Caller-supplied, and already
-    // filtered to allows, so a deny stays keyed on the path and keeps blocking
-    // whatever gets put at it.
-    matcher.exe_sha256 = pin_sha256.map(str::to_string);
+    // remembered allow must not widen on its own.
+    //
+    // Guarded on the verdict for the same reason `app_id` is, one layer up.
+    // Pinning narrows, and a deny that stops matching because the binary was
+    // updated falls through to `default_verdict`, which ships as allow - so a
+    // pinned deny is a block with an expiry date the operator did not ask for.
+    // `reply` already drops the flag on a deny; this is the layer that makes a
+    // future caller unable to reintroduce it.
+    if verdict == Verdict::Allow {
+        matcher.exe_sha256 = pin_sha256.map(str::to_string);
+    }
     match scope {
         PromptScope::ThisPort => {
             matcher.dest = Some(dst.ip().to_string());
@@ -1036,6 +1091,74 @@ mod tests {
         assert_eq!(h.verdict_rx.recv().await, Some((1, Verdict::Allow)));
     }
 
+    /// The lock-free flag and the slot it mirrors are two representations of
+    /// one fact, kept in step by hand at three sites, so this walks every
+    /// transition and asserts they never disagree.
+    ///
+    /// A drifted-true flag costs the verdict thread a whole-binary hash on a
+    /// host where nobody will ever see it, which is the waste the flag exists
+    /// to remove. A drifted-false flag is worse: the prompt carries no hash,
+    /// so both clients hide the pin control and the operator silently loses
+    /// the feature on a host that has a handler.
+    #[tokio::test(start_paused = true)]
+    async fn the_handler_flag_tracks_the_slot() {
+        let h = harness("handler-flag", 8, Verdict::Allow);
+        let flag = h.table.handler_flag();
+        let check = |what: &str| {
+            assert_eq!(
+                flag.load(Ordering::Relaxed),
+                h.table.has_handler(),
+                "the flag and the slot disagreed {what}"
+            );
+        };
+        check("before any handler");
+
+        let (tx, _rx) = mpsc::channel(64);
+        assert!(h.table.set_handler(tx.clone()));
+        check("after a handler claimed the slot");
+
+        // A second claim is refused, so nothing moves.
+        let (other, _other_rx) = mpsc::channel(64);
+        assert!(!h.table.set_handler(other));
+        check("after a refused second claim");
+
+        h.table.clear_handler(&tx);
+        check("after the handler released the slot");
+
+        // Releasing a channel that does not hold the slot must not clear it.
+        let (tx2, _rx2) = mpsc::channel(64);
+        assert!(h.table.set_handler(tx2.clone()));
+        h.table.clear_handler(&tx);
+        check("after a stranger tried to release the slot");
+        h.table.clear_handler(&tx2);
+        check("after the real holder released it");
+    }
+
+    /// The eviction path is the third site, and the one that empties the slot
+    /// without anybody asking it to.
+    #[tokio::test(start_paused = true)]
+    async fn eviction_clears_the_handler_flag() {
+        let mut h = harness("handler-flag-evict", 8, Verdict::Allow);
+        let flag = h.table.handler_flag();
+        let (tx, _rx) = mpsc::channel(64);
+        assert!(h.table.set_handler(tx));
+        assert!(flag.load(Ordering::Relaxed));
+
+        // Let every prompt time out until the handler is struck out.
+        for seq in 1..=MAX_UNANSWERED_EXPIRIES as u64 {
+            h.table
+                .handle_new(conn("/bin/a", &format!("1.1.1.{seq}:443")), seq, None);
+            tokio::time::advance(Duration::from_secs(6)).await;
+            assert_eq!(h.verdict_rx.recv().await, Some((seq, Verdict::Allow)));
+        }
+
+        assert!(!h.table.has_handler(), "the handler should be evicted");
+        assert!(
+            !flag.load(Ordering::Relaxed),
+            "eviction emptied the slot but left the flag claiming an operator"
+        );
+    }
+
     /// The strikes count consecutive timeouts, so a handler that is deciding
     /// prompts is never evicted for the ones its operator was away for.
     #[tokio::test(start_paused = true)]
@@ -1202,6 +1325,16 @@ mod tests {
             // `reply` filters the flag before it reaches here; this asserts
             // the same thing one layer down, so a future caller that forgets
             // cannot quietly produce a self-expiring block.
+            //
+            // The hash is the assertion that matters. Asserting only on `exe`
+            // passed vacuously - `rule_from_reply` sets it for every
+            // `ThisPort` rule whether or not the pin was honoured - so this
+            // test would have stayed green with the guard missing, which is
+            // the one state it exists to catch.
+            assert_eq!(
+                rule.matcher.exe_sha256, None,
+                "{verdict:?} must not be pinned to bytes that can be replaced"
+            );
             assert_eq!(
                 rule.matcher.exe,
                 Some(PathBuf::from("/usr/bin/curl")),
@@ -1731,6 +1864,76 @@ mod tests {
         rule.enabled = true;
         h.table.resolve_covered_by(&rule);
         assert_eq!(h.verdict_rx.recv().await, Some((21, Verdict::Allow)));
+    }
+
+    /// A pinned rule must sweep the prompts it covers.
+    ///
+    /// `first_failing_field` reports `exe_sha256` as the failing criterion
+    /// whenever the rule pins a hash and the caller supplies none, so sweeping
+    /// with `None` made every pinned rule cover nothing at all. The visible
+    /// failure: an operator answers one of a stack of prompts for the same
+    /// application with "allow, forever, this app anywhere, pinned", the rule
+    /// is written, and the siblings sit open until the timeout resolves them
+    /// with `default_verdict` - here the opposite verdict to the one just
+    /// given.
+    #[tokio::test]
+    async fn a_pinned_rule_sweeps_the_prompts_it_covers() {
+        let hash = "ab".repeat(32);
+        let mut h = harness("pinned-sweep", 8, Verdict::Deny);
+        let (tx, mut prompt_rx) = mpsc::channel(16);
+        assert!(h.table.set_handler(tx.clone()));
+        h.table
+            .handle_new(conn("/bin/a", "1.1.1.1:443"), 31, Some(hash.clone()));
+        let _ = prompt_rx.recv().await.unwrap();
+
+        let rule = Rule {
+            name: "pinned-allow".into(),
+            action: hallpass_types::Action::Allow,
+            duration: RuleDuration::Forever,
+            priority: 1,
+            enabled: true,
+            tags: Vec::new(),
+            matcher: RuleMatch {
+                exe: Some(PathBuf::from("/bin/a")),
+                exe_sha256: Some(hash),
+                ..Default::default()
+            },
+        };
+        h.table.resolve_covered_by(&rule);
+        assert_eq!(h.verdict_rx.recv().await, Some((31, Verdict::Allow)));
+    }
+
+    /// The other direction, so the fix above cannot be read as "ignore the
+    /// hash when sweeping": pinning still narrows. A prompt for a different
+    /// set of bytes at the same path is not covered by the pinned rule and
+    /// must stay open to be answered on its own.
+    #[tokio::test]
+    async fn a_pinned_rule_does_not_sweep_a_different_binary() {
+        let mut h = harness("pinned-sweep-narrow", 8, Verdict::Deny);
+        let (tx, mut prompt_rx) = mpsc::channel(16);
+        assert!(h.table.set_handler(tx.clone()));
+        h.table
+            .handle_new(conn("/bin/a", "1.1.1.1:443"), 32, Some("cd".repeat(32)));
+        let _ = prompt_rx.recv().await.unwrap();
+
+        let rule = Rule {
+            name: "pinned-allow".into(),
+            action: hallpass_types::Action::Allow,
+            duration: RuleDuration::Forever,
+            priority: 1,
+            enabled: true,
+            tags: Vec::new(),
+            matcher: RuleMatch {
+                exe: Some(PathBuf::from("/bin/a")),
+                exe_sha256: Some("ab".repeat(32)),
+                ..Default::default()
+            },
+        };
+        h.table.resolve_covered_by(&rule);
+        assert!(
+            h.verdict_rx.try_recv().is_err(),
+            "a pin is a narrowing, so bytes it does not name stay unanswered"
+        );
     }
 
     #[tokio::test(start_paused = true)]
