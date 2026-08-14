@@ -872,9 +872,10 @@ fn rule_from_reply(
     // launcher that makes no per-app scope, a session with no user manager,
     // a unit name this daemon does not parse - and a deny that quietly stops
     // matching resolves the connection with `default_verdict` instead, which
-    // ships as allow. A deny stays exe-only and therefore covers every
-    // application sharing that sandbox path, which is the direction a block
-    // should err in.
+    // an operator is free to set to allow and which says nothing about this
+    // application either way. A deny stays exe-only and therefore covers
+    // every application sharing that sandbox path, which is the direction a
+    // block should err in.
     if verdict == Verdict::Allow {
         matcher.app_id = conn.app_id.clone();
     }
@@ -885,7 +886,8 @@ fn rule_from_reply(
     //
     // Guarded on the verdict for the same reason `app_id` is, one layer up.
     // Pinning narrows, and a deny that stops matching because the binary was
-    // updated falls through to `default_verdict`, which ships as allow - so a
+    // updated falls through to `default_verdict`, which an operator is free to
+    // set to allow and which was never a judgement about this binary - so a
     // pinned deny is a block with an expiry date the operator did not ask for.
     // `reply` already drops the flag on a deny; this is the layer that makes a
     // future caller unable to reintroduce it.
@@ -1358,8 +1360,9 @@ mod tests {
 
     /// Pinning narrows, and narrowing runs the wrong way for a deny: a deny
     /// that stops matching because the binary was updated resolves the
-    /// connection with `default_verdict`, which ships as allow. So the flag is
-    /// dropped rather than honoured, the same way `app_id` already is.
+    /// connection with `default_verdict`, which an operator is free to set to
+    /// allow. So the flag is dropped rather than honoured, the same way
+    /// `app_id` already is.
     #[test]
     fn a_deny_is_never_pinned() {
         let c = conn("/usr/bin/curl", "1.1.1.1:443");
@@ -1402,8 +1405,9 @@ mod tests {
     ///
     /// A deny must not be pinned the same way. The operand only narrows, and
     /// a deny that stops matching because the application turned up without
-    /// a recognized cgroup scope is resolved by `default_verdict`, which
-    /// ships as allow: the operator's block would silently stop applying.
+    /// a recognized cgroup scope is resolved by `default_verdict`, which an
+    /// operator is free to set to allow: the operator's block would silently
+    /// stop applying.
     #[test]
     fn only_an_allow_pins_the_application() {
         let mut c = conn("/app/bin/firefox", "1.1.1.1:443");

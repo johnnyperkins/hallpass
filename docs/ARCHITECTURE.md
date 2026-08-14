@@ -544,8 +544,8 @@ reads would only ever aim a root open somewhere the planter chose.
 Every failure to read the file is "no posture", loudly. Refusing to start
 would leave the host with no firewall at all, assuming the strictest posture
 would leave it reaching nothing, and no operator is present to judge which
-was meant. Unlike the other fail-open defaults this one is visible: `status`
-and `doctor` both report the posture.
+was meant. Unlike `queue_bypass`, the other place availability wins, this one
+is visible: `status` and `doctor` both report the posture.
 
 Engaging a posture deliberately does not wake the flow-kill sweeper. That
 sweeper kills flows an explicit deny *rule* matches, and a posture denies by
@@ -603,8 +603,10 @@ the comments are what a reordering diff deletes.
 **1. The IPC socket binds before anything is installed, and a failure to bind
 is fatal.** A daemon that filters traffic but cannot be reached answers every
 prompt with the default verdict and gives the operator no way to see it
-happening or change it. Under `default_verdict = "allow"` that is an open
-firewall that looks healthy. Binding first makes the failure free to back out
+happening or change it. Under the shipped `default_verdict = "deny"` that is a
+host reaching nothing it has no rule for, with no channel to ask why; under
+`default_verdict = "allow"` it is an open firewall that looks healthy. Neither
+is recoverable from the outside. Binding first makes the failure free to back out
 of: nothing is installed yet, so exiting leaves the system exactly as it was
 found. The same reasoning is why an accept error in the IPC loop backs off
 and retries instead of returning.

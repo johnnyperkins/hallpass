@@ -114,6 +114,19 @@ impl Mode {
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     /// Verdict applied when no rule matches and no prompt reply arrives.
+    ///
+    /// Deny, so that every moment the interactive layer cannot function
+    /// fails the same way policy does. That set is larger than the prompt
+    /// timeout: it also covers a host with no GUI and no `hallpass-cli
+    /// watch` attached, the window between boot and login, a handler that
+    /// crashed, and both held-packet budgets. Allowing there made the tool
+    /// stop working silently, and one of those states is reachable by
+    /// anything that can crash the handler.
+    ///
+    /// The cost is that a host needs rules for whatever runs before a
+    /// human can answer; `etc/rules.d/20-system-*.toml` is that baseline.
+    /// This is policy, not liveness - a daemon that is dead rather than
+    /// undecided is governed by `queue_bypass`.
     pub default_verdict: Verdict,
     /// Seconds to wait for an interactive prompt reply.
     ///
@@ -177,11 +190,11 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Config {
-            default_verdict: Verdict::Allow,
+            default_verdict: Verdict::Deny,
             prompt_timeout_secs: 30,
             queue_num: 0,
             socket_path: PathBuf::from("/run/hallpass/hallpass.sock"),
-            max_pending_prompts: 64,
+            max_pending_prompts: 128,
             rules_dir: PathBuf::from("/etc/hallpass/rules.d"),
             unhandled_proto_verdict: Verdict::Allow,
             syslog: None,
@@ -421,11 +434,15 @@ impl Config {
     /// Load config from `arg`. A malformed file is always a hard error, and
     /// so is a missing one that `--config` named explicitly.
     ///
-    /// The defaults are fail-open on every axis (allow, allow, bypass), so
-    /// silently substituting them for a file the operator asked for turns a
-    /// hardened deployment into an unenforced one that still looks healthy:
-    /// the unit starts, the socket answers, prompts appear, and nothing is
-    /// denied. Only an unspecified path may fall back.
+    /// Substituting the defaults for a file the operator asked for is wrong
+    /// in both directions, which is why only an unspecified path may fall
+    /// back. They no longer match the file on any axis a deployment tunes:
+    /// `default_verdict` is deny, so a host whose config went missing
+    /// enforces a policy naming none of the rules its operator meant to load
+    /// and reaches nothing it has no rule for; `queue_bypass` is still
+    /// bypass, so a hardened deployment silently loses the one guarantee it
+    /// asked for while the unit starts, the socket answers and prompts
+    /// appear.
     pub fn load(arg: &ConfigArg) -> Result<Config, String> {
         let path = arg.path.as_path();
         let cfg: Config = match read_trusted(path) {
@@ -574,11 +591,11 @@ mod tests {
     #[test]
     fn defaults() {
         let c = parse("");
-        assert_eq!(c.default_verdict, Verdict::Allow);
+        assert_eq!(c.default_verdict, Verdict::Deny);
         assert_eq!(c.prompt_timeout_secs, 30);
         assert_eq!(c.queue_num, 0);
         assert_eq!(c.socket_path, PathBuf::from("/run/hallpass/hallpass.sock"));
-        assert_eq!(c.max_pending_prompts, 64);
+        assert_eq!(c.max_pending_prompts, 128);
         assert_eq!(c.rules_dir, PathBuf::from("/etc/hallpass/rules.d"));
         assert!(c.queue_bypass);
         // On by default, and pointed at the state directory the unit
@@ -709,7 +726,9 @@ mod tests {
     }
 
     /// A config the operator named must not be silently replaced by the
-    /// defaults, which are fail-open on every axis.
+    /// defaults, which match a tuned deployment on no axis at all: they deny
+    /// what its rules would have allowed, and fail open where it asked to
+    /// fail closed.
     #[test]
     fn missing_explicit_config_is_fatal_but_missing_default_is_not() {
         let missing = PathBuf::from("/nonexistent/hallpass/config.toml");
@@ -732,7 +751,7 @@ mod tests {
         .expect("an unspecified path may fall back to defaults");
         // Spelled out rather than compared to Config::default(), to show
         // exactly what the explicit case refuses to substitute silently.
-        assert_eq!(cfg.default_verdict, Verdict::Allow);
+        assert_eq!(cfg.default_verdict, Verdict::Deny);
         assert_eq!(cfg.unhandled_proto_verdict, Verdict::Allow);
         assert!(cfg.queue_bypass);
     }

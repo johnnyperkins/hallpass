@@ -45,13 +45,17 @@ auto)
 	;;
 esac
 
-# Which config a *fresh* install starts from. Hardened by default: the
-# permissive one allows every unmatched connection, every unanswered prompt,
-# every transport the rule engine does not model, and everything at all while
-# the daemon is dead (queue_bypass), so a machine that installs it is not
-# filtered until someone writes rules. That is a reasonable desktop default
-# and a bad default for anything else, and the difference is one word here
-# rather than a file an operator has to know exists.
+# Which config a *fresh* install starts from. Hardened by default: it denies
+# every unmatched connection and every unanswered prompt, denies every
+# transport the rule engine does not model, and keeps enforcing while the
+# daemon is dead (queue_bypass = false).
+#
+# The desktop profile now differs on the last two only. It denies unmatched
+# and unanswered connections just the same, and allows the transports rules
+# cannot describe and everything at all while the daemon is dead, so a
+# machine that installs it keeps its network through a crash rather than
+# losing it. That is the difference, and it is one word here rather than a
+# file an operator has to know exists.
 #
 # Only ever applies when there is no config yet; an edited one is never
 # replaced, whatever this says.
@@ -89,6 +93,52 @@ install -d -m755 /etc/hallpass /etc/hallpass/rules.d
 [ -f /etc/hallpass/config.toml ] || install -m644 "$posture_file" /etc/hallpass/config.toml
 [ -e /etc/hallpass/rules.d/example-allow-dns.toml ] \
   || install -m644 etc/rules.d/example-allow-dns.toml /etc/hallpass/rules.d/example-allow-dns.toml
+
+# Baseline rules for the daemons that run before anyone can answer a prompt.
+# Installed only when the binary the rule names is actually on this host: a
+# rule pointing at a systemd-timesyncd that a chrony machine does not have
+# matches nothing, and a rules.d full of those makes the real policy harder
+# to read. Guarded like the example above, so an edit or a deletion survives
+# a reinstall.
+#
+# The exe path is read out of the rule rather than repeated here, so the file
+# stays the single statement of what it grants. It is then canonicalized,
+# because the daemon compares `exe` exactly against the path in
+# /proc/<pid>/exe, which the kernel reports with every symlink already
+# resolved. On a distribution where /usr/sbin is a symlink to /usr/bin (Arch,
+# Fedora 42+, Debian 13+), a rule naming /usr/sbin/NetworkManager passes the
+# -x test below and then matches nothing at all: the installed copy looks
+# right, `rules` lists it, and the host boots without an address anyway.
+# Only the installed copy is rewritten; the shipped file keeps the path a
+# reader recognizes.
+for baseline in etc/rules.d/20-system-*.toml; do
+  [ -e "$baseline" ] || continue
+  name=$(basename "$baseline")
+  target="/etc/hallpass/rules.d/$name"
+  [ -e "$target" ] && continue
+  exe=$(sed -n 's/^exe = "\(.*\)"$/\1/p' "$baseline" | head -1)
+  if [ -z "$exe" ]; then
+    # Every baseline rule is scoped to a binary. One that is not - or that
+    # spells the key so this does not see it - would otherwise be installed
+    # unchecked, which is the direction the guard exists to prevent.
+    echo "  skipping $name: no 'exe = \"...\"' line to check" >&2
+    continue
+  fi
+  real=$(readlink -f "$exe" 2>/dev/null) || real=$exe
+  [ -n "$real" ] || real=$exe
+  if [ ! -x "$real" ]; then
+    echo "  skipping $name: $exe is not on this host."
+    echo "    Nothing takes its place: under default_verdict = \"deny\", whatever"
+    echo "    does this job here (chrony, ntpd, systemd-networkd, dhcpcd) needs a"
+    echo "    rule of its own or it is blocked. Copy the file and edit the path."
+    continue
+  fi
+  install -m644 "$baseline" "$target"
+  if [ "$real" != "$exe" ]; then
+    sed -i "s|^exe = \".*\"\$|exe = \"$real\"|" "$target"
+    echo "  $name: exe rewritten to $real, the path /proc/<pid>/exe reports"
+  fi
+done
 
 # Shell completions and the man page. These are package files, not policy, so
 # unlike the config above they are replaced on every reinstall.
@@ -160,8 +210,13 @@ echo
 echo ">> Done. hallpassd is running."
 echo "   - Posture: ${HALLPASS_POSTURE}. A fresh install writes"
 echo "     /etc/hallpass/config.toml from ${posture_file}; an existing one is never"
-echo "     replaced. 'hardened' denies unmatched and unanswered connections and"
-echo "     keeps enforcing when the daemon dies; 'desktop' allows all three."
+echo "     replaced. Both postures deny unmatched and unanswered connections;"
+echo "     'hardened' also keeps enforcing when the daemon dies and denies the"
+echo "     transports rules cannot describe, where 'desktop' allows both."
+echo "   - Baseline rules for systemd-resolved, systemd-timesyncd and"
+echo "     NetworkManager are in /etc/hallpass/rules.d, so a denied default does"
+echo "     not leave this host without DNS, a clock or an address. Anything else"
+echo "     that needs the network before you can answer a prompt needs a rule."
 echo "   - '$target_user' is now in the 'hallpass' group, which is full control of"
 echo "     the firewall: members can disable enforcement, lift a lockdown, and"
 echo "     delete any rule. Add only who you would trust with that."

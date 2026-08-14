@@ -72,10 +72,10 @@ impl Posture {
     /// Every failure is "no posture", loudly. The alternative - refusing to
     /// start, or assuming the strictest posture - turns a corrupt file into
     /// either a host with no firewall at all or a host that reaches nothing,
-    /// with no operator present to judge which was meant. Fail-open matches
-    /// every other default here (`default_verdict`, `queue_bypass`), and
-    /// unlike them this one is visible: `status` and `doctor` both report the
-    /// posture, so "not locked down" is never silent.
+    /// with no operator present to judge which was meant. Unlike
+    /// `queue_bypass`, the other place availability wins here, this one is
+    /// visible: `status` and `doctor` both report the posture, so "not locked
+    /// down" is never silent.
     pub fn load(path: &Path) -> Posture {
         let posture = Posture {
             active: Mutex::new(None),

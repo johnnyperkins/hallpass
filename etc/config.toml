@@ -17,7 +17,16 @@ mode = "enforce"
 
 # Verdict applied when no rule matches and no client answers the prompt
 # in time: "allow", "deny", or "reject".
-default_verdict = "allow"
+#
+# Deny covers more than an ignored prompt. It is also what happens with no
+# GUI and no `hallpass-cli watch` attached, between boot and login, and when
+# the held-packet budgets are spent, so anything that needs the network
+# before a human can answer needs a rule. The 20-system-*.toml files in
+# rules.d are that baseline; add to them rather than relaxing this.
+#
+# This is policy. A daemon that is dead rather than undecided is governed by
+# queue_bypass below, which still fails open.
+default_verdict = "deny"
 
 # Seconds to wait for an interactive prompt reply before applying the
 # default verdict. Long enough to read the connection and set the duration
@@ -31,8 +40,14 @@ queue_num = 0
 # Unix socket for CLI/UI clients.
 socket_path = "/run/hallpass/hallpass.sock"
 
-# Maximum number of connections held waiting for a prompt reply.
-max_pending_prompts = 64
+# Maximum number of connections held waiting for a prompt reply. Beyond this
+# the default verdict is applied without raising a prompt, so under
+# default_verdict = "deny" an overflow is a silent block rather than the
+# silent pass it used to be. Keep it generous enough that a burst - a browser
+# starting with many tabs, a package update fanning out to mirrors - is not
+# denied without anyone being asked. The real ceiling on held packets is the
+# daemon's own budget, not this number.
+max_pending_prompts = 128
 
 # Verdict for packets whose transport the rule engine does not model
 # (SCTP, ICMP, ...) or that fail to parse: "allow", "deny", or "reject".
