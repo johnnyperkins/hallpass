@@ -523,6 +523,54 @@ mod tests {
         toml::from_str(toml).unwrap()
     }
 
+    /// The two shipped profiles are not examples: `install.sh` copies the
+    /// chosen one to `/etc/hallpass/config.toml` on a host that has no
+    /// config yet. Nothing read them before a daemon did, and by then a
+    /// misspelled key (`deny_unknown_fields` makes it a parse error) or an
+    /// out-of-range value is a firewall that refuses to start on the
+    /// machine that just installed one.
+    #[test]
+    fn the_shipped_profiles_parse_and_validate() {
+        for (name, text) in [
+            ("config.toml", include_str!("../../../etc/config.toml")),
+            (
+                "config.hardened.toml",
+                include_str!("../../../etc/config.hardened.toml"),
+            ),
+        ] {
+            let cfg: Config =
+                toml::from_str(text).unwrap_or_else(|e| panic!("etc/{name} does not parse: {e}"));
+            cfg.validate()
+                .unwrap_or_else(|e| panic!("etc/{name} is invalid: {e}"));
+        }
+    }
+
+    /// The desktop profile spells out the built-in defaults so an operator
+    /// reading `/etc/hallpass/config.toml` sees what an unconfigured daemon
+    /// would do. Changing a default in `Default for Config` and leaving the
+    /// file behind makes it describe the previous release, and the file is
+    /// what a fresh install actually runs on.
+    ///
+    /// Only the keys the file states: it deliberately omits `rules_dir`,
+    /// `syslog` and `lockdown_state`, and asserting those would forbid that.
+    #[test]
+    fn the_desktop_profile_states_the_built_in_defaults() {
+        let shipped: Config = toml::from_str(include_str!("../../../etc/config.toml")).unwrap();
+        let d = Config::default();
+        assert_eq!(shipped.mode, d.mode);
+        assert_eq!(shipped.default_verdict, d.default_verdict);
+        assert_eq!(shipped.prompt_timeout_secs, d.prompt_timeout_secs);
+        assert_eq!(shipped.queue_num, d.queue_num);
+        assert_eq!(shipped.socket_path, d.socket_path);
+        assert_eq!(shipped.max_pending_prompts, d.max_pending_prompts);
+        assert_eq!(shipped.unhandled_proto_verdict, d.unhandled_proto_verdict);
+        assert_eq!(shipped.queue_bypass, d.queue_bypass);
+        assert_eq!(shipped.kill_established, d.kill_established);
+        assert_eq!(shipped.flow_accounting, d.flow_accounting);
+        assert_eq!(shipped.first_seen, d.first_seen);
+        assert_eq!(shipped.first_seen_state, d.first_seen_state);
+    }
+
     #[test]
     fn defaults() {
         let c = parse("");
