@@ -62,8 +62,9 @@ impl TrayState {
         }
     }
 
-    /// The one-line statement behind the icon.
-    fn summary(self) -> &'static str {
+    /// The one-line statement behind the icon. Shared with the window's
+    /// own status mark, so the two cannot describe one host differently.
+    pub fn summary(self) -> &'static str {
         match self {
             TrayState::Enforcing => "Enforcing",
             TrayState::Lockdown => "Lockdown posture in force",

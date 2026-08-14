@@ -17,6 +17,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::editor::RuleEditor;
 use crate::net::{self, UiEvent};
 use crate::prompt::{self, PromptState};
+use crate::theme::{self, Tone, ALLOW_COLOR, DENY_COLOR, MUTED, REJECT_COLOR, TEXT};
 use crate::traffic;
 use crate::tray::{TrayMsg, TrayState};
 
@@ -40,12 +41,16 @@ const EVENT_HISTORY_LIMIT: u32 = 1000;
 /// is only how much of it fits on a screen worth reading.
 const TRAFFIC_ROWS: usize = 200;
 
-/// Green accent for Allow.
-pub(crate) const ALLOW_COLOR: Color32 = Color32::from_rgb(0x2e, 0xa0, 0x43);
-/// Red accent for Deny.
-pub(crate) const DENY_COLOR: Color32 = Color32::from_rgb(0xc9, 0x3c, 0x37);
-/// Orange accent for Reject.
-pub(crate) const REJECT_COLOR: Color32 = Color32::from_rgb(0xd0, 0x87, 0x20);
+/// The filter field's id, so Ctrl+F can hand it the keyboard from any
+/// tab. Named rather than positional: the field is built in one place and
+/// focused from another.
+fn filter_id() -> egui::Id {
+    egui::Id::new("hallpass-filter")
+}
+
+/// Columns in the activity strip above the event feed. Chosen so a column
+/// stays a few pixels wide on the narrowest window this app allows.
+const ACTIVITY_COLUMNS: usize = 72;
 
 /// Which tab of the main window is active.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,6 +60,62 @@ enum Tab {
     Rules,
     Stats,
     Settings,
+}
+
+impl Tab {
+    fn label(self) -> &'static str {
+        match self {
+            Tab::Events => "Events",
+            Tab::Traffic => "Traffic",
+            Tab::Rules => "Rules",
+            Tab::Stats => "Stats",
+            Tab::Settings => "Settings",
+        }
+    }
+
+    const ALL: [Tab; 5] = [
+        Tab::Events,
+        Tab::Traffic,
+        Tab::Rules,
+        Tab::Stats,
+        Tab::Settings,
+    ];
+}
+
+/// Which decisions the feed and the traffic view are narrowed to.
+///
+/// Separate from the text filter because it asks a different question:
+/// the text says which connections, this says which outcomes, and the
+/// common one ("show me what is being stopped") is not a substring of
+/// anything. Both narrow the same iterator, so the count in the header and
+/// the rows below it cannot disagree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum Lens {
+    #[default]
+    All,
+    Allowed,
+    /// Deny and reject, whether or not enforcement applied them: in
+    /// observe mode the interesting rows are precisely the ones that were
+    /// decided and let through anyway.
+    Blocked,
+}
+
+impl Lens {
+    fn label(self) -> &'static str {
+        match self {
+            Lens::All => "All",
+            Lens::Allowed => "Allowed",
+            Lens::Blocked => "Blocked",
+        }
+    }
+
+    fn admits(self, ev: &ConnEvent) -> bool {
+        match self {
+            Lens::All => true,
+            Lens::Allowed => ev.verdict == Verdict::Allow,
+            Lens::Blocked => ev.verdict != Verdict::Allow,
+        }
+    }
 }
 
 /// Connection status shown in the status bar.
@@ -210,6 +271,8 @@ pub struct HallpassApp {
     editor: Option<RuleEditor>,
     /// Free-text filter applied to the event feed and the traffic view.
     filter: String,
+    /// Which outcomes the feed and the traffic view are narrowed to.
+    lens: Lens,
     /// When stats were last requested, for the poll that keeps whole-host
     /// state (the mode, the lockdown posture) visible from every tab.
     stats_asked: std::time::Instant,
@@ -329,6 +392,7 @@ impl HallpassApp {
             last_error: None,
             editor: None,
             filter: String::new(),
+            lens: Lens::default(),
             // In the past, so the first frame asks immediately.
             stats_asked: std::time::Instant::now() - STATS_POLL,
             rules_notice: None,
@@ -687,7 +751,7 @@ impl HallpassApp {
     fn filtered(&self) -> impl Iterator<Item = &ConnEvent> + '_ {
         self.events
             .iter()
-            .filter(|ev| traffic::matches_filter(ev, &self.filter))
+            .filter(|ev| self.lens.admits(ev) && traffic::matches_filter(ev, &self.filter))
     }
 
     /// Whether the observe-mode banner belongs on screen.
@@ -788,7 +852,7 @@ impl HallpassApp {
         }
         let l = self.stats.as_ref()?.lockdown.as_ref()?;
         Some(format!(
-            "LOCKDOWN: only the allow rules tagged {} decide connections; \
+            "only the allow rules tagged {} decide connections; \
              everything else is denied without a prompt ({} rule(s) suppressed)",
             if l.tags.is_empty() {
                 "nothing".to_string()
@@ -811,6 +875,10 @@ impl HallpassApp {
     /// switch and its payload must come from the same reply.)
     fn mode_toggle(&mut self, ui: &mut egui::Ui) {
         let Some(current) = self.daemon_config else {
+            // Nothing is claimed before the daemon has spoken, but the
+            // space is still held: a control that appears a second after
+            // the window does moves everything beside it.
+            ui.label(theme::num_muted("waiting for the daemon"));
             return;
         };
         // A posture owns the mode while it is on, and the daemon refuses a
@@ -821,7 +889,8 @@ impl HallpassApp {
         let locked = self.lockdown_banner().is_some();
         let mut enforce = current.enforce || locked;
         let response = ui
-            .add_enabled(!locked, egui::Checkbox::new(&mut enforce, "Enforce"))
+            .add_enabled_ui(!locked, |ui| theme::switch(ui, &mut enforce, "Enforce"))
+            .inner
             .on_hover_text(
                 "On: rules and prompts decide what connects (active). \
                  Off: observe mode, everything is recorded and nothing is \
@@ -902,6 +971,7 @@ impl HallpassApp {
 
     fn main_window(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
+        theme::ensure_installed(&ctx);
         // Closing the main window parks it in the tray when there is a
         // tray to come back through: prompts stay armed and keep popping
         // while the window is away, which is what makes the close button
@@ -927,109 +997,236 @@ impl HallpassApp {
             }
         }
 
-        egui::Panel::top("tabs").show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.heading("Hallpass");
-                ui.separator();
-                for (tab, label) in [
-                    (Tab::Events, "Events"),
-                    (Tab::Traffic, "Traffic"),
-                    (Tab::Rules, "Rules"),
-                    (Tab::Stats, "Stats"),
-                    (Tab::Settings, "Settings"),
-                ] {
-                    if ui.selectable_label(self.tab == tab, label).clicked() {
-                        self.select_tab(tab);
-                    }
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    self.mode_toggle(ui);
-                });
-            });
-        });
+        self.shortcuts(&ctx);
 
-        egui::Panel::bottom("status").show(ui, |ui| {
-            ui.horizontal(|ui| {
-                match &self.status {
-                    ConnStatus::Connecting => {
-                        ui.colored_label(REJECT_COLOR, "Connecting to daemon...");
-                    }
-                    ConnStatus::Connected => {
-                        ui.colored_label(ALLOW_COLOR, "Connected");
-                    }
-                    ConnStatus::Reconnecting { retry_in } => {
-                        ui.colored_label(
-                            DENY_COLOR,
-                            format!("Disconnected - retrying in {}s", retry_in.as_secs()),
-                        );
-                    }
-                }
-                if let Some(err) = &self.last_error {
-                    ui.separator();
-                    ui.colored_label(
-                        DENY_COLOR,
-                        format!("daemon error: {}", prompt::ui_text(err)),
-                    );
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("Quit").clicked() {
-                        self.quit(&ctx);
-                    }
-                });
+        egui::Panel::top("tabs")
+            .frame(
+                egui::Frame::new()
+                    .fill(theme::SURFACE)
+                    .inner_margin(egui::Margin::symmetric(12, 7)),
+            )
+            .show_separator_line(false)
+            .show(ui, |ui| {
+                self.header(ui);
             });
-        });
 
-        egui::CentralPanel::default().show(ui, |ui| {
-            // Nothing is being blocked while this is showing, and every
-            // other signal (a WOULD- prefix on a verdict, a line in Stats)
-            // is only visible to someone already looking at the right pane.
-            if self.observe_banner() {
-                ui.colored_label(
-                    REJECT_COLOR,
-                    "OBSERVE MODE: policy is evaluated and recorded, nothing is blocked",
-                );
-                ui.separator();
+        egui::Panel::bottom("status")
+            .frame(
+                egui::Frame::new()
+                    .fill(theme::SURFACE)
+                    .inner_margin(egui::Margin::symmetric(12, 5)),
+            )
+            .show_separator_line(false)
+            .show(ui, |ui| {
+                self.status_bar(ui, &ctx);
+            });
+
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::new()
+                    .fill(theme::BG)
+                    .inner_margin(egui::Margin::symmetric(12, 10)),
+            )
+            .show(ui, |ui| {
+                self.banners(ui);
+                match self.tab {
+                    Tab::Events => self.events_tab(ui),
+                    Tab::Traffic => self.traffic_tab(ui),
+                    Tab::Rules => self.rules_tab(ui),
+                    Tab::Stats => self.stats_tab(ui),
+                    Tab::Settings => self.settings_tab(ui),
+                }
+            });
+    }
+
+    /// Keyboard routes into the two things this window is opened for:
+    /// getting to a tab, and getting to the filter.
+    ///
+    /// Ctrl rather than bare digits: the filter field takes typed text,
+    /// and a bare `1` while it has focus has to reach the field.
+    fn shortcuts(&mut self, ctx: &egui::Context) {
+        const KEYS: [egui::Key; 5] = [
+            egui::Key::Num1,
+            egui::Key::Num2,
+            egui::Key::Num3,
+            egui::Key::Num4,
+            egui::Key::Num5,
+        ];
+        let (jump, find) = ctx.input(|i| {
+            (
+                KEYS.iter()
+                    .position(|k| i.modifiers.command && i.key_pressed(*k)),
+                i.modifiers.command && i.key_pressed(egui::Key::F),
+            )
+        });
+        if let Some(index) = jump {
+            self.select_tab(Tab::ALL[index]);
+        }
+        if find {
+            // The feed is the only tab the filter belongs to that is
+            // always there; a find on Rules or Stats means the operator
+            // wants the feed.
+            if !matches!(self.tab, Tab::Events | Tab::Traffic) {
+                self.select_tab(Tab::Events);
             }
-            // The mirror image of the observe banner, and it belongs on
-            // screen for the same reason: almost everything is being denied,
-            // and every other signal for it (a DENY in the feed, a row in
-            // Stats) is only visible to someone already looking at the right
-            // pane. An operator debugging "nothing can connect" must not
-            // have to go looking for the reason.
-            if let Some(l) = self.lockdown_banner() {
-                ui.colored_label(REJECT_COLOR, l);
-                ui.separator();
+            ctx.memory_mut(|m| m.request_focus(filter_id()));
+        }
+    }
+
+    /// The title bar: the mark, the tabs, and the mode.
+    ///
+    /// The mark is painted in the colour of whatever the host is doing, so
+    /// the top-left corner answers "is this thing on" before any tab is
+    /// read; it is the same claim the tray icon makes, from the same
+    /// [`Self::tray_state`], so the two cannot disagree.
+    fn header(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            let state = self.tray_state();
+            theme::brand(ui, tray_state_color(state)).on_hover_text(tray_state_summary(state));
+            ui.add_space(2.0);
+            theme::wordmark(ui);
+            ui.add_space(10.0);
+            for tab in Tab::ALL {
+                if theme::tab(ui, self.tab == tab, tab.label()).clicked() {
+                    self.select_tab(tab);
+                }
             }
-            match self.tab {
-                Tab::Events => self.events_tab(ui),
-                Tab::Traffic => self.traffic_tab(ui),
-                Tab::Rules => self.rules_tab(ui),
-                Tab::Stats => self.stats_tab(ui),
-                Tab::Settings => self.settings_tab(ui),
-            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                self.mode_toggle(ui);
+            });
         });
     }
 
-    fn events_tab(&mut self, ui: &mut egui::Ui) {
+    /// The bottom strip: the daemon link, and the last thing that went
+    /// wrong.
+    fn status_bar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.horizontal(|ui| {
-            ui.label("Filter:");
-            ui.text_edit_singleline(&mut self.filter);
-            if ui.button("Clear").clicked() {
+            let (color, text) = match &self.status {
+                ConnStatus::Connecting => (REJECT_COLOR, "Connecting to daemon...".to_string()),
+                ConnStatus::Connected => (ALLOW_COLOR, "Connected".to_string()),
+                ConnStatus::Reconnecting { retry_in } => (
+                    DENY_COLOR,
+                    format!("Disconnected - retrying in {}s", retry_in.as_secs()),
+                ),
+            };
+            theme::status_dot(ui, color);
+            ui.label(egui::RichText::new(text).color(color).small());
+            if let Some(err) = &self.last_error {
+                ui.add_space(4.0);
+                theme::pill(
+                    ui,
+                    &format!("daemon error: {}", prompt::ui_text(err)),
+                    DENY_COLOR,
+                );
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .button("Quit")
+                    .on_hover_text(
+                        "Releases the prompt slot: later unmatched connections take \
+                         the daemon's default verdict with nothing on screen.",
+                    )
+                    .clicked()
+                {
+                    self.quit(ctx);
+                }
+                if let Some(s) = &self.stats {
+                    ui.label(theme::num_muted(format!(
+                        "up {}",
+                        format_uptime(s.uptime_secs)
+                    )));
+                }
+            });
+        });
+    }
+
+    /// The whole-host notices, on every tab because they are true on every
+    /// tab.
+    fn banners(&mut self, ui: &mut egui::Ui) {
+        // Nothing is being blocked while this is showing, and every
+        // other signal (a WOULD- prefix on a verdict, a line in Stats)
+        // is only visible to someone already looking at the right pane.
+        if self.observe_banner() {
+            theme::banner(
+                ui,
+                Tone::Warn,
+                "\u{23f8}",
+                "OBSERVE MODE",
+                "policy is evaluated and recorded, nothing is blocked",
+            );
+            ui.add_space(8.0);
+        }
+        // The mirror image of the observe banner, and it belongs on
+        // screen for the same reason: almost everything is being denied,
+        // and every other signal for it (a DENY in the feed, a row in
+        // Stats) is only visible to someone already looking at the right
+        // pane. An operator debugging "nothing can connect" must not
+        // have to go looking for the reason.
+        if let Some(l) = self.lockdown_banner() {
+            theme::banner(ui, Tone::Bad, "\u{26a0}", "LOCKDOWN", &l);
+            ui.add_space(8.0);
+        }
+    }
+
+    /// The search field plus the outcome lens, shared by the two views
+    /// that fold the same iterator.
+    fn filter_row(&mut self, ui: &mut egui::Ui, shown: usize, total: usize) {
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("\u{1f50d}").color(MUTED));
+            ui.add(
+                egui::TextEdit::singleline(&mut self.filter)
+                    .id(filter_id())
+                    .hint_text("app, domain, address or rule")
+                    .desired_width(240.0),
+            )
+            .on_hover_text("Ctrl+F from anywhere; Ctrl+1 to Ctrl+5 switch tabs");
+            if !self.filter.is_empty() && ui.small_button("Clear").clicked() {
                 self.filter.clear();
             }
+            ui.add_space(4.0);
+            for lens in [Lens::All, Lens::Allowed, Lens::Blocked] {
+                if theme::tab(ui, self.lens == lens, lens.label()).clicked() {
+                    self.lens = lens;
+                }
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let narrowed = shown != total;
+                ui.label(theme::num_muted(if narrowed {
+                    format!("{shown} of {total}")
+                } else {
+                    format!("{total} events")
+                }));
+            });
         });
-        ui.separator();
-        if self.events.is_empty() {
-            ui.label("No events yet.");
-            return;
-        }
-        // Filtering copies references, not events: the feed is capped at
-        // MAX_EVENTS, so this is bounded work per frame.
+        ui.add_space(8.0);
+    }
+
+    fn events_tab(&mut self, ui: &mut egui::Ui) {
+        // Filtering walks references, not events: the feed is capped at
+        // MAX_EVENTS, so this is bounded work per frame. Counted before
+        // the filter row is drawn and collected after it, because the row
+        // is what edits the filter this frame.
+        let (count, total) = (self.filtered().count(), self.events.len());
+        self.filter_row(ui, count, total);
         let shown: Vec<&ConnEvent> = self.filtered().collect();
-        if shown.is_empty() {
-            ui.label("No events match the filter.");
+        if self.events.is_empty() {
+            empty_state(
+                ui,
+                "Nothing has connected yet",
+                "Decided connections appear here as they happen.",
+            );
             return;
         }
+        if shown.is_empty() {
+            empty_state(
+                ui,
+                "No events match",
+                "Widen the filter, or switch the lens back to All.",
+            );
+            return;
+        }
+        self.activity_card(ui, &shown);
+        ui.add_space(8.0);
         let mut new_rule_from: Option<Connection> = None;
         let (header_h, row_h) = table_heights(ui);
         // A table, not a Grid inside show_rows: show_rows assumed every
@@ -1041,16 +1238,16 @@ impl HallpassApp {
         // the remainder column keeps the grid tracking the window width.
         data_table(ui, "events_table")
             .stick_to_bottom(true)
-            .column(Column::auto()) // Time
-            .column(Column::auto()) // Verdict
-            .column(Column::auto().clip(true).at_least(60.0)) // Application
-            .column(Column::auto().clip(true).at_least(80.0)) // Destination
-            .column(Column::remainder().clip(true).at_least(60.0)) // Rule
-            .column(Column::auto()) // rule-from-row button
+            .column(Column::initial(72.0).at_least(64.0)) // Time
+            .column(Column::initial(96.0).at_least(80.0)) // Verdict
+            .column(Column::initial(170.0).clip(true).at_least(90.0)) // Application
+            .column(Column::initial(230.0).clip(true).at_least(140.0)) // Destination
+            .column(Column::remainder().clip(true).at_least(90.0)) // Rule
+            .column(Column::initial(76.0).at_least(70.0)) // rule-from-row button
             .header(header_h, |mut header| {
                 for title in ["Time", "Verdict", "Application", "Destination", "Rule", ""] {
                     header.col(|ui| {
-                        ui.strong(title);
+                        ui.label(column_title(title));
                     });
                 }
             })
@@ -1058,30 +1255,40 @@ impl HallpassApp {
                 body.rows(row_h, shown.len(), |mut row| {
                     let ev = shown[row.index()];
                     row.col(|ui| {
-                        ui.monospace(format_time(ev.unix_ms));
+                        ui.label(theme::num_muted(format_time(ev.unix_ms)));
                     });
                     row.col(|ui| {
                         // verdict_label comes from the event, not the
                         // verdict, so an unenforced deny reads
                         // "would-deny": the connection went out.
-                        ui.colored_label(event_color(ev), ev.verdict_label());
+                        theme::pill(ui, ev.verdict_label(), event_color(ev));
                     });
                     row.col(|ui| {
-                        ui.label(prompt::exe_name(&ev.conn));
+                        ui.label(egui::RichText::new(prompt::exe_name(&ev.conn)).color(TEXT));
                     });
                     row.col(|ui| {
-                        ui.monospace(format!(
-                            "{} {}",
-                            ev.conn.tuple.proto,
-                            prompt::format_dest(&ev.conn)
-                        ));
+                        ui.spacing_mut().item_spacing.x = 5.0;
+                        ui.label(
+                            egui::RichText::new(ev.conn.tuple.proto.to_string())
+                                .small()
+                                .color(MUTED),
+                        );
+                        ui.label(theme::num(prompt::format_dest(&ev.conn)));
                     });
-                    row.col(|ui| {
-                        ui.label(prompt::ui_text(ev.rule_name.as_deref().unwrap_or("-")));
+                    row.col(|ui| match ev.rule_name.as_deref() {
+                        Some(name) => {
+                            theme::ghost_pill(ui, &prompt::ui_text(name));
+                        }
+                        // Not a rule name: this connection was decided by
+                        // the default verdict, and saying so is the point
+                        // of the column.
+                        None => {
+                            ui.label(egui::RichText::new("default").small().color(MUTED));
+                        }
                     });
                     row.col(|ui| {
                         if ui
-                            .small_button("Rule")
+                            .small_button("+ Rule")
                             .on_hover_text("Create a rule from this connection")
                             .clicked()
                         {
@@ -1095,58 +1302,112 @@ impl HallpassApp {
         }
     }
 
+    /// The strip above the feed: what the machine has been doing, as a
+    /// shape.
+    ///
+    /// A thousand rows say what happened; this says when, and in what
+    /// proportion. A steady trickle of denies and a burst thirty seconds
+    /// ago are the same table and completely different situations.
+    fn activity_card(&self, ui: &mut egui::Ui, shown: &[&ConnEvent]) {
+        let buckets = traffic::buckets(shown.iter().copied(), ACTIVITY_COLUMNS);
+        let (mut allowed, mut blocked, mut would) = (0u64, 0u64, 0u64);
+        for b in &buckets {
+            allowed += b.allowed;
+            blocked += b.blocked;
+            would += b.would_block;
+        }
+        let span = match (shown.first(), shown.last()) {
+            (Some(first), Some(last)) => last.unix_ms.saturating_sub(first.unix_ms) / 1000,
+            _ => 0,
+        };
+        theme::card(ui, "", |ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new("ACTIVITY")
+                        .small()
+                        .strong()
+                        .color(MUTED),
+                );
+                ui.label(theme::num_muted(format!("last {}", format_span(span))));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    // Right to left, so the counts read in the order the
+                    // columns are stacked in.
+                    if would > 0 {
+                        theme::pill(ui, &format!("{would} not enforced"), REJECT_COLOR);
+                    }
+                    theme::pill(ui, &format!("{blocked} blocked"), DENY_COLOR);
+                    theme::pill(ui, &format!("{allowed} allowed"), ALLOW_COLOR);
+                });
+            });
+            ui.add_space(4.0);
+            theme::activity_strip(ui, 44.0, &buckets);
+        });
+    }
+
     fn traffic_tab(&mut self, ui: &mut egui::Ui) {
+        let (count, total) = (self.filtered().count(), self.events.len());
+        self.filter_row(ui, count, total);
         ui.horizontal(|ui| {
-            ui.label("Group by:");
+            ui.label(egui::RichText::new("Group by").small().color(MUTED));
             for g in [
                 traffic::GroupBy::Exe,
                 traffic::GroupBy::Domain,
                 traffic::GroupBy::Rule,
             ] {
-                ui.selectable_value(&mut self.group_by, g, g.label());
+                if theme::tab(ui, self.group_by == g, g.label()).clicked() {
+                    self.group_by = g;
+                }
             }
-            ui.separator();
-            ui.label("Filter:");
-            ui.text_edit_singleline(&mut self.filter);
         });
-        ui.separator();
+        ui.add_space(8.0);
 
         // Rebuilt per frame from the capped feed rather than folded
         // incrementally, so changing the grouping or the filter cannot leave
         // stale counts behind. MAX_EVENTS bounds the cost.
         let agg = traffic::Aggregate::rebuild(self.filtered(), self.group_by);
         if agg.total == 0 {
-            ui.label("No traffic recorded yet.");
+            empty_state(
+                ui,
+                "No traffic recorded yet",
+                "Connections are grouped here as they are decided.",
+            );
             return;
         }
-        ui.label(format!(
-            "{} connections across {} {}",
-            agg.total,
-            agg.len(),
-            self.group_by.label().to_lowercase()
-        ));
-        if agg.overflow > 0 {
-            ui.colored_label(
-                REJECT_COLOR,
-                format!(
-                    "{} connections not counted: too many distinct keys",
-                    agg.overflow
-                ),
+        ui.horizontal(|ui| {
+            ui.label(theme::num(agg.total.to_string()));
+            ui.label(
+                egui::RichText::new(format!(
+                    "connections across {} {}{}",
+                    agg.len(),
+                    self.group_by.label().to_lowercase(),
+                    if agg.len() == 1 { "" } else { "s" }
+                ))
+                .color(MUTED),
             );
-        }
+            if agg.overflow > 0 {
+                theme::pill(
+                    ui,
+                    &format!("{} not counted: too many distinct keys", agg.overflow),
+                    REJECT_COLOR,
+                );
+            }
+        });
+        ui.add_space(6.0);
         let rows = agg.top(TRAFFIC_ROWS);
         let (header_h, row_h) = table_heights(ui);
         data_table(ui, "traffic_table")
-            .column(Column::remainder().clip(true).at_least(120.0)) // key
-            .column(Column::auto()) // Total
-            .column(Column::auto()) // Allowed
-            .column(Column::auto()) // Blocked
-            .column(Column::auto()) // Would block
-            .column(Column::auto()) // Peers
-            .column(Column::auto()) // Last seen
+            .column(Column::remainder().clip(true).at_least(160.0)) // key
+            .column(Column::initial(116.0).at_least(70.0)) // Mix
+            .column(Column::initial(70.0).at_least(56.0)) // Total
+            .column(Column::initial(84.0).at_least(64.0)) // Allowed
+            .column(Column::initial(84.0).at_least(64.0)) // Blocked
+            .column(Column::initial(108.0).at_least(80.0)) // Would block
+            .column(Column::initial(70.0).at_least(56.0)) // Peers
+            .column(Column::initial(90.0).at_least(76.0)) // Last seen
             .header(header_h, |mut header| {
                 for title in [
                     self.group_by.label(),
+                    "Mix",
                     "Total",
                     "Allowed",
                     "Blocked",
@@ -1155,7 +1416,7 @@ impl HallpassApp {
                     "Last seen",
                 ] {
                     header.col(|ui| {
-                        ui.strong(title);
+                        ui.label(column_title(title));
                     });
                 }
             })
@@ -1163,25 +1424,43 @@ impl HallpassApp {
                 body.rows(row_h, rows.len(), |mut table_row| {
                     let row = &rows[table_row.index()];
                     table_row.col(|ui| {
-                        ui.label(prompt::ui_text(&row.key));
+                        ui.label(egui::RichText::new(prompt::ui_text(&row.key)).color(TEXT));
+                    });
+                    // The column four numbers cannot replace: whether this
+                    // row is mostly getting out or mostly being stopped is
+                    // a proportion, and a proportion is a shape.
+                    table_row.col(|ui| {
+                        theme::ratio_bar(
+                            ui,
+                            egui::vec2(ui.available_width().min(100.0), 8.0),
+                            &[
+                                (row.allowed, ALLOW_COLOR),
+                                (row.blocked, DENY_COLOR),
+                                (row.would_block, REJECT_COLOR),
+                            ],
+                        )
+                        .on_hover_text(format!(
+                            "{} allowed, {} blocked, {} recorded but not enforced",
+                            row.allowed, row.blocked, row.would_block
+                        ));
                     });
                     table_row.col(|ui| {
-                        ui.monospace(row.total.to_string());
+                        ui.label(theme::num(row.total.to_string()));
                     });
                     table_row.col(|ui| {
-                        ui.colored_label(ALLOW_COLOR, row.allowed.to_string());
+                        ui.label(count_text(row.allowed, ALLOW_COLOR));
                     });
                     table_row.col(|ui| {
-                        ui.colored_label(DENY_COLOR, row.blocked.to_string());
+                        ui.label(count_text(row.blocked, DENY_COLOR));
                     });
                     table_row.col(|ui| {
-                        ui.colored_label(REJECT_COLOR, row.would_block.to_string());
+                        ui.label(count_text(row.would_block, REJECT_COLOR));
                     });
                     table_row.col(|ui| {
-                        ui.monospace(row.peers.to_string());
+                        ui.label(theme::num_muted(row.peers.to_string()));
                     });
                     table_row.col(|ui| {
-                        ui.monospace(format_time(row.last_ms));
+                        ui.label(theme::num_muted(format_time(row.last_ms)));
                     });
                 });
             });
@@ -1190,19 +1469,25 @@ impl HallpassApp {
     fn rules_tab(&mut self, ui: &mut egui::Ui) {
         let mut bulk: Option<(String, bool)> = None;
         ui.horizontal(|ui| {
-            if ui.button("Add rule").clicked() {
+            if ui.button("+ Add rule").clicked() {
                 self.editor = Some(RuleEditor::add());
             }
             if ui.button("Refresh").clicked() {
                 self.send(ClientMsg::RuleList);
             }
-            ui.label(format!("{} rule(s)", self.rules.len()));
+            let enabled = self.rules.iter().filter(|r| r.enabled).count();
+            ui.label(theme::num(format!("{enabled}")));
+            ui.label(
+                egui::RichText::new(format!("of {} rule(s) enabled", self.rules.len()))
+                    .color(MUTED),
+            );
             bulk = self.tag_filter_controls(ui);
         });
         if let Some(notice) = &self.rules_notice {
-            ui.label(prompt::ui_text(notice));
+            ui.add_space(6.0);
+            theme::banner(ui, Tone::Good, "\u{2714}", &prompt::ui_text(notice), "");
         }
-        ui.separator();
+        ui.add_space(8.0);
         if let Some((tag, enabled)) = bulk {
             // The previous batch's count would otherwise sit there looking
             // like this one's answer until the reply lands.
@@ -1210,7 +1495,11 @@ impl HallpassApp {
             self.send(ClientMsg::RuleToggleTag { tag, enabled });
         }
         if self.rules.is_empty() {
-            ui.label("No rules loaded.");
+            empty_state(
+                ui,
+                "No rules loaded",
+                "Every connection is decided by prompts and the default verdict.",
+            );
             return;
         }
 
@@ -1244,11 +1533,12 @@ impl HallpassApp {
         // of dashes costs width on a table that already has seven.
         let tagged = self.rules.iter().any(|r| !r.tags.is_empty());
         let mut table = data_table(ui, "rules_table")
-            .column(Column::auto()) // On
-            .column(Column::auto().clip(true).at_least(60.0)) // Name
-            .column(Column::auto()); // Action
+            .column(Column::initial(46.0).at_least(40.0)) // On
+            .column(Column::initial(200.0).clip(true).at_least(110.0)) // Name
+            .column(Column::initial(80.0).at_least(70.0)); // Action
         if tagged {
-            table = table.column(Column::auto().clip(true).at_least(50.0)); // Tags
+            table = table.column(Column::initial(150.0).clip(true).at_least(80.0));
+            // Tags
         }
         let titles: &[&str] = if tagged {
             &["On", "Name", "Action", "Tags", "Match", "Priority", "", ""]
@@ -1256,20 +1546,21 @@ impl HallpassApp {
             &["On", "Name", "Action", "Match", "Priority", "", ""]
         };
         table
-            .column(Column::remainder().clip(true).at_least(80.0)) // Match
-            .column(Column::auto()) // Priority
-            .column(Column::auto()) // Edit
-            .column(Column::auto()) // Delete
+            .column(Column::remainder().clip(true).at_least(120.0)) // Match
+            .column(Column::initial(76.0).at_least(64.0)) // Priority
+            .column(Column::initial(62.0).at_least(56.0)) // Edit
+            .column(Column::initial(76.0).at_least(64.0)) // Delete
             .header(header_h, |mut header| {
                 for title in titles {
                     header.col(|ui| {
-                        ui.strong(*title);
+                        ui.label(column_title(title));
                     });
                 }
             })
             .body(|body| {
                 body.rows(row_h, shown.len(), |mut row| {
                     let rule = shown[row.index()];
+                    let stopped = suppressed.iter().any(|n| n == &rule.name);
                     row.col(|ui| {
                         let mut enabled = rule.enabled;
                         let changed = ui.checkbox(&mut enabled, "").changed();
@@ -1278,7 +1569,7 @@ impl HallpassApp {
                         // an operator opens to see what is in force, so the
                         // difference between "on" and "on but not deciding"
                         // has to be on the row.
-                        if suppressed.iter().any(|n| n == &rule.name) {
+                        if stopped {
                             ui.colored_label(REJECT_COLOR, "!")
                                 .on_hover_text("suppressed by lockdown");
                         }
@@ -1287,29 +1578,39 @@ impl HallpassApp {
                         }
                     });
                     row.col(|ui| {
-                        ui.label(prompt::ui_text(&rule.name));
+                        // Dimmed when the rule decides nothing, so a
+                        // disabled or suppressed row reads as inert from
+                        // the shape of the line rather than from its box.
+                        let name = egui::RichText::new(prompt::ui_text(&rule.name));
+                        ui.label(if rule.enabled && !stopped {
+                            name.color(TEXT)
+                        } else {
+                            name.color(MUTED).strikethrough()
+                        });
                     });
                     row.col(|ui| {
                         let v = Verdict::from(rule.action);
-                        ui.colored_label(verdict_color(v), verdict_label(v));
+                        theme::pill(ui, verdict_label(v), verdict_color(v));
                     });
                     if tagged {
                         row.col(|ui| {
+                            ui.spacing_mut().item_spacing.x = 4.0;
                             // Through ui_text like every other daemon-supplied
                             // string here, though `valid_tag` should have made
                             // a hazardous tag impossible.
-                            ui.label(prompt::ui_text(&if rule.tags.is_empty() {
-                                "-".to_string()
-                            } else {
-                                rule.tags.join(",")
-                            }));
+                            for tag in &rule.tags {
+                                theme::ghost_pill(ui, &prompt::ui_text(tag));
+                            }
+                            if rule.tags.is_empty() {
+                                ui.label(theme::num_muted("-"));
+                            }
                         });
                     }
                     row.col(|ui| {
-                        ui.monospace(prompt::ui_text(&rule.matcher.summary()));
+                        ui.label(theme::num(prompt::ui_text(&rule.matcher.summary())));
                     });
                     row.col(|ui| {
-                        ui.label(rule.priority.to_string());
+                        ui.label(theme::num_muted(rule.priority.to_string()));
                     });
                     row.col(|ui| {
                         if ui.button("Edit").clicked() {
@@ -1317,7 +1618,15 @@ impl HallpassApp {
                         }
                     });
                     row.col(|ui| {
-                        if ui.button("Delete").clicked() {
+                        // The only destructive control in the window, and
+                        // the one row-level mistake nothing else undoes.
+                        if ui
+                            .add(
+                                egui::Button::new(egui::RichText::new("Delete").color(DENY_COLOR))
+                                    .fill(theme::tint(DENY_COLOR)),
+                            )
+                            .clicked()
+                        {
                             delete = Some(rule.name.clone());
                         }
                     });
@@ -1372,8 +1681,8 @@ impl HallpassApp {
         }
 
         let mut bulk = None;
-        ui.separator();
-        ui.label("Tag:");
+        ui.add_space(6.0);
+        ui.label(egui::RichText::new("Tag").small().color(MUTED));
         egui::ComboBox::from_id_salt("rules-tag-filter")
             .selected_text(self.rule_tag_filter.as_deref().unwrap_or("(all)"))
             .show_ui(ui, |ui| {
@@ -1411,137 +1720,294 @@ impl HallpassApp {
         }
     }
 
+    /// The Stats tab: four headline numbers, then the counters that only
+    /// matter when they are not zero.
+    ///
+    /// Ordered by what an operator came here to find out. The tiles answer
+    /// "is this thing working and what is it doing"; the cards below answer
+    /// "why is it not", and each one is a group that fails together - the
+    /// prompt path, the kernel queues, the integrity watchdog, the volume
+    /// accounting. A flat list of eighteen rows made the two kinds
+    /// indistinguishable.
     fn stats_tab(&mut self, ui: &mut egui::Ui) {
-        if ui.button("Refresh").clicked() {
-            self.send(ClientMsg::Stats);
-        }
-        ui.separator();
         let Some(s) = self.stats.clone() else {
-            ui.label("Waiting for the daemon...");
+            empty_state(
+                ui,
+                "Waiting for the daemon",
+                "Counters appear as soon as it answers.",
+            );
             return;
         };
-        egui::Grid::new("stats_grid").num_columns(2).show(ui, |ui| {
-            ui.label("Total connections");
-            ui.monospace(s.connections_total.to_string());
-            ui.end_row();
-            ui.label("Allowed");
-            ui.colored_label(ALLOW_COLOR, s.allowed.to_string());
-            ui.end_row();
-            ui.label("Denied / rejected");
-            ui.colored_label(DENY_COLOR, s.denied.to_string());
-            ui.end_row();
-            ui.label("Prompted");
-            ui.monospace(s.prompted.to_string());
-            ui.end_row();
-            // Whether anyone is being asked at all, and how often nobody
-            // answered. Without these rows a window that has quietly lost the
-            // prompt slot looks exactly like a quiet machine.
-            ui.label("Prompt handler");
-            if s.prompt_handler_connected {
-                ui.monospace("connected");
-            } else {
-                ui.colored_label(DENY_COLOR, "none - connections take the default");
-            }
-            ui.end_row();
-            ui.label("Unanswered prompts");
-            ui.monospace(s.prompts_unanswered.to_string());
-            ui.end_row();
-            ui.label("Prompt overflows");
-            ui.monospace(s.prompts_overflowed.to_string());
-            ui.end_row();
-            ui.label("Handlers evicted");
-            ui.monospace(s.prompt_handlers_evicted.to_string());
-            ui.end_row();
-            ui.label("Rules loaded");
-            ui.monospace(s.rules_loaded.to_string());
-            ui.end_row();
-            // The kernel's own queue counters: a packet dropped from a full
-            // verdict queue never reached the daemon, so no counter above
-            // moved for it. Red when nonzero because packets were dropped
-            // without policy running; "unavailable" (never 0) when nothing
-            // was read. Drops only: a working fail-open queue passes its
-            // overflow through unjudged and uncounted, which is what the
-            // fail-open row below is for reading this one.
-            ui.label("Verdict queue kernel drops");
-            let missed = match (s.verdict_queue_dropped, s.verdict_queue_user_dropped) {
-                // Saturating, as everywhere a stats reply is rendered: the
-                // sum must not be able to panic on socket input.
-                (Some(dropped), Some(undelivered)) => Some(dropped.saturating_add(undelivered)),
-                _ => None,
-            };
-            match missed {
-                Some(0) => ui.monospace("0"),
-                Some(n) => ui.colored_label(
-                    DENY_COLOR,
-                    format!("{n} packets dropped before policy saw them"),
-                ),
-                None => ui.monospace("unavailable"),
-            };
-            ui.end_row();
-            // Plain even when "no": that is the intended state under a
-            // fail-closed posture, which this panel cannot see.
-            ui.label("Verdict queue fail-open");
-            match s.verdict_queue_fail_open {
-                Some(true) => ui.monospace("yes"),
-                Some(false) => ui.monospace("no"),
-                None => ui.monospace("unavailable"),
-            };
-            ui.end_row();
-            ui.label("Verdict queue depth");
-            match (s.verdict_queue_depth, s.verdict_queue_max_len) {
-                // Against the length the daemon set at bind, because a
-                // depth only reads as pressure against its ceiling. No
-                // ceiling means the kernel refused the request and kept its
-                // own, which the daemon logged and this panel will not
-                // guess at.
-                (Some(n), Some(max)) => ui.monospace(format!("{n} of {max}")),
-                (Some(n), None) => ui.monospace(n.to_string()),
-                (None, _) => ui.monospace("unavailable"),
-            };
-            ui.end_row();
-            ui.label("Snoop queue kernel drops");
-            // Domain annotations, not verdicts, so never painted; the
-            // userspace half of the same loss is dns_snoop_dropped.
-            match (s.snoop_queue_dropped, s.snoop_queue_user_dropped) {
-                (Some(dropped), Some(undelivered)) => {
-                    ui.monospace(dropped.saturating_add(undelivered).to_string())
-                }
-                _ => ui.monospace("unavailable"),
-            };
-            ui.end_row();
-            // Every detected flush is a window in which the host was
-            // unfiltered; red for the same reason the kernel-drop row is.
-            // The watchdog repairs each one; a failed repair is in the
-            // journal, so this row claims detection, not success.
-            ui.label("Table flushes");
-            match (s.nft_flushes, s.nft_last_flush_ms) {
-                (0, _) => ui.monospace("0"),
-                (n, ms) => ui.colored_label(
-                    DENY_COLOR,
-                    format!(
-                        "{n} - something flushed the nftables ruleset, last {}",
-                        ms.map(hallpass_types::format_ts)
-                            .unwrap_or_else(|| "unknown".into()),
-                    ),
-                ),
-            };
-            ui.end_row();
-            // Volume from conntrack teardown accounting; zero when
-            // flow_accounting is off, like any counter the host is not
-            // producing.
-            ui.label("Flows accounted");
-            ui.monospace(s.flows_accounted.to_string());
-            ui.end_row();
-            ui.label("Flow bytes");
-            ui.monospace(hallpass_types::human_bytes(s.flow_bytes));
-            ui.end_row();
-            ui.label("Flow packets");
-            ui.monospace(s.flow_packets.to_string());
-            ui.end_row();
-            ui.label("Daemon uptime");
-            ui.monospace(format_uptime(s.uptime_secs));
-            ui.end_row();
-        });
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                let tile_w = ((ui.available_width() - 3.0 * 8.0) / 4.0 - 26.0).max(90.0);
+                ui.horizontal(|ui| {
+                    theme::stat_tile(
+                        ui,
+                        tile_w,
+                        "CONNECTIONS",
+                        &compact(s.connections_total),
+                        TEXT,
+                        &format!("up {}", format_uptime(s.uptime_secs)),
+                    );
+                    theme::stat_tile(
+                        ui,
+                        tile_w,
+                        "ALLOWED",
+                        &compact(s.allowed),
+                        ALLOW_COLOR,
+                        &percent_of(s.allowed, s.connections_total),
+                    );
+                    theme::stat_tile(
+                        ui,
+                        tile_w,
+                        "DENIED / REJECTED",
+                        &compact(s.denied),
+                        DENY_COLOR,
+                        &percent_of(s.denied, s.connections_total),
+                    );
+                    theme::stat_tile(
+                        ui,
+                        tile_w,
+                        "PROMPTED",
+                        &compact(s.prompted),
+                        REJECT_COLOR,
+                        &format!("{} unanswered", s.prompts_unanswered),
+                    );
+                });
+                ui.add_space(8.0);
+                theme::ratio_bar(
+                    ui,
+                    egui::vec2(ui.available_width(), 10.0),
+                    &[(s.allowed, ALLOW_COLOR), (s.denied, DENY_COLOR)],
+                )
+                .on_hover_text(format!(
+                    "{} allowed, {} denied or rejected since the daemon started",
+                    s.allowed, s.denied
+                ));
+                ui.add_space(10.0);
+
+                ui.columns(2, |cols| {
+                    // Whether anyone is being asked at all, and how often
+                    // nobody answered. Without this card a window that has
+                    // quietly lost the prompt slot looks exactly like a
+                    // quiet machine.
+                    theme::card(&mut cols[0], "PROMPTING", |ui| {
+                        egui::Grid::new("stats_prompt")
+                            .num_columns(2)
+                            .striped(false)
+                            .spacing([12.0, 4.0])
+                            .show(ui, |ui| {
+                                ui.label(egui::RichText::new("Prompt handler").color(MUTED));
+                                if s.prompt_handler_connected {
+                                    theme::pill(ui, "connected", ALLOW_COLOR);
+                                } else {
+                                    theme::pill(
+                                        ui,
+                                        "none - connections take the default",
+                                        DENY_COLOR,
+                                    );
+                                }
+                                ui.end_row();
+                                theme::kv(
+                                    ui,
+                                    "Unanswered prompts",
+                                    theme::num(s.prompts_unanswered.to_string()),
+                                );
+                                theme::kv(
+                                    ui,
+                                    "Prompt overflows",
+                                    theme::num(s.prompts_overflowed.to_string()),
+                                );
+                                theme::kv(
+                                    ui,
+                                    "Handlers evicted",
+                                    theme::num(s.prompt_handlers_evicted.to_string()),
+                                );
+                                theme::kv(
+                                    ui,
+                                    "Rules loaded",
+                                    theme::num(s.rules_loaded.to_string()),
+                                );
+                            });
+                    });
+                    // Volume from conntrack teardown accounting; zeros when
+                    // flow_accounting is off, like any counter the host is
+                    // not producing.
+                    theme::card(&mut cols[1], "VOLUME", |ui| {
+                        egui::Grid::new("stats_volume")
+                            .num_columns(2)
+                            .striped(false)
+                            .spacing([12.0, 4.0])
+                            .show(ui, |ui| {
+                                theme::kv(
+                                    ui,
+                                    "Flows accounted",
+                                    theme::num(s.flows_accounted.to_string()),
+                                );
+                                theme::kv(
+                                    ui,
+                                    "Flow bytes",
+                                    theme::num(hallpass_types::human_bytes(s.flow_bytes)),
+                                );
+                                theme::kv(
+                                    ui,
+                                    "Flow packets",
+                                    theme::num(s.flow_packets.to_string()),
+                                );
+                                theme::kv(
+                                    ui,
+                                    "Daemon uptime",
+                                    theme::num(format_uptime(s.uptime_secs)),
+                                );
+                            });
+                    });
+                });
+                ui.add_space(8.0);
+
+                ui.columns(2, |cols| {
+                    theme::card(&mut cols[0], "KERNEL QUEUES", |ui| {
+                        egui::Grid::new("stats_queues")
+                            .num_columns(2)
+                            .striped(false)
+                            .spacing([12.0, 4.0])
+                            .show(ui, |ui| {
+                                // A packet dropped from a full verdict queue
+                                // never reached the daemon, so no counter
+                                // above moved for it. Painted when nonzero
+                                // because packets were dropped without policy
+                                // running; "unavailable" (never 0) when
+                                // nothing was read. Drops only: a working
+                                // fail-open queue passes its overflow through
+                                // unjudged and uncounted, which is what the
+                                // fail-open row is for reading this one.
+                                let missed =
+                                    match (s.verdict_queue_dropped, s.verdict_queue_user_dropped) {
+                                        // Saturating, as everywhere a stats reply
+                                        // is rendered: the sum must not be able to
+                                        // panic on socket input.
+                                        (Some(dropped), Some(undelivered)) => {
+                                            Some(dropped.saturating_add(undelivered))
+                                        }
+                                        _ => None,
+                                    };
+                                ui.label(egui::RichText::new("Verdict queue drops").color(MUTED));
+                                match missed {
+                                    Some(0) => {
+                                        ui.label(theme::num("0"));
+                                    }
+                                    Some(n) => {
+                                        theme::pill(
+                                            ui,
+                                            &format!("{n} dropped before policy saw them"),
+                                            DENY_COLOR,
+                                        );
+                                    }
+                                    None => {
+                                        ui.label(theme::num_muted("unavailable"));
+                                    }
+                                }
+                                ui.end_row();
+                                // Plain even when "no": that is the intended
+                                // state under a fail-closed posture, which
+                                // this panel cannot see.
+                                theme::kv(
+                                    ui,
+                                    "Verdict queue fail-open",
+                                    theme::num(match s.verdict_queue_fail_open {
+                                        Some(true) => "yes",
+                                        Some(false) => "no",
+                                        None => "unavailable",
+                                    }),
+                                );
+                                // Depth against the length the daemon set at
+                                // bind, because a depth only reads as pressure
+                                // against its ceiling. No ceiling means the
+                                // kernel refused the request and kept its own,
+                                // which the daemon logged and this panel will
+                                // not guess at.
+                                ui.label(egui::RichText::new("Verdict queue depth").color(MUTED));
+                                match (s.verdict_queue_depth, s.verdict_queue_max_len) {
+                                    (Some(n), Some(max)) => {
+                                        ui.horizontal(|ui| {
+                                            ui.label(theme::num(format!("{n} of {max}")));
+                                            theme::ratio_bar(
+                                                ui,
+                                                egui::vec2(60.0, 6.0),
+                                                &[
+                                                    (n, REJECT_COLOR),
+                                                    (
+                                                        u64::from(max).saturating_sub(n),
+                                                        theme::HAIRLINE,
+                                                    ),
+                                                ],
+                                            );
+                                        });
+                                    }
+                                    (Some(n), None) => {
+                                        ui.label(theme::num(n.to_string()));
+                                    }
+                                    (None, _) => {
+                                        ui.label(theme::num_muted("unavailable"));
+                                    }
+                                }
+                                ui.end_row();
+                                // Domain annotations, not verdicts, so never
+                                // painted; the userspace half of the same loss
+                                // is dns_snoop_dropped.
+                                theme::kv(
+                                    ui,
+                                    "Snoop queue drops",
+                                    match (s.snoop_queue_dropped, s.snoop_queue_user_dropped) {
+                                        (Some(dropped), Some(undelivered)) => theme::num(
+                                            dropped.saturating_add(undelivered).to_string(),
+                                        ),
+                                        _ => theme::num_muted("unavailable"),
+                                    },
+                                );
+                            });
+                    });
+                    // Every detected flush is a window in which the host was
+                    // unfiltered. The watchdog repairs each one; a failed
+                    // repair is in the journal, so this card claims
+                    // detection, not success.
+                    theme::card(&mut cols[1], "RULESET INTEGRITY", |ui| {
+                        match (s.nft_flushes, s.nft_last_flush_ms) {
+                            (0, _) => {
+                                ui.horizontal(|ui| {
+                                    theme::pill(ui, "intact", ALLOW_COLOR);
+                                    ui.label(
+                                        egui::RichText::new(
+                                            "nothing has flushed the nftables ruleset",
+                                        )
+                                        .color(MUTED),
+                                    );
+                                });
+                            }
+                            (n, ms) => {
+                                theme::banner(
+                                    ui,
+                                    Tone::Bad,
+                                    "\u{26a0}",
+                                    &format!("{n} flush(es) detected"),
+                                    &format!(
+                                        "something flushed the nftables ruleset, last {}",
+                                        ms.map(hallpass_types::format_ts)
+                                            .unwrap_or_else(|| "unknown".into()),
+                                    ),
+                                );
+                            }
+                        }
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("Refresh counters").clicked() {
+                                self.send(ClientMsg::Stats);
+                            }
+                        });
+                    });
+                });
+            });
     }
 
     /// The runtime-settings form: prompt timeout and default action.
@@ -1554,34 +2020,61 @@ impl HallpassApp {
     /// instead of pretending to persist.
     fn settings_tab(&mut self, ui: &mut egui::Ui) {
         let Some(current) = self.daemon_config else {
-            ui.label("Waiting for the daemon...");
+            empty_state(
+                ui,
+                "Waiting for the daemon",
+                "The form fills in with the values it reports.",
+            );
             return;
         };
-        egui::Grid::new("settings_grid")
-            .num_columns(2)
-            .spacing([8.0, 6.0])
-            .show(ui, |ui| {
-                ui.label("Prompt timeout (seconds)")
-                    .on_hover_text("How long a prompt waits before the default action applies");
-                ui.add(egui::TextEdit::singleline(&mut self.settings_timeout).desired_width(80.0));
-                ui.end_row();
-
-                ui.label("Default action").on_hover_text(
-                    "Applied when no rule matches and nobody answers the prompt in time",
-                );
-                egui::ComboBox::from_id_salt("settings-default-verdict")
-                    .selected_text(verdict_label(self.settings_verdict))
-                    .show_ui(ui, |ui| {
-                        for v in [Verdict::Allow, Verdict::Deny, Verdict::Reject] {
-                            ui.selectable_value(&mut self.settings_verdict, v, verdict_label(v));
+        theme::card(ui, "RUNTIME SETTINGS", |ui| {
+            ui.set_max_width(660.0);
+            setting_row(
+                ui,
+                "Prompt timeout",
+                "How long a prompt waits before the default action applies",
+                |ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.settings_timeout).desired_width(56.0),
+                    );
+                    ui.label(egui::RichText::new("seconds").color(MUTED));
+                },
+            );
+            setting_row(
+                ui,
+                "Default action",
+                "Applied when no rule matches and nobody answers in time",
+                |ui| {
+                    for v in [Verdict::Allow, Verdict::Deny, Verdict::Reject] {
+                        if theme::chip_colored(
+                            ui,
+                            self.settings_verdict == v,
+                            verdict_label(v),
+                            verdict_color(v),
+                        )
+                        .clicked()
+                        {
+                            self.settings_verdict = v;
                         }
-                    });
-                ui.end_row();
-            });
-        ui.add_space(6.0);
+                    }
+                },
+            );
+            // The consequence, not just the name: this is what happens to
+            // every connection on this host that nobody answers for.
+            ui.label(
+                egui::RichText::new(match self.settings_verdict {
+                    Verdict::Allow => "Unanswered connections go out.",
+                    Verdict::Deny => "Unanswered connections are dropped.",
+                    Verdict::Reject => "Unanswered connections are refused.",
+                })
+                .small()
+                .color(verdict_color(self.settings_verdict)),
+            );
+        });
+        ui.add_space(8.0);
         if let Some(err) = &self.settings_error {
-            ui.colored_label(DENY_COLOR, err);
-            ui.add_space(6.0);
+            theme::banner(ui, Tone::Bad, "\u{26a0}", err, "");
+            ui.add_space(8.0);
         }
         ui.horizontal(|ui| {
             if ui.button("Apply").clicked() {
@@ -1615,7 +2108,8 @@ impl HallpassApp {
                  make them permanent in /etc/hallpass/config.toml. Prompts already \
                  on screen keep the deadline they were created with.",
             )
-            .small(),
+            .small()
+            .color(MUTED),
         );
     }
 
@@ -1904,19 +2398,33 @@ fn prompt_ui(
     rest: &[String],
     answered: &mut Vec<(u64, ClientMsg)>,
 ) {
+    theme::ensure_installed(ui.ctx());
     // Salted by prompt id like the details grid: two apps prompting at
     // once means two of these windows live in one pass, and their panels
     // must not collide on one id.
-    egui::Panel::bottom(egui::Id::new(("prompt-actions", p.id))).show(ui, |ui| {
-        prompt_actions_ui(ui, p, now_ms, answered);
-    });
-    egui::CentralPanel::default().show(ui, |ui| {
-        egui::ScrollArea::vertical()
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                prompt_info_ui(ui, p, rest);
-            });
-    });
+    egui::Panel::bottom(egui::Id::new(("prompt-actions", p.id)))
+        .frame(
+            egui::Frame::new()
+                .fill(theme::SURFACE)
+                .inner_margin(egui::Margin::symmetric(10, 8)),
+        )
+        .show_separator_line(false)
+        .show(ui, |ui| {
+            prompt_actions_ui(ui, p, now_ms, answered);
+        });
+    egui::CentralPanel::default()
+        .frame(
+            egui::Frame::new()
+                .fill(theme::BG)
+                .inner_margin(egui::Margin::symmetric(10, 8)),
+        )
+        .show(ui, |ui| {
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    prompt_info_ui(ui, p, rest);
+                });
+        });
 }
 
 /// The scrolling half: everything the operator reads to decide.
@@ -1927,63 +2435,89 @@ fn prompt_info_ui(ui: &mut egui::Ui, p: &PromptState, rest: &[String]) {
     // than two call sites a later edit could split.
     let whats_new = conn.first_seen.and_then(|f| f.describe());
 
-    ui.horizontal(|ui| {
-        ui.label(RichText::new(prompt::exe_name(conn)).strong().size(18.0));
-        ui.label(format!("wants to connect ({})", conn.tuple.proto));
-        // In the title line rather than the details grid below, because it
-        // changes what the question is: a first-ever connection from a
-        // program is the one an operator reads the rest of this window for.
-        // Absent when nothing is new *and* when the daemon is not tracking,
-        // which is why there is no "seen before" badge to pair with it: it
-        // would be a claim the daemon may have no basis for.
-        if let Some(what) = whats_new {
-            ui.label(RichText::new("NEW").strong().color(REJECT_COLOR))
-                .on_hover_text(what);
+    // The header band. Its colour is the prompt's own risk, read off the
+    // same facts the body states in words: a first sighting, a history of
+    // refusals, or a binary that no longer matches the rule pinned to it.
+    // A routine prompt gets the neutral accent, so the loud ones are loud
+    // by contrast rather than by everything shouting.
+    let risk = prompt_tone(p);
+    theme::band(ui, risk.color(), |ui| {
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            ui.label(
+                RichText::new(prompt::exe_name(conn))
+                    .strong()
+                    .size(18.0)
+                    .color(TEXT),
+            );
+            ui.label(RichText::new("wants to connect").color(MUTED));
+            theme::ghost_pill(ui, &conn.tuple.proto.to_string());
+            // In the title line rather than the details grid below,
+            // because it changes what the question is: a first-ever
+            // connection from a program is the one an operator reads
+            // the rest of this window for. Absent when nothing is new
+            // *and* when the daemon is not tracking, which is why
+            // there is no "seen before" badge to pair with it: it
+            // would be a claim the daemon may have no basis for.
+            if let Some(what) = whats_new {
+                theme::pill(ui, "NEW", REJECT_COLOR).on_hover_text(what);
+            }
+        });
+        if let Some(exe) = &conn.exe_path {
+            // Full path, sanitized: this is the line the operator
+            // checks to see which binary is actually asking.
+            ui.label(
+                RichText::new(prompt::path_text(exe))
+                    .small()
+                    .monospace()
+                    .color(MUTED),
+            );
         }
     });
-    if let Some(exe) = &conn.exe_path {
-        // Full path, sanitized: this is the line the operator checks to see
-        // which binary is actually asking.
-        ui.label(RichText::new(prompt::path_text(exe)).small().monospace());
-    }
     if let Some(cmdline) = &conn.cmdline {
-        ui.label(RichText::new(prompt::truncate(cmdline, 100)).small());
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new(prompt::truncate(cmdline, 100))
+                .small()
+                .color(MUTED),
+        );
     }
-    // Above the separator, with the identity lines rather than in the
-    // details grid: it says a rule was written for this program and the
-    // binary running now is not the one that rule pins, which changes what
-    // the whole window is about. Coloured like a deny for the same reason
-    // the NEW badge is: it is the thing to read first. The sentence itself
-    // is the shared one, so this window and `hallpass-cli watch` cannot end
-    // up saying different things about the same fact.
+    // Its own banner rather than a line of text: it says a rule was
+    // written for this program and the binary running now is not the one
+    // that rule pins, which changes what the whole window is about. The
+    // sentence itself is the shared one, so this window and `hallpass-cli
+    // watch` cannot end up saying different things about the same fact.
     if let Some(what) = p.context.hash_mismatch_describe() {
+        ui.add_space(4.0);
         ui.label(
             RichText::new(format!("Warning: {}", prompt::sentence_text(&what)))
                 .strong()
-                .color(REJECT_COLOR),
+                .color(DENY_COLOR),
         );
     }
-    ui.separator();
+    ui.add_space(6.0);
 
     egui::Grid::new(("prompt_details", p.id))
         .num_columns(2)
+        .striped(false)
+        .spacing([10.0, 4.0])
         .show(ui, |ui| {
-            ui.label("Destination");
-            ui.monospace(prompt::format_dest(conn));
+            ui.label(RichText::new("Destination").color(MUTED));
+            ui.label(theme::num(prompt::format_dest(conn)));
             ui.end_row();
-            ui.label("User / process");
-            ui.monospace(format!(
+            ui.label(RichText::new("User / process").color(MUTED));
+            ui.label(theme::num(format!(
                 "uid {} / pid {}",
                 opt_num(conn.uid),
                 opt_num(conn.pid)
-            ));
+            )));
             ui.end_row();
             // Only for a packaged application, which is where the executable
             // path above says little: it resolves inside the sandbox, so it
             // names neither a file on this host nor the application uniquely.
             if let Some(app) = &conn.app_id {
-                ui.label("Application");
-                ui.monospace(prompt::ui_text(app));
+                ui.label(RichText::new("Application").color(MUTED));
+                ui.label(theme::num(prompt::ui_text(app)));
                 ui.end_row();
             }
             // With the identity rows rather than the history ones below:
@@ -1992,10 +2526,15 @@ fn prompt_info_ui(ui: &mut egui::Ui, p: &PromptState, rest: &[String]) {
             // nearest parent first, one per line, because a chain joined
             // into one cell wraps into an unreadable run in a 440px window.
             if !p.context.ancestors.is_empty() {
-                ui.label("Started by");
+                ui.label(RichText::new("Started by").color(MUTED));
                 ui.vertical(|ui| {
                     for exe in &p.context.ancestors {
-                        ui.label(RichText::new(prompt::path_text(exe)).small().monospace());
+                        ui.label(
+                            RichText::new(prompt::path_text(exe))
+                                .small()
+                                .monospace()
+                                .color(TEXT),
+                        );
                     }
                 });
                 ui.end_row();
@@ -2005,7 +2544,7 @@ fn prompt_info_ui(ui: &mut egui::Ui, p: &PromptState, rest: &[String]) {
             // not enough on its own: the keyboard path to the buttons never
             // passes through it.
             if let Some(what) = whats_new {
-                ui.label("First seen");
+                ui.label(RichText::new("First seen").color(MUTED));
                 ui.colored_label(REJECT_COLOR, what);
                 ui.end_row();
             }
@@ -2015,8 +2554,8 @@ fn prompt_info_ui(ui: &mut egui::Ui, p: &PromptState, rest: &[String]) {
             // first sighting. Absent rather than a zero, which the shared
             // sentence decides for both clients.
             if let Some(what) = p.context.denials_describe() {
-                ui.label("Denied lately");
-                ui.colored_label(REJECT_COLOR, what);
+                ui.label(RichText::new("Denied lately").color(MUTED));
+                ui.colored_label(DENY_COLOR, what);
                 ui.end_row();
             }
         });
@@ -2024,37 +2563,66 @@ fn prompt_info_ui(ui: &mut egui::Ui, p: &PromptState, rest: &[String]) {
     // label column, and this is the one line here meant to be read
     // character by character (or copied into an `exe_sha256` rule).
     if let Some(hash) = &p.context.exe_sha256 {
-        ui.add_space(4.0);
-        ui.label(RichText::new("Executable SHA-256").small());
+        ui.add_space(6.0);
+        ui.label(RichText::new("Executable SHA-256").small().color(MUTED));
         ui.label(
             RichText::new(prompt::truncate(hash, 64))
                 .small()
-                .monospace(),
+                .monospace()
+                .color(TEXT)
+                .background_color(theme::SURFACE),
         );
     }
     if !rest.is_empty() {
-        ui.add_space(4.0);
-        ui.label(
-            RichText::new(format!(
-                "{} more request(s) pending from this app:",
-                rest.len()
-            ))
-            .small(),
-        );
-        // A handful is informative; a browser's full endpoint list is not.
-        for dest in rest.iter().take(5) {
-            ui.label(RichText::new(format!("  {dest}")).small().monospace());
-        }
-        if rest.len() > 5 {
-            ui.label(RichText::new(format!("  ...and {} more", rest.len() - 5)).small());
-        }
-        ui.label(
-            RichText::new(
-                "Answering \"This host\" or \"App anywhere\" also settles the covered ones.",
-            )
-            .small(),
-        );
+        ui.add_space(6.0);
+        theme::card(ui, "", |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(
+                RichText::new(format!(
+                    "{} more request(s) pending from this app:",
+                    rest.len()
+                ))
+                .small()
+                .color(TEXT),
+            );
+            // A handful is informative; a browser's full endpoint list is not.
+            for dest in rest.iter().take(5) {
+                ui.label(RichText::new(dest).small().monospace().color(MUTED));
+            }
+            if rest.len() > 5 {
+                ui.label(
+                    RichText::new(format!("...and {} more", rest.len() - 5))
+                        .small()
+                        .color(MUTED),
+                );
+            }
+            ui.label(
+                RichText::new(
+                    "Answering \"This host\" or \"App anywhere\" also settles the covered ones.",
+                )
+                .small()
+                .color(MUTED),
+            );
+        });
     }
+}
+
+/// How loudly this prompt should present itself.
+///
+/// Read off the facts the body already states, so the colour of the band
+/// can never disagree with the words under it: a binary that no longer
+/// matches the rule pinned to it is the strongest thing this window says,
+/// a first sighting or a recent history of refusals is the next, and
+/// everything else is an ordinary question.
+fn prompt_tone(p: &PromptState) -> Tone {
+    if p.context.hash_mismatch_describe().is_some() {
+        return Tone::Bad;
+    }
+    let new_here = p.conn.first_seen.and_then(|f| f.describe()).is_some();
+    if new_here || p.context.denials_describe().is_some() {
+        return Tone::Warn;
+    }
+    Tone::Info
 }
 
 /// The pinned half: the pickers, the warning the scope picker earns, the
@@ -2068,28 +2636,20 @@ fn prompt_actions_ui(
     answered: &mut Vec<(u64, ClientMsg)>,
 ) {
     ui.horizontal(|ui| {
-        egui::ComboBox::from_id_salt(("duration", p.id))
-            .selected_text(duration_label(p.duration))
-            .show_ui(ui, |ui| {
-                for d in [
-                    RuleDuration::Once,
-                    RuleDuration::Session,
-                    RuleDuration::Forever,
-                ] {
-                    ui.selectable_value(&mut p.duration, d, duration_label(d));
-                }
-            });
-        egui::ComboBox::from_id_salt(("scope", p.id))
-            .selected_text(scope_label(p.scope))
-            .show_ui(ui, |ui| {
-                for s in [
-                    PromptScope::ThisPort,
-                    PromptScope::ThisHost,
-                    PromptScope::AppAnywhere,
-                ] {
-                    ui.selectable_value(&mut p.scope, s, scope_label(s));
-                }
-            });
+        ui.label(RichText::new("For").small().color(MUTED));
+        for d in [
+            RuleDuration::Once,
+            RuleDuration::Session,
+            RuleDuration::Forever,
+        ] {
+            // Segmented rather than a drop-down: both pickers are two
+            // clicks deep in a window that answers itself on a timer, and
+            // what they are set to has to be readable without opening
+            // anything.
+            if theme::chip(ui, p.duration == d, duration_label(d)).clicked() {
+                p.duration = d;
+            }
+        }
         // Only when the daemon computed a hash for this prompt: it pins the
         // value shown here and nothing else, so a prompt without one has
         // nothing to pin and a reply asking anyway would create no rule at
@@ -2100,15 +2660,29 @@ fn prompt_actions_ui(
         // reply drops the flag on a deny (a deny keyed on the path should keep
         // blocking whatever is written there).
         if p.can_pin() && p.duration != RuleDuration::Once {
-            ui.checkbox(&mut p.pin_exe, "Pin binary").on_hover_text(
-                "Allow only this exact executable: the rule stops matching if the \
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.checkbox(&mut p.pin_exe, "Pin binary").on_hover_text(
+                    "Allow only this exact executable: the rule stops matching if the \
                      file at that path is replaced. Worth it for anything you can write \
                      yourself, since a path is not an identity. The rule will need \
                      answering again after the program updates.",
-            );
+                );
+            });
         }
     });
-    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("To").small().color(MUTED));
+        for sc in [
+            PromptScope::ThisPort,
+            PromptScope::ThisHost,
+            PromptScope::AppAnywhere,
+        ] {
+            if theme::chip(ui, p.scope == sc, scope_label(sc)).clicked() {
+                p.scope = sc;
+            }
+        }
+    });
+    ui.add_space(4.0);
 
     // Attribution is advisory (procfs races, eBPF offset guesses, cache
     // TTLs), and an "App anywhere" allow rule is only as strong as the exe
@@ -2140,36 +2714,38 @@ fn prompt_actions_ui(
                 ),
             );
         }
-        ui.add_space(6.0);
+        ui.add_space(4.0);
     }
 
     ui.horizontal(|ui| {
-        let allow = egui::Button::new(RichText::new("Allow").color(Color32::WHITE).strong())
-            .fill(ALLOW_COLOR)
-            .min_size(egui::vec2(100.0, 28.0));
-        let deny = egui::Button::new(RichText::new("Deny").color(Color32::WHITE).strong())
-            .fill(DENY_COLOR)
-            .min_size(egui::vec2(100.0, 28.0));
+        let width = (ui.available_width() - ui.spacing().item_spacing.x) / 2.0;
         // Deny is added first, so it leads keyboard traversal: egui hands
         // focus out in the order widgets are added. This window interrupts
         // whatever the operator was doing, and the answer given without
         // reading it has to be the recoverable one - a wrong deny costs a
         // retry, a wrong allow costs the connection the prompt existed to
         // stop.
-        if ui.add(deny).clicked() {
+        if ui
+            .add(theme::verdict_button("Deny", DENY_COLOR).min_size(egui::vec2(width, 32.0)))
+            .clicked()
+        {
             answered.push((p.id, p.reply(Verdict::Deny)));
         }
-        if ui.add(allow).clicked() {
+        if ui
+            .add(theme::verdict_button("Allow", ALLOW_COLOR).min_size(egui::vec2(width, 32.0)))
+            .clicked()
+        {
             answered.push((p.id, p.reply(Verdict::Allow)));
         }
     });
-    ui.add_space(6.0);
+    ui.add_space(4.0);
 
     let frac = p.remaining_fraction(now_ms);
-    ui.add(egui::ProgressBar::new(frac).text(format!(
-        "{}s until default verdict",
-        p.remaining_secs(now_ms)
-    )));
+    theme::countdown(
+        ui,
+        frac,
+        &format!("{}s until default verdict", p.remaining_secs(now_ms)),
+    );
 }
 
 impl eframe::App for HallpassApp {
@@ -2216,13 +2792,114 @@ fn table_heights(ui: &egui::Ui) -> (f32, f32) {
 
 /// The style every data table shares, so it cannot drift per tab. The
 /// columns and cells stay at each call site, where they are load-bearing.
+///
+/// Sensed for hover, which egui_extras turns into a highlight across the
+/// whole row: these rows are dense and several columns wide, and the
+/// pointer is the only thing saying which one a click is about to act on.
 fn data_table<'a>(ui: &'a mut egui::Ui, salt: &'static str) -> TableBuilder<'a> {
     TableBuilder::new(ui)
         .id_salt(salt)
         .striped(true)
         .resizable(true)
+        .sense(egui::Sense::hover())
         .auto_shrink([false, false])
         .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+}
+
+/// A table's column heading: small, muted, and out of the way of the data.
+fn column_title(title: &str) -> RichText {
+    RichText::new(title.to_uppercase())
+        .small()
+        .strong()
+        .color(MUTED)
+}
+
+/// A count in a table cell, dimmed when it is zero.
+///
+/// A column of bright zeros reads as activity from across the room, which
+/// is exactly backwards: the whole point of these columns is that a
+/// nonzero blocked count should catch the eye.
+fn count_text(n: u64, color: Color32) -> RichText {
+    if n == 0 {
+        theme::num_muted("0")
+    } else {
+        theme::num(n.to_string()).color(color)
+    }
+}
+
+/// One line of the settings form: what it is, what it does, and the
+/// control itself.
+///
+/// Laid out by hand rather than in a Grid: the description under each
+/// title is a paragraph, and a grid column sized to its content would
+/// either wrap it to nothing or push the controls off the card.
+fn setting_row(ui: &mut egui::Ui, title: &str, hint: &str, control: impl FnOnce(&mut egui::Ui)) {
+    ui.horizontal(|ui| {
+        ui.vertical(|ui| {
+            ui.set_width(280.0);
+            ui.label(RichText::new(title).color(TEXT));
+            ui.label(RichText::new(hint).small().color(MUTED));
+        });
+        control(ui);
+    });
+    ui.add_space(10.0);
+}
+
+/// What a tab says when it has nothing to show: the reason, and what would
+/// change it.
+fn empty_state(ui: &mut egui::Ui, headline: &str, hint: &str) {
+    ui.add_space(28.0);
+    ui.vertical_centered(|ui| {
+        ui.label(RichText::new(headline).color(TEXT).size(15.0));
+        ui.label(RichText::new(hint).color(MUTED).small());
+    });
+}
+
+/// A long count, shortened: 18402 becomes 18.4k.
+///
+/// Only in the headline tiles, where the number is read as a magnitude and
+/// the exact digits are one card lower. Nothing that has to be exact (a
+/// queue depth, a drop count) goes through here.
+fn compact(n: u64) -> String {
+    match n {
+        0..=9_999 => n.to_string(),
+        10_000..=999_999 => format!("{:.1}k", n as f64 / 1_000.0),
+        _ => format!("{:.1}M", n as f64 / 1_000_000.0),
+    }
+}
+
+/// `n` as a share of `total`, for the line under a headline number.
+fn percent_of(n: u64, total: u64) -> String {
+    if total == 0 {
+        return "no traffic yet".to_string();
+    }
+    format!("{:.1}% of all connections", n as f64 * 100.0 / total as f64)
+}
+
+/// A duration in seconds as the coarsest unit that still says something.
+fn format_span(secs: u64) -> String {
+    match secs {
+        0 => "moment".to_string(),
+        1..=90 => format!("{secs}s"),
+        91..=5_400 => format!("{}m", secs / 60),
+        _ => format!("{}h", secs / 3600),
+    }
+}
+
+/// The colour the brand mark takes for each host state, and the sentence
+/// behind it. Both come from [`TrayState`] so the window's mark and the
+/// tray icon cannot make different claims about one host.
+fn tray_state_color(state: TrayState) -> Color32 {
+    match state {
+        TrayState::Enforcing => ALLOW_COLOR,
+        TrayState::Lockdown => DENY_COLOR,
+        TrayState::Observing => REJECT_COLOR,
+        TrayState::Unknown => MUTED,
+    }
+}
+
+fn tray_state_summary(state: TrayState) -> &'static str {
+    state.summary()
 }
 
 fn verdict_label(v: Verdict) -> &'static str {

@@ -787,6 +787,45 @@ fn the_filter_selects_across_exe_domain_rule_and_destination() {
     }
 }
 
+/// The outcome lens narrows the same iterator the text filter does, and
+/// composes with it: the feed and the traffic view have to agree on what
+/// is on screen whichever of the two is doing the narrowing.
+///
+/// "Blocked" is deny and reject whether or not enforcement applied them.
+/// In observe mode the interesting rows are precisely the decisions that
+/// were recorded and let through anyway, and a lens that hid them would
+/// answer "show me what is being stopped" with an empty screen on the one
+/// host where the question is urgent.
+#[test]
+fn the_lens_narrows_by_outcome_and_composes_with_the_filter() {
+    let mut t = TestApp::new();
+    let decided = |exe: &str, verdict: Verdict, enforced: bool, ms: u64| ConnEvent {
+        verdict,
+        enforced,
+        ..event(exe, "1.1.1.1:443", ms)
+    };
+    t.daemon(DaemonMsg::Events(vec![
+        decided("/usr/bin/curl", Verdict::Allow, true, 1_000),
+        decided("/usr/bin/curl", Verdict::Deny, true, 2_000),
+        decided("/usr/bin/wget", Verdict::Reject, false, 3_000),
+    ]));
+
+    for (lens, expected) in [(Lens::All, 3), (Lens::Allowed, 1), (Lens::Blocked, 2)] {
+        t.app.lens = lens;
+        assert_eq!(t.app.filtered().count(), expected, "lens {lens:?}");
+        let agg = traffic::Aggregate::rebuild(t.app.filtered(), traffic::GroupBy::Exe);
+        assert_eq!(
+            agg.total as usize, expected,
+            "the traffic view disagreed with the feed under {lens:?}"
+        );
+    }
+
+    // Both narrowings apply, not the last one set.
+    t.app.lens = Lens::Blocked;
+    t.app.filter = "wget".to_string();
+    assert_eq!(t.app.filtered().count(), 1);
+}
+
 // ---- what the window claims about enforcement (5c2c1a8) ------------------
 
 /// The banner is the only signal an operator gets that nothing is being

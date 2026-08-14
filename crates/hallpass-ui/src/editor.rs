@@ -323,6 +323,7 @@ impl RuleEditor {
     /// the daemon acks; see [`RuleEditor::ack_err`] and
     /// [`RuleEditor::ack_lost`] for the paths that keep it open.
     pub fn window(&mut self, ctx: &egui::Context) -> (bool, Option<Rule>) {
+        crate::theme::ensure_installed(ctx);
         let mut open = true;
         let mut saved = None;
         let title = match &self.editing {
@@ -403,13 +404,22 @@ impl RuleEditor {
                 .id_salt("rule-editor-error")
                 .max_height(40.0)
                 .show(ui, |ui| {
-                    ui.colored_label(crate::app::DENY_COLOR, err);
+                    crate::theme::banner(ui, crate::theme::Tone::Bad, "\u{26a0}", err, "");
                 });
         }
         ui.add_space(6.0);
         ui.horizontal(|ui| {
             if ui
-                .add_enabled(!self.awaiting, egui::Button::new("Save"))
+                .add_enabled(
+                    !self.awaiting,
+                    egui::Button::new(
+                        egui::RichText::new("Save")
+                            .color(egui::Color32::WHITE)
+                            .strong(),
+                    )
+                    .fill(crate::theme::ACCENT.gamma_multiply(0.85))
+                    .min_size(egui::vec2(90.0, 28.0)),
+                )
                 .clicked()
             {
                 match self.to_rule() {
@@ -421,7 +431,7 @@ impl RuleEditor {
                 }
             }
             if self.awaiting {
-                ui.label("Saving...");
+                ui.label(egui::RichText::new("Saving...").color(crate::theme::MUTED));
             }
         });
     }
@@ -432,24 +442,31 @@ impl RuleEditor {
             .num_columns(2)
             .spacing([8.0, 4.0])
             .show(ui, |ui| {
-                ui.label("Name");
+                field_label(ui, "Name");
                 ui.add_enabled(
                     self.editing.is_none(),
                     TextEdit::singleline(&mut self.name).hint_text("required"),
                 );
                 ui.end_row();
 
-                ui.label("Action");
-                ComboBox::from_id_salt("editor-action")
-                    .selected_text(self.action.as_str())
-                    .show_ui(ui, |ui| {
-                        for a in [Action::Allow, Action::Deny, Action::Reject] {
-                            ui.selectable_value(&mut self.action, a, a.as_str());
+                field_label(ui, "Action");
+                ui.horizontal(|ui| {
+                    for a in [Action::Allow, Action::Deny, Action::Reject] {
+                        if crate::theme::chip_colored(
+                            ui,
+                            self.action == a,
+                            a.as_str(),
+                            action_color(a),
+                        )
+                        .clicked()
+                        {
+                            self.action = a;
                         }
-                    });
+                    }
+                });
                 ui.end_row();
 
-                ui.label("Duration");
+                field_label(ui, "Duration");
                 ui.horizontal(|ui| {
                     ComboBox::from_id_salt("editor-duration")
                         .selected_text(self.duration.label())
@@ -473,11 +490,11 @@ impl RuleEditor {
                 });
                 ui.end_row();
 
-                ui.label("Priority");
+                field_label(ui, "Priority");
                 ui.add(TextEdit::singleline(&mut self.priority).desired_width(60.0));
                 ui.end_row();
 
-                ui.label("Enabled");
+                field_label(ui, "Enabled");
                 ui.checkbox(&mut self.enabled, "");
                 ui.end_row();
 
@@ -485,7 +502,7 @@ impl RuleEditor {
                 // properties: a tag selects the rule, it does not select
                 // connections, and putting it under "Match criteria" would
                 // read as an operand that narrows what the rule catches.
-                ui.label("Tags");
+                field_label(ui, "Tags");
                 ui.add(
                     TextEdit::singleline(&mut self.tags)
                         .hint_text("work, vpn")
@@ -494,8 +511,19 @@ impl RuleEditor {
                 ui.end_row();
             });
 
-        ui.separator();
-        ui.label("Match criteria (all set fields must match; leave blank to ignore):");
+        ui.add_space(8.0);
+        ui.label(
+            egui::RichText::new("MATCH CRITERIA")
+                .small()
+                .strong()
+                .color(crate::theme::MUTED),
+        );
+        ui.label(
+            egui::RichText::new("All set fields must match; leave blank to ignore.")
+                .small()
+                .color(crate::theme::MUTED),
+        );
+        ui.add_space(4.0);
 
         egui::Grid::new("rule-editor-match")
             .num_columns(2)
@@ -511,12 +539,12 @@ impl RuleEditor {
                     ("Domain", &mut self.domain, "example.org or *.example.org"),
                     ("User (uid)", &mut self.user, "1000"),
                 ] {
-                    ui.label(label);
+                    field_label(ui, label);
                     ui.add(TextEdit::singleline(field).hint_text(hint));
                     ui.end_row();
                 }
 
-                ui.label("Protocol");
+                field_label(ui, "Protocol");
                 ComboBox::from_id_salt("editor-proto")
                     .selected_text(proto_label(self.proto))
                     .show_ui(ui, |ui| {
@@ -545,7 +573,7 @@ impl RuleEditor {
                     ("Interface", &mut self.iface, "wg0"),
                     ("App id", &mut self.app_id, "flatpak:org.mozilla.firefox"),
                 ] {
-                    ui.label(label);
+                    field_label(ui, label);
                     ui.add(TextEdit::singleline(field).hint_text(hint));
                     ui.end_row();
                 }
@@ -562,7 +590,7 @@ impl RuleEditor {
         // warning rather than a rule.
         if self.action != Action::Allow && !self.app_id.trim().is_empty() {
             ui.colored_label(
-                crate::app::REJECT_COLOR,
+                crate::theme::REJECT_COLOR,
                 "\u{26a0} An app id narrows this rule. A deny carrying one stops applying \
                  whenever the application runs outside its packaging scope; leave it blank \
                  to block the executable however it is launched.",
@@ -570,8 +598,27 @@ impl RuleEditor {
         }
 
         if self.editing.is_some() && self.duration == DurationChoice::Timed {
-            ui.label("Saving a timed rule restarts its clock from now.");
+            ui.label(
+                egui::RichText::new("Saving a timed rule restarts its clock from now.")
+                    .small()
+                    .color(crate::theme::MUTED),
+            );
         }
+    }
+}
+
+/// A form label: muted, so the eye lands on the values rather than on the
+/// two dozen field names beside them.
+fn field_label(ui: &mut egui::Ui, text: &str) {
+    ui.label(egui::RichText::new(text).color(crate::theme::MUTED));
+}
+
+/// The verdict palette, for the action picker's own chip.
+fn action_color(action: Action) -> egui::Color32 {
+    match action {
+        Action::Allow => crate::theme::ALLOW_COLOR,
+        Action::Deny => crate::theme::DENY_COLOR,
+        Action::Reject => crate::theme::REJECT_COLOR,
     }
 }
 

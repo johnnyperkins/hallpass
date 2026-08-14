@@ -245,7 +245,11 @@ fn the_prompt_window_carries_the_daemon_context() {
 fn deny_leads_keyboard_traversal() {
     let mut harness = prompt_harness();
     let mut reached = Vec::new();
-    for _ in 0..8 {
+    // Enough presses to walk the whole panel: the pickers are segmented
+    // controls, so each option is its own focus stop, and the two verdict
+    // buttons are the last widgets added. The property is the order the
+    // two are reached in, not how many stops precede them.
+    for _ in 0..16 {
         harness.key_press(egui::Key::Tab);
         harness.run();
         for label in ["Deny", "Allow"] {

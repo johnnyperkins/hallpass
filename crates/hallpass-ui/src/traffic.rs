@@ -133,6 +133,57 @@ impl Aggregate {
     }
 }
 
+/// What happened in one slice of time, for the activity strip.
+///
+/// Split the same three ways the traffic rows are, and for the same
+/// reason: "blocked" and "would have been blocked" are different facts
+/// about the host, and a strip that merged them would draw an observing
+/// machine exactly like an enforcing one.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Bucket {
+    pub allowed: u64,
+    pub blocked: u64,
+    pub would_block: u64,
+}
+
+impl Bucket {
+    pub fn total(self) -> u64 {
+        self.allowed + self.blocked + self.would_block
+    }
+}
+
+/// Fold events into `columns` equal slices spanning the feed's own time
+/// range, oldest first.
+///
+/// The range comes from the events rather than from the clock: the feed is
+/// capped, so on a busy host it covers the last few seconds and on a quiet
+/// one the last few hours, and a strip pinned to a fixed window would be
+/// empty in the second case and one solid column in the first.
+pub fn buckets<'a>(events: impl Iterator<Item = &'a ConnEvent>, columns: usize) -> Vec<Bucket> {
+    let stamped: Vec<(u64, Verdict, bool)> = events
+        .map(|ev| (ev.unix_ms, ev.verdict, ev.enforced))
+        .collect();
+    if stamped.is_empty() || columns == 0 {
+        return Vec::new();
+    }
+    let first = stamped.iter().map(|(ms, ..)| *ms).min().unwrap_or(0);
+    let last = stamped.iter().map(|(ms, ..)| *ms).max().unwrap_or(0);
+    let span = last.saturating_sub(first).max(1);
+    let mut out = vec![Bucket::default(); columns];
+    for (ms, verdict, enforced) in stamped {
+        // The newest event lands in the last column rather than one past
+        // it, which is what the saturating index below is for.
+        let i = ((ms - first) as u128 * columns as u128 / span as u128) as usize;
+        let slot = &mut out[i.min(columns - 1)];
+        match (verdict, enforced) {
+            (Verdict::Allow, _) => slot.allowed += 1,
+            (_, true) => slot.blocked += 1,
+            (_, false) => slot.would_block += 1,
+        }
+    }
+    out
+}
+
 /// The grouping key, before sanitizing.
 fn raw_key(ev: &ConnEvent, group_by: GroupBy) -> String {
     let c = &ev.conn;
@@ -291,5 +342,52 @@ mod tests {
         assert!(matches_filter(&e, "allow-web"));
         assert!(matches_filter(&e, "93.184"));
         assert!(!matches_filter(&e, "firefox"));
+    }
+
+    /// The strip spans the feed's own range, oldest column first, and the
+    /// newest event lands in the last column rather than one past the end.
+    /// Off by one here is a panic on an index, not a cosmetic error.
+    #[test]
+    fn buckets_span_the_feed_and_keep_the_newest_in_range() {
+        let at = |ms: u64, verdict: Verdict, enforced: bool| {
+            let mut e = ev("/usr/bin/curl", "1.1.1.1:443", verdict, enforced);
+            e.unix_ms = ms;
+            e
+        };
+        let events = [
+            at(1_000, Verdict::Allow, true),
+            at(5_000, Verdict::Deny, true),
+            at(9_000, Verdict::Deny, false),
+            // Exactly on the range's end: the divisor is the span itself,
+            // so this is the index that would overflow unclamped.
+            at(9_000, Verdict::Allow, true),
+        ];
+        let out = buckets(events.iter(), 4);
+        assert_eq!(out.len(), 4);
+        assert_eq!(out[0].allowed, 1, "the oldest event opens the strip");
+        assert_eq!(out[3].blocked + out[3].would_block + out[3].allowed, 2);
+        assert_eq!(out.iter().map(|b| b.total()).sum::<u64>(), 4);
+        // Each class stays its own: an unenforced deny is not a block.
+        assert_eq!(out.iter().map(|b| b.would_block).sum::<u64>(), 1);
+        assert_eq!(out.iter().map(|b| b.blocked).sum::<u64>(), 1);
+    }
+
+    /// A feed with nothing in it, and one whose events all share a
+    /// millisecond: both are ordinary states, not division by zero.
+    #[test]
+    fn buckets_handle_an_empty_and_an_instant_feed() {
+        assert!(buckets(std::iter::empty(), 8).is_empty());
+        assert!(buckets(
+            [ev("/bin/x", "1.1.1.1:443", Verdict::Allow, true)].iter(),
+            0
+        )
+        .is_empty());
+        let same = [
+            ev("/bin/x", "1.1.1.1:443", Verdict::Allow, true),
+            ev("/bin/x", "1.1.1.2:443", Verdict::Allow, true),
+        ];
+        let out = buckets(same.iter(), 5);
+        assert_eq!(out.len(), 5);
+        assert_eq!(out.iter().map(|b| b.total()).sum::<u64>(), 2);
     }
 }
