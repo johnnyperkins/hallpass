@@ -60,6 +60,12 @@ fn main() -> eframe::Result {
             .with_inner_size([820.0, 520.0])
             .with_min_inner_size([480.0, 320.0])
             .with_app_id("hallpass-ui")
+            // The mark, painted rather than shipped as a file. Grey until
+            // the daemon has said what the host is doing; the window
+            // repaints it in the state's colour from then on (see
+            // `HallpassApp::sync_tray`), so the taskbar entry carries the
+            // same claim the corner mark and the tray icon do.
+            .with_icon(theme::icon(theme::MUTED))
             .with_visible(!(args.hidden && x11)),
         ..Default::default()
     };

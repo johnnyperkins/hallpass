@@ -995,19 +995,21 @@ fn a_posture_outranks_the_stored_mode_in_the_tray() {
     );
 }
 
-/// The icon is a DBus round trip and the frame loop runs at display rate, so
-/// a state that has not moved must not be resent.
+/// The icon is a DBus round trip, the window icon is a rasterized mark,
+/// and the frame loop runs at display rate: a state that has not moved
+/// must not be resent to either.
 #[test]
 fn the_tray_is_updated_on_change_rather_than_every_frame() {
     let mut t = TestApp::new();
     let (to_tray, from_tray) = std::sync::mpsc::channel();
     t.app.to_tray = Some(to_tray);
+    let ctx = egui::Context::default();
 
     t.feed(UiEvent::Connected);
     t.daemon(DaemonMsg::Stats(stats(true)));
-    t.app.sync_tray();
-    t.app.sync_tray();
-    t.app.sync_tray();
+    t.app.sync_tray(&ctx);
+    t.app.sync_tray(&ctx);
+    t.app.sync_tray(&ctx);
     assert_eq!(
         from_tray.try_iter().collect::<Vec<_>>(),
         vec![TrayState::Enforcing],
@@ -1015,7 +1017,7 @@ fn the_tray_is_updated_on_change_rather_than_every_frame() {
     );
 
     t.daemon(DaemonMsg::Stats(stats(false)));
-    t.app.sync_tray();
+    t.app.sync_tray(&ctx);
     assert_eq!(
         from_tray.try_iter().collect::<Vec<_>>(),
         vec![TrayState::Observing]

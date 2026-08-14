@@ -44,6 +44,26 @@ impl GroupBy {
     }
 }
 
+/// What the traffic table is ordered by.
+///
+/// The busiest row first is the right default and the wrong answer to
+/// half the questions this tab is opened with: "what is being blocked
+/// most" and "what talked to something last" are the other two, and both
+/// are one click away only if the column headings sort.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SortBy {
+    #[default]
+    Total,
+    Allowed,
+    Blocked,
+    WouldBlock,
+    Peers,
+    LastSeen,
+    /// The grouping key itself, for finding a known name rather than
+    /// ranking anything.
+    Key,
+}
+
 /// One aggregated row, ready to render.
 #[derive(Debug, Default, Clone)]
 pub struct Row {
@@ -118,11 +138,31 @@ impl Aggregate {
         row.peers = row.peer_set.len();
     }
 
-    /// Rows sorted by count, busiest first, capped at `limit`.
-    pub fn top(&self, limit: usize) -> Vec<Row> {
+    /// Rows ordered by `sort`, capped at `limit`.
+    ///
+    /// Ties always break by key ascending, whichever column is sorted and
+    /// whichever way: this table is rebuilt from scratch every frame, and
+    /// rows that swap places between redraws are unreadable on a live
+    /// feed where most counts are equal.
+    pub fn top(&self, limit: usize, sort: SortBy, descending: bool) -> Vec<Row> {
         let mut rows: Vec<Row> = self.rows.values().cloned().collect();
-        // Ties break by key so equal rows do not shuffle between redraws.
-        rows.sort_by(|a, b| b.total.cmp(&a.total).then_with(|| a.key.cmp(&b.key)));
+        rows.sort_by(|a, b| {
+            let ordered = match sort {
+                SortBy::Total => a.total.cmp(&b.total),
+                SortBy::Allowed => a.allowed.cmp(&b.allowed),
+                SortBy::Blocked => a.blocked.cmp(&b.blocked),
+                SortBy::WouldBlock => a.would_block.cmp(&b.would_block),
+                SortBy::Peers => a.peers.cmp(&b.peers),
+                SortBy::LastSeen => a.last_ms.cmp(&b.last_ms),
+                SortBy::Key => a.key.cmp(&b.key),
+            };
+            let ordered = if descending {
+                ordered.reverse()
+            } else {
+                ordered
+            };
+            ordered.then_with(|| a.key.cmp(&b.key))
+        });
         rows.truncate(limit);
         rows
     }
@@ -272,7 +312,7 @@ mod tests {
             ev("/usr/bin/wget", "1.1.1.1:80", Verdict::Allow, true),
         ];
         let agg = Aggregate::rebuild(events.iter(), GroupBy::Exe);
-        let rows = agg.top(10);
+        let rows = agg.top(10, SortBy::Total, true);
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].key, "/usr/bin/curl");
         assert_eq!((rows[0].total, rows[0].allowed), (3, 1));
@@ -323,7 +363,7 @@ mod tests {
             ),
             GroupBy::Exe,
         );
-        let rows = agg.top(1);
+        let rows = agg.top(1, SortBy::Total, true);
         assert!(!rows[0].key.contains('\x1b'), "{:?}", rows[0].key);
         assert!(!rows[0].key.contains('\r'), "{:?}", rows[0].key);
     }
@@ -342,6 +382,37 @@ mod tests {
         assert!(matches_filter(&e, "allow-web"));
         assert!(matches_filter(&e, "93.184"));
         assert!(!matches_filter(&e, "firefox"));
+    }
+
+    /// Every column sorts, and a tie never reshuffles: the table is
+    /// rebuilt from the feed every frame, so equal rows swapping places
+    /// would make a live screen unreadable.
+    #[test]
+    fn rows_sort_by_any_column_and_break_ties_stably() {
+        let mut agg = Aggregate::default();
+        for (exe, verdict, enforced) in [
+            ("/bin/b", Verdict::Deny, true),
+            ("/bin/a", Verdict::Allow, true),
+            ("/bin/c", Verdict::Deny, false),
+        ] {
+            agg.add(&ev(exe, "1.1.1.1:443", verdict, enforced), GroupBy::Exe);
+        }
+        let keys = |sort, desc| -> Vec<String> {
+            agg.top(10, sort, desc).into_iter().map(|r| r.key).collect()
+        };
+        // One connection each: every count column is a three-way tie, and
+        // the tiebreak has to be the key, both directions.
+        assert_eq!(keys(SortBy::Total, true), ["/bin/a", "/bin/b", "/bin/c"]);
+        assert_eq!(keys(SortBy::Total, false), ["/bin/a", "/bin/b", "/bin/c"]);
+        assert_eq!(keys(SortBy::Blocked, true)[0], "/bin/b", "the applied deny");
+        assert_eq!(
+            keys(SortBy::WouldBlock, true)[0],
+            "/bin/c",
+            "the recorded but unapplied deny"
+        );
+        assert_eq!(keys(SortBy::Allowed, true)[0], "/bin/a");
+        assert_eq!(keys(SortBy::Key, false), ["/bin/a", "/bin/b", "/bin/c"]);
+        assert_eq!(keys(SortBy::Key, true), ["/bin/c", "/bin/b", "/bin/a"]);
     }
 
     /// The strip spans the feed's own range, oldest column first, and the

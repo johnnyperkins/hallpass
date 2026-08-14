@@ -329,6 +329,35 @@ fn closing_the_window_dismisses_every_prompt_it_covers() {
     assert!(harness.state().prompt_ids().is_empty());
 }
 
+/// Escape reaches the same dismissal the close button does, for the same
+/// prompts, with the same meaning: deny, once, for everything the window
+/// covers. A keyboard route that answered differently from the mouse one
+/// would be a second policy nobody documented.
+#[test]
+fn escape_dismisses_a_prompt_window_like_closing_it() {
+    let (app, mut from_ui) = app_with_prompts(2);
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(600.0, 500.0))
+        .build_ui_state(
+            |ui, app: &mut HallpassApp| app.prompt_windows(ui.ctx()),
+            app,
+        );
+    // Stepped rather than run: a live prompt asks for a repaint every
+    // 100ms to move its countdown, so `run` would never see the frame
+    // loop go quiet.
+    harness.step();
+
+    harness.key_press(egui::Key::Escape);
+    harness.step();
+
+    assert_eq!(
+        drain(&mut from_ui),
+        (1..=2).map(prompt::close_reply).collect::<Vec<_>>(),
+        "escape left prompts for the daemon's default verdict"
+    );
+    assert!(harness.state().prompt_ids().is_empty());
+}
+
 /// Quitting abandons every prompt on screen, so it answers them for the same
 /// reason closing one window does. Best effort by nature - the process may
 /// exit before the network thread writes the replies - but the queue must
@@ -628,6 +657,52 @@ fn the_bulk_buttons_act_on_the_selected_tag() {
     assert!(
         harness.state().rules.iter().all(|r| r.enabled),
         "the rows were edited before the daemon agreed to it"
+    );
+}
+
+/// The traffic headings sort the table, and a second click on the column
+/// already sorted reverses it. The rows themselves are rebuilt from the
+/// feed every frame, so what a click changes is this state and nothing
+/// else.
+#[test]
+fn the_traffic_headings_sort_and_reverse() {
+    let (to_daemon, mut from_ui) = tokio::sync::mpsc::unbounded_channel();
+    let (_to_ui, from_net) = std::sync::mpsc::channel();
+    let mut app = HallpassApp::with_channels(to_daemon, from_net);
+    app.tab = Tab::Traffic;
+    app.events.push_back(hallpass_types::ConnEvent {
+        conn: conn(EXE, "93.184.216.34:443"),
+        verdict: Verdict::Deny,
+        rule_name: None,
+        unix_ms: hallpass_types::unix_ms_now(),
+        enforced: true,
+    });
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(1040.0, 520.0))
+        .build_ui_state(|ui, app: &mut HallpassApp| app.main_window(ui), app);
+
+    assert_eq!(
+        harness.state().traffic_sort,
+        (crate::traffic::SortBy::Total, true),
+        "busiest first is the default"
+    );
+    harness.get_by_label("BLOCKED").click();
+    harness.run();
+    assert_eq!(
+        harness.state().traffic_sort,
+        (crate::traffic::SortBy::Blocked, true),
+        "a new column starts at the end that answers the question"
+    );
+    harness.get_by_label("BLOCKED").click();
+    harness.run();
+    assert_eq!(
+        harness.state().traffic_sort,
+        (crate::traffic::SortBy::Blocked, false),
+        "the same column again reverses"
+    );
+    assert!(
+        drain(&mut from_ui).is_empty(),
+        "sorting is a local view change and asks the daemon nothing"
     );
 }
 

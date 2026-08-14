@@ -652,6 +652,70 @@ fn tab_sized(ui: &mut Ui, selected: bool, text: &str, height: f32, accent: Color
     response
 }
 
+/// A sortable column heading: the title, plus an arrow when this is the
+/// column the table is ordered by.
+///
+/// Painted rather than a plain label so the whole cell is the hit target:
+/// these headings are small text, and a click that misses by two pixels
+/// on a live table reads as the sort not working.
+pub fn sort_header(ui: &mut Ui, title: &str, direction: Option<bool>) -> Response {
+    let text = title.to_uppercase();
+    let font = egui::TextStyle::Small.resolve(ui.style());
+    let galley = ui
+        .painter()
+        .layout_no_wrap(text.clone(), font.clone(), Color32::PLACEHOLDER);
+    // Room for the marker whether or not this column carries it, so the
+    // headings do not shift sideways when the sort moves.
+    let size = Vec2::new(
+        galley.size().x + 16.0,
+        galley.size().y.max(ui.available_height()),
+    );
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+    let label = text.clone();
+    response
+        .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label.clone()));
+    if ui.is_rect_visible(rect) {
+        let color = match (direction.is_some(), response.hovered()) {
+            (_, true) => TEXT,
+            (true, _) => ACCENT,
+            (false, _) => MUTED,
+        };
+        let galley = ui.painter().layout_no_wrap(text, font, color);
+        let text_left = rect.left() + 2.0;
+        ui.painter().galley(
+            egui::pos2(text_left, rect.center().y - galley.size().y / 2.0),
+            galley.clone(),
+            color,
+        );
+        // Painted rather than written: the bundled fonts have no
+        // dependable triangle, and a heading that renders as a hollow box
+        // is worse than no marker at all.
+        if let Some(descending) = direction {
+            let x = text_left + galley.size().x + 5.0;
+            let y = rect.center().y;
+            let (a, b, tip) = if descending {
+                (
+                    egui::pos2(x, y - 2.0),
+                    egui::pos2(x + 7.0, y - 2.0),
+                    egui::pos2(x + 3.5, y + 2.5),
+                )
+            } else {
+                (
+                    egui::pos2(x, y + 2.0),
+                    egui::pos2(x + 7.0, y + 2.0),
+                    egui::pos2(x + 3.5, y - 2.5),
+                )
+            };
+            ui.painter().add(egui::epaint::PathShape::convex_polygon(
+                vec![a, b, tip],
+                color,
+                Stroke::NONE,
+            ));
+        }
+    }
+    response
+}
+
 /// A verdict button for the prompt window: big, filled, and unmistakably
 /// the thing to press.
 pub fn verdict_button(text: &str, color: Color32) -> egui::Button<'static> {
@@ -719,33 +783,42 @@ pub fn countdown(ui: &mut Ui, fraction: f32, text: &str) {
 /// window is often glanced at rather than read, and the top-left corner is
 /// where a glance lands first.
 pub fn brand(ui: &mut Ui, color: Color32) -> Response {
-    let size = Vec2::new(20.0, 22.0);
-    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::hover());
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(20.0, 22.0), egui::Sense::hover());
     if !ui.is_rect_visible(rect) {
         return response;
     }
-    let r = rect.shrink(1.0);
-    let top = r.top();
-    let bottom = r.bottom();
-    let (l, right) = (r.left(), r.right());
-    let shoulder = top + r.height() * 0.55;
-    // A shield: flat shoulders, tapering to a point.
-    let outline = vec![
-        egui::pos2(l, top + 2.0),
-        egui::pos2(right, top + 2.0),
-        egui::pos2(right, shoulder),
-        egui::pos2(r.center().x, bottom),
-        egui::pos2(l, shoulder),
-    ];
+    let (outline, bolt) = shield(rect.shrink(1.0));
     ui.painter().add(egui::epaint::PathShape::convex_polygon(
         outline,
         tint(color),
         Stroke::new(1.4, color),
     ));
-    // A bolt through it, in the background colour, so the mark reads at
-    // 16 pixels as well as it does here.
-    let w = r.width();
-    let h = r.height();
+    ui.painter().add(egui::epaint::PathShape::convex_polygon(
+        bolt,
+        color,
+        Stroke::NONE,
+    ));
+    response
+}
+
+/// The mark's geometry: the shield, and the bolt through it.
+///
+/// One definition, used by the painted mark and by the rasterized window
+/// icon, so the thing in the corner and the thing in the taskbar are the
+/// same drawing rather than two that drifted.
+fn shield(r: egui::Rect) -> (Vec<egui::Pos2>, Vec<egui::Pos2>) {
+    let (l, right, top, bottom) = (r.left(), r.right(), r.top(), r.bottom());
+    let (w, h) = (r.width(), r.height());
+    let shoulder = top + h * 0.55;
+    // Flat shoulders, tapering to a point.
+    let outline = vec![
+        egui::pos2(l, top + h * 0.09),
+        egui::pos2(right, top + h * 0.09),
+        egui::pos2(right, shoulder),
+        egui::pos2(r.center().x, bottom),
+        egui::pos2(l, shoulder),
+    ];
+    // A bolt, so the mark reads at 16 pixels as well as it does at 64.
     let bolt = vec![
         egui::pos2(l + w * 0.55, top + h * 0.18),
         egui::pos2(l + w * 0.30, top + h * 0.52),
@@ -754,12 +827,100 @@ pub fn brand(ui: &mut Ui, color: Color32) -> Response {
         egui::pos2(l + w * 0.70, top + h * 0.44),
         egui::pos2(l + w * 0.52, top + h * 0.44),
     ];
-    ui.painter().add(egui::epaint::PathShape::convex_polygon(
-        bolt,
-        color,
-        Stroke::NONE,
-    ));
-    response
+    (outline, bolt)
+}
+
+/// The window icon: the mark again, rasterized, in the colour of whatever
+/// the host is doing.
+///
+/// Painted rather than shipped as a file so the taskbar entry can carry
+/// the state the same way the corner mark and the tray icon do, and so
+/// there is one drawing to keep in step instead of three.
+pub fn icon(color: Color32) -> egui::IconData {
+    const SIZE: u32 = 64;
+    // Its own dark ground rather than the window's: this lands on a
+    // taskbar of unknown colour, and a shield that borrows the desktop's
+    // background is a shield-shaped hole.
+    let ground = Color32::from_rgb(0x10, 0x16, 0x20);
+    let rect = egui::Rect::from_min_size(
+        egui::pos2(3.0, 2.0),
+        Vec2::new(SIZE as f32 - 6.0, SIZE as f32 - 4.0),
+    );
+    let (outline, bolt) = shield(rect);
+    let inner: Vec<egui::Pos2> = shrink_towards(&outline, 0.88);
+    let mut rgba = Vec::with_capacity((SIZE * SIZE * 4) as usize);
+    for y in 0..SIZE {
+        for x in 0..SIZE {
+            // Three by three samples per pixel: the shield is all
+            // diagonals, and at this size a hard edge looks broken.
+            let (mut body, mut edge, mut spark) = (0.0f32, 0.0f32, 0.0f32);
+            for sy in 0..3 {
+                for sx in 0..3 {
+                    let p = egui::pos2(
+                        x as f32 + (sx as f32 + 0.5) / 3.0,
+                        y as f32 + (sy as f32 + 0.5) / 3.0,
+                    );
+                    if contains(&bolt, p) {
+                        spark += 1.0;
+                    } else if contains(&inner, p) {
+                        body += 1.0;
+                    } else if contains(&outline, p) {
+                        edge += 1.0;
+                    }
+                }
+            }
+            let coverage = (body + edge + spark) / 9.0;
+            let pixel = if coverage == 0.0 {
+                Color32::TRANSPARENT
+            } else {
+                // Mixed by which part won the pixel, so an edge sample
+                // next to a body sample blends instead of stepping.
+                let mix = |a: Color32, b: Color32, t: f32| a.lerp_to_gamma(b, t);
+                let lit = spark + edge;
+                mix(
+                    ground,
+                    color,
+                    if coverage > 0.0 {
+                        lit / (lit + body).max(1.0)
+                    } else {
+                        0.0
+                    },
+                )
+            };
+            let [r, g, b, _] = pixel.to_array();
+            rgba.extend_from_slice(&[r, g, b, (coverage * 255.0) as u8]);
+        }
+    }
+    egui::IconData {
+        rgba,
+        width: SIZE,
+        height: SIZE,
+    }
+}
+
+/// A polygon pulled towards its own centre, for the icon's inner fill.
+fn shrink_towards(points: &[egui::Pos2], factor: f32) -> Vec<egui::Pos2> {
+    let n = points.len() as f32;
+    let cx = points.iter().map(|p| p.x).sum::<f32>() / n;
+    let cy = points.iter().map(|p| p.y).sum::<f32>() / n;
+    points
+        .iter()
+        .map(|p| egui::pos2(cx + (p.x - cx) * factor, cy + (p.y - cy) * factor))
+        .collect()
+}
+
+/// Ray casting, because the bolt is not convex.
+fn contains(poly: &[egui::Pos2], p: egui::Pos2) -> bool {
+    let mut inside = false;
+    let mut j = poly.len() - 1;
+    for i in 0..poly.len() {
+        let (a, b) = (poly[i], poly[j]);
+        if (a.y > p.y) != (b.y > p.y) && p.x < (b.x - a.x) * (p.y - a.y) / (b.y - a.y) + a.x {
+            inside = !inside;
+        }
+        j = i;
+    }
+    inside
 }
 
 /// The wordmark: spaced capitals, because this is a title and not a
@@ -820,6 +981,23 @@ mod tests {
                 + (f32::from(a.b()) - f32::from(b.b())).abs();
             assert!(d > 120.0, "{a:?} and {b:?} are too close to tell apart");
         }
+    }
+
+    /// The window icon has to be a shield on a transparent field, not a
+    /// square: it lands on a taskbar whose colour this window does not
+    /// know, and a full-bleed opaque icon is the one way that looks
+    /// broken. Checked at the corners (outside the shield) and at the
+    /// centre (inside it).
+    #[test]
+    fn the_window_icon_is_a_shield_on_transparency() {
+        let icon = icon(ALLOW_COLOR);
+        let (w, h) = (icon.width as usize, icon.height as usize);
+        assert_eq!(icon.rgba.len(), w * h * 4);
+        let alpha_at = |x: usize, y: usize| icon.rgba[(y * w + x) * 4 + 3];
+        for (x, y) in [(0, 0), (w - 1, 0), (0, h - 1), (w - 1, h - 1)] {
+            assert_eq!(alpha_at(x, y), 0, "the corner at {x},{y} is not clear");
+        }
+        assert_eq!(alpha_at(w / 2, h / 3), 255, "the shield has a hole in it");
     }
 
     /// Installing is idempotent and does not depend on being first: the

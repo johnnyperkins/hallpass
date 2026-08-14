@@ -292,6 +292,10 @@ pub struct HallpassApp {
     rule_tag_filter: Option<String>,
     /// What the traffic view groups by.
     group_by: traffic::GroupBy,
+    /// Which column the traffic view is ordered by, and whether the
+    /// largest comes first. Busiest-first is the default; the headings
+    /// answer the other two questions this tab gets opened with.
+    traffic_sort: (traffic::SortBy, bool),
     /// Runtime settings as the daemon last reported them. None until it
     /// has answered once, for the same reason `stats` starts None: the
     /// settings tab must not display values the daemon never confirmed.
@@ -398,6 +402,7 @@ impl HallpassApp {
             rules_notice: None,
             rule_tag_filter: None,
             group_by: traffic::GroupBy::default(),
+            traffic_sort: (traffic::SortBy::default(), true),
             daemon_config: None,
             enforcing: None,
             settings_timeout: String::new(),
@@ -813,15 +818,29 @@ impl HallpassApp {
     /// On change only: the icon is a DBus round trip and this runs every
     /// frame. A send failure means the tray thread is gone, which
     /// [`TrayMsg::Unavailable`] already reports through the other channel.
-    fn sync_tray(&mut self) {
+    fn sync_tray(&mut self, ctx: &egui::Context) {
         let state = self.tray_state();
         if state == self.tray_state {
             return;
         }
+        self.sync_window_icon(ctx, state);
         self.tray_state = state;
         if let Some(to_tray) = &self.to_tray {
             let _ = to_tray.send(state);
         }
+    }
+
+    /// Repaint the window icon when the state changes, so the taskbar
+    /// entry says what the tray icon and the corner mark say.
+    ///
+    /// On change only, like the tray push: rasterizing the mark is cheap
+    /// but not free, and this would otherwise run every frame. Best
+    /// effort by platform - X11 honours a window icon, Wayland shows the
+    /// desktop entry's instead and ignores this.
+    fn sync_window_icon(&self, ctx: &egui::Context, state: TrayState) {
+        ctx.send_viewport_cmd(egui::ViewportCommand::Icon(Some(std::sync::Arc::new(
+            theme::icon(tray_state_color(state)),
+        ))));
     }
 
     /// Ask for stats again when the last answer is old enough, whatever tab
@@ -1264,7 +1283,14 @@ impl HallpassApp {
                         theme::pill(ui, ev.verdict_label(), event_color(ev));
                     });
                     row.col(|ui| {
-                        ui.label(egui::RichText::new(prompt::exe_name(&ev.conn)).color(TEXT));
+                        // The column shows the file name; the path is what
+                        // a rule keys on, and it is one hover away rather
+                        // than a tab away.
+                        ui.label(egui::RichText::new(prompt::exe_name(&ev.conn)).color(TEXT))
+                            .on_hover_text(match &ev.conn.exe_path {
+                                Some(exe) => prompt::path_text(exe),
+                                None => "unattributed".to_string(),
+                            });
                     });
                     row.col(|ui| {
                         ui.spacing_mut().item_spacing.x = 5.0;
@@ -1273,11 +1299,13 @@ impl HallpassApp {
                                 .small()
                                 .color(MUTED),
                         );
-                        ui.label(theme::num(prompt::format_dest(&ev.conn)));
+                        ui.label(theme::num(prompt::format_dest(&ev.conn)))
+                            .on_hover_text(prompt::format_dest(&ev.conn));
                     });
                     row.col(|ui| match ev.rule_name.as_deref() {
                         Some(name) => {
-                            theme::ghost_pill(ui, &prompt::ui_text(name));
+                            theme::ghost_pill(ui, &prompt::ui_text(name))
+                                .on_hover_text(prompt::ui_text(name));
                         }
                         // Not a rule name: this connection was decided by
                         // the default verdict, and saying so is the point
@@ -1393,7 +1421,7 @@ impl HallpassApp {
             }
         });
         ui.add_space(6.0);
-        let rows = agg.top(TRAFFIC_ROWS);
+        let rows = agg.top(TRAFFIC_ROWS, self.traffic_sort.0, self.traffic_sort.1);
         let (header_h, row_h) = table_heights(ui);
         data_table(ui, "traffic_table")
             .column(Column::remainder().clip(true).at_least(160.0)) // key
@@ -1405,26 +1433,52 @@ impl HallpassApp {
             .column(Column::initial(70.0).at_least(56.0)) // Peers
             .column(Column::initial(90.0).at_least(76.0)) // Last seen
             .header(header_h, |mut header| {
-                for title in [
-                    self.group_by.label(),
-                    "Mix",
-                    "Total",
-                    "Allowed",
-                    "Blocked",
-                    "Would block",
-                    "Peers",
-                    "Last seen",
+                // Every column but the mix bar sorts; the bar is the four
+                // counts beside it drawn as one shape, so it has nothing
+                // of its own to order by.
+                let (active, descending) = self.traffic_sort;
+                let mut clicked = None;
+                for (title, sort) in [
+                    (self.group_by.label(), Some(traffic::SortBy::Key)),
+                    ("Mix", None),
+                    ("Total", Some(traffic::SortBy::Total)),
+                    ("Allowed", Some(traffic::SortBy::Allowed)),
+                    ("Blocked", Some(traffic::SortBy::Blocked)),
+                    ("Would block", Some(traffic::SortBy::WouldBlock)),
+                    ("Peers", Some(traffic::SortBy::Peers)),
+                    ("Last seen", Some(traffic::SortBy::LastSeen)),
                 ] {
-                    header.col(|ui| {
-                        ui.label(column_title(title));
+                    header.col(|ui| match sort {
+                        Some(sort) => {
+                            let direction = (sort == active).then_some(descending);
+                            if theme::sort_header(ui, title, direction).clicked() {
+                                clicked = Some(sort);
+                            }
+                        }
+                        None => {
+                            ui.label(column_title(title))
+                                .on_hover_text("Allowed, blocked, and recorded but not enforced");
+                        }
                     });
+                }
+                if let Some(sort) = clicked {
+                    // A second click on the column already sorted flips
+                    // it; a first click on another starts from the end
+                    // that answers the question, which is the largest
+                    // count or the most recent time, but the first name.
+                    self.traffic_sort = if sort == active {
+                        (sort, !descending)
+                    } else {
+                        (sort, sort != traffic::SortBy::Key)
+                    };
                 }
             })
             .body(|body| {
                 body.rows(row_h, rows.len(), |mut table_row| {
                     let row = &rows[table_row.index()];
                     table_row.col(|ui| {
-                        ui.label(egui::RichText::new(prompt::ui_text(&row.key)).color(TEXT));
+                        ui.label(egui::RichText::new(prompt::ui_text(&row.key)).color(TEXT))
+                            .on_hover_text(prompt::ui_text(&row.key));
                     });
                     // The column four numbers cannot replace: whether this
                     // row is mostly getting out or mostly being stopped is
@@ -1586,7 +1640,8 @@ impl HallpassApp {
                             name.color(TEXT)
                         } else {
                             name.color(MUTED).strikethrough()
-                        });
+                        })
+                        .on_hover_text(prompt::ui_text(&rule.name));
                     });
                     row.col(|ui| {
                         let v = Verdict::from(rule.action);
@@ -1607,7 +1662,8 @@ impl HallpassApp {
                         });
                     }
                     row.col(|ui| {
-                        ui.label(theme::num(prompt::ui_text(&rule.matcher.summary())));
+                        ui.label(theme::num(prompt::ui_text(&rule.matcher.summary())))
+                            .on_hover_text(prompt::ui_text(&rule.matcher.summary()));
                     });
                     row.col(|ui| {
                         ui.label(theme::num_muted(rule.priority.to_string()));
@@ -2327,7 +2383,16 @@ fn prompt_popup(
                 board.pending.retain(|p| p.id != id);
                 replies.push(reply);
             }
-            if ui.ctx().input(|i| i.viewport().close_requested()) {
+            // Escape is the keyboard's close button, and it means what
+            // the close button means: deny, once, every prompt this
+            // window covers. Handled here rather than by asking the
+            // platform to close the window, so the keyboard route runs
+            // the same branch as the mouse one on every backend - the
+            // window is parked by the emptied path below either way.
+            let dismissed = ui
+                .ctx()
+                .input(|i| i.viewport().close_requested() || i.key_pressed(egui::Key::Escape));
+            if dismissed {
                 // Closing the window is a decision, not the absence of
                 // one: deny, once, this port (see prompt::close_reply).
                 // The whole group goes, because one window carries the
@@ -2765,7 +2830,7 @@ impl eframe::App for HallpassApp {
         // tray still reaches here: the net thread pairs every event with a
         // repaint request, so a mode changed by another client updates the
         // icon of a window nobody has opened, which is the whole point.
-        self.sync_tray();
+        self.sync_tray(&ctx);
         self.main_window(ui);
         self.editor_window(&ctx);
         self.prompt_windows(&ctx);
