@@ -346,6 +346,62 @@ carries what an upgrade changes on a running host.
 
 ### Changed
 
+- **Unmatched connections are denied by default.** `default_verdict` ships as
+  `"deny"` instead of `"allow"`, and so does the built-in default a host with
+  no config file falls back to. A connection that matches no rule and that
+  nobody answers is now blocked.
+
+  That covers more than an ignored prompt. The same verdict applies with no
+  GUI and no `hallpass-cli watch` attached, between boot and login, after a
+  handler crashes, and when either held-packet budget is spent. Allowing in
+  those states meant the tool stopped working silently, and one of them is
+  reachable by anything that can crash the handler.
+
+  This is the policy axis only. `queue_bypass` still ships `true`, so a daemon
+  that is dead rather than undecided still lets traffic through instead of
+  bricking the network. `etc/config.hardened.toml` closes that too.
+
+  **Upgrade notes.** An existing `/etc/hallpass/config.toml` is never
+  rewritten by the installer, so a host whose file *states*
+  `default_verdict = "allow"` keeps allow until that line is edited. A file
+  that omits the key does not: every field falls back to the built-in default,
+  which this release changes, so such a host flips to deny on upgrade. Check
+  for the line before upgrading an unattended one. New installs get deny along
+  with the baseline rules below, and an upgrade gets those rules too, since
+  none of them is on the host yet. Read the two entries together: deny without
+  the baseline is a host that boots without DNS.
+
+- **Baseline rules for the daemons that run before anyone can answer.**
+  `etc/rules.d/` gains `20-system-resolved.toml`, `20-system-timesyncd.toml`,
+  `20-system-timesyncd-dns.toml` and `20-system-networkmanager.toml`, shipped
+  enabled, so a deny default does not leave a booting host without name
+  resolution, a clock, or an address.
+
+  Each is scoped to a binary rather than to a port, because a rule matching
+  port 53 alone lets every local process speak DNS to any host it picks.
+  Priority 20 sits below the 50 that answering a prompt writes, so anything
+  decided later overrides them. Applications are unaffected either way: they
+  ask the resolver stub over loopback, which is exempt before any rule is
+  consulted. `20-system-networkmanager.toml` is the one broad grant, exe-only,
+  and it says in the file why and when to delete it.
+
+  `install.sh` writes each only when the binary it names exists, so a chrony
+  host gets no dead timesyncd rule, and guards them like the example rule, so
+  editing or deleting one survives a reinstall. It also canonicalizes the path
+  in the installed copy: the daemon compares `exe` against what
+  `/proc/<pid>/exe` reports, which the kernel resolves fully, so on a
+  distribution where `/usr/sbin` links to `/usr/bin` a rule naming
+  `/usr/sbin/NetworkManager` would list correctly and match nothing.
+
+- **The desktop profile holds 128 pending prompts, up from 64.** Past the cap
+  a connection takes the default verdict without raising a prompt at all.
+  Under the old allow default that overflow was a silent pass; under deny it
+  is a silent block, so a burst of new connections - a browser starting with
+  many tabs, a package update fanning out to mirrors - could be denied without
+  anyone being asked. This matches what `etc/config.hardened.toml` already
+  used, and for the same reason. The real ceiling on held packets is the
+  daemon's own budget rather than this number, so the cost is small.
+
 - **A prompt now waits 30 seconds by default, up from 15.** The window asks
   for a duration and a scope as well as a verdict, and 15 seconds was short
   enough that reading an unfamiliar executable path and then setting those

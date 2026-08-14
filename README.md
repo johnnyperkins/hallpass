@@ -108,7 +108,7 @@ One command builds, installs, and starts everything:
 ./install.sh                          # eBPF attribution when the toolchain is present
 HALLPASS_EBPF=1 ./install.sh          # require eBPF (fail instead of falling back)
 HALLPASS_EBPF=0 ./install.sh          # force the procfs-only build (stable Rust)
-HALLPASS_POSTURE=desktop ./install.sh # permissive config instead of the hardened one
+HALLPASS_POSTURE=desktop ./install.sh # fail-open-on-crash config instead of the hardened one
 ```
 
 It builds the release binaries as your user, then uses `sudo` (prompting
@@ -124,9 +124,13 @@ Two things it does that are worth reading before you run it:
   unanswered connections are denied, transports the rule engine does not model
   are denied, and `queue_bypass = false` keeps enforcement up when the daemon
   is dead or its queue is full. `HALLPASS_POSTURE=desktop` writes
-  `etc/config.toml` instead, which allows all three - fine for a desktop where
-  you are at the keyboard to answer prompts, wrong for anything unattended.
-  Either way an existing `config.toml` is left exactly as you edited it.
+  `etc/config.toml` instead, which denies unmatched and unanswered connections
+  just the same and allows the other two - fine for a desktop where you are at
+  the keyboard to answer prompts and would rather a crashed daemon not take the
+  network with it, wrong for anything unattended. Either way an existing
+  `config.toml` is left exactly as you edited it, and either way the
+  `20-system-*.toml` baseline rules go into `/etc/hallpass/rules.d` so a denied
+  default does not leave the host without DNS, a clock or an address.
 - **The `hallpass` group is full control of the firewall**, and the script
   adds you to it. A member can set `enforce = false`, lift a lockdown posture,
   delete any rule, or take the prompt-handler slot and answer allow. Add only
@@ -167,6 +171,19 @@ install -Dm755 target/release/hallpass-cli /usr/bin/hallpass-cli
 install -Dm755 target/release/hallpass-ui  /usr/bin/hallpass-ui
 install -Dm644 etc/config.toml           /etc/hallpass/config.toml
 install -Dm644 etc/rules.d/example-allow-dns.toml /etc/hallpass/rules.d/example-allow-dns.toml  # ships disabled
+
+# Not optional under either shipped config: both deny what no rule matches,
+# so without these the host boots with no DNS, no clock and no address.
+# Install only the ones whose binary this host has, and check each path
+# against the one /proc/<pid>/exe reports - the daemon matches `exe`
+# exactly, and where /usr/sbin is a symlink to /usr/bin the rule as shipped
+# would match nothing. `readlink -f` on the path in the file gives the one
+# to write. A host running chrony, ntpd, systemd-networkd or dhcpcd instead
+# needs a rule of its own for it, on the same pattern.
+install -Dm644 etc/rules.d/20-system-resolved.toml      /etc/hallpass/rules.d/20-system-resolved.toml
+install -Dm644 etc/rules.d/20-system-timesyncd.toml     /etc/hallpass/rules.d/20-system-timesyncd.toml
+install -Dm644 etc/rules.d/20-system-networkmanager.toml /etc/hallpass/rules.d/20-system-networkmanager.toml
+
 install -Dm644 etc/hallpassd.service     /etc/systemd/system/hallpassd.service
 install -Dm644 etc/hallpass-ui.desktop   /usr/share/applications/hallpass-ui.desktop
 
@@ -514,17 +531,27 @@ without applying, which are the ones worth looking at on an unenforced host.
 
 ## Security model
 
-**The enforcement guarantee in one sentence: by default, hallpass only blocks
-what a live, healthy daemon explicitly denies.** Everything below is a
-consequence of that. Queue `bypass`, `default_verdict = "allow"`, and the
-prompt-timeout default all fail open, so a dead, wedged, or unconfigured
-daemon lets traffic through. For an enforce-by-default posture, start from
-[`etc/config.hardened.toml`](etc/config.hardened.toml) (`default_verdict =
-"deny"`, `queue_bypass = false`): unmatched connections are denied and
-enforcement survives a dead or overloaded daemon. The residual gap is an
-attacker with root, who can delete the nftables table outright.
+**The enforcement guarantee in one sentence: a live daemon passes only what a
+rule allows or an operator approves, and a dead one passes everything.** Those
+are two different axes and they fail in opposite directions deliberately.
 
-- **Fail-open by default**: the NFQUEUE verdict rule uses the `bypass` flag,
+`default_verdict = "deny"` is the policy axis. A connection no rule matches and
+no operator answers is denied, and that covers more than an ignored prompt: a
+host with no GUI and no `hallpass-cli watch` attached, the window between boot
+and login, a handler that crashed, and both held-packet budgets. Anything
+needing the network before a human can answer therefore needs a rule, which is
+what the `20-system-*.toml` files in [`etc/rules.d`](etc/rules.d) are for.
+Allowing in those states made the tool stop working silently, and one of them
+is reachable by anything that can crash the handler.
+
+Queue `bypass` is the liveness axis, and it still fails open: if the daemon
+dies the kernel passes traffic rather than bricking the network. Set
+`queue_bypass = false` to close that too, which is what
+[`etc/config.hardened.toml`](etc/config.hardened.toml) does, along with denying
+the protocols rules cannot model. The residual gap is an attacker with root,
+who can delete the nftables table outright.
+
+- **Fail-open when the daemon dies**: the NFQUEUE verdict rule uses the `bypass` flag,
   so if the daemon dies traffic flows unfiltered instead of bricking the
   network. On clean shutdown and on panic, the nftables table is removed.
   This is an availability-over-enforcement tradeoff; set
@@ -607,7 +634,8 @@ attacker with root, who can delete the nftables table outright.
   permission policy as rule files. It sets `default_verdict`, `queue_bypass`,
   and the rules directory, so it is the most security-relevant file on disk.
   A `--config` path that does not exist is fatal rather than silently
-  replaced by the (fail-open) built-in defaults.
+  replaced by the built-in defaults, which deny unmatched connections and so
+  would enforce a policy naming none of the rules the operator meant to load.
 - **Session grants (`hallpass-cli run`) cover a process tree, one user, and
   only what would have prompted.** The daemon roots the grant at the wrapper
   process using the IPC socket's peer credentials, so a client cannot open
@@ -741,7 +769,7 @@ attacker with root, who can delete the nftables table outright.
   `cmdline_contains` and `user` operand is inapplicable to it. What is left is
   tuple matching, which is a different product with a rule model of its own,
   and it cannot ship on by default either: a `forward` base chain feeding the
-  verdict queue under the hardened config's `default_verdict = "deny"` would
+  verdict queue under the shipped `default_verdict = "deny"` would
   black out every container on the host, with no prompt possible because
   there is no process to name in one. Filter forwarded traffic with an
   nftables `forward` chain of your own; hallpass will not fight you for it.
