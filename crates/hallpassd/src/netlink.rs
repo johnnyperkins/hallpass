@@ -51,8 +51,21 @@ pub const fn align4(n: usize) -> usize {
 }
 
 /// One netlink attribute: 4-byte header, payload, padding to 4.
+///
+/// The length field is 16 bits, so a payload that does not fit one would be
+/// written whole under a wrapped length, and the kernel would parse the
+/// bytes past the claimed length as further attributes rather than reject
+/// the message. Every caller here passes an address, a port or a nest of
+/// those, so this is cheap insurance in tests and debug builds against a
+/// future one that does not, in the same spirit as the [`Attrs`] walk below
+/// refusing to index past its buffer.
 pub fn nla(kind: u16, payload: &[u8]) -> Vec<u8> {
     let len = 4 + payload.len();
+    debug_assert!(
+        len <= u16::MAX as usize,
+        "netlink attribute payload of {} bytes does not fit a 16-bit length",
+        payload.len()
+    );
     let mut out = Vec::with_capacity(align4(len));
     out.extend_from_slice(&(len as u16).to_ne_bytes());
     out.extend_from_slice(&kind.to_ne_bytes());

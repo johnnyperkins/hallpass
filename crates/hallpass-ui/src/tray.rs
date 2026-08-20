@@ -9,8 +9,8 @@
 //! to the window as [`TrayMsg`] on a plain channel, each paired with a
 //! repaint request: a parked window paints no frames of its own, and the
 //! request is what wakes it to drain the channel (probe-verified on X11,
-//! where a hidden window's frame loop keeps responding to repaint
-//! requests; see the platform facts in TODO.md).
+//! where a hidden window's frame loop keeps responding to repaint requests;
+//! `main.rs` records why that confines close-to-tray to X11).
 
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 

@@ -97,8 +97,10 @@ fn build_delete(tuple: &FlowTuple, seq: u32) -> Vec<u8> {
             ]
             .concat(),
         ),
-        // One packet has one family, and the packet parser already unmapped
-        // v4-mapped addresses.
+        // Both halves of a tuple are read from the same IP header, so a
+        // mixed-family pair is not a packet this daemon can be handed. The
+        // v4-mapped form does not arise either: it is a sockaddr encoding,
+        // and nothing on the wire carries one.
         _ => unreachable!("mixed-family flow tuple"),
     };
     let proto_num = match tuple.proto {

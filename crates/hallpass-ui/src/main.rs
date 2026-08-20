@@ -49,7 +49,7 @@ fn main() -> eframe::Result {
     // included), which would freeze prompt popups for as long as it stayed
     // minimized. On X11 a hidden window's frame loop keeps running, popups
     // born while hidden surface normally, and re-show plus focus work. All
-    // probe-verified 2026-08-09 (facts recorded in TODO.md), so any X11
+    // probe-verified on both backends 2026-08-09, so any X11
     // display - XWayland included - is preferred over native Wayland, and
     // sessions with neither keep the old behavior: visible window, close
     // quits.
