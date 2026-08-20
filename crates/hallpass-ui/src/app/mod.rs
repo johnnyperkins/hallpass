@@ -275,7 +275,8 @@ pub struct HallpassApp {
     lens: Lens,
     /// When stats were last requested, for the poll that keeps whole-host
     /// state (the mode, the lockdown posture) visible from every tab.
-    stats_asked: std::time::Instant,
+    /// `None` until the first frame asks.
+    stats_asked: Option<std::time::Instant>,
     /// What the last bulk toggle actually did, shown in the rules tab.
     ///
     /// The daemon acts on its own live set, which is not necessarily the one
@@ -397,8 +398,11 @@ impl HallpassApp {
             editor: None,
             filter: String::new(),
             lens: Lens::default(),
-            // In the past, so the first frame asks immediately.
-            stats_asked: std::time::Instant::now() - STATS_POLL,
+            // Never asked, so the first frame asks immediately. Not an
+            // `Instant` backdated by `STATS_POLL`: `Instant` is
+            // monotonic-since-boot on Linux, and fabricating one in the past
+            // panics when the session starts within `STATS_POLL` of boot.
+            stats_asked: None,
             rules_notice: None,
             rule_tag_filter: None,
             group_by: traffic::GroupBy::default(),
@@ -851,8 +855,11 @@ impl HallpassApp {
             return;
         }
         let now = std::time::Instant::now();
-        if now.duration_since(self.stats_asked) >= STATS_POLL {
-            self.stats_asked = now;
+        if self
+            .stats_asked
+            .is_none_or(|asked| now.duration_since(asked) >= STATS_POLL)
+        {
+            self.stats_asked = Some(now);
             self.send(ClientMsg::Stats);
         }
         ctx.request_repaint_after(STATS_POLL);
