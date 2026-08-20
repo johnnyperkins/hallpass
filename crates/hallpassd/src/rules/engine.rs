@@ -59,12 +59,24 @@ impl RuleSet {
                 .cmp(&a.priority)
                 .then_with(|| a.name.cmp(&b.name))
         });
-        let has_hash_rules = compiled.iter().any(|r| r.deciding() && r.wants_exe_hash());
-        RuleSet {
+        let mut set = RuleSet {
             rules: compiled,
-            has_hash_rules,
+            has_hash_rules: false,
             locked_down: lockdown.is_some(),
-        }
+        };
+        let has_hash_rules = set.deciding_rules().any(CompiledRule::wants_exe_hash);
+        set.has_hash_rules = has_hash_rules;
+        set
+    }
+
+    /// The rules the operator and the posture currently let decide, in
+    /// evaluation order.
+    ///
+    /// The one filter behind the `has_hash_rules` gate, [`RuleSet::match_conn`]
+    /// and [`RuleSet::hash_pinning_candidates`], so the gate and the filters
+    /// cannot drift into asking different questions.
+    fn deciding_rules(&self) -> impl Iterator<Item = &CompiledRule> {
+        self.rules.iter().filter(|r| r.deciding())
     }
 
     /// Whether a lockdown posture was in force when this set was compiled.
@@ -89,7 +101,7 @@ impl RuleSet {
             .count() as u32
     }
 
-    /// First enabled rule matching `conn`, with its verdict. `exe_sha256`
+    /// First deciding rule matching `conn`, with its verdict. `exe_sha256`
     /// is the connection executable's hash if it was computed; pass the
     /// result of gating on [`RuleSet::wants_exe_hash_for`].
     pub fn match_conn(
@@ -97,9 +109,7 @@ impl RuleSet {
         conn: &Connection,
         exe_sha256: Option<&str>,
     ) -> Option<(&CompiledRule, Verdict)> {
-        self.rules
-            .iter()
-            .filter(|r| r.deciding())
+        self.deciding_rules()
             .find(|r| r.matches(conn, exe_sha256))
             .map(|r| (r, Verdict::from(r.action)))
     }
@@ -114,8 +124,10 @@ impl RuleSet {
     ///
     /// An explanation that disagrees with enforcement is worse than none, so
     /// this shares everything that can decide the outcome with `match_conn`:
-    /// the same `rules` vector in the same order, the same `enabled` filter,
-    /// and the same predicate, since [`CompiledRule::matches`] is defined as
+    /// the same `rules` vector in the same order, the same
+    /// [`CompiledRule::deciding`] filter (told apart here as Disabled versus
+    /// Suppressed, which cannot change who decides), and the same predicate,
+    /// since [`CompiledRule::matches`] is defined as
     /// [`CompiledRule::first_failing_field`] returning None. The only thing
     /// added here is the reason, which cannot influence the verdict.
     ///
@@ -169,7 +181,7 @@ impl RuleSet {
         ExplainResult { matched, trace }
     }
 
-    /// True when some enabled hash-pinning rule could apply to `conn`
+    /// True when some deciding hash-pinning rule could apply to `conn`
     /// (its other criteria match), so hashing the executable can change
     /// the verdict. Keeps binary hashing off the packet path unless a
     /// hash rule is actually in play for this connection.
@@ -177,7 +189,7 @@ impl RuleSet {
         self.hash_pinning_candidates(conn).next().is_some()
     }
 
-    /// Names of enabled rules that `conn` satisfies in every field except
+    /// Names of deciding rules that `conn` satisfies in every field except
     /// the executable hash, which it has and which does not match, at most
     /// `max` of them in evaluation order.
     ///
@@ -212,7 +224,7 @@ impl RuleSet {
             .collect()
     }
 
-    /// Enabled rules whose hash operand is the only thing standing between
+    /// Deciding rules whose hash operand is the only thing standing between
     /// `conn` and their verdict, in evaluation order.
     ///
     /// One definition for two questions the packet path and the prompt path
@@ -220,6 +232,14 @@ impl RuleSet {
     /// connection" and "which rules did the hash it produced miss". Written
     /// twice, a prompt could name rules the engine never consulted, or stay
     /// silent about the ones it did.
+    ///
+    /// [`CompiledRule::deciding`], not `enabled`, and for the same reason
+    /// [`RuleSet::match_conn`] filters on it: a rule a lockdown posture
+    /// suppresses decides nothing, so hashing a binary on its account is
+    /// work the verdict cannot use, and naming it as a hash mismatch would
+    /// point the operator at a rule that never looked at their binary. It is
+    /// also what the `has_hash_rules` gate above is computed over, and the
+    /// gate and the filter have to ask the same question.
     fn hash_pinning_candidates<'a>(
         &'a self,
         conn: &'a Connection,
@@ -228,9 +248,8 @@ impl RuleSet {
         // it costs neither path a scan to find that out.
         self.has_hash_rules
             .then(|| {
-                self.rules.iter().filter(move |r| {
-                    r.enabled && r.wants_exe_hash() && r.matches_ignoring_hash(conn)
-                })
+                self.deciding_rules()
+                    .filter(move |r| r.wants_exe_hash() && r.matches_ignoring_hash(conn))
             })
             .into_iter()
             .flatten()
@@ -271,6 +290,25 @@ mod tests {
             enabled,
             tags: Vec::new(),
             matcher: m,
+        }
+    }
+
+    /// An allow rule that pins `/usr/bin/curl` to the `"ab".repeat(32)`
+    /// binary, the shape every hash-path test builds.
+    fn pinned(name: &str, priority: u32, enabled: bool, tags: &[&str]) -> Rule {
+        Rule {
+            tags: tags.iter().map(|t| (*t).to_string()).collect(),
+            ..rule(
+                name,
+                Action::Allow,
+                priority,
+                enabled,
+                RuleMatch {
+                    exe: Some(PathBuf::from("/usr/bin/curl")),
+                    exe_sha256: Some("ab".repeat(32)),
+                    ..Default::default()
+                },
+            )
         }
     }
 
@@ -732,23 +770,10 @@ mod tests {
     /// for this program and the binary running now is not the one it pins.
     #[test]
     fn hash_mismatch_rules_names_the_rules_the_binary_missed() {
-        let pinned = |name: &str, priority: u32, enabled: bool| {
-            rule(
-                name,
-                Action::Allow,
-                priority,
-                enabled,
-                RuleMatch {
-                    exe: Some(PathBuf::from("/usr/bin/curl")),
-                    exe_sha256: Some("ab".repeat(32)),
-                    ..Default::default()
-                },
-            )
-        };
         let rules = vec![
-            pinned("pin-high", 10, true),
-            pinned("pin-low", 1, true),
-            pinned("pin-off", 20, false),
+            pinned("pin-high", 10, true, &[]),
+            pinned("pin-low", 1, true, &[]),
+            pinned("pin-off", 20, false, &[]),
             // Pins a hash but is not about this program at all.
             rule(
                 "other-exe",
@@ -823,6 +848,54 @@ mod tests {
         assert!(set
             .hash_mismatch_rules(&wget, Some(&other_hash), 4)
             .is_empty());
+    }
+
+    /// A rule a lockdown posture suppresses decides nothing, so it must not
+    /// pull a binary onto the hashing path or be named as a hash the
+    /// operator's binary missed. Both questions read
+    /// `hash_pinning_candidates`, and both used to filter on `enabled`
+    /// alone while the `has_hash_rules` gate beside them already filtered
+    /// on `deciding()` - so one deciding pin was enough to let every
+    /// suppressed pin in the set back into the answer.
+    #[test]
+    fn a_suppressed_pin_neither_hashes_nor_is_named() {
+        let other_hash = "cd".repeat(32);
+
+        // Posture pins `keep`, so `drop-me` is suppressed while it is on.
+        let rules = vec![
+            pinned("keep", 10, true, &["keep"]),
+            pinned("drop-me", 10, true, &[]),
+        ];
+        let posture = vec!["keep".to_string()];
+        let set = RuleSet::compile_with_lockdown(&rules, Some(&posture));
+        assert_eq!(set.suppressed_count(), 1);
+        assert_eq!(
+            set.hash_mismatch_rules(&curl(), Some(&other_hash), 4),
+            ["keep"],
+            "only the rule the posture still lets decide is named"
+        );
+
+        // With every pin suppressed there is nothing a hash can change, so
+        // the packet path must not read the binary at all.
+        let all_suppressed =
+            RuleSet::compile_with_lockdown(&rules, Some(&["unrelated".to_string()]));
+        assert_eq!(all_suppressed.suppressed_count(), 2);
+        assert!(
+            !all_suppressed.wants_exe_hash_for(&curl()),
+            "a posture that suppresses every pin takes hashing off the packet path"
+        );
+        assert!(all_suppressed
+            .hash_mismatch_rules(&curl(), Some(&other_hash), 4)
+            .is_empty());
+
+        // The same set with no posture in force answers for both rules.
+        let unlocked = RuleSet::compile(&rules);
+        assert_eq!(
+            unlocked.hash_mismatch_rules(&curl(), Some(&other_hash), 4),
+            ["drop-me", "keep"],
+            "ties break by name, and nothing is suppressed"
+        );
+        assert!(unlocked.wants_exe_hash_for(&curl()));
     }
 
     /// A set with no hash-pinning rule in it has nothing to say about a
