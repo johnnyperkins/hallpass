@@ -107,6 +107,10 @@ impl RunSession {
 #[derive(Debug)]
 pub struct SessionRegistry {
     active: ArcSwap<Vec<Arc<RunSession>>>,
+    // Locked with poison recovery for the reason the event history
+    // documents: no verdict is decided under it, and propagating a past
+    // panic would refuse every future session over a failure already
+    // contained.
     writers: Mutex<()>,
     next_id: AtomicU64,
 }

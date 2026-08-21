@@ -67,6 +67,9 @@ pub fn nla(kind: u16, payload: &[u8]) -> Vec<u8> {
         payload.len()
     );
     let mut out = Vec::with_capacity(align4(len));
+    // Native-endian on purpose: netlink headers are host byte order, not
+    // network order - only attribute *payloads* with a CTA_*/NFQA_* type
+    // documented as big-endian get to_be_bytes at their call sites.
     out.extend_from_slice(&(len as u16).to_ne_bytes());
     out.extend_from_slice(&kind.to_ne_bytes());
     out.extend_from_slice(payload);
