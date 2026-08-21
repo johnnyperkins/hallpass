@@ -495,6 +495,20 @@ carries what an upgrade changes on a running host.
 
 ### Fixed
 
+- **`max_pending_prompts` above 512 is now rejected at config load.** The
+  per-client IPC queue holds 512 messages, and a reconnecting prompt handler
+  is re-sent every pending prompt into it in one sweep: a deeper pending
+  table silently dropped the overflow, and those prompts sat invisible until
+  their timeouts applied `default_verdict`. A config that set a larger value
+  was buying capacity that was never really there; it now fails validation
+  and the daemon says so at startup instead.
+- **Hashing an executable could be stalled by growing the file mid-read.**
+  The size cap was checked before an uncapped read-to-EOF, so a process
+  appending to its own binary during the hash kept the packet-decision
+  thread reading for as long as the writer kept writing - a stalled packet
+  for every other connection on the host. The read itself is now capped; a
+  file that outgrows its metadata mid-read is refused like the size check
+  refuses it.
 - **A prompt rule that pinned a binary hash resolved no other prompts.**
   Answering one of several stacked prompts for the same application with
   "allow, forever, this app anywhere" and the pin ticked wrote the rule but
