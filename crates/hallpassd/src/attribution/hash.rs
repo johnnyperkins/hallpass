@@ -153,7 +153,27 @@ impl ExeHashCache {
         let mut hasher = Sha256::new();
         // A read that fails part way is not cached: it is a transient
         // failure, not a decision about this file.
-        std::io::copy(&mut file, &mut hasher).ok()?;
+        //
+        // The read is capped even though the size was just checked: the fd
+        // stays writable by the file's owner, and copy-to-EOF on a file
+        // being appended to would keep the verdict thread reading for as
+        // long as the writer keeps writing. A file that outgrew its
+        // metadata mid-read is refused like the size check refuses it, and
+        // not cached: the growth moved ctime, so this FileId no longer
+        // describes the file anyway.
+        let copied = std::io::copy(
+            &mut std::io::Read::take(&mut file, self.max_bytes + 1),
+            &mut hasher,
+        )
+        .ok()?;
+        if copied > self.max_bytes {
+            tracing::warn!(
+                bytes = copied,
+                "executable grew past the hashing cap while being hashed; \
+                 refusing the hash"
+            );
+            return None;
+        }
         let hex = format!("{:x}", hasher.finalize());
         self.entries.lock().unwrap().put(id, Some(hex.clone()));
         Some(hex)
