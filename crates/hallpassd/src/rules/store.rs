@@ -615,14 +615,19 @@ impl RuleStore {
         self.active.load_full()
     }
 
+    /// The loaded rules, recovering a poisoned lock. Poison here cannot
+    /// reach a verdict - the packet path reads the ArcSwap snapshot - but
+    /// propagating it would leave every later rule operation panicking in
+    /// turn: policy frozen until restart over a panic that already
+    /// happened. The entries are consistent at every await-free point a
+    /// panic can interrupt, so recovering them is strictly better.
+    fn lock_entries(&self) -> std::sync::MutexGuard<'_, Vec<Entry>> {
+        self.entries.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// All rules, for `RuleList` replies.
     pub fn list(&self) -> Vec<Rule> {
-        self.entries
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|e| e.rule.clone())
-            .collect()
+        self.lock_entries().iter().map(|e| e.rule.clone()).collect()
     }
 
     /// Count one connection decided by the rule named `name`.
@@ -667,7 +672,7 @@ impl RuleStore {
     /// rather than being omitted, since "this rule has never matched" is the
     /// interesting answer.
     pub fn hits(&self) -> Vec<hallpass_types::RuleHit> {
-        let entries = self.entries.lock().unwrap();
+        let entries = self.lock_entries();
         let map = self.hits.read().unwrap_or_else(|e| e.into_inner());
         entries
             .iter()
@@ -725,7 +730,7 @@ impl RuleStore {
         // Persist while holding the entries lock: the directory watcher's
         // reload_disk() takes the same lock, so it cannot observe the new
         // file before this add lands in `entries`.
-        let mut entries = self.entries.lock().unwrap();
+        let mut entries = self.lock_entries();
         // One lookup serves both the cap exemption and the replacement
         // below; persist() takes the entries as a shared slice, so nothing
         // between here and the remove() can shift the position.
@@ -765,7 +770,7 @@ impl RuleStore {
 
     /// Delete a rule by name, removing its file if persisted.
     pub fn delete(&self, name: &str) -> Result<(), String> {
-        let mut entries = self.entries.lock().unwrap();
+        let mut entries = self.lock_entries();
         let pos = entries
             .iter()
             .position(|e| e.rule.name == name)
@@ -809,7 +814,7 @@ impl RuleStore {
         enabled: bool,
         select: impl Fn(&Rule) -> bool,
     ) -> (usize, u32, Vec<(String, String)>) {
-        let mut entries = self.entries.lock().unwrap();
+        let mut entries = self.lock_entries();
         let mut matched = 0usize;
         let mut changed = 0u32;
         let mut failed = Vec::new();
@@ -877,7 +882,7 @@ impl RuleStore {
     /// second, which bounds how long an expired rule can keep matching.
     pub fn sweep_expired(&self) -> bool {
         let now = hallpass_types::unix_ms_now();
-        let mut entries = self.entries.lock().unwrap();
+        let mut entries = self.lock_entries();
         let before = entries.len();
         // File removal happens under the lock; see delete() for the
         // watcher race this avoids.
@@ -925,7 +930,7 @@ impl RuleStore {
             );
             return false;
         }
-        let mut entries = self.entries.lock().unwrap();
+        let mut entries = self.lock_entries();
         // Taken under the lock, so no further write can start before this
         // decision. A scan that straddled one describes a directory that
         // never existed at any instant - half a bulk toggle written, half
