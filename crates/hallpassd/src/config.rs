@@ -464,6 +464,15 @@ impl Config {
         if self.max_pending_prompts == 0 {
             return Err("max_pending_prompts must be at least 1".into());
         }
+        // A reconnecting prompt handler is re-sent every pending prompt
+        // into its per-client queue in one sweep; a pending table deeper
+        // than that queue would silently drop the overflow.
+        if self.max_pending_prompts > crate::ipc::server::OUT_QUEUE_CAP {
+            return Err(format!(
+                "max_pending_prompts must be at most {}",
+                crate::ipc::server::OUT_QUEUE_CAP
+            ));
+        }
         if self.queue_num == u16::MAX {
             // queue_num + 1 is the DNS snoop queue.
             return Err(format!("queue_num must be below {}", u16::MAX));
@@ -643,6 +652,8 @@ mod tests {
         assert!(parse("prompt_timeout_secs = 0").validate().is_err());
         assert!(parse("prompt_timeout_secs = 3601").validate().is_err());
         assert!(parse("max_pending_prompts = 0").validate().is_err());
+        assert!(parse("max_pending_prompts = 513").validate().is_err());
+        assert!(parse("max_pending_prompts = 512").validate().is_ok());
         assert!(parse("queue_num = 65535").validate().is_err());
         assert!(parse("").validate().is_ok());
 

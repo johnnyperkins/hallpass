@@ -312,7 +312,12 @@ const ACCEPT_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis
 /// Per-client outbound queue depth. Bounded so a client that stops
 /// reading cannot grow daemon memory; events are dropped when full and
 /// prompt delivery falls back to the timeout default.
-const OUT_QUEUE_CAP: usize = 512;
+///
+/// Also the ceiling for `max_pending_prompts` (enforced by config
+/// validation): a handler that reconnects is re-sent every pending prompt
+/// into this queue in one sweep, so a pending table deeper than the queue
+/// would drop the overflow silently until their timeouts.
+pub(crate) const OUT_QUEUE_CAP: usize = 512;
 
 async fn handle_conn(
     stream: UnixStream,
