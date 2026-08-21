@@ -142,6 +142,21 @@ for baseline in etc/rules.d/20-system-*.toml; do
     echo "    rule of its own or it is blocked. Copy the file and edit the path."
     continue
   fi
+  if [ "$real" != "$exe" ]; then
+    # The resolved path lands inside a TOML basic string via a sed
+    # replacement, and each layer has characters it cannot carry: " and
+    # backslash break the TOML string, | and & break the sed expression.
+    # Backslash and & could be escaped for sed, but not for TOML, so a
+    # path containing any of them is skipped whole rather than installed
+    # pointing at a path the daemon will never report.
+    case $real in
+      *'"'* | *'\'* | *'|'* | *'&'*)
+        echo "  skipping $name: resolved path $real cannot be written into" >&2
+        echo "    the rule file verbatim. Copy the file and edit the path." >&2
+        continue
+        ;;
+    esac
+  fi
   install -m644 "$baseline" "$target"
   if [ "$real" != "$exe" ]; then
     sed -i "s|^exe = \".*\"\$|exe = \"$real\"|" "$target"
