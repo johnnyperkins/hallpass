@@ -804,7 +804,16 @@ pub(super) const MAX_CMDLINE_BYTES: usize = 4096;
 pub(super) fn read_proc_details(proc_root: &Path, pid: u32) -> (Option<PathBuf>, Option<String>) {
     let base = proc_root.join(pid.to_string());
     let exe = std::fs::read_link(base.join("exe")).ok();
-    let cmdline = std::fs::read(base.join("cmdline")).ok().and_then(|raw| {
+    // Read a bounded prefix, not the whole file: argv can run to ARG_MAX
+    // (megabytes) and everything past the cap is cut by truncate_cmdline
+    // anyway. Twice the cap so the argv has to be half NUL padding before
+    // a cut prefix could come out shorter than the cap and miss the
+    // truncation marker.
+    let cmdline = std::fs::File::open(base.join("cmdline")).ok().and_then(|f| {
+        let mut raw = Vec::new();
+        f.take(2 * MAX_CMDLINE_BYTES as u64)
+            .read_to_end(&mut raw)
+            .ok()?;
         let joined = raw
             .split(|b| *b == 0)
             .filter(|part| !part.is_empty())
