@@ -391,7 +391,7 @@ fn queue_check(
         (Some(d), None) => format!("depth {d}"),
         (None, _) => "depth unavailable".into(),
     };
-    let lost = dropped.unwrap_or(0) + user_dropped.unwrap_or(0);
+    let lost = dropped.unwrap_or(0).saturating_add(user_dropped.unwrap_or(0));
     if lost > 0 {
         checks.push(Check::new(
             name,
