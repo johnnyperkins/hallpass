@@ -530,6 +530,7 @@ pub fn run(mut queue: Queue, queue_num: u16, mut deps: QueueDeps) -> std::io::Re
     // do not "fix" this into a wrapping counter that could collide live keys.
     let mut next_seq: u64 = 0;
     let mut recv_errors: u32 = 0;
+    let mut prompt_send_failures: u64 = 0;
     let mut fatal: Option<std::io::Error> = None;
     // Out of `deps` so `decide` can take it mutably while the rest of the
     // deps are borrowed for the context it reads. Dropped when this function
@@ -765,7 +766,21 @@ pub fn run(mut queue: Queue, queue_num: u16, mut deps: QueueDeps) -> std::io::Re
                         {
                             held.insert(seq, msg);
                         } else {
-                            // Prompt path gone (shutdown); fail open.
+                            // Prompt path gone. At shutdown that is expected;
+                            // any other way for the channel to close is the
+                            // prompt task dying, after which every unmatched
+                            // packet is allowed - which must not happen in
+                            // silence. Log rate-limited: the failure repeats
+                            // per packet until the daemon restarts.
+                            prompt_send_failures += 1;
+                            if prompt_send_failures.is_power_of_two() {
+                                tracing::warn!(
+                                    failures = prompt_send_failures,
+                                    "prompt channel closed; allowing unmatched \
+                                     connections without prompting (expected \
+                                     only at shutdown)"
+                                );
+                            }
                             apply_verdict(&mut queue, msg, Verdict::Allow);
                         }
                     }
