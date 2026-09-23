@@ -13,6 +13,9 @@ mod net;
 mod notify;
 mod prompt;
 mod prompt_view;
+// Used by the prompt agent, which lands in a following commit.
+#[cfg_attr(not(test), expect(dead_code))]
+mod router;
 mod theme;
 mod traffic;
 mod tray;
