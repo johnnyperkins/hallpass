@@ -257,6 +257,13 @@ pub struct HallpassApp {
     /// events rather than this window's frame.
     prompts: Arc<Mutex<PromptBoard>>,
     events: VecDeque<ConnEvent>,
+    /// Keys of the last history backfill that have not yet come in live.
+    ///
+    /// The daemon writes a reply ahead of pushed events already waiting for
+    /// this client, so events emitted between Subscribe and the history
+    /// snapshot arrive after the backfill that already holds them. Each is
+    /// dropped once, here, instead of being shown and counted twice.
+    history_keys: std::collections::HashSet<EventKey>,
     rules: Vec<Rule>,
     /// None until the daemon has answered once.
     ///
@@ -392,6 +399,7 @@ impl HallpassApp {
             tab: Tab::Events,
             prompts: Arc::new(Mutex::new(PromptBoard::default())),
             events: VecDeque::new(),
+            history_keys: std::collections::HashSet::new(),
             rules: Vec::new(),
             stats: None,
             last_error: None,
@@ -501,6 +509,7 @@ impl HallpassApp {
                 UiEvent::Connected => {
                     self.status = ConnStatus::Connected;
                     self.last_error = None;
+                    self.history_keys.clear();
                     // A count from before the reconnect describes a daemon
                     // this one has not spoken to.
                     self.rules_notice = None;
@@ -602,7 +611,11 @@ impl HallpassApp {
             DaemonMsg::PromptExpired { id } => {
                 self.prompts.lock().unwrap().pending.retain(|p| p.id != id);
             }
-            DaemonMsg::Event(ev) => self.push_event(ev),
+            DaemonMsg::Event(ev) => {
+                if !self.history_keys.remove(&event_key(&ev)) {
+                    self.push_event(ev);
+                }
+            }
             // Backfill from the daemon's short history, so a window opened
             // after the traffic shows what already happened instead of an
             // apparently idle machine. Oldest first, same order as the live
@@ -615,9 +628,14 @@ impl HallpassApp {
                 // from this ring each frame.
                 let held: std::collections::HashSet<EventKey> =
                     self.events.iter().map(event_key).collect();
+                self.history_keys.clear();
                 for ev in events {
-                    if !held.contains(&event_key(&ev)) {
+                    let key = event_key(&ev);
+                    if !held.contains(&key) {
                         self.push_event(ev);
+                        // Not yet seen live: its live copy may still be on
+                        // the way (see `history_keys`).
+                        self.history_keys.insert(key);
                     }
                 }
             }

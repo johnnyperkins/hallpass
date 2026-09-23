@@ -707,6 +707,26 @@ fn a_live_event_is_not_re_added_by_the_backfill() {
     assert_eq!(t.app.events.len(), 2);
 }
 
+/// The other order: the daemon writes the history reply ahead of pushed
+/// events already queued for this client, so an event the backfill holds
+/// can arrive live after it. It is shown once.
+#[test]
+fn a_live_event_the_backfill_already_held_is_not_added_again() {
+    let mut t = TestApp::new();
+    let first = event("/usr/bin/curl", "1.1.1.1:443", 1_000);
+    let queued = event("/usr/bin/curl", "1.1.1.2:443", 2_000);
+    t.daemon(DaemonMsg::Events(vec![first, queued.clone()]));
+    t.daemon(DaemonMsg::Event(queued.clone()));
+    assert_eq!(
+        t.app.events.len(),
+        2,
+        "the queued live copy was added again"
+    );
+    // Only once: a later decision on the same key is a new one.
+    t.daemon(DaemonMsg::Event(queued));
+    assert_eq!(t.app.events.len(), 3);
+}
+
 /// Replay detection must not swallow genuinely distinct decisions. Identity
 /// is the decision itself: when it happened, which flow, and what was
 /// decided.
