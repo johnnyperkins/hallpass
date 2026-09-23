@@ -27,14 +27,24 @@ use crate::stats::Counters;
 /// Priority given to rules created from prompt replies.
 const PROMPT_RULE_PRIORITY: u32 = 50;
 
-/// Coalescing key: (exe, app id, proto, dst ip, dst port). The protocol is
-/// part of it because a TCP and a UDP flow to the same ip:port (e.g. HTTPS
+/// Coalescing key: (uid, exe, app id, proto, dst ip, dst port). The protocol
+/// is part of it because a TCP and a UDP flow to the same ip:port (e.g. HTTPS
 /// and QUIC) are different requests; one prompt must not answer both. The
 /// application is part of it for the same reason the generated rule pins it
 /// ([`rule_from_reply`]): a sandboxed application's executable path is
 /// shared by every application of that packaging system, so exe alone would
-/// let one dialog answer for two of them.
-type Key = (Option<PathBuf>, Option<String>, Proto, IpAddr, u16);
+/// let one dialog answer for two of them. The user is part of it because
+/// the dialog shows the first connection's uid and command line: another
+/// user's connection from the same binary joined it unseen and was released
+/// by an answer given about someone else's, `Once` included.
+type Key = (
+    Option<u32>,
+    Option<PathBuf>,
+    Option<String>,
+    Proto,
+    IpAddr,
+    u16,
+);
 
 struct Pending {
     key: Key,
@@ -270,6 +280,7 @@ impl PromptTable {
             return;
         }
         let key: Key = (
+            conn.uid,
             conn.exe_path.clone(),
             conn.app_id.clone(),
             conn.tuple.proto,
@@ -876,8 +887,14 @@ fn rule_from_reply(
     // application either way. A deny stays exe-only and therefore covers
     // every application sharing that sandbox path, which is the direction a
     // block should err in.
+    //
+    // The user follows the same rule for the same reasons. The operator
+    // answered about one user's process; an allow that also covered every
+    // other account running that binary is a grant nobody was shown, and a
+    // deny that stopped at one account would leave the rest to the default.
     if verdict == Verdict::Allow {
         matcher.app_id = conn.app_id.clone();
+        matcher.user = conn.uid;
     }
     // The operator approved these bytes rather than this name. An exe path is
     // not an identity: an allow granted to something under a home directory or
@@ -895,9 +912,14 @@ fn rule_from_reply(
         matcher.exe_sha256 = pin_sha256.map(str::to_string);
     }
     match scope {
+        // With the protocol: a port number means nothing without one, and the
+        // prompt was about one (the coalescing key already keeps TCP and UDP
+        // apart). Without it an answer about HTTPS on 443 also allowed QUIC
+        // on 443, for good, and resolved a pending UDP prompt with it.
         PromptScope::ThisPort => {
             matcher.dest = Some(dst.ip().to_string());
             matcher.port = Some(dst.port());
+            matcher.proto = Some(conn.tuple.proto);
         }
         PromptScope::ThisHost => {
             matcher.dest = Some(dst.ip().to_string());
@@ -1272,6 +1294,27 @@ mod tests {
         );
         // The exe criterion keeps the real path: only the name is reduced.
         assert_eq!(rule.matcher.exe, Some(PathBuf::from(hostile)));
+    }
+
+    /// A port answer names its protocol, and an allow names the user it was
+    /// given for; a deny keeps covering every account.
+    #[test]
+    fn answered_rules_carry_the_protocol_and_an_allow_the_user() {
+        let c = conn("/usr/bin/curl", "1.1.1.1:443");
+        let rule = |verdict, scope| {
+            rule_from_reply("abc", 1, &c, verdict, RuleDuration::Forever, scope, None).unwrap()
+        };
+        let allow = rule(Verdict::Allow, PromptScope::ThisPort);
+        assert_eq!(allow.matcher.proto, Some(Proto::Tcp));
+        assert_eq!(allow.matcher.user, Some(1000));
+        let deny = rule(Verdict::Deny, PromptScope::ThisPort);
+        assert_eq!(deny.matcher.proto, Some(Proto::Tcp));
+        assert_eq!(deny.matcher.user, None);
+        // No port, no protocol: the host answer covers both.
+        assert_eq!(
+            rule(Verdict::Allow, PromptScope::ThisHost).matcher.proto,
+            None
+        );
     }
 
     /// **A path is not an identity.** An allow the operator granted to
