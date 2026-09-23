@@ -147,6 +147,15 @@ impl SessionError {
     }
 }
 
+/// Aborts the task it holds when dropped.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// One connection attempt + serve loop.
 ///
 /// Returns `Ok(())` only when the UI side has shut down. Any socket-level
@@ -209,10 +218,30 @@ async fn connect_and_serve(
         handshaken: true,
         message,
     };
+    // Reads happen on their own task. `read_msg` is not cancel-safe: raced
+    // in the select below, it was dropped whenever the UI had something to
+    // send while a frame was arriving, the bytes it had already consumed were
+    // lost, and the rest of the connection was decoded from the middle of a
+    // frame. That broke the session and emptied the prompt slot at exactly
+    // the moment the replies were largest (the rule list and history on
+    // connect). The task ends with the connection, or when this function
+    // returns and the guard aborts it.
+    let (in_tx, mut incoming) = tokio::sync::mpsc::channel(16);
+    let _reads = AbortOnDrop(tokio::spawn(async move {
+        loop {
+            let msg = read_msg::<DaemonMsg, _>(&mut reader).await;
+            let stop = msg.is_err();
+            if in_tx.send(msg).await.is_err() || stop {
+                break;
+            }
+        }
+    }));
     loop {
         tokio::select! {
-            incoming = read_msg::<DaemonMsg, _>(&mut reader) => {
-                let msg = incoming.map_err(|e| fail(format!("read: {e}")))?;
+            incoming = incoming.recv() => {
+                let msg = incoming
+                    .ok_or_else(|| fail("reader stopped".into()))?
+                    .map_err(|e| fail(format!("read: {e}")))?;
                 // Tee the prompt lifecycle to the notifier before the UI:
                 // the UI channel is only drained while the main window
                 // paints, and the banner exists for when it does not.
