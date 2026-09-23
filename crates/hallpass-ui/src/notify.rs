@@ -1,24 +1,23 @@
 //! Desktop notifications for prompt arrivals.
 //!
-//! The popup viewports cannot interrupt an operator who is working in
-//! another application: window birth needs a main-window pass (which an
-//! occluded main window may not run for seconds), and the compositor
-//! decides whether a new window gets focus at all. A desktop
-//! notification is the platform's sanctioned interrupt: it renders over
-//! whatever is focused, immediately, from any thread, with no egui pass
-//! involved. So this module runs on its own thread and hears about
-//! prompts straight from the network thread, not from the UI frame.
+//! A prompt window cannot interrupt an operator who is working in
+//! another application: it takes a process start to appear, and the
+//! compositor decides whether a new window gets focus or stays on top at
+//! all (on Wayland, never on top). A desktop notification is the
+//! platform's sanctioned interrupt: it renders over whatever is focused,
+//! immediately, from any thread. So this module runs on its own thread in
+//! the agent and hears about prompts straight from the network thread.
 //!
 //! Its state derives from the message streams alone: an inbound
 //! `PromptRequest` opens or updates a banner, an inbound `PromptExpired`
 //! or an outbound `PromptReply` retires the id, and a disconnect retires
 //! everything (the daemon re-issues surviving prompts on reconnect).
-//! Deriving from the streams rather than sharing the popup board keeps
+//! Deriving from the streams rather than sharing the agent's router keeps
 //! this from becoming one more hand-synced copy of "what is pending".
 //!
 //! Deliberately absent: Allow/Deny actions on the banner. A verdict
-//! deserves the full context the popup shows (path, command line, the
-//! pending list), not a decision made from a two-line banner that the
+//! deserves the full context the prompt window shows (path, command line,
+//! the pending list), not a decision made from a two-line banner that the
 //! lock screen may also display.
 
 use std::collections::HashMap;
@@ -50,24 +49,26 @@ pub enum NotifyEvent {
 /// Most application groups with a live banner at once. The daemon's
 /// pending-prompt table is the real bound; this is a local backstop so a
 /// misbehaving stream cannot grow the map. Past the cap a new group gets
-/// no banner, which costs awareness of that group only, never a verdict,
-/// and the popup path still shows it.
+/// no banner, which costs awareness of that group only, never a verdict:
+/// the prompt still goes to its window.
 const MAX_BANNER_GROUPS: usize = 64;
 
-/// One banner per application, like the popup windows: a browser at
-/// startup is one banner with a count, not a stack. Unattributed prompts
-/// are not grouped, for the same reason their popups are not: two
-/// unattributed programs are not "the same app".
+/// One banner per application, keyed as the prompt windows are
+/// (executable, application id): a browser at startup is one banner with a
+/// count, not a stack, and two packaged applications running one path are
+/// two banners, as they are two windows. Unattributed prompts are not
+/// grouped, for the same reason their windows are not: two unattributed
+/// programs are not "the same app".
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum Key {
-    App(PathBuf),
+    App(PathBuf, Option<String>),
     Anon(u64),
 }
 
 impl Key {
     fn of(conn: &Connection, id: u64) -> Key {
         match &conn.exe_path {
-            Some(exe) => Key::App(exe.clone()),
+            Some(exe) => Key::App(exe.clone(), conn.app_id.clone()),
             None => Key::Anon(id),
         }
     }
@@ -115,8 +116,8 @@ fn escape_markup(s: &str) -> String {
 
 /// Banner text for a group: newest last, the front prompt named, the
 /// rest counted. Every field is chosen by the process being judged, so
-/// everything goes through the same sanitizers the popup uses, plus the
-/// markup escape.
+/// everything goes through the same sanitizers the prompt window uses,
+/// plus the markup escape.
 fn banner_text(entries: &[Entry]) -> (String, String) {
     let front = &entries[0];
     let name = escape_markup(&prompt::exe_name(&front.conn));
@@ -127,11 +128,11 @@ fn banner_text(entries: &[Entry]) -> (String, String) {
     // that distinguishes a prompt worth walking back to the keyboard for.
     //
     // Across the whole group, not just the front entry: a group is keyed on
-    // the executable alone, so a prompt for a destination this program has
-    // never reached coalesces behind a routine one from the same program.
-    // Reading only the front would drop the marker for exactly the prompt
-    // that earned it, in the one situation the banner exists for - the
-    // operator is not looking at the screen.
+    // the application, not the destination, so a prompt for a destination
+    // this program has never reached coalesces behind a routine one from
+    // the same program. Reading only the front would drop the marker for
+    // exactly the prompt that earned it, in the one situation the banner
+    // exists for - the operator is not looking at the screen.
     let anything_new = entries
         .iter()
         .any(|e| e.conn.first_seen.and_then(|f| f.tag()).is_some());
@@ -183,7 +184,7 @@ impl<S: Sink> Tracker<S> {
         let key = Key::of(&conn, id);
         if !self.groups.contains_key(&key) && self.groups.len() >= MAX_BANNER_GROUPS {
             tracing::warn!(
-                "banner group cap reached; not raising a notification (popup still shows)"
+                "banner group cap reached; not raising a notification (the prompt window is unaffected)"
             );
             return;
         }
@@ -244,7 +245,7 @@ impl<S: Sink> Tracker<S> {
 }
 
 /// The DBus-backed sink. A missing notification daemon degrades to the
-/// popup path alone: warned once, then quiet, and never a failure the
+/// prompt windows alone: warned once, then quiet, and never a failure the
 /// prompt flow can see.
 struct DbusSink {
     warned: bool,
@@ -374,10 +375,10 @@ mod tests {
 
     /// The banner exists for the operator who is not looking at the screen,
     /// so the NEW marker has to survive coalescing. Groups are keyed on the
-    /// executable alone: a prompt for a destination this program has never
-    /// reached lands behind a routine one from the same program, and reading
-    /// only the front entry dropped the marker for exactly the prompt that
-    /// earned it.
+    /// application, not the destination: a prompt for a destination this
+    /// program has never reached lands behind a routine one from the same
+    /// program, and reading only the front entry dropped the marker for
+    /// exactly the prompt that earned it.
     #[test]
     fn a_new_prompt_behind_a_routine_one_still_marks_the_banner() {
         let routine = Entry {
@@ -483,8 +484,35 @@ mod tests {
         assert!(t.groups.is_empty());
     }
 
+    /// Two packaged applications running one path are two prompt windows,
+    /// so they are two banners: merged, one would name the other's prompts
+    /// in its count.
+    #[test]
+    fn one_path_under_two_app_ids_is_two_banners() {
+        let mut t = tracker();
+        for (id, app) in [(1, "flatpak:org.example.A"), (2, "flatpak:org.example.B")] {
+            let mut c = conn(Some("/app/bin/tool"), None);
+            c.app_id = Some(app.into());
+            t.handle(
+                NotifyEvent::Request {
+                    id,
+                    conn: Box::new(c),
+                    deadline_ms: 40_000,
+                },
+                10_000,
+            );
+        }
+        let shows = t
+            .sink
+            .calls
+            .iter()
+            .filter(|c| matches!(c, Call::Show(..)))
+            .count();
+        assert_eq!(shows, 2, "{:?}", t.sink.calls);
+    }
+
     /// Unattributed prompts are separate banners, same reasoning as
-    /// their popups: two unattributed programs are not "the same app".
+    /// their windows: two unattributed programs are not "the same app".
     #[test]
     fn anonymous_prompts_are_not_grouped() {
         let mut t = tracker();
@@ -529,7 +557,7 @@ mod tests {
     }
 
     /// Past the group cap new groups get no banner: awareness loss for
-    /// that group only, never a verdict, and the popup still shows.
+    /// that group only, never a verdict, and the prompt window still shows.
     #[test]
     fn group_cap_drops_new_banners_not_old_ones() {
         let mut t = tracker();
