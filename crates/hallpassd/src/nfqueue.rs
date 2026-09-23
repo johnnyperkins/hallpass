@@ -863,33 +863,43 @@ pub fn run(mut queue: Queue, queue_num: u16, mut deps: QueueDeps) -> std::io::Re
                                 .then(|| deps.exe_hash.for_connection(&conn, exe.id))
                                 .flatten()
                         });
-                        if deps
-                            .prompt_tx
-                            .send(PromptTask {
-                                seq,
-                                conn,
-                                exe_sha256,
-                            })
-                            .is_ok()
-                        {
-                            held.insert(seq, msg);
-                        } else {
-                            // Prompt path gone. At shutdown that is expected;
-                            // any other way for the channel to close is the
-                            // prompt task dying, after which every unmatched
-                            // packet is allowed - which must not happen in
-                            // silence. Log rate-limited: the failure repeats
-                            // per packet until the daemon restarts.
-                            prompt_send_failures += 1;
-                            if prompt_send_failures.is_power_of_two() {
-                                tracing::warn!(
-                                    failures = prompt_send_failures,
-                                    "prompt channel closed; allowing unmatched \
-                                     connections without prompting (expected \
-                                     only at shutdown)"
+                        match deps.prompt_tx.send(PromptTask {
+                            seq,
+                            conn,
+                            exe_sha256,
+                        }) {
+                            Ok(()) => {
+                                held.insert(seq, msg);
+                            }
+                            Err(unsent) => {
+                                // Prompt path gone. At shutdown that is
+                                // expected; any other way for the channel to
+                                // close is the prompt task dying, after which
+                                // every unmatched packet takes the default
+                                // verdict, as an unanswered prompt would -
+                                // which must not happen in silence. Log
+                                // rate-limited: the failure repeats per
+                                // packet until the daemon restarts.
+                                prompt_send_failures += 1;
+                                if prompt_send_failures.is_power_of_two() {
+                                    tracing::warn!(
+                                        failures = prompt_send_failures,
+                                        "prompt channel closed; unmatched connections \
+                                         take the default verdict without prompting \
+                                         (expected only at shutdown)"
+                                    );
+                                }
+                                let verdict = deps.settings.default_verdict();
+                                commit(
+                                    &mut queue,
+                                    msg,
+                                    verdict,
+                                    None,
+                                    unsent.0.conn,
+                                    &deps,
+                                    enforcing,
                                 );
                             }
-                            apply_verdict(&mut queue, msg, Verdict::Allow);
                         }
                     }
                 }
@@ -932,10 +942,14 @@ pub fn run(mut queue: Queue, queue_num: u16, mut deps: QueueDeps) -> std::io::Re
     }
 
     // Shutdown or fatal error: release anything still held so nothing
-    // hangs in the kernel, and unbind so packets stop being queued.
-    for (_, mut msg) in held.drain() {
-        msg.set_verdict(NfqVerdict::Accept);
-        let _ = queue.verdict(msg);
+    // hangs in the kernel, and unbind so packets stop being queued. Released
+    // with the default verdict, which is what their prompts would have come
+    // to: accepting them let every connection that was waiting on a question
+    // through, on the fail-closed fatal path too, where the table stays up
+    // precisely so that nothing gets through unjudged.
+    let on_exit = applied_verdict(deps.settings.default_verdict(), deps.settings.enforcing());
+    for (_, msg) in held.drain() {
+        apply_verdict(&mut queue, msg, on_exit);
     }
     if let Err(e) = queue.unbind(queue_num) {
         tracing::warn!(queue_num, "nfqueue unbind failed: {e}");
