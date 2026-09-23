@@ -5,7 +5,10 @@
 //! socket, which cannot reach `/run/hallpass` - can focus a hallpass window
 //! and type into it with XTEST, and answer a prompt or turn enforcement off
 //! (probe-confirmed 2026-09-22). A Wayland client cannot reach another
-//! client's surfaces at all.
+//! client's surfaces, and GNOME and KDE keep input injection privileged;
+//! wlroots compositors such as Sway offer a virtual keyboard and pointer to
+//! any client a sandbox's security context does not filter, and those type
+//! into whichever window has focus.
 //!
 //! Forced rather than left to winit's default, so the choice is stated and
 //! tested here and cannot drift with a library upgrade. A Wayland session

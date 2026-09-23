@@ -1,10 +1,10 @@
-//! State and pure helpers for prompt popup windows.
+//! State and pure helpers for prompt windows.
 
 use hallpass_types::{
     sanitize_for_display, ClientMsg, Connection, PromptContext, PromptScope, RuleDuration, Verdict,
 };
 
-/// State of one pending prompt popup (one immediate viewport each).
+/// State of one pending prompt, as its window holds it.
 pub struct PromptState {
     /// Prompt ID; echoed back in the reply.
     pub id: u64,
@@ -15,7 +15,7 @@ pub struct PromptState {
     /// Unix milliseconds when the prompt was received.
     pub received_ms: u64,
     /// Unix milliseconds when this prompt first became the front of its
-    /// popup window, stamped by the popup's render pass.
+    /// window, stamped by the prompt view's render pass.
     ///
     /// The progress bar drains from here rather than from `received_ms`: a
     /// prompt that queued behind another in the same window would otherwise
@@ -37,7 +37,7 @@ pub struct PromptState {
 }
 
 impl PromptState {
-    /// Create popup state with the spec defaults (Session / This port).
+    /// Create prompt state with the spec defaults (Session / This port).
     pub fn new(
         id: u64,
         conn: Connection,
@@ -83,7 +83,7 @@ impl PromptState {
     /// Whether Allow answers yet at `now_ms`: only once this prompt has been
     /// at the front of its window for [`ALLOW_ARM_MS`].
     ///
-    /// A popup comes to the front with focus, and when one prompt is
+    /// A prompt window can come up with focus, and when one prompt is
     /// answered the next takes its place in the same spot, so a click or a
     /// keypress meant for something else, or the second half of a
     /// double-click, landed on a connection nobody had read. Deny is not

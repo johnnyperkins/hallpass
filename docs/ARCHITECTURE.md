@@ -10,7 +10,7 @@ pieces fit and which of the arrangements are load-bearing.
 | --- | --- |
 | `hallpassd` | Everything privileged: the nftables ruleset, the NFQUEUE verdict loop, attribution, DNS snooping, the rule store and engine, the prompt table, the event bus, stats, syslog export, and the IPC server |
 | `hallpass-cli` | The command line client: `status`, `rules`, `events`, `top`, `watch`, plus JSON and color output |
-| `hallpass-ui` | The egui desktop app: prompt popups and a management window |
+| `hallpass-ui` | The desktop GUI: a windowless prompt agent, per-application prompt windows, and a management window, all one binary |
 | `hallpass-types` | Types shared by daemon and clients, and the wire codec |
 | `hallpass-ebpf` | The kernel-side programs: connect kprobes, exec/exit tracepoints, libc resolver uprobes |
 | `hallpass-ebpf-common` | `no_std` types shared between the kernel programs and userspace |
@@ -560,6 +560,42 @@ sweeper kills flows an explicit deny *rule* matches, and a posture denies by
 suppressing allows rather than by adding a deny, so waking it would find
 nothing to kill and read as a promise the code does not keep. Flows already
 established when a posture engages keep running.
+
+## The desktop GUI
+
+One binary, three roles, because on Wayland no toplevel can hide. The
+previous single-process GUI needed a hidden-but-live root window to keep
+prompts coming while the operator had closed it, which only X11 provides,
+and on XWayland any X client could type into it.
+
+- **`hallpass-ui agent`** holds the prompt-handler slot, the tray and the
+  notifications, and draws nothing. Everything it hears arrives on one
+  channel and is handled on one thread. It reclaims the slot after
+  `PromptHandlerRevoked`, and whenever a stats reply says nobody holds it.
+  A lock in `$XDG_RUNTIME_DIR` keeps it to one per user.
+- **`hallpass-ui prompt`** is one application's queue (executable plus app
+  id; unattributed prompts are never grouped) in its own toplevel. It has no
+  daemon connection. It is exec'd from `/proc/self/exe`, so agent and window
+  are one build even mid-upgrade, and it takes its end of a
+  `UnixStream::pair()` from stdin, then moves it off fd 0 so nothing it
+  starts inherits it.
+- **`hallpass-ui`** is the management window, an ordinary client that
+  subscribes with `prompts: false`.
+
+`router.rs` holds the rules the agent enforces, as pure bookkeeping with no
+I/O: the agent is the only authority on which prompt belongs to which
+window; a window is told to close once empty, and that close answers
+nothing; a window exits on its own only when the operator closes it, which
+denies exactly the prompts it drew, and a prompt that crossed that close is
+moved to a fresh window; a window that dies denies what it held, once; a
+window answers only for its own prompts. Each window has a writer thread
+with a write timeout, so one that stops reading is killed without stalling
+the agent, and one that ignores a close is killed after a grace period. The
+agent also expires prompts on their deadline itself, since the daemon's
+`PromptExpired` is best effort.
+
+`backend.rs` pins native Wayland whenever `WAYLAND_DISPLAY` is set and
+non-empty, and X11 only when it is the only display.
 
 ## The wire protocol
 

@@ -11,12 +11,12 @@ use hallpass_types::{ClientMsg, PromptScope, RuleDuration, Verdict};
 use crate::prompt::{self, PromptState};
 use crate::theme::{self, Tone, ALLOW_COLOR, DENY_COLOR, MUTED, REJECT_COLOR, TEXT};
 
-/// Body of a single prompt popup: the app's oldest pending prompt, plus
+/// Body of a prompt window: the app's oldest pending prompt, plus
 /// its other pending destinations (`rest`), which a host- or app-wide
 /// answer will cover in the same stroke.
 ///
 /// Split into a bottom action panel and a scrolling info body, in that
-/// order, because the viewport is a fixed 440x330 and every info line
+/// order, because the window is a fixed 440x330 and every info line
 /// (path, command line, resolved names) is text the judged process
 /// chose: stacked in one column, enough of it pushed Allow and Deny out
 /// of the window, an unanswerable prompt an adversary can construct.

@@ -330,22 +330,38 @@ carries what an upgrade changes on a running host.
   config.toml stays the operator's file. `--observe` disables enforcement
   host-wide and therefore requires `--yes`.
 
-- **Tray icon and close-to-tray for the UI.** hallpass-ui now shows a
-  status icon (StatusNotifierItem; on stock GNOME this needs the
-  AppIndicator extension, which Ubuntu ships enabled). Closing the main
-  window parks it behind the icon instead of quitting, so prompts keep
-  appearing while the window is out of the way; the icon's menu (or a
-  click on it) brings the window back. Quit (the status-bar button or the
-  tray menu item) still denies open prompts once, releases the
-  prompt-handler slot, and exits. The installed autostart entry now
-  launches `hallpass-ui --hidden`, so login gets a prompt surface with no
-  window in the way; the app-menu entry still opens the window. On a
-  session where the icon cannot exist (no StatusNotifier host, or no X11
-  display), closing the window quits exactly as before - the window is
-  never parked somewhere it cannot be recovered from.
+- **Tray icon for the UI.** The prompt agent shows a status icon
+  (StatusNotifierItem; on stock GNOME this needs the AppIndicator
+  extension, which Ubuntu ships enabled). Its menu opens the management
+  window, or asks the one it opened for attention, and its Quit denies open
+  prompts once, releases the prompt-handler slot, and exits. Prompts and
+  notifications work without it.
 
 ### Changed
 
+- **The desktop GUI is now a windowless agent plus separate windows, all on
+  native Wayland.** Under XWayland, where the GUI used to run whenever
+  `DISPLAY` was set, any X client could synthesize input into a prompt or the
+  management window: a sandboxed application given only the X11 socket could
+  answer prompts or turn enforcement off. Shown live against two prompts.
+  `hallpass-ui agent`, autostarted at login, now holds the prompt-handler
+  role, the tray icon and the notifications, and opens one window per
+  application with prompts waiting; `hallpass-ui` alone opens the management
+  window, which takes no prompts and says when nobody does. Both pin native
+  Wayland whenever the session has it. On Wayland no hallpass window can
+  stay on top, and whether a new prompt window gets focus is the
+  compositor's call; it asks for attention and the notification is the
+  interrupt.
+
+  **Upgrade notes.** `--hidden` is gone: `install.sh` replaces the autostart
+  entry with one that runs `hallpass-ui agent`, but a per-user copy in
+  `~/.config/autostart` that still passes `--hidden` now starts nothing.
+  A `hallpass-ui` left running from before is not the agent: across this
+  release's protocol bump the daemon refuses it and it retries behind its
+  tray icon, and on a matching protocol it holds the prompt slot until it
+  quits. Quit it (its tray's Quit, or its window where there is no tray),
+  then start `hallpass-ui agent` or log in again. `hallpass-cli doctor`'s
+  no-handler hint now names the agent.
 - **Executable paths are checked against the host's own file.** A process
   whose `/proc/<pid>/exe` names a path the host has a different file at (a
   bind mount in a private mount namespace, a container on the host network)
@@ -506,13 +522,14 @@ carries what an upgrade changes on a running host.
 - The installer and README now state what joining the `hallpass` group means:
   a member can disable enforcement, lift a lockdown posture, delete any rule,
   or take the prompt-handler slot.
-- **The tray icon now says whether anything is being enforced.** The UI
-  autostarts hidden, so a host enforcing nothing showed the same icon as one
-  enforcing everything; the icon and its tooltip now distinguish enforcing, a
-  lockdown posture, observe mode, and "waiting for the daemon". Nothing is
-  claimed until the daemon on the current connection has said so, so a
-  reconnect no longer re-asserts the previous daemon's mode, and a posture
-  lifted while the window was disconnected no longer reappears with it.
+- **The tray icon now says whether anything is being enforced.** The prompt
+  agent autostarts with no window, so a host enforcing nothing showed the
+  same icon as one enforcing everything; the icon and its tooltip now
+  distinguish enforcing, a lockdown posture, observe mode, and "waiting for
+  the daemon". Nothing is claimed until the daemon on the current
+  connection has said so, so a reconnect no longer re-asserts the previous
+  daemon's mode, and a posture lifted while the window was disconnected no
+  longer reappears with it.
 - **`hallpass-cli doctor` reports a `forwarding` check.** Hallpass filters the
   `output` and `input` hooks only, so traffic this host *routes* - containers,
   VMs, bridged namespaces - is not seen and not matched against any rule. That
@@ -589,15 +606,6 @@ carries what an upgrade changes on a running host.
   pinned even by a future caller that forgets to filter it.
 - Fixed a dependency advisory (RUSTSEC-2026-0257, `webbrowser` argument
   injection) pulled in through the GUI's window stack.
-- **The UI prefers the X11 backend (XWayland on Wayland sessions).**
-  Close-to-tray needs to hide the window, keep painting prompts while
-  hidden, and re-show on demand; the Wayland backend can do none of that
-  (hide is a no-op there, and a minimized window stops receiving frames
-  entirely). One consequence exists on every backend and predates this
-  change: while the main window is manually minimized, prompt popups
-  cannot appear until it is restored - desktop notifications still fire.
-  Sessions with no X11 display keep the previous behavior throughout:
-  visible window at start, close quits.
 - **`exe_glob` wildcards no longer cross `/`.** `*` and `?` stop at a path
   separator, the way a shell's do, and a subtree is written `**`. Existing
   patterns narrow: `exe_glob = "/opt/vendor/*"`, which previously covered

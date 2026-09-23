@@ -35,8 +35,8 @@ persisted as a rule.
                     | hallpass- |              | hallpass-ui |
                     |    cli    |              |   (egui)    |
                     +-----------+              +-------------+
-                     status, rules,             prompt popups,
-                     events, watch              management window
+                     status, rules,             prompt agent and
+                     events, watch              windows, management
 ```
 
 ## Components
@@ -45,7 +45,7 @@ persisted as a rule.
 | ---------------------- | ----------------------------------------------------------------------- |
 | `hallpassd`            | The daemon: nfqueue loop, rule engine, prompts, IPC server, attribution, DNS snooping |
 | `hallpass-cli`         | Command line client: status, rule management, event stream, interactive watch |
-| `hallpass-ui`          | egui desktop app: prompt popups and a management window                 |
+| `hallpass-ui`          | egui desktop app: a prompt agent, prompt windows and a management window |
 | `hallpass-types`       | Shared types and the length-prefixed postcard wire protocol             |
 | `hallpass-ebpf`        | Kernel-side eBPF programs (kprobes on `tcp_v4_connect` etc., exec/exit tracepoints, libc resolver uprobes); built separately, not a workspace member |
 | `hallpass-ebpf-common` | `no_std` types shared between kernel and userspace                      |
@@ -529,24 +529,47 @@ only when the prompt actually carries a hash. A reply asking to pin one that
 does not creates no rule at all rather than the broader unpinned rule, which
 would look identical in every listing.
 
-The GUI (`hallpass-ui`) connects to the same socket, pops up a dialog for each
-unmatched connection (allow/deny, scope, duration), and offers a management
-window for rules, live events, and statistics. Deny leads the dialog's
-keyboard traversal, and closing a prompt window denies every connection it
-covers rather than leaving them to the timeout: dismissing a decision is a
-decision, and it is the one the operator can undo. The deny is `Once`, so it
-writes no rule. Allow only answers once a prompt has been at the front of its
-window for a moment, so a click or keypress aimed at whatever was there
-before it cannot approve it. Only one client at a time can hold the
-prompt-handler role.
+The GUI (`hallpass-ui`) is three kinds of process from one binary. The
+**prompt agent** (`hallpass-ui agent`, autostarted at login) draws nothing:
+it holds the daemon's prompt-handler role, the tray icon and the desktop
+notifications, and opens a **prompt window** for each application with
+connections waiting (allow/deny, scope, duration). The **management window**
+(`hallpass-ui`, from the app menu or the tray) is an ordinary client for
+rules, live events, statistics and settings. It takes no prompts, and on an
+enforcing host with no lockdown posture it says so in a banner, with a
+button that starts the agent, whenever nobody holds the prompt-handler role.
+Only one client at a time can hold it.
 
-Whenever an X11 display is available the GUI runs on it, XWayland included,
-because close-to-tray needs what the native Wayland backend lacks. The cost:
-any client of that X server can synthesize input (XTest) into the prompt
-window, including a sandboxed application given the X11 socket but not the
-hallpass socket. The arming delay does not stop a program that waits it out.
-On a desktop where that matters, run the GUI with `DISPLAY` unset so it uses
-native Wayland, where closing the window quits instead of hiding it.
+Deny leads a prompt window's keyboard traversal, and closing the window
+denies every connection it was showing rather than leaving them to the
+timeout: dismissing a decision is a decision, and it is the one the operator
+can undo. The deny is `Once`, so it writes no rule. A prompt that arrived as
+the window was being closed was never on screen, so it goes to a fresh window
+instead. A prompt window that dies without answering denies what it held,
+once. Allow only answers once a prompt has been at the front of its window
+for a moment, so a click or keypress aimed at whatever was there before it
+cannot approve it. At most eight prompt windows are open at once; prompts
+for further applications wait for one to close, and one that times out
+waiting takes the default verdict like any unanswered prompt.
+
+Every hallpass window runs on native Wayland whenever the session has it,
+even with `DISPLAY` set. Under XWayland any client of the X server can
+synthesize input (XTest) into another X window, including a sandboxed
+application given the X11 socket but not the hallpass socket, and that was
+shown to answer live prompts. A Wayland client cannot reach another client's
+surfaces, and GNOME and KDE keep input injection privileged. wlroots-based
+compositors such as Sway offer their virtual keyboard and pointer to any
+client unless a sandbox's security context filters them, and there a client
+can still type into whichever window has focus. The cost is that nothing
+hallpass draws can stay on top of other windows on Wayland, and whether a new
+prompt window takes focus is the compositor's call (GNOME gives it): the
+window asks for the operator's attention, and the notification is the
+interrupt. On a session with X11 alone the GUI runs there and logs a
+warning; every X client can already inject into every window on such a
+session, a terminal running sudo included, and no single application
+changes that. The prompt windows talk to the agent over a socket pair it
+hands them at startup, so nothing listens for answers anywhere: only a
+window the agent started can answer.
 
 The management window reads as a status surface: the mark in its top-left
 corner carries the same colour as the tray icon (green enforcing, amber

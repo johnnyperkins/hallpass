@@ -41,9 +41,8 @@ const BACKOFF_MAX: Duration = Duration::from_secs(30);
 /// Spawn the background thread running the tokio runtime and connection loop.
 ///
 /// `to_notify` is the notifier's channel: prompt lifecycle events are
-/// teed straight from this thread, because the UI-side channel is only
-/// drained while the main window paints, and the entire point of a
-/// desktop notification is to fire while it does not.
+/// teed straight from this thread, so a banner never waits on whoever
+/// drains the UI side.
 pub fn spawn(
     socket: PathBuf,
     to_ui: Sender<UiEvent>,
@@ -89,12 +88,13 @@ pub(crate) fn reports_send_failure(msg: &ClientMsg) -> bool {
 /// Deliver an event to the UI side and wake it. Returns false if the UI
 /// side is gone (app shutting down).
 fn send_ui(to_ui: &Sender<UiEvent>, wake: &Wake, ev: UiEvent) -> bool {
-    // The channel to the window is unbounded, because a prompt must never be
-    // dropped on its way to the operator, and it is drained only while the
-    // window paints, which an unfocused or covered one may not do for a long
-    // time. Events are the one thing arriving at a rate someone else sets
-    // (any local process can open connections), so they alone are counted
-    // and shed past a bound; everything else always goes through.
+    // The channel to the UI side is unbounded, because a prompt must never be
+    // dropped on its way to the operator. Events are the one thing arriving
+    // at a rate someone else sets (any local process can open connections),
+    // and the management window, the only side that takes them, drains only
+    // while it paints, which an unfocused or covered one may not do for a
+    // long time; so they alone are counted and shed past a bound, and
+    // everything else always goes through.
     if let UiEvent::Daemon(DaemonMsg::Event(_)) = &ev {
         if QUEUED_EVENTS.fetch_add(1, Ordering::Relaxed) >= MAX_QUEUED_EVENTS {
             QUEUED_EVENTS.fetch_sub(1, Ordering::Relaxed);
@@ -271,9 +271,8 @@ async fn connect_and_serve(
                 let msg = incoming
                     .ok_or_else(|| fail("reader stopped".into()))?
                     .map_err(|e| fail(format!("read: {e}")))?;
-                // Tee the prompt lifecycle to the notifier before the UI:
-                // the UI channel is only drained while the main window
-                // paints, and the banner exists for when it does not.
+                // Tee the prompt lifecycle to the notifier before the UI
+                // side, so the banner goes up before any window does.
                 match &msg {
                     // The banner shows identity and destination only, so the
                     // prompt context is not teed to it: it is what the window

@@ -127,11 +127,10 @@ pub fn band<R>(ui: &mut Ui, color: Color32, add: impl FnOnce(&mut Ui) -> R) -> R
 /// Install the palette on `ctx`, once per context.
 ///
 /// Called from every entry point that can be the first one on a frame (the
-/// main window, a prompt popup, the rule editor) rather than only at
-/// startup: popups render from their own viewport callbacks, tests drive
-/// each of those directly, and a screen that came up unstyled would be a
-/// different layout from the one shipped - which is exactly what the
-/// prompt window's fixed size makes load-bearing.
+/// management window, a prompt window, the rule editor) rather than only at
+/// startup: tests drive each of those directly, and a screen that came up
+/// unstyled would be a different layout from the one shipped - which is
+/// exactly what the prompt window's fixed size makes load-bearing.
 pub fn ensure_installed(ctx: &egui::Context) {
     let id = egui::Id::new("hallpass-theme");
     if ctx.data(|d| d.get_temp::<bool>(id)).unwrap_or(false) {
@@ -1001,8 +1000,8 @@ mod tests {
     }
 
     /// Installing is idempotent and does not depend on being first: the
-    /// popups, the editor and the main window each call it on whatever
-    /// frame they happen to open on.
+    /// prompt windows, the editor and the management window each call it on
+    /// whatever frame they happen to open on.
     #[test]
     fn installing_twice_is_the_same_as_once() {
         let ctx = egui::Context::default();
