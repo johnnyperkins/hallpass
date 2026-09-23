@@ -9,9 +9,10 @@ description = "Hallpass application firewall desktop UI"
 hallpass-types = { path = "../hallpass-types" }
 # The agent and window link (src/link.rs) frames its own messages.
 serde = { workspace = true }
-# Safe dup2 over stdin, so the link leaves fd 0 (src/link.rs); already in
-# the tree through hallpass-cli.
-rustix = { version = "1", features = ["stdio"] }
+# Safe dup2 over stdin, so the link leaves fd 0 (src/link.rs), and pidfds
+# for killing a stuck prompt window (src/agent.rs); already in the tree
+# through hallpass-cli.
+rustix = { version = "1", features = ["process", "stdio"] }
 eframe = "0.35"
 # Table only (virtualized rows with a fixed header, width-filling columns);
 # every optional feature stays off.

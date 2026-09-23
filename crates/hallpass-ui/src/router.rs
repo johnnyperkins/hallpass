@@ -283,6 +283,7 @@ impl Router {
     }
 
     /// Windows alive, retired or not.
+    #[cfg(test)]
     pub fn window_count(&self) -> usize {
         self.windows.len()
     }

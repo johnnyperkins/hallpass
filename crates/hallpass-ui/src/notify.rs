@@ -290,8 +290,10 @@ impl Sink for DbusSink {
 }
 
 /// Spawn the notifier thread. Blocking DBus round trips live here and
-/// nowhere near a frame.
-pub fn spawn(rx: Receiver<NotifyEvent>) {
+/// nowhere near a frame. The thread ends once every sender is gone and the
+/// banners left are retired; a process that exits right after must wait for
+/// it, or those banners outlive it.
+pub fn spawn(rx: Receiver<NotifyEvent>) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name("hallpass-notify".into())
         .spawn(move || {
@@ -303,7 +305,7 @@ pub fn spawn(rx: Receiver<NotifyEvent>) {
             // no banner outlives the process that would answer it.
             tracker.clear();
         })
-        .expect("failed to spawn notifier thread");
+        .expect("failed to spawn notifier thread")
 }
 
 #[cfg(test)]

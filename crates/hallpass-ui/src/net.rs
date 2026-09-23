@@ -50,7 +50,7 @@ pub fn spawn(
     from_ui: UnboundedReceiver<ClientMsg>,
     wake: Wake,
     to_notify: Sender<NotifyEvent>,
-) {
+) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name("hallpass-net".into())
         .spawn(move || {
@@ -60,7 +60,7 @@ pub fn spawn(
                 .expect("failed to build tokio runtime");
             rt.block_on(run(socket, to_ui, from_ui, wake, to_notify));
         })
-        .expect("failed to spawn network thread");
+        .expect("failed to spawn network thread")
 }
 
 /// Whether a message dropped on reconnect is reported to the operator

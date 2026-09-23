@@ -1,22 +1,26 @@
-//! Hallpass UI - interactive firewall prompt popups and management window.
+//! Hallpass UI - interactive firewall prompts and management window.
 //!
-//! Single process: eframe/egui runs on the main thread, a tokio runtime on a
-//! background thread maintains the daemon socket connection. The two sides
-//! talk over channels (see [`net`]).
+//! One binary, three roles:
+//! - `hallpass-ui agent` ([`agent`]): windowless; holds the daemon's prompt
+//!   slot, the tray icon and the notifications, and starts the prompt
+//!   windows.
+//! - `hallpass-ui prompt` ([`prompt_window`]): one application's prompts,
+//!   started by the agent over a private link ([`link`]).
+//! - `hallpass-ui`: the management window, an ordinary daemon client.
+//!
+//! In each, a tokio runtime on a background thread keeps the daemon
+//! connection where there is one (see [`net`]).
 
+mod agent;
 mod app;
 mod backend;
 mod editor;
-// Partly used until the prompt agent lands in a following commit.
-#[cfg_attr(not(test), expect(dead_code))]
 mod link;
 mod net;
 mod notify;
 mod prompt;
 mod prompt_view;
 mod prompt_window;
-// Used by the prompt agent, which lands in a following commit.
-#[cfg_attr(not(test), expect(dead_code))]
 mod router;
 mod theme;
 mod traffic;
@@ -50,10 +54,13 @@ const DEFAULT_SOCKET: &str = "/run/hallpass/hallpass.sock";
 
 /// What this process is, parsed by [`parse_args`].
 enum Mode {
-    /// The management window (and, until the agent lands, the prompts).
+    /// The management window (and, until it becomes a plain client, the
+    /// prompts).
     Window(Args),
     /// One prompt window, started by the agent with the link as stdin.
     Prompt,
+    /// The windowless agent, speaking to the daemon at this socket.
+    Agent(PathBuf),
 }
 
 /// The management window's command line.
@@ -76,6 +83,7 @@ fn main() -> eframe::Result {
     let mode = parse_args(std::env::args().skip(1)).unwrap_or_else(|e| {
         eprintln!("{e}");
         eprintln!("usage: hallpass-ui [--socket PATH] [--hidden]");
+        eprintln!("       hallpass-ui agent [--socket PATH]");
         std::process::exit(2);
     });
     let args = match mode {
@@ -92,6 +100,7 @@ fn main() -> eframe::Result {
             backend::apply(&mut options, backend);
             return prompt_window::run(options);
         }
+        Mode::Agent(socket) => std::process::exit(agent::run(socket)),
     };
 
     // Close-to-tray needs capabilities winit's Wayland backend does not
@@ -131,17 +140,32 @@ fn main() -> eframe::Result {
     )
 }
 
-/// Parse `prompt` (alone), or `--socket PATH` (or `--socket=PATH`) and
-/// `--hidden`.
+/// Parse `prompt` (alone), `agent [--socket PATH]`, or the window's
+/// `--socket PATH` (or `--socket=PATH`) and `--hidden`.
 fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Mode, String> {
     let mut iter = args.into_iter().peekable();
-    if iter.peek().map(String::as_str) == Some("prompt") {
-        iter.next();
-        return match iter.next() {
-            None => Ok(Mode::Prompt),
-            Some(arg) => Err(format!("prompt takes no arguments: {arg}")),
-        };
+    match iter.peek().map(String::as_str) {
+        Some("prompt") => {
+            iter.next();
+            return match iter.next() {
+                None => Ok(Mode::Prompt),
+                Some(arg) => Err(format!("prompt takes no arguments: {arg}")),
+            };
+        }
+        Some("agent") => {
+            iter.next();
+            let args = parse_window_args(iter)?;
+            if args.hidden {
+                return Err("agent has no window to hide".into());
+            }
+            return Ok(Mode::Agent(args.socket));
+        }
+        _ => {}
     }
+    parse_window_args(iter).map(Mode::Window)
+}
+
+fn parse_window_args(mut iter: impl Iterator<Item = String>) -> Result<Args, String> {
     let mut parsed = Args {
         socket: PathBuf::from(DEFAULT_SOCKET),
         hidden: false,
@@ -160,7 +184,7 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Mode, String> {
             return Err(format!("unknown argument: {arg}"));
         }
     }
-    Ok(Mode::Window(parsed))
+    Ok(parsed)
 }
 
 #[cfg(test)]
@@ -170,7 +194,7 @@ mod tests {
     fn window_args(args: Vec<String>) -> Args {
         match parse_args(args).unwrap() {
             Mode::Window(args) => args,
-            Mode::Prompt => panic!("parsed as a prompt window"),
+            _ => panic!("not parsed as the management window"),
         }
     }
 
@@ -209,5 +233,18 @@ mod tests {
         assert!(parse_args(vec!["prompt".to_string(), "--hidden".to_string()]).is_err());
         // Only as the first word: it is a mode, not a flag.
         assert!(parse_args(vec!["--hidden".to_string(), "prompt".to_string()]).is_err());
+    }
+
+    #[test]
+    fn agent_mode_takes_a_socket_and_nothing_to_hide() {
+        assert!(matches!(
+            parse_args(vec!["agent".to_string()]),
+            Ok(Mode::Agent(s)) if s == std::path::Path::new(DEFAULT_SOCKET)
+        ));
+        assert!(matches!(
+            parse_args(vec!["agent".to_string(), "--socket=/tmp/a.sock".to_string()]),
+            Ok(Mode::Agent(s)) if s == std::path::Path::new("/tmp/a.sock")
+        ));
+        assert!(parse_args(vec!["agent".to_string(), "--hidden".to_string()]).is_err());
     }
 }
