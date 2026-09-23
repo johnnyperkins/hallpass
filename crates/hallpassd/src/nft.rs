@@ -81,15 +81,52 @@ pub fn snoop_queue(queue_num: u16) -> u16 {
 }
 
 /// Render the ruleset installed at startup.
-fn ruleset(queue_num: u16, verdict_bypass: bool) -> String {
+///
+/// `drop_unjudgeable` drops outbound packets conntrack calls `invalid` or
+/// `untracked`. Only `ct state new` is queued, so those never reach the
+/// daemon at all: no rule, no lockdown and no `unhandled_proto_verdict`
+/// sees them. A process with CAP_NET_RAW (a container on the host network
+/// has it by default) can write a whole conversation in them - ICMP error
+/// and reply types, TCP flag combinations conntrack refuses, later
+/// fragments. Tied to `unhandled_proto_verdict` because it is the same
+/// question, what to do with a packet the rule engine cannot model, and the
+/// operator who answered deny for SCTP answered it for these.
+///
+/// IPv6 neighbour discovery and MLD are the exception. Conntrack leaves them
+/// `untracked` on purpose, and they are the kernel's own: dropping them
+/// stops neighbour solicitations and the answers to everyone else's, which
+/// takes the host's IPv6 down. They are accepted by type ahead of the drop.
+/// A raw socket can forge those types too, and what it can carry in them is
+/// the residue this accepts to keep IPv6 working.
+fn ruleset(queue_num: u16, verdict_bypass: bool, drop_unjudgeable: bool) -> String {
     let snoop = snoop_queue(queue_num);
     let mark = REJECT_MARK;
     let export = EXPORT_MARK;
     let bypass = if verdict_bypass { " bypass" } else { "" };
-    // `reject_marked` is its own base chain at a later priority than `output`,
-    // so a packet the daemon accepted with REJECT_MARK reaches it: reinjection
-    // resumes at the next base chain in the hook, not inside `output`.
-    // Unmarked (allowed) packets traverse it and fall through untouched.
+    let unjudgeable = if drop_unjudgeable {
+        "\t\tct state untracked icmpv6 type { nd-router-solicit, nd-router-advert, \
+         nd-neighbor-solicit, nd-neighbor-advert, mld-listener-query, \
+         mld-listener-report, mld-listener-done, mld2-listener-report } accept\n\
+         \t\tct state { invalid, untracked } drop\n"
+    } else {
+        ""
+    };
+    // `reject_marked` is its own base chain after `output`, so a packet the
+    // daemon accepted with REJECT_MARK reaches it: reinjection resumes at the
+    // next base chain in the hook, not inside `output`. Unmarked (allowed)
+    // packets traverse it and fall through untouched.
+    //
+    // One step after `output`'s priority, and strictly after it. Equal
+    // priorities do not order two base chains in any documented way, and the
+    // kernel inserts a newly registered hook ahead of existing ones of the
+    // same priority: declared second at `mangle`, this chain ran before
+    // `output`, the reinjected packet resumed past it, and every reject was
+    // an accept. `mangle + 1` rather than `priority filter` keeps the gap as
+    // narrow as a priority can: a chain from another ruleset at `filter` (a
+    // VPN's routing mark) could rewrite the mark first, and a rewritten
+    // reject is an accept. Another chain at `mangle` itself (iptables'
+    // mangle table) can still sort between the two; nothing short of
+    // deciding the reject inside `output` closes that.
     //
     // Not named `reject`: that is an nftables keyword, and using it makes the
     // whole ruleset fail to parse. `install` then leaves no table at all, so
@@ -109,11 +146,12 @@ fn ruleset(queue_num: u16, verdict_bypass: bool) -> String {
          \tchain output {{\n\
          \t\ttype filter hook output priority mangle; policy accept;\n\
          \t\tmeta skuid 0 meta mark {export} accept\n\
+         {unjudgeable}\
          \t\tct state new queue num {queue_num}{bypass}\n\
          \t\tudp dport 53 ct state != new queue num {snoop} bypass\n\
          \t}}\n\
          \tchain reject_marked {{\n\
-         \t\ttype filter hook output priority filter; policy accept;\n\
+         \t\ttype filter hook output priority mangle + 1; policy accept;\n\
          \t\tmeta mark {mark} meta l4proto tcp reject with tcp reset\n\
          \t\tmeta mark {mark} reject\n\
          \t}}\n\
@@ -126,11 +164,28 @@ fn ruleset(queue_num: u16, verdict_bypass: bool) -> String {
 }
 
 /// Install the hallpass table, replacing any stale one from a previous run.
-pub fn install(queue_num: u16, verdict_bypass: bool) -> std::io::Result<()> {
-    // A leftover table from a crashed run would double-queue packets.
-    // Deletion of a nonexistent table fails; that is expected and ignored.
-    let _ = run_nft(&["delete", "table", "inet", "hallpass"], None);
-    run_nft(&["-f", "-"], Some(&ruleset(queue_num, verdict_bypass)))
+pub fn install(
+    queue_num: u16,
+    verdict_bypass: bool,
+    drop_unjudgeable: bool,
+) -> std::io::Result<()> {
+    run_nft(
+        &["-f", "-"],
+        Some(&install_script(queue_num, verdict_bypass, drop_unjudgeable)),
+    )
+}
+
+/// The whole replacement as one `nft -f` transaction: declare the table so
+/// the delete cannot fail, delete it, add the new one. A leftover table from
+/// a crashed run would double-queue packets, so it has to go, but deleting it
+/// in one command and adding the new one in the next left the host with no
+/// table between the two, unfiltered, including after a fail-closed crash
+/// whose standing table was the only thing still enforcing.
+fn install_script(queue_num: u16, verdict_bypass: bool, drop_unjudgeable: bool) -> String {
+    format!(
+        "table inet hallpass {{}}\ndelete table inet hallpass\n{}",
+        ruleset(queue_num, verdict_bypass, drop_unjudgeable)
+    )
 }
 
 /// Whether the hallpass table is still installed.
@@ -209,6 +264,7 @@ static TABLE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 pub fn spawn_watchdog(
     queue_num: u16,
     verdict_bypass: bool,
+    drop_unjudgeable: bool,
     shutdown: Arc<AtomicBool>,
     fatal_tx: tokio::sync::mpsc::UnboundedSender<()>,
     counters: Arc<crate::stats::Counters>,
@@ -239,7 +295,7 @@ pub fn spawn_watchdog(
                 if stopping.load(Ordering::Relaxed) || table_present() {
                     return;
                 }
-                let repaired = install(queue_num, verdict_bypass);
+                let repaired = install(queue_num, verdict_bypass, drop_unjudgeable);
                 // Still under the lock. A shutdown that started after the
                 // check dispatched is about to tear the table down anyway;
                 // counting or escalating its repair would be noise.
@@ -357,7 +413,7 @@ mod tests {
 
     #[test]
     fn ruleset_contains_expected_rules() {
-        let r = ruleset(3, true);
+        let r = ruleset(3, true, false);
         assert!(r.contains("table inet hallpass"));
         assert!(r.contains("type filter hook output priority mangle; policy accept;"));
         assert!(r.contains("ct state new queue num 3 bypass"));
@@ -374,7 +430,7 @@ mod tests {
     /// rules are only reachable from a chain the queue rule does not own.
     #[test]
     fn reject_rules_live_in_their_own_later_chain() {
-        let r = ruleset(3, true);
+        let r = ruleset(3, true, false);
         let output = r
             .split("\tchain reject_marked {")
             .next()
@@ -383,7 +439,12 @@ mod tests {
             !output.contains(&format!("meta mark {REJECT_MARK}")),
             "reject rules must not sit in the chain that queues packets:\n{r}"
         );
-        assert!(r.contains("\tchain reject_marked {\n\t\ttype filter hook output priority filter;"));
+        // Strictly after `output`'s priority: equal priorities give no
+        // order the reinjection can rely on.
+        assert!(r.contains("\tchain output {\n\t\ttype filter hook output priority mangle;"));
+        assert!(
+            r.contains("\tchain reject_marked {\n\t\ttype filter hook output priority mangle + 1;")
+        );
         // The mark rules must both be inside the reject chain.
         let reject = r
             .split("\tchain reject_marked {")
@@ -418,8 +479,8 @@ mod tests {
             return;
         };
 
-        for bypass in [true, false] {
-            let text = ruleset(3, bypass);
+        for (bypass, strict) in [(true, false), (false, true)] {
+            let text = install_script(3, bypass, strict);
             let mut child = Command::new(nft)
                 .args(["-c", "-f", "-"])
                 .stdin(Stdio::piped())
@@ -451,7 +512,7 @@ mod tests {
     #[test]
     fn export_mark_is_accepted_before_the_queue_rule() {
         for bypass in [true, false] {
-            let r = ruleset(3, bypass);
+            let r = ruleset(3, bypass, false);
             let output = r
                 .split("\tchain reject_marked {")
                 .next()
@@ -470,9 +531,45 @@ mod tests {
         assert_ne!(EXPORT_MARK, REJECT_MARK, "the two marks must not collide");
     }
 
+    /// Packets conntrack cannot place are dropped only when the operator
+    /// asked for what the engine cannot model to be refused, and never
+    /// before the export exemption.
+    #[test]
+    fn unjudgeable_packets_are_dropped_only_when_asked() {
+        let rule = "ct state { invalid, untracked } drop";
+        assert!(!ruleset(3, true, false).contains(rule));
+        let r = ruleset(3, true, true);
+        let export = r.find("meta skuid 0").unwrap();
+        let drop = r.find(rule).expect("rendered");
+        let queue = r.find("ct state new queue").unwrap();
+        assert!(export < drop && drop < queue, "{r}");
+        // Neighbour discovery is untracked by design and must get out, or
+        // the host loses IPv6.
+        let nd = r
+            .find("ct state untracked icmpv6 type {")
+            .expect("neighbour discovery exempted");
+        assert!(export < nd && nd < drop, "{r}");
+        for t in [
+            "nd-neighbor-solicit",
+            "nd-neighbor-advert",
+            "mld2-listener-report",
+        ] {
+            assert!(r[nd..drop].contains(t), "{t} not exempted:\n{r}");
+        }
+    }
+
+    /// The replacement is one transaction: nothing between the old table
+    /// and the new one.
+    #[test]
+    fn install_replaces_the_table_in_one_script() {
+        let script = install_script(3, false, true);
+        assert!(script.starts_with("table inet hallpass {}\ndelete table inet hallpass\n"));
+        assert!(script.ends_with(&ruleset(3, false, true)));
+    }
+
     #[test]
     fn fail_closed_drops_bypass_on_verdict_queue_only() {
-        let r = ruleset(3, false);
+        let r = ruleset(3, false, false);
         assert!(r.contains("ct state new queue num 3\n"));
         assert!(!r.contains("queue num 3 bypass"));
         // Snoop queues are observational; they always keep bypass.

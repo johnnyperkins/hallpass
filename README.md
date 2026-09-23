@@ -806,17 +806,27 @@ who can delete the nftables table outright.
   here. It reads the whole `conf/<iface>/forwarding` tree rather than
   `net.ipv4.ip_forward` alone, because the global knob is only an alias for
   `conf/all` and the kernel consults the arrival interface's own.
-- Rules only model TCP and UDP. Other transports (SCTP, ICMP, ...) are not
-  matched against rules; they are counted and resolved by the
+- Rules only model TCP and UDP. UDP-Lite, which any process can use in place
+  of UDP, is always denied: it cannot be judged as UDP, because its ports are
+  a separate space and attribution would name whichever program holds the
+  same UDP port. Other transports (SCTP, ICMP, ...) are not matched against
+  rules; they are counted and resolved by the
   `unhandled_proto_verdict` policy (`allow` by default, `deny` in the
-  hardened config).
-- **UDP verdicts are per flow, not per datagram**: conntrack marks only the
-  first datagram of a UDP flow as `ct state new`, so exactly one verdict
-  reaches the queue and it covers the whole flow until the conntrack entry
-  expires. A `Once` prompt reply therefore means "this flow" for UDP (as it
-  means "this connection" for TCP): the held datagram is released with the
-  verdict, no rule is persisted, and a genuinely new flow to the same
-  destination prompts again.
+  hardened config). Packets conntrack cannot place (`invalid`, `untracked`)
+  are never new connections and never reach the daemon; when that policy is
+  not `allow` and the daemon starts enforcing, the table drops them
+  outright, since a process with `CAP_NET_RAW` can otherwise carry a whole
+  conversation in them. IPv6 neighbour discovery and MLD, which conntrack
+  leaves untracked by design, are let through.
+- **UDP verdicts are per flow once the peer answers.** A UDP flow stays
+  `ct state new` until a reply is seen, so every datagram of an unanswered
+  flow reaches the queue and is decided (and logged) on its own; from the
+  first reply on, the flow is established and its verdict covers the rest
+  of it until the conntrack entry expires. A `Once` prompt reply therefore
+  means "this flow" for an answered UDP flow (as it means "this connection"
+  for TCP): the held datagram is released with the verdict, no rule is
+  persisted, and a genuinely new flow to the same destination prompts
+  again. A peer that never answers is asked about again per datagram.
 - eBPF struct offsets are tuned for x86_64 distro kernels; on mismatch the
   daemon falls back to procfs attribution automatically.
 

@@ -421,14 +421,22 @@ async fn main() {
     // table with no verdicts behind it, which reads as healthy from
     // outside (the journal says the ruleset is installed) while policy is
     // not being applied to a single packet.
+    // Packets conntrack cannot place never reach the queue; see nft::ruleset.
+    // Only when starting enforcing: observe mode promises that nothing this
+    // daemon does changes what reaches the wire, and the unhandled path
+    // itself only logs there. Read once, like `fail_open` above: a runtime
+    // mode toggle does not reinstall the table, so it applies at restart.
+    let drop_unjudgeable =
+        cfg.mode.enforcing() && cfg.unhandled_proto_verdict != hallpass_types::Verdict::Allow;
     let nft_installed = match &queue_thread {
         None => false,
-        Some(_) => match nft::install(cfg.queue_num, cfg.queue_bypass) {
+        Some(_) => match nft::install(cfg.queue_num, cfg.queue_bypass, drop_unjudgeable) {
             Ok(()) => {
                 tracing::info!("nftables ruleset installed");
                 nft_watchdog = Some(nft::spawn_watchdog(
                     cfg.queue_num,
                     cfg.queue_bypass,
+                    drop_unjudgeable,
                     Arc::clone(&shutdown),
                     fatal_tx_watchdog,
                     Arc::clone(&counters),

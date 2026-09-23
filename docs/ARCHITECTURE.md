@@ -35,10 +35,16 @@ The daemon installs one nftables table, `inet hallpass`, with three chains:
 
 - `output`, hook output, priority mangle. `ct state new` goes to the verdict
   queue. Established outbound DNS queries (`udp dport 53 ct state != new`) go
-  to the snoop queue.
-- `input`, hook input, priority mangle. `udp sport 53`, that is DNS replies,
-  goes to the snoop queue.
-- `reject_marked`, hook output, priority filter. Two rules that turn a packet
+  to the snoop queue. When `unhandled_proto_verdict` is not `allow` and the
+  daemon starts enforcing, packets conntrack calls `invalid` or `untracked`
+  are dropped here: they are never `new`, so no queue would ever see them.
+  IPv6 neighbour discovery and MLD, untracked by design, are accepted first.
+- `input`, hook input, priority mangle. `udp sport 53 ct state established`,
+  that is replies to DNS queries this host sent, goes to the snoop queue.
+  Unsolicited packets from port 53 are not queued at all.
+- `reject_marked`, hook output, priority `mangle + 1`: strictly after
+  `output`, since equal priorities give no order a reinjected packet can rely
+  on, and as close to it as a priority gets. Two rules that turn a packet
   carrying `REJECT_MARK` into a TCP reset or an ICMP unreachable.
 
 The snoop queue number is the verdict queue number plus one. Each queue has
