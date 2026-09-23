@@ -30,6 +30,16 @@ pub(crate) fn prompt_ui(
     answered: &mut Vec<(u64, ClientMsg)>,
 ) {
     theme::ensure_installed(ui.ctx());
+    // First pass with this prompt in front: restart the visible countdown
+    // from now. Its deadline is unchanged (see PromptState::fronted_ms), so
+    // this cannot delay the default verdict; it only stops a prompt that
+    // queued behind another from surfacing with its bar already part-drained.
+    // Stamped here rather than by whoever owns the window, because this view
+    // is what reads it: a window that forgot would leave Allow disarmed for
+    // good.
+    if p.fronted_ms.is_none() {
+        p.fronted_ms = Some(now_ms);
+    }
     // Salted by prompt id like the details grid: two apps prompting at
     // once means two of these windows live in one pass, and their panels
     // must not collide on one id.
@@ -380,8 +390,14 @@ fn prompt_actions_ui(
             answered.push((p.id, p.reply(Verdict::Allow)));
         }
         if !armed {
+            // For the moment it arms, not a full arm period from now: a
+            // pass drawn part way through (a pointer move) would otherwise
+            // push the repaint that enables Allow back each time.
+            let wait = p
+                .allow_arms_at()
+                .map_or(prompt::ALLOW_ARM_MS, |at| at.saturating_sub(now_ms));
             ui.ctx()
-                .request_repaint_after(std::time::Duration::from_millis(prompt::ALLOW_ARM_MS));
+                .request_repaint_after(std::time::Duration::from_millis(wait));
         }
     });
     ui.add_space(4.0);

@@ -89,8 +89,14 @@ impl PromptState {
     /// double-click, landed on a connection nobody had read. Deny is not
     /// held back: answered unread, it costs a retry.
     pub fn allow_armed(&self, now_ms: u64) -> bool {
+        self.allow_arms_at().is_some_and(|at| now_ms >= at)
+    }
+
+    /// Unix milliseconds at which Allow arms, or `None` while this prompt
+    /// has not reached the front; see [`PromptState::allow_armed`].
+    pub fn allow_arms_at(&self) -> Option<u64> {
         self.fronted_ms
-            .is_some_and(|fronted| now_ms >= fronted.saturating_add(ALLOW_ARM_MS))
+            .map(|fronted| fronted.saturating_add(ALLOW_ARM_MS))
     }
 
     /// Build the reply message for the given verdict.
@@ -266,7 +272,9 @@ mod tests {
     fn allow_arms_only_after_the_prompt_has_been_in_front() {
         let mut p = PromptState::new(1, conn(None, None), 60_000, 1_000, Default::default());
         assert!(!p.allow_armed(50_000), "never fronted, never armed");
+        assert_eq!(p.allow_arms_at(), None);
         p.fronted_ms = Some(2_000);
+        assert_eq!(p.allow_arms_at(), Some(2_000 + ALLOW_ARM_MS));
         assert!(!p.allow_armed(2_000));
         assert!(!p.allow_armed(2_000 + ALLOW_ARM_MS - 1));
         assert!(p.allow_armed(2_000 + ALLOW_ARM_MS));
