@@ -14,8 +14,27 @@ mod traffic;
 mod tray;
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use eframe::egui;
+
+/// How a background thread tells whoever drains its channel to look.
+///
+/// Not an `egui::Context`: the daemon link and the tray outlive any one
+/// window's event loop, and the side draining them may have no window.
+type Wake = Arc<dyn Fn() + Send + Sync>;
+
+/// A [`Wake`] that repaints the root viewport of `ctx`, whose frame is the
+/// one that drains the channels.
+///
+/// Named explicitly: `request_repaint` targets whichever viewport is on
+/// egui's stack at the moment of the call, and from another thread that is
+/// a prompt popup whenever one is mid-pass, which would repaint the popup
+/// and leave the message waiting for the root's next frame.
+fn repaint(ctx: &egui::Context) -> Wake {
+    let ctx = ctx.clone();
+    Arc::new(move || ctx.request_repaint_of(egui::ViewportId::ROOT))
+}
 
 /// Default daemon socket path.
 const DEFAULT_SOCKET: &str = "/run/hallpass/hallpass.sock";

@@ -370,10 +370,11 @@ impl HallpassApp {
         let (to_ui, from_net) = std::sync::mpsc::channel();
         let (to_notify, from_net_notify) = std::sync::mpsc::channel();
         crate::notify::spawn(from_net_notify);
-        net::spawn(socket, to_ui, from_ui, cc.egui_ctx.clone(), to_notify);
+        let wake = crate::repaint(&cc.egui_ctx);
+        net::spawn(socket, to_ui, from_ui, wake.clone(), to_notify);
         let mut app = Self::with_channels(to_daemon, from_net);
         if tray {
-            let tray = crate::tray::spawn(cc.egui_ctx.clone());
+            let tray = crate::tray::spawn(wake);
             app.from_tray = Some(tray.msgs);
             app.to_tray = Some(tray.state);
             app.park_on_close = true;

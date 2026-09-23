@@ -14,7 +14,7 @@
 
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 
-use eframe::egui;
+use crate::Wake;
 
 /// How often the tray thread looks at the service's health while no state
 /// update is arriving. Also the longest a state change can wait, which it
@@ -92,14 +92,14 @@ pub enum TrayMsg {
 
 struct HallpassTray {
     to_ui: Sender<TrayMsg>,
-    ctx: egui::Context,
+    wake: Wake,
     state: TrayState,
 }
 
 impl HallpassTray {
     fn send(&self, msg: TrayMsg) {
         let _ = self.to_ui.send(msg);
-        self.ctx.request_repaint();
+        (self.wake)();
     }
 }
 
@@ -175,7 +175,7 @@ pub struct Tray {
 /// frame. An unreachable bus or absent watcher arrives as
 /// [`TrayMsg::Unavailable`] rather than an error: the window keeps
 /// working, only close-to-tray degrades back to quit.
-pub fn spawn(ctx: egui::Context) -> Tray {
+pub fn spawn(wake: Wake) -> Tray {
     let (to_ui, from_tray) = std::sync::mpsc::channel();
     let (to_tray, from_ui) = std::sync::mpsc::channel();
     std::thread::Builder::new()
@@ -185,13 +185,13 @@ pub fn spawn(ctx: egui::Context) -> Tray {
             // quit-on-close: with the tray dead, a park would strand the
             // window hidden with no icon to come back through.
             let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                run(to_ui.clone(), from_ui, ctx.clone());
+                run(to_ui.clone(), from_ui, wake.clone());
             }))
             .is_err();
             if panicked {
                 tracing::warn!("tray thread panicked; window close will quit");
                 let _ = to_ui.send(TrayMsg::Unavailable);
-                ctx.request_repaint();
+                wake();
             }
         })
         .expect("spawning the tray thread");
@@ -201,11 +201,11 @@ pub fn spawn(ctx: egui::Context) -> Tray {
     }
 }
 
-fn run(to_ui: Sender<TrayMsg>, from_ui: Receiver<TrayState>, ctx: egui::Context) {
+fn run(to_ui: Sender<TrayMsg>, from_ui: Receiver<TrayState>, wake: Wake) {
     use ksni::blocking::TrayMethods;
     let tray = HallpassTray {
         to_ui: to_ui.clone(),
-        ctx: ctx.clone(),
+        wake: wake.clone(),
         state: TrayState::Unknown,
     };
     match tray.spawn() {
@@ -224,7 +224,7 @@ fn run(to_ui: Sender<TrayMsg>, from_ui: Receiver<TrayState>, ctx: egui::Context)
             if handle.is_closed() {
                 tracing::warn!("tray service ended; window close will quit");
                 let _ = to_ui.send(TrayMsg::Unavailable);
-                ctx.request_repaint();
+                wake();
                 break;
             }
             match from_ui.recv_timeout(HEALTH_POLL) {
@@ -240,7 +240,7 @@ fn run(to_ui: Sender<TrayMsg>, from_ui: Receiver<TrayState>, ctx: egui::Context)
         Err(e) => {
             tracing::info!("tray icon unavailable ({e}); window close will quit");
             let _ = to_ui.send(TrayMsg::Unavailable);
-            ctx.request_repaint();
+            wake();
         }
     }
 }

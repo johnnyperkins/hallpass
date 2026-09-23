@@ -1,8 +1,9 @@
 //! Tokio side of the UI: daemon socket connection with reconnect backoff.
 //!
-//! Bridge to the egui thread:
-//! - daemon -> UI: `std::sync::mpsc::Sender<UiEvent>` plus
-//!   `egui::Context::request_repaint()` to wake the event loop.
+//! Bridge to the UI side:
+//! - daemon -> UI: `std::sync::mpsc::Sender<UiEvent>` plus a [`Wake`] call
+//!   so whoever drains the channel (a window's event loop, or a thread with
+//!   no window at all) notices.
 //! - UI -> daemon: `tokio::sync::mpsc::UnboundedReceiver<ClientMsg>`.
 
 use std::path::PathBuf;
@@ -10,15 +11,15 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::Sender;
 use std::time::Duration;
 
-use eframe::egui;
 use hallpass_types::wire::{read_msg, write_msg};
 use hallpass_types::{ClientMsg, DaemonMsg, PROTOCOL_VERSION};
 use tokio::net::UnixStream;
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::notify::NotifyEvent;
+use crate::Wake;
 
-/// Messages delivered from the network task to the egui thread.
+/// Messages delivered from the network task to the UI side.
 #[derive(Debug)]
 pub enum UiEvent {
     /// Socket connected and handshake completed.
@@ -47,7 +48,7 @@ pub fn spawn(
     socket: PathBuf,
     to_ui: Sender<UiEvent>,
     from_ui: UnboundedReceiver<ClientMsg>,
-    ctx: egui::Context,
+    wake: Wake,
     to_notify: Sender<NotifyEvent>,
 ) {
     std::thread::Builder::new()
@@ -57,13 +58,11 @@ pub fn spawn(
                 .enable_all()
                 .build()
                 .expect("failed to build tokio runtime");
-            rt.block_on(run(socket, to_ui, from_ui, ctx, to_notify));
+            rt.block_on(run(socket, to_ui, from_ui, wake, to_notify));
         })
         .expect("failed to spawn network thread");
 }
 
-/// Deliver an event to the UI thread and wake egui. Returns false if the UI
-/// side is gone (app shutting down).
 /// Whether a message dropped on reconnect is reported to the operator
 /// through [`UiEvent::SendFailed`].
 ///
@@ -87,7 +86,9 @@ pub(crate) fn reports_send_failure(msg: &ClientMsg) -> bool {
     )
 }
 
-fn send_ui(to_ui: &Sender<UiEvent>, ctx: &egui::Context, ev: UiEvent) -> bool {
+/// Deliver an event to the UI side and wake it. Returns false if the UI
+/// side is gone (app shutting down).
+fn send_ui(to_ui: &Sender<UiEvent>, wake: &Wake, ev: UiEvent) -> bool {
     // The channel to the window is unbounded, because a prompt must never be
     // dropped on its way to the operator, and it is drained only while the
     // window paints, which an unfocused or covered one may not do for a long
@@ -102,7 +103,7 @@ fn send_ui(to_ui: &Sender<UiEvent>, ctx: &egui::Context, ev: UiEvent) -> bool {
     }
     let ok = to_ui.send(ev).is_ok();
     if ok {
-        ctx.request_repaint();
+        wake();
     }
     ok
 }
@@ -128,12 +129,12 @@ async fn run(
     socket: PathBuf,
     to_ui: Sender<UiEvent>,
     mut from_ui: UnboundedReceiver<ClientMsg>,
-    ctx: egui::Context,
+    wake: Wake,
     to_notify: Sender<NotifyEvent>,
 ) {
     let mut backoff = BACKOFF_MIN;
     loop {
-        match connect_and_serve(&socket, &to_ui, &mut from_ui, &ctx, &to_notify).await {
+        match connect_and_serve(&socket, &to_ui, &mut from_ui, &wake, &to_notify).await {
             Ok(()) => {
                 // UI channel closed: app is exiting.
                 return;
@@ -149,7 +150,7 @@ async fn run(
                 // survivors on reconnect, which re-raises the banners.
                 let _ = to_notify.send(NotifyEvent::Disconnected);
                 tracing::warn!("daemon connection failed: {}", e.message);
-                if !send_ui(&to_ui, &ctx, UiEvent::Disconnected { retry_in: backoff }) {
+                if !send_ui(&to_ui, &wake, UiEvent::Disconnected { retry_in: backoff }) {
                     return;
                 }
                 tokio::time::sleep(backoff).await;
@@ -192,7 +193,7 @@ async fn connect_and_serve(
     socket: &PathBuf,
     to_ui: &Sender<UiEvent>,
     from_ui: &mut UnboundedReceiver<ClientMsg>,
-    ctx: &egui::Context,
+    wake: &Wake,
     to_notify: &Sender<NotifyEvent>,
 ) -> Result<(), SessionError> {
     let stream = UnixStream::connect(socket)
@@ -232,12 +233,12 @@ async fn connect_and_serve(
     // changes, settings changes and prompt replies are reported so their
     // loss is not silent; see [`reports_send_failure`].
     while let Ok(msg) = from_ui.try_recv() {
-        if reports_send_failure(&msg) && !send_ui(to_ui, ctx, UiEvent::SendFailed { msg }) {
+        if reports_send_failure(&msg) && !send_ui(to_ui, wake, UiEvent::SendFailed { msg }) {
             return Ok(());
         }
     }
 
-    if !send_ui(to_ui, ctx, UiEvent::Connected) {
+    if !send_ui(to_ui, wake, UiEvent::Connected) {
         return Ok(());
     }
     tracing::info!("connected to daemon at {}", socket.display());
@@ -289,7 +290,7 @@ async fn connect_and_serve(
                     }
                     _ => {}
                 }
-                if !send_ui(to_ui, ctx, UiEvent::Daemon(msg)) {
+                if !send_ui(to_ui, wake, UiEvent::Daemon(msg)) {
                     return Ok(());
                 }
             }
@@ -305,7 +306,7 @@ async fn connect_and_serve(
                             let _ = to_notify.send(NotifyEvent::Gone { id: *id });
                         }
                         if let Err(e) = write_msg(&mut writer, &msg).await {
-                            send_ui(to_ui, ctx, UiEvent::SendFailed { msg });
+                            send_ui(to_ui, wake, UiEvent::SendFailed { msg });
                             return Err(fail(format!("write: {e}")));
                         }
                     }
