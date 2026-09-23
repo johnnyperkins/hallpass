@@ -1641,6 +1641,8 @@ dependencies = [
  "hallpass-types",
  "ksni",
  "notify-rust",
+ "rustix 1.1.4",
+ "serde",
  "tokio",
  "tracing",
  "tracing-subscriber",

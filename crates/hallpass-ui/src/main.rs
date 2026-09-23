@@ -6,6 +6,9 @@
 
 mod app;
 mod editor;
+// Used by the prompt agent and window, which land in the following commits.
+#[cfg_attr(not(test), expect(dead_code))]
+mod link;
 mod net;
 mod notify;
 mod prompt;
