@@ -5,6 +5,7 @@
 //! the reader loop handles requests. The first client subscribing with
 //! `prompts: true` becomes the sole prompt handler until it disconnects.
 
+use std::collections::HashMap;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::Path;
 use std::sync::Arc;
@@ -285,6 +286,11 @@ pub fn bind(path: &Path, group: &str) -> std::io::Result<UnixListener> {
 /// reachable without any privilege, since EMFILE is a transient accept error.
 pub async fn serve(listener: UnixListener, deps: Arc<IpcDeps>, tier: Tier) -> std::io::Result<()> {
     tracing::info!(?tier, "IPC listening");
+    // Per socket, so a full observe socket never costs a control client its
+    // connection.
+    let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
+    let per_uid = Arc::new(std::sync::Mutex::new(HashMap::<u32, usize>::new()));
+    let mut refused: u64 = 0;
     loop {
         let stream = match listener.accept().await {
             Ok((stream, _addr)) => stream,
@@ -297,27 +303,124 @@ pub async fn serve(listener: UnixListener, deps: Arc<IpcDeps>, tier: Tier) -> st
                 continue;
             }
         };
+        // One account's share first: Hello proves nothing about intent, so a
+        // client that says it and goes quiet holds its slot for good, and a
+        // single observer could otherwise take all of them.
+        let uid_slot = stream
+            .peer_cred()
+            .ok()
+            .and_then(|c| UidSlot::take(&per_uid, c.uid()));
+        let (Some(uid_slot), Ok(slot)) = (uid_slot, Arc::clone(&slots).try_acquire_owned()) else {
+            // Closed on the spot. Logged at powers of two, because the thing
+            // filling the slots is also what would fill the journal.
+            refused += 1;
+            if refused.is_power_of_two() {
+                tracing::warn!(
+                    ?tier,
+                    refused,
+                    limit = MAX_CONNECTIONS,
+                    "IPC connection limit reached, refusing new connections"
+                );
+            }
+            drop(stream);
+            continue;
+        };
         let deps = Arc::clone(&deps);
         tokio::spawn(async move {
             if let Err(e) = handle_conn(stream, deps, tier).await {
                 tracing::debug!("client connection closed: {e}");
             }
+            drop((slot, uid_slot));
         });
     }
 }
 
+/// Most connections one socket holds open at once.
+///
+/// Every connection is a descriptor, and the daemon's descriptors are also
+/// what attribution opens `/proc` with for every connection on the host: a
+/// member of the observer group holding idle connections until `accept`
+/// hit EMFILE locked the operator's clients out and turned every `/proc`
+/// read into a silent miss, so exe-scoped deny rules stopped matching. A
+/// desktop runs a GUI and a CLI or two; this is far past that and far
+/// short of the descriptor limit.
+const MAX_CONNECTIONS: usize = 64;
+
+/// Most connections one uid holds on one socket; see [`UidSlot`].
+const MAX_CONNECTIONS_PER_UID: usize = 16;
+
+/// One connection counted against its peer's uid, released on drop.
+struct UidSlot {
+    counts: Arc<std::sync::Mutex<HashMap<u32, usize>>>,
+    uid: u32,
+}
+
+impl UidSlot {
+    /// Count a connection for `uid`, or `None` when it already holds
+    /// [`MAX_CONNECTIONS_PER_UID`].
+    fn take(counts: &Arc<std::sync::Mutex<HashMap<u32, usize>>>, uid: u32) -> Option<UidSlot> {
+        let mut map = counts.lock().unwrap_or_else(|e| e.into_inner());
+        let n = map.entry(uid).or_insert(0);
+        if *n >= MAX_CONNECTIONS_PER_UID {
+            return None;
+        }
+        *n += 1;
+        Some(UidSlot {
+            counts: Arc::clone(counts),
+            uid,
+        })
+    }
+}
+
+impl Drop for UidSlot {
+    fn drop(&mut self) {
+        let mut map = self.counts.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(n) = map.get_mut(&self.uid) {
+            *n -= 1;
+            if *n == 0 {
+                map.remove(&self.uid);
+            }
+        }
+    }
+}
+
+/// How long a new connection has to say Hello before it is closed. The
+/// connection limit only helps if connections that never speak give their
+/// slot back.
+const HELLO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Replies queued for one client at once. Replies are built whole before
+/// they are queued and some run to half a megabyte (the event history, the
+/// rule list), so bounding them by count at the depth of the push queue let
+/// a client that sent requests and never read the answers pin hundreds of
+/// megabytes. Past this many, the request loop waits for the client to
+/// read, which stops it reading requests too.
+const REPLY_QUEUE_CAP: usize = 4;
+
 /// Pause after a failed `accept` before trying again.
 const ACCEPT_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
 
-/// Per-client outbound queue depth. Bounded so a client that stops
-/// reading cannot grow daemon memory; events are dropped when full and
-/// prompt delivery falls back to the timeout default.
+/// Per-client queue depth for pushed messages (events, prompts). Bounded so
+/// a client that stops reading cannot grow daemon memory; events are
+/// dropped when full and prompt delivery falls back to the timeout default.
+/// Replies have their own, much smaller queue: [`REPLY_QUEUE_CAP`].
 ///
 /// Also the ceiling for `max_pending_prompts` (enforced by config
 /// validation): a handler that reconnects is re-sent every pending prompt
 /// into this queue in one sweep, so a pending table deeper than the queue
 /// would drop the overflow silently until their timeouts.
 pub(crate) const OUT_QUEUE_CAP: usize = 512;
+
+/// Aborts the task it holds when dropped.
+struct AbortOnDrop(Option<tokio::task::JoinHandle<()>>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        if let Some(task) = self.0.take() {
+            task.abort();
+        }
+    }
+}
 
 async fn handle_conn(
     stream: UnixStream,
@@ -338,11 +441,21 @@ async fn handle_conn(
         crate::session::PeerProcess::resolve(peer.as_ref().and_then(|c| c.pid()).map(|p| p as u32));
     let (mut reader, mut writer) = stream.into_split();
 
-    // All outbound traffic goes through one channel so the prompt table
-    // and event forwarders can write without owning the stream.
+    // Pushed traffic goes through one channel so the prompt table and the
+    // event forwarder can write without owning the stream; replies go
+    // through another, bounded for their size (see REPLY_QUEUE_CAP). Replies
+    // first when both are ready: a client waiting on an answer should not
+    // wait behind a backlog of events.
     let (out_tx, mut out_rx) = mpsc::channel::<DaemonMsg>(OUT_QUEUE_CAP);
+    let (reply_tx, mut reply_rx) = mpsc::channel::<DaemonMsg>(REPLY_QUEUE_CAP);
     let writer_task = tokio::spawn(async move {
-        while let Some(msg) = out_rx.recv().await {
+        loop {
+            let msg = tokio::select! {
+                biased;
+                Some(msg) = reply_rx.recv() => msg,
+                Some(msg) = out_rx.recv() => msg,
+                else => break,
+            };
             if wire::write_msg(&mut writer, &msg).await.is_err() {
                 break;
             }
@@ -361,6 +474,7 @@ async fn handle_conn(
     };
     let result = message_loop(
         &mut reader,
+        &reply_tx,
         &out_tx,
         PeerCreds {
             uid: peer_uid,
@@ -374,6 +488,7 @@ async fn handle_conn(
 
     drop(session);
     deps.prompts.clear_handler(&out_tx);
+    drop(reply_tx);
     drop(out_tx);
     let _ = writer_task.await;
     result
@@ -436,8 +551,8 @@ fn explain(req: &hallpass_types::ExplainRequest, deps: &IpcDeps) -> hallpass_typ
 /// Queue a reply for the writer task. Replies use the awaiting send: the
 /// queue only fills if the client stops reading, and then blocking this
 /// client's own request loop is the correct backpressure.
-async fn send(out_tx: &mpsc::Sender<DaemonMsg>, msg: DaemonMsg) {
-    let _ = out_tx.send(msg).await;
+async fn send(reply_tx: &mpsc::Sender<DaemonMsg>, msg: DaemonMsg) {
+    let _ = reply_tx.send(msg).await;
 }
 
 /// Who is on the other end of a client connection, as the kernel reports
@@ -468,6 +583,7 @@ impl Drop for SessionGuard {
 
 async fn message_loop(
     reader: &mut (impl tokio::io::AsyncRead + Unpin),
+    reply_tx: &mpsc::Sender<DaemonMsg>,
     out_tx: &mpsc::Sender<DaemonMsg>,
     peer: PeerCreds,
     deps: &IpcDeps,
@@ -475,10 +591,18 @@ async fn message_loop(
     tier: Tier,
 ) -> Result<(), wire::WireError> {
     let peer_uid = peer.uid;
-    match wire::read_msg::<ClientMsg, _>(reader).await? {
+    let hello = tokio::time::timeout(HELLO_TIMEOUT, wire::read_msg::<ClientMsg, _>(reader))
+        .await
+        .map_err(|_| {
+            wire::WireError::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "no Hello within the handshake timeout",
+            ))
+        })??;
+    match hello {
         ClientMsg::Hello { version } if version == PROTOCOL_VERSION => {
             send(
-                out_tx,
+                reply_tx,
                 DaemonMsg::HelloAck {
                     version: PROTOCOL_VERSION,
                 },
@@ -487,7 +611,7 @@ async fn message_loop(
         }
         ClientMsg::Hello { version } => {
             send(
-                out_tx,
+                reply_tx,
                 DaemonMsg::Err {
                     message: format!(
                         "protocol version mismatch: client {version}, daemon {PROTOCOL_VERSION}"
@@ -499,7 +623,7 @@ async fn message_loop(
         }
         _ => {
             send(
-                out_tx,
+                reply_tx,
                 DaemonMsg::Err {
                     message: "expected Hello as first message".into(),
                 },
@@ -514,7 +638,12 @@ async fn message_loop(
     // Subscribe created unbounded tasks and receivers, and every EventBus::emit
     // runs on the verdict path and must walk that receiver set: one socket
     // became a per-packet multiplier on the loop that decides every connection.
-    let mut events_subscribed = false;
+    //
+    // Aborted when this function returns. The forwarder holds a sender, and
+    // the writer only ends when every sender is gone, so left to notice the
+    // closed connection by itself it lingered, descriptor and all, until two
+    // more events had gone by: forever, on a quiet host.
+    let mut forwarder = AbortOnDrop(None);
 
     loop {
         let msg = match wire::read_msg::<ClientMsg, _>(reader).await {
@@ -536,7 +665,7 @@ async fn message_loop(
             let refused = client_msg_name(&msg);
             tracing::debug!(msg = refused, "refused on the read-only socket");
             send(
-                out_tx,
+                reply_tx,
                 DaemonMsg::Err {
                     message: format!(
                         "{refused} is not available on the read-only socket; \
@@ -557,11 +686,10 @@ async fn message_loop(
                 // same request, so events are wired up either way and
                 // the reply reports the prompt-slot outcome.
                 let prompt_denied = prompts && !deps.prompts.set_handler(out_tx.clone());
-                if events && !events_subscribed {
-                    events_subscribed = true;
+                if events && forwarder.0.is_none() {
                     let mut rx = deps.events.subscribe();
                     let tx = out_tx.clone();
-                    tokio::spawn(async move {
+                    forwarder.0 = Some(tokio::spawn(async move {
                         loop {
                             match rx.recv().await {
                                 // try_send: a client that stops draining
@@ -579,7 +707,7 @@ async fn message_loop(
                                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                             }
                         }
-                    });
+                    }));
                 }
                 if prompt_denied {
                     DaemonMsg::Err {
@@ -750,7 +878,7 @@ async fn message_loop(
             }
             ClientMsg::RunSessionList => DaemonMsg::RunSessions(deps.sessions.list()),
         };
-        send(out_tx, reply).await;
+        send(reply_tx, reply).await;
     }
 }
 
@@ -1429,6 +1557,87 @@ mod tests {
             DaemonMsg::Ok
         ));
         assert!(!deps.prompts.has_handler());
+    }
+
+    /// A connection that never says Hello gives its slot back.
+    #[tokio::test(start_paused = true)]
+    async fn a_silent_connection_is_closed_at_the_hello_deadline() {
+        let (deps, _dir) = test_deps("hello-deadline");
+        let (server, _client) = UnixStream::pair().unwrap();
+        let err = handle_conn(server, deps, Tier::Control).await.unwrap_err();
+        assert!(
+            matches!(&err, wire::WireError::Io(e) if e.kind() == std::io::ErrorKind::TimedOut),
+            "{err}"
+        );
+    }
+
+    /// Past its limit a socket closes new connections at once, so idle ones
+    /// cannot run the daemon out of descriptors. One test process is one
+    /// uid, so the limit this reaches is the per-account one, which is the
+    /// one that stops a single observer holding every slot.
+    #[tokio::test]
+    async fn connections_past_the_limit_are_closed() {
+        let (deps, dir) = test_deps("conn-limit");
+        let sock = dir.path().join("test.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        tokio::spawn(serve(listener, deps, Tier::Observe));
+
+        let mut held = Vec::new();
+        for _ in 0..MAX_CONNECTIONS_PER_UID {
+            let mut c = client(&sock).await;
+            wire::write_msg(
+                &mut c,
+                &ClientMsg::Hello {
+                    version: PROTOCOL_VERSION,
+                },
+            )
+            .await
+            .unwrap();
+            // Answered, so the server has taken this one's slot.
+            assert!(matches!(
+                wire::read_msg::<DaemonMsg, _>(&mut c).await.unwrap(),
+                DaemonMsg::HelloAck { .. }
+            ));
+            held.push(c);
+        }
+        let mut over = client(&sock).await;
+        let _ = wire::write_msg(
+            &mut over,
+            &ClientMsg::Hello {
+                version: PROTOCOL_VERSION,
+            },
+        )
+        .await;
+        let reply = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            wire::read_msg::<DaemonMsg, _>(&mut over),
+        )
+        .await
+        .expect("the refused connection was closed, not left hanging");
+        assert!(reply.is_err(), "a connection past the limit was served");
+
+        // A slot freed is a slot available again.
+        drop(held.pop());
+        let mut c = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let mut c = client(&sock).await;
+                let _ = wire::write_msg(
+                    &mut c,
+                    &ClientMsg::Hello {
+                        version: PROTOCOL_VERSION,
+                    },
+                )
+                .await;
+                if let Ok(DaemonMsg::HelloAck { .. }) = wire::read_msg::<DaemonMsg, _>(&mut c).await
+                {
+                    break c;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the freed slot was never reused");
+        wire::write_msg(&mut c, &ClientMsg::Stats).await.unwrap();
     }
 
     #[tokio::test]
