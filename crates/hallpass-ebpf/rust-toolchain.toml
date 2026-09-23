@@ -1,5 +1,11 @@
 # The bpfel-unknown-none target is tier 3: it needs nightly and a
 # build-std of core (see .cargo/config.toml).
+#
+# Pinned to a dated nightly, the one the eBPF object was last built and run
+# with: an unpinned channel builds the program that runs in the kernel with
+# whatever compiler happens to be current, different on every machine and
+# every CI run. Move the date deliberately, and rebuild and run the e2e suite
+# with `--ebpf` when you do.
 [toolchain]
-channel = "nightly"
+channel = "nightly-2026-07-11"
 components = ["rust-src"]
