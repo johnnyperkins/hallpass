@@ -181,11 +181,38 @@ fn commit(
     if let Some(name) = &rule_name {
         deps.rules.record_hit(name);
     }
+    let applied = applied_verdict(verdict, enforcing);
+    if packet::is_dns_query(&conn.tuple) {
+        snoop_released_query(deps, conn.tuple, &msg, applied);
+    }
     if !enforcing && verdict != Verdict::Allow {
         deps.stats.record_observed_only();
     }
     deps.events.emit(conn, verdict, rule_name, enforcing);
-    apply_verdict(queue, msg, applied_verdict(verdict, enforcing));
+    apply_verdict(queue, msg, applied);
+}
+
+/// Hand the first query of a DNS flow to the snoop consumer, if it is about
+/// to leave the host.
+///
+/// The first query of a flow is `ct state new`, so it arrives here rather
+/// than on the snoop queue, and recording it is what lets its reply into
+/// the domain cache. Recorded only once allowed: recorded while it was
+/// still being judged, a query policy then denied still armed the tracker,
+/// and the server it was addressed to (on a routable host, anyone) could
+/// answer it anyway and have the answer accepted. Before the packet is
+/// released, so the record is queued ahead of any reply.
+fn snoop_released_query(deps: &QueueDeps, tuple: FlowTuple, msg: &nfq::Message, applied: Verdict) {
+    if applied != Verdict::Allow {
+        return;
+    }
+    if deps
+        .dns_tx
+        .try_send((tuple, msg.get_payload().to_vec()))
+        .is_err()
+    {
+        deps.stats.record_dns_snoop_dropped();
+    }
 }
 
 /// What to do with one received flow packet.
@@ -650,11 +677,15 @@ pub fn run(mut queue: Queue, queue_num: u16, mut deps: QueueDeps) -> std::io::Re
                 // is only held while enforcing, but the mode can flip while
                 // it waits, and "observe blocks nothing" is promised from
                 // the moment of the toggle.
-                apply_verdict(
-                    &mut queue,
-                    msg,
-                    applied_verdict(verdict, deps.settings.enforcing()),
-                );
+                let applied = applied_verdict(verdict, deps.settings.enforcing());
+                if let packet::Parsed::Flow(tuple) =
+                    packet::parse(msg.get_payload(), msg.get_original_len())
+                {
+                    if packet::is_dns_query(&tuple) {
+                        snoop_released_query(&deps, tuple, &msg, applied);
+                    }
+                }
+                apply_verdict(&mut queue, msg, applied);
             }
         }
 
@@ -723,17 +754,6 @@ pub fn run(mut queue: Queue, queue_num: u16, mut deps: QueueDeps) -> std::io::Re
                     apply_verdict(&mut queue, msg, applied);
                     continue;
                 };
-
-                // The first query on a DNS flow is `ct state new` and thus
-                // arrives on the verdict queue; snoop it before deciding.
-                if packet::is_dns_query(&tuple)
-                    && deps
-                        .dns_tx
-                        .try_send((tuple, msg.get_payload().to_vec()))
-                        .is_err()
-                {
-                    deps.stats.record_dns_snoop_dropped();
-                }
 
                 let iface = iface_map.name(msg.get_outdev());
                 let ctx = DecideCtx {

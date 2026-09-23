@@ -17,6 +17,11 @@ use lru::LruCache;
 /// Default cache capacity (distinct IPs).
 pub const CACHE_CAPACITY: usize = 8192;
 
+/// Addresses one response may add to the cache; see [`IpDomainCache::absorb`].
+/// Real answers carry a handful, and the largest round-robin sets a few
+/// dozen at most.
+const MAX_ADDRS_PER_RESPONSE: usize = 32;
+
 /// Outstanding queries the tracker remembers (per-key, LRU).
 pub const TRACKER_CAPACITY: usize = 512;
 /// How long an observed query stays answerable.
@@ -341,10 +346,24 @@ impl IpDomainCache {
         }
     }
 
-    /// Cache every address from a parsed response under the query name.
+    /// Cache the addresses from a parsed response under the query name.
+    ///
+    /// At most [`MAX_ADDRS_PER_RESPONSE`] of them. A resolver asked about a
+    /// zone its owner controls answers with as many records as fit, and one
+    /// 64 KiB response carried thousands: a few lookups of their own name
+    /// evicted every other application's entries, and every domain rule
+    /// fell back to a prompt or the default with them.
+    ///
+    /// A name that is itself an address is not a name. `getaddrinfo` on a
+    /// numeric host "resolves" it, and caching the result labelled the
+    /// address with its own text, overwriting the domain a real lookup had
+    /// recorded for it.
     pub fn absorb(&self, resp: &SnoopedResponse) {
+        if resp.query_name.parse::<IpAddr>().is_ok() {
+            return;
+        }
         let now = Instant::now();
-        for (ip, ttl) in &resp.addrs {
+        for (ip, ttl) in resp.addrs.iter().take(MAX_ADDRS_PER_RESPONSE) {
             self.insert_at(*ip, &resp.query_name, *ttl, now);
         }
     }
@@ -380,6 +399,44 @@ impl IpDomainCache {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn absorb_takes_a_bounded_number_of_addresses() {
+        let cache = IpDomainCache::new(1024);
+        let addrs = (0..200u32)
+            .map(|n| (IpAddr::from(std::net::Ipv4Addr::from(0x0a00_0000 + n)), 300))
+            .collect();
+        cache.absorb(&SnoopedResponse {
+            id: 1,
+            query_name: "flood.example".into(),
+            addrs,
+        });
+        let cached = (0..200u32)
+            .filter(|n| {
+                cache
+                    .lookup(&IpAddr::from(std::net::Ipv4Addr::from(0x0a00_0000 + n)))
+                    .is_some()
+            })
+            .count();
+        assert_eq!(cached, MAX_ADDRS_PER_RESPONSE);
+    }
+
+    #[test]
+    fn an_address_is_never_cached_as_its_own_name() {
+        let cache = IpDomainCache::new(16);
+        let ip: IpAddr = "140.82.112.3".parse().unwrap();
+        cache.absorb(&SnoopedResponse {
+            id: 1,
+            query_name: "github.com".into(),
+            addrs: vec![(ip, 300)],
+        });
+        cache.absorb(&SnoopedResponse {
+            id: 0,
+            query_name: "140.82.112.3".into(),
+            addrs: vec![(ip, 300)],
+        });
+        assert_eq!(cache.lookup(&ip).as_deref(), Some("github.com"));
+    }
     use super::*;
 
     /// Encode a dotted name into uncompressed wire format.

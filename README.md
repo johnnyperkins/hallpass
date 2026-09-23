@@ -584,11 +584,22 @@ who can delete the nftables table outright.
   addresses, transaction ID, and question name match a recorded query.
   Spoofed packets from source port 53 cannot poison domain rules.
 - **Domain rules are a convenience, not a boundary against a local
-  process choosing its own DNS.** Both snoopers record what was resolved;
-  a process that controls a zone can point a name it owns at any address,
-  and the cache keeps one domain per address, so the last resolver of an
-  address wins. Scope security-relevant rules with `exe`/`exe_sha256` or
-  IP/CIDR criteria rather than domain alone.
+  process choosing its own DNS.** Both snoopers record what was resolved,
+  and a process chooses what it resolves: it can query a server of its own,
+  or point its own libc at one (`LOCALDOMAIN`, `RES_OPTIONS` and a search
+  domain it controls), and have *any* name, not only one it owns, answered
+  with any address. The cache keeps one domain per address, so the last
+  resolver of an address wins, for every process on the host. Scope
+  security-relevant rules with `exe`/`exe_sha256` or IP/CIDR criteria
+  rather than domain alone.
+- **An allowed UDP flow can be borrowed.** Only a flow's first packet is
+  judged; later packets that match its conntrack entry are not. UDP has no
+  connection to close, so once a process closes its socket, another one can
+  bind the same local port and keep sending to the same destination inside
+  the entry the first one was allowed, refreshing it as it goes. Local
+  ports are visible in `/proc/net/udp`. This is what judging new
+  connections means, and it matters most for a broad allow such as a
+  resolver's port 53 to anywhere.
 - **Rule files**: files in `rules.d` are ignored (with a warning) unless owned
   by root (or the daemon's own euid) and not group/other writable. Symlinks
   are skipped, and the ownership check and the parsed bytes come from the
