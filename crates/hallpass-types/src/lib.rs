@@ -951,15 +951,26 @@ pub fn validate_tags(tags: &[String]) -> Result<(), String> {
 /// Control characters (C0, DEL, C1) move the cursor and clear lines; the bidi
 /// marks and overrides reverse runs of text; the zero-width characters and the
 /// BOM hide where one string ends and the next begins.
-fn is_display_hazard(c: char) -> bool {
+pub fn is_display_hazard(c: char) -> bool {
     c.is_control()
         || matches!(c,
             '\u{00ad}'                // soft hyphen
+            | '\u{034f}'              // combining grapheme joiner
             | '\u{061c}'              // arabic letter mark
+            | '\u{115f}' | '\u{1160}' // hangul choseong and jungseong fillers
+            | '\u{180e}'              // mongolian vowel separator
             | '\u{200b}'..='\u{200f}' // zero width, LRM, RLM
+            | '\u{2028}' | '\u{2029}' // line and paragraph separators
             | '\u{202a}'..='\u{202e}' // bidi embeddings and overrides
+            | '\u{2060}'..='\u{2064}' // word joiner, invisible operators
             | '\u{2066}'..='\u{2069}' // bidi isolates
+            | '\u{2800}'              // braille blank, a space that is not whitespace
+            | '\u{3164}'              // hangul filler
+            | '\u{fe00}'..='\u{fe0f}' // variation selectors
             | '\u{feff}'              // BOM / zero width no-break space
+            | '\u{ffa0}'              // halfwidth hangul filler
+            | '\u{e0000}'..='\u{e007f}' // tag characters
+            | '\u{e0100}'..='\u{e01ef}' // variation selectors supplement
         )
 }
 
