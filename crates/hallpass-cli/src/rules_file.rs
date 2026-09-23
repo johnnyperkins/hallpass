@@ -29,14 +29,44 @@ struct Document {
 }
 
 /// Render `rules` as one TOML document.
+///
+/// A rule the sanitizer had to change does not survive a round trip: what
+/// `rules import` reads back matches a different string, and for a deny
+/// written from a prompt about a hostile path that is a block that quietly
+/// no longer applies. Those rules are named in a comment at the top of the
+/// document and on stderr, so the loss is visible where the file is made
+/// and where it is read.
 pub fn export(rules: &[Rule]) -> Result<String, CliError> {
+    let mut altered = Vec::new();
     let doc = Document {
-        rule: rules.iter().map(sanitized_rule).collect(),
+        rule: rules
+            .iter()
+            .map(|r| {
+                let clean = sanitized_rule(r);
+                if clean != *r {
+                    altered.push(clean.name.clone());
+                }
+                clean
+            })
+            .collect(),
     };
     // Sanitizing also decodes paths through `Path::display`, so a non-UTF-8
     // exe path cannot fail serialization here the way it would in `serde_json`.
-    toml::to_string_pretty(&doc)
-        .map_err(|e| CliError::Protocol(format!("cannot encode rules as toml: {e}")))
+    let body = toml::to_string_pretty(&doc)
+        .map_err(|e| CliError::Protocol(format!("cannot encode rules as toml: {e}")))?;
+    if altered.is_empty() {
+        return Ok(body);
+    }
+    let mut out = String::from(
+        "# WARNING: these rules contained characters that were replaced for display.\n\
+         # Imported from this file they match different strings than the originals:\n",
+    );
+    for name in &altered {
+        eprintln!("warning: rule {name} was altered for display and will not import as it was");
+        out.push_str(&format!("#   {name}\n"));
+    }
+    out.push_str(&body);
+    Ok(out)
 }
 
 /// Parse a document written by [`export`].
@@ -53,6 +83,21 @@ mod tests {
     use super::*;
     use hallpass_types::{Action, Proto, RuleDuration, RuleMatch};
     use std::path::PathBuf;
+
+    /// A rule the sanitizer changed is flagged in the document, not
+    /// exported as if it would come back the same.
+    #[test]
+    fn an_altered_rule_is_named_in_the_export() {
+        let mut rules = sample();
+        rules[0].matcher.exe = Some(PathBuf::from("/tmp/x\u{200b}evil"));
+        let text = export(&rules).unwrap();
+        assert!(text.starts_with("# WARNING"), "{text}");
+        assert!(text.contains(&format!("#   {}\n", rules[0].name)), "{text}");
+        assert!(
+            !export(&sample()).unwrap().starts_with('#'),
+            "clean rules carry no warning"
+        );
+    }
 
     /// A ruleset covering several matcher fields and every duration kind.
     fn sample() -> Vec<Rule> {
