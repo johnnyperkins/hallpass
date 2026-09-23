@@ -1,9 +1,9 @@
-//! The eframe application: main management window + prompt popup viewports.
+//! The management window: an ordinary daemon client with no prompts, no
+//! tray and nothing that outlives its close (see `agent` for those).
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::sync::mpsc::{Receiver, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::mpsc::Receiver;
 use std::time::Duration;
 
 use eframe::egui::{self, Color32, RichText};
@@ -13,11 +13,10 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use crate::editor::RuleEditor;
 use crate::net::{self, UiEvent};
-use crate::prompt::{self, PromptState};
-use crate::prompt_view::prompt_ui;
+use crate::prompt;
 use crate::theme::{self, Tone, ALLOW_COLOR, DENY_COLOR, MUTED, REJECT_COLOR, TEXT};
 use crate::traffic;
-use crate::tray::{TrayMsg, TrayState};
+use crate::tray::TrayState;
 
 /// Maximum number of events kept in the scrollback.
 /// How often the window refetches `Stats`.
@@ -192,68 +191,36 @@ fn ack_kind(msg: &ClientMsg) -> Option<AckKind> {
     }
 }
 
-/// The daemon-facing sender, shared between the main window's frame and
-/// the prompt popups' own render callbacks (see [`HallpassApp::prompt_windows`]).
+/// The daemon-facing sender and what each request's ack will answer.
 ///
 /// The ack FIFO only works if its order equals the order messages enter
-/// the outgoing channel, so recording the expected ack and sending happen
-/// in one critical section: two callers interleaving between the push and
-/// the send would otherwise have the daemon's replies matched against a
-/// queue in a different order than the requests it actually received.
+/// the outgoing channel, so every send goes through here, where recording
+/// the expected ack and sending are one step.
 struct DaemonLink {
     /// Channel to the tokio thread (UI -> daemon).
     to_daemon: UnboundedSender<ClientMsg>,
     /// FIFO of what each expected Ok/Err answers, in send order.
-    pending_acks: Mutex<VecDeque<AckKind>>,
+    pending_acks: VecDeque<AckKind>,
 }
 
 impl DaemonLink {
-    fn send(&self, msg: ClientMsg) {
-        let mut acks = self.pending_acks.lock().unwrap();
+    fn send(&mut self, msg: ClientMsg) {
         if let Some(kind) = ack_kind(&msg) {
-            acks.push_back(kind);
+            self.pending_acks.push_back(kind);
         }
         // The net thread outlives the app; a send error only happens during
-        // shutdown and is safe to ignore. Sent under the lock: the push
-        // above and this send must stay adjacent in channel order.
+        // shutdown and is safe to ignore.
         let _ = self.to_daemon.send(msg);
     }
 }
 
-/// Shared prompt state: the pending queue plus which viewport generation
-/// currently owns each popup window.
-///
-/// The generations exist because an emptied popup cannot be closed or
-/// resurfaced from its own side: destroying a child viewport takes a main
-/// window pass (which an unfocused or occluded main window may not run
-/// for a long time), and a minimized window cannot be programmatically
-/// unminimized everywhere (winit ignores it on Wayland). So an emptied
-/// window is *abandoned*: parked minimized and invisible where the
-/// platform allows, its generation bumped so the next prompt for the same
-/// application gets a fresh viewport id and a fresh window, and the
-/// parked one is reaped whenever the main window next paints. Stale
-/// generations render nothing, so an abandoned window can never show a
-/// prompt that a fresh window also shows.
-#[derive(Default)]
-struct PromptBoard {
-    pending: Vec<PromptState>,
-    /// Bumped when a window's queue empties; pruned by the main window's
-    /// frame for windows with no pending prompts (their parked viewports
-    /// are reaped in that same pass), which is what bounds the map.
-    generations: HashMap<PromptWindow, u64>,
-}
-
 pub struct HallpassApp {
-    /// Shared sender plus ack bookkeeping; popup callbacks hold clones.
-    link: Arc<DaemonLink>,
+    /// Sender plus ack bookkeeping.
+    link: DaemonLink,
     /// Channel from the tokio thread (daemon -> UI).
     from_net: Receiver<UiEvent>,
     status: ConnStatus,
     tab: Tab,
-    /// Pending prompts plus popup-window bookkeeping, shared with the
-    /// popup viewports' render callbacks, which run on their own window
-    /// events rather than this window's frame.
-    prompts: Arc<Mutex<PromptBoard>>,
     events: VecDeque<ConnEvent>,
     /// Keys of the last history backfill that have not yet come in live.
     ///
@@ -321,14 +288,6 @@ pub struct HallpassApp {
     /// Parse error or daemon rejection for the settings form, shown next
     /// to its Apply button rather than in the status bar.
     settings_error: Option<String>,
-    /// Popup viewports declared on the previous frame. A viewport id
-    /// appearing that was not in here is a window being born, which is
-    /// the one moment it gets its focus and attention requests; replaced
-    /// wholesale every frame, so it stays bounded by the live windows.
-    surfaced_popups: std::collections::HashSet<egui::ViewportId>,
-    /// Tray activation channel; None when no tray service was started
-    /// (no X11-capable display, or tests).
-    from_tray: Option<Receiver<TrayMsg>>,
     /// Whether the daemon on the *current* connection has reported its mode.
     ///
     /// `enforcing` and `stats` survive a disconnect so the tabs keep showing
@@ -339,45 +298,32 @@ pub struct HallpassApp {
     /// or one that accepts the connection and then wedges before answering,
     /// would be drawn as enforcing for as long as that lasted.
     mode_reported: bool,
-    /// Enforcement state channel to the tray icon, paired with `from_tray`.
-    to_tray: Option<Sender<TrayState>>,
-    /// The last state pushed, so the icon is redrawn on change rather than
-    /// on every frame: a DBus round trip at 60fps for a fact that moves
-    /// every few seconds at most.
-    tray_state: TrayState,
-    /// Whether the close button parks the window in the tray instead of
-    /// quitting. Starts true only where a tray can exist, and drops back
-    /// to false if the tray service finds no StatusNotifier host:
-    /// parking must never outlive the icon that un-parks it.
-    park_on_close: bool,
-    /// Set by the quit paths so the close request they issue is not
-    /// intercepted and parked.
-    quitting: bool,
+    /// The state the window icon was last painted for, so it is redrawn
+    /// on change rather than every frame.
+    icon_state: TrayState,
 }
 
 impl HallpassApp {
     /// The eframe entry point: connect to `socket` on the network thread.
     ///
     /// The creation context contributes exactly one thing, the [`egui::Context`]
-    /// the network and tray threads wake the event loop with. `tray` is
-    /// whether the session can re-show a hidden window (the X11 backend);
-    /// without that, a tray icon would offer a Show that does nothing, so
-    /// none is started and close keeps quitting.
-    pub fn new(cc: &eframe::CreationContext<'_>, socket: PathBuf, tray: bool) -> Self {
+    /// the network thread wakes the event loop with. No tray and no
+    /// notifications here: both belong to the agent, and this window is an
+    /// ordinary client that holds no prompts.
+    pub fn new(cc: &eframe::CreationContext<'_>, socket: PathBuf) -> Self {
         let (to_daemon, from_ui) = tokio::sync::mpsc::unbounded_channel();
         let (to_ui, from_net) = std::sync::mpsc::channel();
-        let (to_notify, from_net_notify) = std::sync::mpsc::channel();
-        crate::notify::spawn(from_net_notify);
-        let wake = crate::repaint(&cc.egui_ctx);
-        net::spawn(socket, to_ui, from_ui, wake.clone(), to_notify);
-        let mut app = Self::with_channels(to_daemon, from_net);
-        if tray {
-            let tray = crate::tray::spawn(wake);
-            app.from_tray = Some(tray.msgs);
-            app.to_tray = Some(tray.state);
-            app.park_on_close = true;
-        }
-        app
+        // Nobody listens: this client never subscribes to prompts, so the
+        // network thread has no prompt lifecycle to tee.
+        let (to_notify, _) = std::sync::mpsc::channel();
+        net::spawn(
+            socket,
+            to_ui,
+            from_ui,
+            crate::repaint(&cc.egui_ctx),
+            to_notify,
+        );
+        Self::with_channels(to_daemon, from_net)
     }
 
     /// An app wired to nothing but this channel pair.
@@ -389,14 +335,13 @@ impl HallpassApp {
     /// this project's GUI defects have actually lived.
     fn with_channels(to_daemon: UnboundedSender<ClientMsg>, from_net: Receiver<UiEvent>) -> Self {
         Self {
-            link: Arc::new(DaemonLink {
+            link: DaemonLink {
                 to_daemon,
-                pending_acks: Mutex::new(VecDeque::new()),
-            }),
+                pending_acks: VecDeque::new(),
+            },
             from_net,
             status: ConnStatus::Connecting,
             tab: Tab::Events,
-            prompts: Arc::new(Mutex::new(PromptBoard::default())),
             events: VecDeque::new(),
             history_keys: std::collections::HashSet::new(),
             rules: Vec::new(),
@@ -419,13 +364,8 @@ impl HallpassApp {
             settings_timeout: String::new(),
             settings_verdict: Verdict::Allow,
             settings_error: None,
-            surfaced_popups: std::collections::HashSet::new(),
-            from_tray: None,
             mode_reported: false,
-            to_tray: None,
-            tray_state: TrayState::Unknown,
-            park_on_close: false,
-            quitting: false,
+            icon_state: TrayState::Unknown,
         }
     }
 
@@ -433,69 +373,9 @@ impl HallpassApp {
         self.link.send(msg);
     }
 
-    /// The one real exit path: every quit control funnels here so open
-    /// prompts are always denied-once (releasing the handler slot
-    /// cleanly) before the window goes down, and so the close request it
-    /// issues is not intercepted and parked.
-    fn quit(&mut self, ctx: &egui::Context) {
-        self.quitting = true;
-        self.abandon_open_prompts();
-        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-    }
-
-    /// Drain tray activations, like [`Self::drain_net`] but for the tray
-    /// thread. A parked window still runs this: the tray pairs every
-    /// message with a repaint request, and a hidden X11 window's frame
-    /// loop keeps servicing those.
-    fn drain_tray(&mut self, ctx: &egui::Context) {
-        let Some(from_tray) = &self.from_tray else {
-            return;
-        };
-        // Collected first: the receiver borrow must end before the
-        // handlers take &mut self.
-        let msgs: Vec<TrayMsg> = from_tray.try_iter().collect();
-        for msg in msgs {
-            match msg {
-                TrayMsg::Show => {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-                }
-                TrayMsg::Quit => self.quit(ctx),
-                TrayMsg::Unavailable => {
-                    self.park_on_close = false;
-                    // The failure may have lost a race with a park (close
-                    // clicked before the tray gave up, or a --hidden
-                    // start): a hidden window with no icon is unreachable,
-                    // so re-show unconditionally. On a visible window the
-                    // command is a no-op.
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                }
-            }
-        }
-    }
-
-    /// Test seams: the shared state is behind locks the tests should not
-    /// have to spell out, and what they assert on is ids and kinds.
-    #[cfg(test)]
-    fn prompt_ids(&self) -> Vec<u64> {
-        self.prompts
-            .lock()
-            .unwrap()
-            .pending
-            .iter()
-            .map(|p| p.id)
-            .collect()
-    }
-
     #[cfg(test)]
     fn pending_ack_kinds(&self) -> Vec<AckKind> {
-        self.link
-            .pending_acks
-            .lock()
-            .unwrap()
-            .iter()
-            .copied()
-            .collect()
+        self.link.pending_acks.iter().copied().collect()
     }
 
     /// Drain messages from the network thread into UI state.
@@ -518,11 +398,12 @@ impl HallpassApp {
                     // mode until this daemon has said what it is: the one it
                     // restarted into may not be the one it died in.
                     self.mode_reported = false;
-                    // Register as prompt handler + event subscriber and prime
-                    // the rule/stat views (net.rs only does the handshake).
+                    // The event feed, never the prompt slot: prompts are the
+                    // agent's. Then prime the rule/stat views (net.rs only
+                    // does the handshake).
                     self.send(ClientMsg::Subscribe {
                         events: true,
-                        prompts: true,
+                        prompts: false,
                     });
                     self.send(ClientMsg::RuleList);
                     self.send(ClientMsg::Stats);
@@ -543,10 +424,8 @@ impl HallpassApp {
                 }
                 UiEvent::Disconnected { retry_in } => {
                     self.status = ConnStatus::Reconnecting { retry_in };
-                    // Pending prompts and in-flight acks are dead with
-                    // the connection.
-                    self.prompts.lock().unwrap().pending.clear();
-                    self.link.pending_acks.lock().unwrap().clear();
+                    // In-flight acks are dead with the connection.
+                    self.link.pending_acks.clear();
                     if let Some(editor) = self.editor.as_mut().filter(|e| e.awaiting_ack()) {
                         editor.ack_lost("connection lost; the rule was not saved");
                     }
@@ -554,7 +433,7 @@ impl HallpassApp {
                 UiEvent::SendFailed { msg } => {
                     // Its ack will never arrive; keep the FIFO aligned.
                     if ack_kind(&msg).is_some() {
-                        self.link.pending_acks.lock().unwrap().pop_front();
+                        self.link.pending_acks.pop_front();
                     }
                     if matches!(msg, ClientMsg::RuleAdd(_)) {
                         if let Some(editor) = self.editor.as_mut().filter(|e| e.awaiting_ack()) {
@@ -590,26 +469,6 @@ impl HallpassApp {
     fn handle_daemon_msg(&mut self, msg: hallpass_types::DaemonMsg) {
         use hallpass_types::DaemonMsg;
         match msg {
-            DaemonMsg::PromptRequest {
-                id,
-                conn,
-                deadline_ms,
-                context,
-            } => {
-                let mut board = self.prompts.lock().unwrap();
-                if !board.pending.iter().any(|p| p.id == id) {
-                    board.pending.push(PromptState::new(
-                        id,
-                        conn,
-                        deadline_ms,
-                        hallpass_types::unix_ms_now(),
-                        context,
-                    ));
-                }
-            }
-            DaemonMsg::PromptExpired { id } => {
-                self.prompts.lock().unwrap().pending.retain(|p| p.id != id);
-            }
             DaemonMsg::Event(ev) => {
                 if !self.history_keys.remove(&event_key(&ev)) {
                     self.push_event(ev);
@@ -660,7 +519,7 @@ impl HallpassApp {
             // the form (and everything typed into it) alive on a reject,
             // close it on success, and route unrelated acks elsewhere.
             DaemonMsg::Err { message } => {
-                let kind = self.link.pending_acks.lock().unwrap().pop_front();
+                let kind = self.link.pending_acks.pop_front();
                 match (kind, self.editor.as_mut().filter(|e| e.awaiting_ack())) {
                     (Some(AckKind::RuleSave), Some(editor)) => editor.ack_err(&message),
                     // A refused settings change belongs next to the Apply
@@ -679,7 +538,7 @@ impl HallpassApp {
                 }
             }
             DaemonMsg::Ok => {
-                let kind = self.link.pending_acks.lock().unwrap().pop_front();
+                let kind = self.link.pending_acks.pop_front();
                 if kind == Some(AckKind::RuleSave)
                     && self.editor.as_ref().is_some_and(RuleEditor::awaiting_ack)
                 {
@@ -692,40 +551,13 @@ impl HallpassApp {
                     self.send(refetch);
                 }
             }
-            // The daemon took the prompt slot back because prompts sent here
-            // timed out unanswered. Claim it again immediately: this window
-            // is alive and reading, so the eviction was about an operator who
-            // was not at the keyboard, and leaving the slot empty would mean
-            // every later connection is decided by the daemon's default with
-            // nothing on screen. A client that is genuinely wedged never gets
-            // this far, which is what makes the eviction worth doing.
-            //
-            // `events: false`, unlike the subscribe on connect: the daemon
-            // starts one event forwarder per connection and this one is
-            // already running, so only the slot is being asked for.
-            DaemonMsg::PromptHandlerRevoked => {
-                self.send(ClientMsg::Subscribe {
-                    events: false,
-                    prompts: true,
-                });
-                self.last_error = Some(
-                    "the daemon released this window's prompt slot after \
-                     prompts went unanswered; reclaiming it"
-                        .to_string(),
-                );
-            }
-            // None of these are requested by this client. Ignoring them
-            // keeps the connection alive: the alternative on an unexpected
-            // reply would be tearing down the stream that carries prompts.
-            // Session grants surface here anyway, through the rule name on
-            // the events they allow, so nothing is hidden by not asking.
             // The bulk toggle's own ack: it occupies a slot in the queue like
             // any other answered request, and the rules it did not manage to
             // write are the operator's to see - the screen is about to be
             // refetched, so those rules will quietly reappear enabled with
             // nothing said about why.
             DaemonMsg::RulesToggled { changed, failed } => {
-                let kind = self.link.pending_acks.lock().unwrap().pop_front();
+                let kind = self.link.pending_acks.pop_front();
                 // Always said, not only on failure: the daemon acted on its
                 // own live tag set, which may hold rules this table never
                 // showed, and the refetch that follows renders the result
@@ -750,9 +582,15 @@ impl HallpassApp {
                     self.send(refetch);
                 }
             }
-            // Never requested by this client: the posture reaches the
-            // window through `Stats`, which the tab already refetches.
-            DaemonMsg::LockdownState(_)
+            // None of these are requested by this client. Ignoring them keeps
+            // the connection alive rather than tearing it down over a reply.
+            // The posture reaches the window through `Stats`, and session
+            // grants through the rule name on the events they allow. The
+            // prompt messages belong to the agent, which holds the slot.
+            DaemonMsg::PromptRequest { .. }
+            | DaemonMsg::PromptExpired { .. }
+            | DaemonMsg::PromptHandlerRevoked
+            | DaemonMsg::LockdownState(_)
             | DaemonMsg::RuleHits(_)
             | DaemonMsg::Explanation(_)
             | DaemonMsg::RunSessionStarted { .. }
@@ -788,8 +626,8 @@ impl HallpassApp {
     /// Only once the daemon on this connection has said so: before the first
     /// reply there is nothing to report, and reporting it anyway would
     /// announce that nothing is being blocked on a daemon that is blocking.
-    /// Behind [`Self::mode_is_known`] with the tray, so the two cannot make
-    /// different claims about one host.
+    /// Behind [`Self::mode_is_known`] with the corner mark, so the two cannot
+    /// make different claims about one host.
     fn observe_banner(&self) -> bool {
         if !self.mode_is_known() {
             return false;
@@ -804,7 +642,8 @@ impl HallpassApp {
         self.enforcing == Some(false) && self.lockdown_banner().is_none()
     }
 
-    /// What the tray icon should be showing.
+    /// What the corner mark and the window icon claim. The agent's tray
+    /// icon applies the same rules to the same replies (`agent::HostState`).
     ///
     /// Ordered the same way the banners are, and for the same reason: a
     /// posture overrides the stored mode, so a locked-down host with a stored
@@ -828,7 +667,7 @@ impl HallpassApp {
 
     /// Whether anything may be claimed about what this host is enforcing.
     ///
-    /// The single gate the tray and both banners sit behind, so they cannot
+    /// The single gate the corner mark and both banners sit behind, so they cannot
     /// disagree about the same host: connected, and the daemon on *this*
     /// connection has answered. Either half alone is not enough - `enforcing`
     /// outlives the connection it came from, and a connection outlives
@@ -837,31 +676,19 @@ impl HallpassApp {
         matches!(self.status, ConnStatus::Connected) && self.mode_reported
     }
 
-    /// Push the state to the tray when it changes.
-    ///
-    /// On change only: the icon is a DBus round trip and this runs every
-    /// frame. A send failure means the tray thread is gone, which
-    /// [`TrayMsg::Unavailable`] already reports through the other channel.
-    fn sync_tray(&mut self, ctx: &egui::Context) {
-        let state = self.tray_state();
-        if state == self.tray_state {
-            return;
-        }
-        self.sync_window_icon(ctx, state);
-        self.tray_state = state;
-        if let Some(to_tray) = &self.to_tray {
-            let _ = to_tray.send(state);
-        }
-    }
-
     /// Repaint the window icon when the state changes, so the taskbar
     /// entry says what the tray icon and the corner mark say.
     ///
-    /// On change only, like the tray push: rasterizing the mark is cheap
-    /// but not free, and this would otherwise run every frame. Best
-    /// effort by platform - X11 honours a window icon, Wayland shows the
-    /// desktop entry's instead and ignores this.
-    fn sync_window_icon(&self, ctx: &egui::Context, state: TrayState) {
+    /// On change only: rasterizing the mark is cheap but not free, and this
+    /// would otherwise run every frame. Best effort by platform - X11
+    /// honours a window icon, Wayland shows the desktop entry's instead and
+    /// ignores this.
+    fn sync_icon(&mut self, ctx: &egui::Context) {
+        let state = self.tray_state();
+        if state == self.icon_state {
+            return;
+        }
+        self.icon_state = state;
         ctx.send_viewport_cmd(egui::ViewportCommand::Icon(Some(std::sync::Arc::new(
             theme::icon(tray_state_color(state)),
         ))));
@@ -952,49 +779,6 @@ impl HallpassApp {
         }
     }
 
-    /// Hand `ids` back to the daemon as denied.
-    ///
-    /// A prompt this client accepted is its responsibility until it answers
-    /// or gives it up, and giving one up quietly is not neutral: the daemon
-    /// times it out and applies `default_verdict`, which is allow unless the
-    /// operator changed it. So every way of abandoning a prompt routes
-    /// through here rather than just dropping it, and denies once, for this
-    /// port only. Ids no longer pending are skipped, so an answer made in
-    /// the same frame is never overwritten by the dismissal that follows it.
-    fn dismiss_prompts(&mut self, ids: impl IntoIterator<Item = u64>) {
-        for id in ids {
-            let was_pending = {
-                let mut board = self.prompts.lock().unwrap();
-                let before = board.pending.len();
-                board.pending.retain(|p| p.id != id);
-                board.pending.len() != before
-            };
-            if was_pending {
-                self.send(prompt::close_reply(id));
-            }
-        }
-    }
-
-    /// Answer every prompt still on screen before the process exits.
-    ///
-    /// Leaving with prompts open abandons them the same way closing their
-    /// window does, so it answers them the same way (deny, once). Best
-    /// effort by nature: the replies are queued to the network thread and
-    /// the process may exit before it writes them, in which case the
-    /// daemon's timeout still decides. Queuing them costs nothing and is
-    /// right whenever it wins.
-    fn abandon_open_prompts(&mut self) {
-        let pending: Vec<u64> = self
-            .prompts
-            .lock()
-            .unwrap()
-            .pending
-            .iter()
-            .map(|p| p.id)
-            .collect();
-        self.dismiss_prompts(pending);
-    }
-
     fn select_tab(&mut self, tab: Tab) {
         if self.tab != tab {
             self.tab = tab;
@@ -1018,31 +802,6 @@ impl HallpassApp {
     fn main_window(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         theme::ensure_installed(&ctx);
-        // Closing the main window parks it in the tray when there is a
-        // tray to come back through: prompts stay armed and keep popping
-        // while the window is away, which is what makes the close button
-        // safe to press on a prompt surface. (An earlier version hid
-        // unconditionally; on Wayland's no-op hide that read as the close
-        // button not working, which is why hiding is gated on the tray
-        // and the tray on the X11 backend.) Without a tray - no X11
-        // display, no StatusNotifier host, or a quit already under way -
-        // close still quits exactly like Quit, with the cost stated where
-        // it is paid: quitting releases the prompt-handler slot, and
-        // every later unmatched connection takes the daemon's default
-        // verdict with nothing on screen; the prompts still open are
-        // denied-once first rather than left to time out. The dismissal
-        // is idempotent (ids no longer pending are skipped), so re-running
-        // on the teardown frames costs nothing; every exit path funnels
-        // through `quit` so prompts are always abandoned the same way.
-        if ctx.input(|i| i.viewport().close_requested()) {
-            if self.park_on_close && !self.quitting {
-                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-            } else {
-                self.abandon_open_prompts();
-            }
-        }
-
         self.shortcuts(&ctx);
 
         egui::Panel::top("tabs")
@@ -1064,7 +823,7 @@ impl HallpassApp {
             )
             .show_separator_line(false)
             .show(ui, |ui| {
-                self.status_bar(ui, &ctx);
+                self.status_bar(ui);
             });
 
         egui::CentralPanel::default()
@@ -1123,8 +882,9 @@ impl HallpassApp {
     ///
     /// The mark is painted in the colour of whatever the host is doing, so
     /// the top-left corner answers "is this thing on" before any tab is
-    /// read; it is the same claim the tray icon makes, from the same
-    /// [`Self::tray_state`], so the two cannot disagree.
+    /// read. It is the same claim the window icon makes, from the same
+    /// [`Self::tray_state`]; the agent's tray icon applies the same rules in
+    /// its own process (`agent::HostState`).
     fn header(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             let state = self.tray_state();
@@ -1145,7 +905,7 @@ impl HallpassApp {
 
     /// The bottom strip: the daemon link, and the last thing that went
     /// wrong.
-    fn status_bar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+    fn status_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             let (color, text) = match &self.status {
                 ConnStatus::Connecting => (REJECT_COLOR, "Connecting to daemon...".to_string()),
@@ -1166,16 +926,6 @@ impl HallpassApp {
                 );
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .button("Quit")
-                    .on_hover_text(
-                        "Releases the prompt slot: later unmatched connections take \
-                         the daemon's default verdict with nothing on screen.",
-                    )
-                    .clicked()
-                {
-                    self.quit(ctx);
-                }
                 if let Some(s) = &self.stats {
                     ui.label(theme::num_muted(format!(
                         "up {}",
@@ -1873,9 +1623,9 @@ impl HallpassApp {
 
                 ui.columns(2, |cols| {
                     // Whether anyone is being asked at all, and how often
-                    // nobody answered. Without this card a window that has
-                    // quietly lost the prompt slot looks exactly like a
-                    // quiet machine.
+                    // nobody answered. Without this card an agent that is
+                    // not running, or has quietly lost the prompt slot,
+                    // looks exactly like a quiet machine.
                     theme::card(&mut cols[0], "PROMPTING", |ui| {
                         egui::Grid::new("stats_prompt")
                             .num_columns(2)
@@ -2195,280 +1945,12 @@ impl HallpassApp {
             .color(MUTED),
         );
     }
-
-    // ---- prompt popups ---------------------------------------------------
-
-    /// Declare one *deferred* viewport per application with pending
-    /// prompts, showing the oldest prompt plus the app's other pending
-    /// destinations. One busy program (a browser at startup) then costs
-    /// one window, not one per endpoint; answering with a host- or
-    /// app-wide scope makes the daemon resolve the covered prompts, which
-    /// arrive back as `PromptExpired` and empty the window's queue.
-    ///
-    /// Deferred rather than immediate, and the distinction is
-    /// load-bearing: an immediate viewport paints, and therefore sees
-    /// input, only while the parent window's pass runs, so popups froze
-    /// whenever the main window was unfocused or occluded - alt-tabbing
-    /// straight to a popup reproduced it every time. A deferred
-    /// viewport's callback runs on that window's own events, so
-    /// [`prompt_popup`] reaches everything it needs through shared state
-    /// and sends replies itself; a prompt stays answerable while the main
-    /// window never paints at all.
-    fn prompt_windows(&mut self, ctx: &egui::Context) {
-        let now_ms = hallpass_types::unix_ms_now();
-        let declared: Vec<(PromptWindow, u64)> = {
-            let mut board = self.prompts.lock().unwrap();
-            // Expired locally: close silently, the daemon applies its
-            // default. The popups repeat this for themselves, because this
-            // frame only runs while the main window paints.
-            board.pending.retain(|p| now_ms < p.deadline_ms);
-            // Prompts without an attributed exe are NOT grouped: two
-            // unattributed programs are not "the same app", and one
-            // window's close button must not dismiss the other's request.
-            let mut windows = Vec::new();
-            for p in board.pending.iter() {
-                let w = match &p.conn.exe_path {
-                    Some(exe) => PromptWindow::App(exe.clone(), p.conn.app_id.clone()),
-                    None => PromptWindow::Anon(p.id),
-                };
-                if !windows.contains(&w) {
-                    windows.push(w);
-                }
-            }
-            // Forget generations for windows with no pending prompts.
-            // Their parked viewports go undeclared this pass, so egui
-            // reaps them at its end; this prune is also what bounds the
-            // map (see PromptBoard).
-            board.generations.retain(|w, _| windows.contains(w));
-            windows
-                .into_iter()
-                .map(|w| {
-                    let generation = board.generations.get(&w).copied().unwrap_or(0);
-                    (w, generation)
-                })
-                .collect()
-        };
-
-        tracing::debug!(
-            count = declared.len(),
-            ?declared,
-            "declaring prompt viewports"
-        );
-        let mut surfaced = std::collections::HashSet::new();
-        for (window, generation) in declared {
-            let viewport_id = window.viewport_id(generation);
-            let builder = egui::ViewportBuilder::default()
-                .with_title("Connection request")
-                .with_inner_size([440.0, 330.0])
-                .with_resizable(false)
-                .with_always_on_top()
-                .with_active(true);
-            let prompts = Arc::clone(&self.prompts);
-            let link = Arc::clone(&self.link);
-            ctx.show_viewport_deferred(viewport_id, builder, move |ui, _class| {
-                prompt_popup(ui, &window, generation, &prompts, &link);
-            });
-            if !self.surfaced_popups.contains(&viewport_id) {
-                // A new window, and a prompt interrupts by design: the
-                // operator is in another application when the connection
-                // it asks about happens. Focus is a real focus on X11 and
-                // a documented no-op on Wayland, where silently taking
-                // focus is compositor policy, not ours to override; the
-                // attention request is the channel Wayland does provide
-                // (xdg-activation urgency: the shell flags the window and
-                // one click lands on it). Requested once at birth, so an
-                // operator who deliberately switches away from a prompt
-                // is not fought over focus every frame.
-                tracing::debug!(?viewport_id, "new prompt window; requesting focus");
-                ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Focus);
-                ctx.send_viewport_cmd_to(
-                    viewport_id,
-                    egui::ViewportCommand::RequestUserAttention(egui::UserAttentionType::Critical),
-                );
-            }
-            surfaced.insert(viewport_id);
-        }
-        self.surfaced_popups = surfaced;
-    }
-}
-
-/// Which popup one viewport shows: an application's whole queue, or a
-/// single unattributed prompt.
-///
-/// An application is (executable, application id), not the executable
-/// alone. Two packaged applications can run from one path inside their
-/// sandboxes, the daemon already raises them as separate prompts, and the
-/// rule an answer generates is scoped to one of the two: grouping them into
-/// one window would put the other's destinations under "also pending from
-/// this app" and promise that answering settles them, which it cannot.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-enum PromptWindow {
-    App(PathBuf, Option<String>),
-    Anon(u64),
-}
-
-impl PromptWindow {
-    fn covers(&self, p: &PromptState) -> bool {
-        match self {
-            PromptWindow::App(exe, app_id) => {
-                p.conn.exe_path.as_ref() == Some(exe) && p.conn.app_id == *app_id
-            }
-            PromptWindow::Anon(id) => p.conn.exe_path.is_none() && p.id == *id,
-        }
-    }
-
-    /// Viewport id for this window at one generation. Keyed by the
-    /// application rather than the prompt id, so the window survives its
-    /// front prompt being answered and shows the next one; the generation is
-    /// in the key so an abandoned window's id is never reused (see
-    /// [`PromptBoard`]).
-    fn viewport_id(&self, generation: u64) -> egui::ViewportId {
-        match self {
-            PromptWindow::App(exe, app_id) => {
-                egui::ViewportId::from_hash_of(("hallpass-prompt-app", exe, app_id, generation))
-            }
-            PromptWindow::Anon(id) => {
-                egui::ViewportId::from_hash_of(("hallpass-prompt-anon", id, generation))
-            }
-        }
-    }
-}
-
-/// One popup's whole frame, run by its viewport's own render callback,
-/// possibly while the main window is not painting at all. Everything it
-/// touches is shared state, and replies go straight out the daemon link:
-/// routing either through the main window's frame would reintroduce the
-/// freeze this callback exists to end.
-fn prompt_popup(
-    ui: &mut egui::Ui,
-    window: &PromptWindow,
-    generation: u64,
-    prompts: &Mutex<PromptBoard>,
-    link: &DaemonLink,
-) {
-    let now_ms = hallpass_types::unix_ms_now();
-    let mut answered: Vec<(u64, ClientMsg)> = Vec::new();
-    let mut replies: Vec<ClientMsg> = Vec::new();
-    let park;
-    {
-        let mut board = prompts.lock().unwrap();
-        // Expired locally: close silently, the daemon applies its default.
-        board.pending.retain(|p| now_ms < p.deadline_ms);
-        let current = board.generations.get(window).copied().unwrap_or(0);
-        let mut ids: Vec<u64> = if generation == current {
-            board
-                .pending
-                .iter()
-                .filter(|p| window.covers(p))
-                .map(|p| p.id)
-                .collect()
-        } else {
-            // A newer window owns this app's queue now; this one is
-            // abandoned and must never render a prompt the fresh window
-            // also shows.
-            Vec::new()
-        };
-        tracing::debug!(?window, generation, current, ?ids, "prompt popup pass");
-        if ids.is_empty() {
-            // Paint an empty frame rather than none: an unpainted frame
-            // is the black window this branch used to leave.
-            egui::CentralPanel::default().show(ui, |_| {});
-            if generation == current {
-                // Emptied from a path that could not park this window
-                // (expired, swept by a covering rule, answered over the
-                // CLI). Abandon it: bump the generation so the next
-                // prompt for this app gets a fresh window.
-                *board.generations.entry(window.clone()).or_insert(0) += 1;
-            }
-            park = true;
-        } else {
-            // Oldest prompt (lowest id) in front, stable across frames.
-            ids.sort_unstable();
-            let rest: Vec<String> = ids[1..]
-                .iter()
-                .filter_map(|id| board.pending.iter().find(|p| p.id == *id))
-                .map(|p| format!("{} {}", p.conn.tuple.proto, prompt::format_dest(&p.conn)))
-                .collect();
-            let front = board
-                .pending
-                .iter_mut()
-                .find(|p| p.id == ids[0])
-                .expect("front id was just read from this list");
-            prompt_ui(ui, front, now_ms, &rest, &mut answered);
-            // Answers first, removed inside the same lock hold that read
-            // the list, so the dismissal below never speaks for a prompt
-            // the operator decided in this same frame.
-            for (id, reply) in answered {
-                board.pending.retain(|p| p.id != id);
-                replies.push(reply);
-            }
-            // Escape is the keyboard's close button, and it means what
-            // the close button means: deny, once, every prompt this
-            // window covers. Handled here rather than by asking the
-            // platform to close the window, so the keyboard route runs
-            // the same branch as the mouse one on every backend - the
-            // window is parked by the emptied path below either way.
-            let dismissed = ui
-                .ctx()
-                .input(|i| i.viewport().close_requested() || i.key_pressed(egui::Key::Escape));
-            if dismissed {
-                // Closing the window is a decision, not the absence of
-                // one: deny, once, this port (see prompt::close_reply).
-                // The whole group goes, because one window carries the
-                // whole app's queue and leaving the rest would just
-                // reopen it for the next one.
-                for id in ids {
-                    let before = board.pending.len();
-                    board.pending.retain(|p| p.id != id);
-                    if board.pending.len() != before {
-                        replies.push(prompt::close_reply(id));
-                    }
-                }
-            }
-            let emptied = !board.pending.iter().any(|p| window.covers(p));
-            if emptied {
-                // This pass answered or dismissed the last prompt. Abandon
-                // the window (see PromptBoard for why it cannot simply be
-                // closed or reused from here).
-                *board.generations.entry(window.clone()).or_insert(0) += 1;
-            }
-            park = emptied;
-        }
-    }
-    // Outside the prompts lock: the link takes its own; one order, never
-    // nested the other way around.
-    for reply in replies {
-        link.send(reply);
-    }
-    if park {
-        // Park the abandoned window using only commands its own pass can
-        // apply: hide (real on X11, a winit no-op on Wayland) and minimize
-        // (real on Wayland via xdg-shell). Destroying it outright is not
-        // in this side's power: that takes a main window pass that stops
-        // declaring the viewport, and an unfocused or occluded main window
-        // may not paint for a long time (measured live: three seconds of
-        // ignored root repaint requests while unfocused). The repaint
-        // request nudges the main window to reap whenever the compositor
-        // lets it paint; until then the window sits hidden or minimized,
-        // not empty on screen.
-        tracing::debug!(?window, generation, "prompt popup emptied; parking window");
-        ui.ctx()
-            .send_viewport_cmd(egui::ViewportCommand::Visible(false));
-        ui.ctx()
-            .send_viewport_cmd(egui::ViewportCommand::Minimized(true));
-        ui.ctx().request_repaint_of(egui::ViewportId::ROOT);
-    } else {
-        // Keep the countdown moving without leaning on the main window's
-        // repaint schedule.
-        ui.ctx().request_repaint_after(Duration::from_millis(100));
-    }
 }
 
 impl eframe::App for HallpassApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.drain_net();
-        self.drain_tray(&ctx);
         // The posture banner and the mode both come from `Stats`, which
         // until now only the Stats tab refetched: a lockdown entered by
         // another client never appeared while the operator sat on Events,
@@ -2477,20 +1959,10 @@ impl eframe::App for HallpassApp {
         // makes a whole-host state visible from whatever tab is open.
         self.poll_stats(&ctx);
         // After the drain and the poll, so the icon reflects what this frame
-        // knows rather than what the last one did. A window parked in the
-        // tray still reaches here: the net thread pairs every event with a
-        // repaint request, so a mode changed by another client updates the
-        // icon of a window nobody has opened, which is the whole point.
-        self.sync_tray(&ctx);
+        // knows rather than what the last one did.
+        self.sync_icon(&ctx);
         self.main_window(ui);
         self.editor_window(&ctx);
-        self.prompt_windows(&ctx);
-        if !self.prompts.lock().unwrap().pending.is_empty() {
-            // Keep this window's own frame ticking too: the popups repaint
-            // themselves, but the viewport declarations above only refresh
-            // when this frame runs.
-            ctx.request_repaint_after(Duration::from_millis(100));
-        }
     }
 }
 

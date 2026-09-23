@@ -439,7 +439,328 @@ const PINNED_NAME_MAX: usize = 40;
 
 #[cfg(test)]
 mod tests {
+    //! Layout as a security property: the verdict buttons stay reachable
+    //! whatever the judged process put in the body, Deny leads keyboard
+    //! traversal, and Allow does not answer a prompt nobody has read yet.
+
+    use std::path::PathBuf;
+
+    use egui_kittest::kittest::{NodeT as _, Queryable as _};
+    use egui_kittest::Harness;
+    use hallpass_types::{Connection, FlowTuple, PromptContext, Proto};
+
     use super::*;
+
+    fn conn(exe: &str, dst: &str) -> Connection {
+        Connection {
+            tuple: FlowTuple {
+                proto: Proto::Tcp,
+                src: "10.0.0.1:40000".parse().expect("source address"),
+                dst: dst.parse().expect("destination address"),
+            },
+            uid: Some(1000),
+            pid: Some(4242),
+            exe_path: Some(PathBuf::from(exe)),
+            cmdline: None,
+            parent_exe: None,
+            domain: None,
+            iface: None,
+            app_id: None,
+            first_seen: None,
+        }
+    }
+
+    /// A prompt plus what its buttons answered, so a test can read the reply
+    /// back out from behind the harness.
+    struct PromptFixture {
+        prompt: PromptState,
+        answered: Vec<(u64, ClientMsg)>,
+    }
+
+    /// Fixed rather than wall clock: the countdown is display-only here, and a
+    /// real clock would make the progress bar (and so the frame) differ per run.
+    const NOW_MS: u64 = 1_700_000_000_000;
+
+    const EXE: &str = "/usr/bin/curl";
+
+    /// A fully populated prompt context: ancestry, hash, a hash-mismatch
+    /// warning and a denial count all present at once.
+    ///
+    /// The default for every fixture here on purpose. This module exists to hold
+    /// the layout property that the viewport is a fixed 440x330 and the verdict
+    /// buttons must stay reachable no matter how much the scrolling body wants,
+    /// so the fixtures carry the largest body the daemon can produce rather than
+    /// the smallest.
+    /// Sized from the daemon's own caps rather than a hand-picked number, so
+    /// "the largest body" stays true if a cap moves.
+    fn ctx() -> PromptContext {
+        PromptContext {
+            ancestors: (0..hallpass_types::MAX_PROMPT_ANCESTORS)
+                .map(|i| PathBuf::from(format!("/usr/lib/ancestor-{i}/launcher")))
+                .collect(),
+            exe_sha256: Some("ab".repeat(32)),
+            hash_mismatch_rules: (0..hallpass_types::MAX_HASH_MISMATCH_RULES)
+                .map(|i| format!("pinned-rule-{i}"))
+                .collect(),
+            recent_denials: 7,
+        }
+    }
+
+    /// One prompt window's body, laid out on its own the way its viewport shows
+    /// it, in front long enough for Allow to answer.
+    fn prompt_harness() -> Harness<'static, PromptFixture> {
+        prompt_harness_fronted(NOW_MS - crate::prompt::ALLOW_ARM_MS)
+    }
+
+    /// [`prompt_harness`], with the prompt at the front of its window since
+    /// `fronted_ms`.
+    fn prompt_harness_fronted(fronted_ms: u64) -> Harness<'static, PromptFixture> {
+        let mut prompt = PromptState::new(
+            1,
+            conn(EXE, "93.184.216.34:443"),
+            NOW_MS + 30_000,
+            NOW_MS,
+            ctx(),
+        );
+        prompt.fronted_ms = Some(fronted_ms);
+        let state = PromptFixture {
+            prompt,
+            answered: Vec::new(),
+        };
+        Harness::builder()
+            .with_size(egui::vec2(440.0, 330.0))
+            .build_ui_state(
+                |ui, state: &mut PromptFixture| {
+                    prompt_ui(ui, &mut state.prompt, NOW_MS, &[], &mut state.answered);
+                },
+                state,
+            )
+    }
+
+    /// The buttons must survive the worst content the window can carry: a
+    /// path at its display cap, a file name at the filesystem's, a command line
+    /// at its cap, an application id at its cap, the full pending list, and the
+    /// App-anywhere warning, all inside the fixed 440x330 viewport. Every one of
+    /// those strings is chosen by the process being judged, so "the info pushed
+    /// Allow and Deny off the window" is an unanswerable prompt an adversary can
+    /// construct; the actions are pinned to a bottom panel and the info scrolls,
+    /// and this clicks Deny through exactly that worst case to prove it stays
+    /// reachable.
+    ///
+    /// The file name and application id are the two that also reach the pinned
+    /// panel, through the App-anywhere warning, so they are sized to wrap as
+    /// many lines as they can: wide glyphs, with break points.
+    #[test]
+    fn buttons_survive_worst_case_content() {
+        // NAME_MAX: the longest file name the kernel will hand the daemon.
+        let file_name = "WWWW ".repeat(51);
+        let mut state = PromptFixture {
+            prompt: PromptState::new(
+                1,
+                conn(
+                    &format!("/very/long/{}/{file_name}", "x".repeat(180)),
+                    "93.184.216.34:443",
+                ),
+                NOW_MS + 30_000,
+                NOW_MS,
+                ctx(),
+            ),
+            answered: Vec::new(),
+        };
+        state.prompt.conn.cmdline = Some(format!("curl {}", "a".repeat(200)));
+        state.prompt.conn.app_id = Some(format!(
+            "flatpak:{}",
+            "WWW.".repeat(hallpass_types::MAX_APP_ID_NAME_BYTES / 4)
+        ));
+        state.prompt.scope = PromptScope::AppAnywhere; // adds the warning label
+        let rest: Vec<String> = (0..9).map(|i| format!("tcp 10.0.0.{i}:443")).collect();
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(440.0, 330.0))
+            .build_ui_state(
+                move |ui, state: &mut PromptFixture| {
+                    prompt_ui(ui, &mut state.prompt, NOW_MS, &rest, &mut state.answered);
+                },
+                state,
+            );
+        // Settled first: the panel sizes itself from the frame before, so the
+        // first pass alone would not show where the buttons end up.
+        harness.run();
+        harness.get_by_label("Deny").click();
+        harness.run();
+        let expected = harness.state().prompt.reply(Verdict::Deny);
+        assert_eq!(
+            harness.state().answered,
+            vec![(1, expected)],
+            "Deny was not clickable under worst-case content"
+        );
+    }
+
+    /// A prompt for something never seen here has to say so where the operator
+    /// is already looking, and a routine one must not.
+    ///
+    /// A property of the laid-out tree rather than of the state: the flag is on
+    /// the connection either way, and what this proves is that it reaches the
+    /// window at all. The badge is deliberately not the only carrier - keyboard
+    /// traversal never passes through it, so the details grid states it in words
+    /// too, and both are asserted here.
+    #[test]
+    fn a_new_application_is_announced_in_the_prompt_window() {
+        let mut fixture = PromptFixture {
+            prompt: PromptState::new(
+                1,
+                conn(EXE, "93.184.216.34:443"),
+                NOW_MS + 30_000,
+                NOW_MS,
+                ctx(),
+            ),
+            answered: Vec::new(),
+        };
+        fixture.prompt.conn.first_seen = Some(hallpass_types::FirstSeen {
+            app: true,
+            dest: true,
+        });
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(440.0, 330.0))
+            .build_ui_state(
+                |ui, state: &mut PromptFixture| {
+                    prompt_ui(ui, &mut state.prompt, NOW_MS, &[], &mut state.answered);
+                },
+                fixture,
+            );
+        harness.get_by_label("NEW");
+        harness.get_by_label("this application has not connected before");
+
+        // Nothing new, and tracking off, both render as an ordinary prompt: a
+        // window that said "seen before" would be making a claim the daemon may
+        // have no basis for.
+        for quiet in [
+            Some(hallpass_types::FirstSeen {
+                app: false,
+                dest: false,
+            }),
+            None,
+        ] {
+            harness.state_mut().prompt.conn.first_seen = quiet;
+            harness.run();
+            assert!(
+                harness.query_by_label("NEW").is_none(),
+                "an unremarkable connection was announced as new ({quiet:?})"
+            );
+        }
+    }
+
+    /// The context the daemon builds has to reach the window, and the loudest
+    /// part of it has to be where the operator is already looking.
+    ///
+    /// A hash-mismatch is the strongest thing this window ever says: a rule was
+    /// written for this program and the binary asking now is not the one it
+    /// pins. It sits above the separator with the identity lines rather than in
+    /// the details grid, because it changes what the whole prompt is about.
+    #[test]
+    fn the_prompt_window_carries_the_daemon_context() {
+        let mut harness = prompt_harness();
+        let context = ctx();
+        // The sentences are the shared ones, so asserting the rendered label
+        // against them also pins this window and `hallpass-cli watch` to saying
+        // the same thing.
+        harness.get_by_label(&format!(
+            "Warning: {}",
+            context.hash_mismatch_describe().unwrap()
+        ));
+        harness.get_by_label(&context.denials_describe().unwrap());
+        harness.get_by_label("/usr/lib/ancestor-2/launcher");
+        harness.get_by_label(&"ab".repeat(32));
+
+        // An empty context renders an ordinary prompt. Zero denials in
+        // particular say nothing rather than "never denied": the daemon's
+        // history is bounded and lost on restart, so it does not know that.
+        harness.state_mut().prompt.context = PromptContext::default();
+        harness.run();
+        for absent in ["Started by", "Executable SHA-256", "Denied lately"] {
+            assert!(
+                harness.query_by_label(absent).is_none(),
+                "an empty context still rendered {absent:?}"
+            );
+        }
+    }
+
+    /// Deny has to be what keyboard traversal reaches first.
+    ///
+    /// This window steals focus from whatever the operator was doing, and the
+    /// answer given without reading it has to be the recoverable one: a wrong
+    /// deny costs a retry, a wrong allow costs the connection the prompt existed
+    /// to stop. Widget order is traversal order in egui, so this is a property
+    /// of the laid-out tree and nothing else.
+    #[test]
+    fn deny_leads_keyboard_traversal() {
+        let mut harness = prompt_harness();
+        let mut reached = Vec::new();
+        // Enough presses to walk the whole panel: the pickers are segmented
+        // controls, so each option is its own focus stop, and the two verdict
+        // buttons are the last widgets added. The property is the order the
+        // two are reached in, not how many stops precede them.
+        for _ in 0..16 {
+            harness.key_press(egui::Key::Tab);
+            harness.run();
+            for label in ["Deny", "Allow"] {
+                if harness.get_by_label(label).accesskit_node().is_focused() {
+                    reached.push(label);
+                }
+            }
+            // Traversal wraps, so stop once both have been seen or the order
+            // gets recorded twice.
+            if reached.len() == 2 {
+                break;
+            }
+        }
+        assert_eq!(
+            reached.first().copied(),
+            Some("Deny"),
+            "tab order reached {reached:?}"
+        );
+        assert!(
+            reached.contains(&"Allow"),
+            "traversal must still reach Allow: {reached:?}"
+        );
+    }
+
+    /// The reorder above moves the buttons past each other, so the wiring is
+    /// worth pinning: each button answers with its own verdict, carrying the
+    /// duration and scope the operator picked.
+    #[test]
+    fn each_button_answers_with_its_own_verdict() {
+        for (label, verdict) in [("Deny", Verdict::Deny), ("Allow", Verdict::Allow)] {
+            let mut harness = prompt_harness();
+            harness.get_by_label(label).click();
+            harness.run();
+            let expected = harness.state().prompt.reply(verdict);
+            assert_eq!(
+                harness.state().answered,
+                vec![(1, expected)],
+                "{label} answered with the wrong verdict"
+            );
+        }
+    }
+
+    /// A prompt that has only just come to the front does not take an Allow:
+    /// the click was aimed at whatever sat there a moment ago.
+    #[test]
+    fn allow_does_not_answer_a_prompt_that_just_surfaced() {
+        let mut harness = prompt_harness_fronted(NOW_MS);
+        harness.get_by_label("Allow").click();
+        harness.run();
+        assert!(
+            harness.state().answered.is_empty(),
+            "an unread prompt was allowed"
+        );
+        harness.get_by_label("Deny").click();
+        harness.run();
+        assert_eq!(
+            harness.state().answered.len(),
+            1,
+            "Deny still answers at once"
+        );
+    }
 
     #[test]
     fn labels() {

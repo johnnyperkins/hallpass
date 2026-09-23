@@ -588,20 +588,16 @@ fn a_dropped_prompt_reply_says_what_happens_next() {
     );
 }
 
-/// Everything in flight dies with the connection: prompt ids the daemon
-/// will reissue, acks that will never arrive, and a save whose answer is
-/// gone. The form keeps what was typed.
+/// Everything in flight dies with the connection: acks that will never
+/// arrive, and a save whose answer is gone. The form keeps what was typed.
 #[test]
 fn a_lost_connection_clears_what_cannot_survive_it() {
     let mut t = TestApp::new();
-    t.daemon(prompt_request(1, "/usr/bin/curl"));
     t.editor_awaiting_ack();
-    assert_eq!(t.app.prompt_ids().len(), 1);
 
     t.feed(UiEvent::Disconnected {
         retry_in: Duration::from_secs(1),
     });
-    assert!(t.app.prompt_ids().is_empty());
     assert!(t.app.pending_ack_kinds().is_empty());
     let editor = t.app.editor.as_ref().expect("the form survives");
     assert!(!editor.awaiting_ack(), "nothing is coming to answer it");
@@ -609,7 +605,8 @@ fn a_lost_connection_clears_what_cannot_survive_it() {
 
 /// Subscribe has to be sent before the history request, or events decided
 /// between the two are in neither and vanish. Rules and stats prime the
-/// views the window opens on.
+/// views the window opens on. Never the prompt slot: that is the agent's,
+/// and a window claiming it would take prompts away from it.
 #[test]
 fn connecting_subscribes_before_asking_for_history() {
     let mut t = TestApp::new();
@@ -619,7 +616,7 @@ fn connecting_subscribes_before_asking_for_history() {
         vec![
             ClientMsg::Subscribe {
                 events: true,
-                prompts: true,
+                prompts: false,
             },
             ClientMsg::RuleList,
             ClientMsg::Stats,
@@ -633,42 +630,19 @@ fn connecting_subscribes_before_asking_for_history() {
     assert_eq!(t.app.pending_ack_kinds(), vec![AckKind::Other]);
 }
 
-/// The daemon releases the prompt slot when prompts sent to it time out
-/// unanswered, which is what a hostile client holding the slot looks like -
-/// and also what this window looks like when its operator walked away.
-/// Reclaiming it is what makes the second case cost nothing: absorbing the
-/// message would leave every later connection decided by the daemon's
-/// default with nothing on screen to say so.
+/// Prompt traffic reaching this window (a daemon that sent it anyway, or a
+/// mistake on either side) is left alone: the window never answers,
+/// reclaims or reports on a slot it does not hold.
 #[test]
-fn a_revoked_prompt_slot_is_claimed_again() {
+fn prompt_messages_are_left_to_the_agent() {
     let mut t = TestApp::new();
     t.feed(UiEvent::Connected);
     t.sent();
-    t.daemon(DaemonMsg::Ok); // the initial Subscribe's ack
-    assert!(t.app.pending_ack_kinds().is_empty());
-
+    t.daemon(prompt_request(1, "/usr/bin/curl"));
+    t.daemon(DaemonMsg::PromptExpired { id: 1 });
     t.daemon(DaemonMsg::PromptHandlerRevoked);
-    assert_eq!(
-        t.sent(),
-        vec![ClientMsg::Subscribe {
-            events: false,
-            prompts: true,
-        }],
-        "the slot is claimed again, and only the slot: this connection's \
-         event subscription is untouched"
-    );
-    assert!(
-        t.app
-            .last_error
-            .as_deref()
-            .is_some_and(|e| e.contains("prompt slot")),
-        "the operator is told: {:?}",
-        t.app.last_error
-    );
-    // Acked like any other Subscribe, so the FIFO stays aligned.
-    assert_eq!(t.app.pending_ack_kinds(), vec![AckKind::Other]);
-    t.daemon(DaemonMsg::Ok);
-    assert!(t.app.pending_ack_kinds().is_empty());
+    assert!(t.sent().is_empty());
+    assert!(t.app.last_error.is_none());
 }
 
 // ---- the event feed (5c2c1a8) --------------------------------------------
@@ -891,13 +865,12 @@ fn observe_mode_is_not_announced_before_the_daemon_says_so() {
     );
 }
 
-/// The autostart entry passes `--hidden`, so the icon is usually the only
-/// thing hallpass shows. It must never claim enforcement the window cannot
-/// vouch for: before the first stats reply nothing has been said, and a
-/// window that has lost the socket does not know whether what it last saw
-/// still holds.
+/// The corner mark and window icon must never claim enforcement the window
+/// cannot vouch for: before the first stats reply nothing has been said,
+/// and a window that has lost the socket does not know whether what it
+/// last saw still holds.
 #[test]
-fn the_tray_never_claims_enforcement_it_cannot_vouch_for() {
+fn the_mark_never_claims_enforcement_it_cannot_vouch_for() {
     let mut t = TestApp::new();
     assert_eq!(
         t.app.tray_state(),
@@ -1015,35 +988,6 @@ fn a_posture_outranks_the_stored_mode_in_the_tray() {
     );
 }
 
-/// The icon is a DBus round trip, the window icon is a rasterized mark,
-/// and the frame loop runs at display rate: a state that has not moved
-/// must not be resent to either.
-#[test]
-fn the_tray_is_updated_on_change_rather_than_every_frame() {
-    let mut t = TestApp::new();
-    let (to_tray, from_tray) = std::sync::mpsc::channel();
-    t.app.to_tray = Some(to_tray);
-    let ctx = egui::Context::default();
-
-    t.feed(UiEvent::Connected);
-    t.daemon(DaemonMsg::Stats(stats(true)));
-    t.app.sync_tray(&ctx);
-    t.app.sync_tray(&ctx);
-    t.app.sync_tray(&ctx);
-    assert_eq!(
-        from_tray.try_iter().collect::<Vec<_>>(),
-        vec![TrayState::Enforcing],
-        "one push for one change"
-    );
-
-    t.daemon(DaemonMsg::Stats(stats(false)));
-    t.app.sync_tray(&ctx);
-    assert_eq!(
-        from_tray.try_iter().collect::<Vec<_>>(),
-        vec![TrayState::Observing]
-    );
-}
-
 /// Opening a data tab refreshes what it shows, rather than rendering
 /// whatever was current when the window last asked. The traffic tab reads
 /// the enforcement flag for its wording, so it refreshes the stats too.
@@ -1103,89 +1047,11 @@ fn a_settings_ack_reconciles_by_refetching() {
     }
 }
 
-// ---- prompts -------------------------------------------------------------
-
-/// The daemon reissues a prompt request when a second handler subscribes,
-/// and a duplicate must not become a second window over the same decision.
-#[test]
-fn a_repeated_prompt_request_does_not_stack() {
-    let mut t = TestApp::new();
-    t.daemon(prompt_request(1, "/usr/bin/curl"));
-    t.daemon(prompt_request(1, "/usr/bin/curl"));
-    assert_eq!(t.app.prompt_ids().len(), 1);
-
-    t.daemon(prompt_request(2, "/usr/bin/curl"));
-    assert_eq!(t.app.prompt_ids().len(), 2);
-}
-
-/// A prompt answered elsewhere, timed out, or resolved by a rule that
-/// covers it comes back as PromptExpired; its window has to go with it.
-#[test]
-fn an_expired_prompt_is_dropped() {
-    let mut t = TestApp::new();
-    t.daemon(prompt_request(1, "/usr/bin/curl"));
-    t.daemon(prompt_request(2, "/usr/bin/curl"));
-    t.daemon(DaemonMsg::PromptExpired { id: 1 });
-    assert_eq!(t.app.prompt_ids(), vec![2]);
-}
-
-/// Giving up a prompt denies, and denies once: it settles the connection on
-/// screen without writing policy for any future one. Pinned as a literal
-/// because every field is a decision - a wider scope or a lasting duration
-/// would make dismissing a window an act of policy.
-#[test]
-fn a_dismissed_prompt_is_denied_for_this_connection_only() {
-    assert_eq!(
-        prompt::close_reply(7),
-        ClientMsg::PromptReply {
-            id: 7,
-            verdict: Verdict::Deny,
-            duration: RuleDuration::Once,
-            scope: PromptScope::ThisPort,
-            pin_exe: false,
-        }
-    );
-}
-
-/// Abandoning prompts answers them. Whichever way the client gives one up,
-/// silence would leave it to the daemon's timeout and `default_verdict`,
-/// which is allow unless the operator changed it.
-#[test]
-fn dismissing_prompts_answers_every_one_of_them() {
-    let mut t = TestApp::new();
-    for id in 1..=3 {
-        t.daemon(prompt_request(id, "/usr/bin/curl"));
-    }
-    t.app.dismiss_prompts([1, 3]);
-
-    assert_eq!(
-        t.sent(),
-        vec![prompt::close_reply(1), prompt::close_reply(3)]
-    );
-    assert_eq!(
-        t.app.prompt_ids(),
-        vec![2],
-        "a dismissed prompt leaves the queue, an untouched one stays"
-    );
-}
-
-/// An id that is no longer pending has already been decided: replying again
-/// would draw a daemon error, and could overwrite an answer the operator
-/// gave in the same frame the window closed.
-#[test]
-fn dismissing_skips_prompts_that_are_no_longer_pending() {
-    let mut t = TestApp::new();
-    t.daemon(prompt_request(1, "/usr/bin/curl"));
-    t.daemon(DaemonMsg::PromptExpired { id: 1 });
-    t.app.dismiss_prompts([1, 99]);
-    assert!(t.sent().is_empty());
-}
-
 // ---- replies this client does not ask for --------------------------------
 
 /// Rule hits and explanations are answers to requests the window never
 /// makes. Ignoring them keeps the connection alive; the alternative on an
-/// unexpected reply is tearing down the stream that carries prompts.
+/// unexpected reply is tearing down the stream the whole window runs on.
 #[test]
 fn unrequested_replies_are_ignored_rather_than_fatal() {
     let mut t = TestApp::new();

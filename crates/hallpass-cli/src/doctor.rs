@@ -248,7 +248,10 @@ fn stats_checks(s: &Stats, checks: &mut Vec<Check>) {
         checks.push(Check::warn(
             "prompts",
             "no prompt handler: unmatched connections take the default verdict silently".into(),
-            Some("open hallpass-ui or run `hallpass-cli watch`".into()),
+            Some(
+                "start `hallpass-ui agent` (it autostarts at login) or run `hallpass-cli watch`"
+                    .into(),
+            ),
         ));
     }
     count_warn(

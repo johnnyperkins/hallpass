@@ -1,16 +1,13 @@
-//! System tray icon (StatusNotifierItem over DBus): the resident handle to
-//! a window that closes to the background instead of quitting.
+//! System tray icon (StatusNotifierItem over DBus): the agent's resident
+//! face, and the way back to the management window.
 //!
 //! The DBus service lives on ksni's own driver thread (the async-io
 //! flavor; the default tokio flavor would flip the workspace's zbus to
 //! tokio and panic notify-rust's runtime-less notification thread - see
 //! Cargo.toml). A short-lived named thread does the initial synchronous
-//! bus handshake so window startup never waits on DBus. Activations cross
-//! to the window as [`TrayMsg`] on a plain channel, each paired with a
-//! repaint request: a parked window paints no frames of its own, and the
-//! request is what wakes it to drain the channel (probe-verified on X11,
-//! where a hidden window's frame loop keeps responding to repaint requests;
-//! `main.rs` records why that confines close-to-tray to X11).
+//! bus handshake so agent startup never waits on DBus. Activations cross
+//! to the agent as [`TrayMsg`] on a plain channel, each paired with a
+//! [`Wake`] so the agent drains it.
 
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 
@@ -21,12 +18,13 @@ use crate::Wake;
 /// never does: an update wakes the thread immediately.
 const HEALTH_POLL: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// What the window tells the tray about the host.
+/// What the agent tells the tray about the host.
 ///
-/// The autostart entry passes `--hidden`, so on most sessions this icon is
+/// The agent autostarts with no window, so on most sessions this icon is
 /// the only thing hallpass ever shows: a host enforcing nothing presented
-/// exactly the icon of a host enforcing everything. The main window already
-/// carries this as a banner, and the banner is behind a window nobody opened.
+/// exactly the icon of a host enforcing everything. The management window
+/// carries this as a banner, and the banner is behind a window nobody
+/// opened.
 ///
 /// This is the agreed answer to the Enforce switch being quiet. Flipping that
 /// switch is not a privilege escalation - anyone who can reach the socket can
@@ -71,22 +69,21 @@ impl TrayState {
             TrayState::Observing => "Observe mode: nothing is being blocked",
             // Covers both halves of this state. "Not connected" would be a
             // claim about the socket that is false for the other half, where
-            // the window is connected and the daemon has not answered yet.
+            // the agent is connected and the daemon has not answered yet.
             TrayState::Unknown => "Waiting for the daemon",
         }
     }
 }
 
-/// What the tray asks of the window.
+/// What the tray asks of the agent.
 pub enum TrayMsg {
-    /// Re-show and focus the main window (icon activation or menu Show).
+    /// Open the management window (icon activation or menu Show).
     Show,
     /// Quit for real: deny open prompts once, release the handler slot,
     /// exit.
     Quit,
-    /// No StatusNotifier host answered on the session bus. The window must
-    /// fall back to quit-on-close: parking with no icon to come back
-    /// through would strand the app invisible.
+    /// No StatusNotifier host answered on the session bus, or the service
+    /// died. Prompts carry on; only the icon's way to the window is gone.
     Unavailable,
 }
 
@@ -162,34 +159,33 @@ impl ksni::Tray for HallpassTray {
     }
 }
 
-/// Both ends of the window's conversation with the tray.
+/// Both ends of the agent's conversation with the tray.
 pub struct Tray {
-    /// Activations, drained by the window every frame.
+    /// Activations, drained by the agent on each wake.
     pub msgs: Receiver<TrayMsg>,
-    /// What the host is doing, pushed by the window when it changes.
+    /// What the host is doing, pushed by the agent when it changes.
     /// Dropping this ends the tray thread, which is what quitting does.
     pub state: Sender<TrayState>,
 }
 
-/// Start the tray service; the window drains the returned channel every
-/// frame. An unreachable bus or absent watcher arrives as
-/// [`TrayMsg::Unavailable`] rather than an error: the window keeps
-/// working, only close-to-tray degrades back to quit.
+/// Start the tray service; the agent drains the returned channel when
+/// woken. An unreachable bus or absent watcher arrives as
+/// [`TrayMsg::Unavailable`] rather than an error: the agent keeps working
+/// without an icon.
 pub fn spawn(wake: Wake) -> Tray {
     let (to_ui, from_tray) = std::sync::mpsc::channel();
     let (to_tray, from_ui) = std::sync::mpsc::channel();
     std::thread::Builder::new()
         .name("tray".into())
         .spawn(move || {
-            // A panic inside ksni must still downgrade the window to
-            // quit-on-close: with the tray dead, a park would strand the
-            // window hidden with no icon to come back through.
+            // A panic inside ksni is reported like any other loss of the
+            // icon, so the agent does not keep pushing state to nobody.
             let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 run(to_ui.clone(), from_ui, wake.clone());
             }))
             .is_err();
             if panicked {
-                tracing::warn!("tray thread panicked; window close will quit");
+                tracing::warn!("tray thread panicked; no tray icon");
                 let _ = to_ui.send(TrayMsg::Unavailable);
                 wake();
             }
@@ -213,16 +209,16 @@ fn run(to_ui: Sender<TrayMsg>, from_ui: Receiver<TrayState>, wake: Wake) {
         // (assume_sni_available = false) makes a hostless session an Err
         // instead of a silent icon-that-never-appears, but the service
         // can also die *after* a good start (bus drop, panic on ksni's
-        // own thread), and a parked window must learn its icon is gone.
+        // own thread), and the agent must learn its icon is gone.
         // The handle is the whole health API, so this thread keeps it
         // and watches; a transient watcher restart (shell crash) is not
         // a death, ksni re-registers on its own and the poll stays quiet.
         Ok(handle) => loop {
             // Checked every iteration rather than only on the timeout arm,
-            // so a window pushing state faster than `HEALTH_POLL` cannot
+            // so an agent pushing state faster than `HEALTH_POLL` cannot
             // starve the liveness check it shares this thread with.
             if handle.is_closed() {
-                tracing::warn!("tray service ended; window close will quit");
+                tracing::warn!("tray service ended; no tray icon");
                 let _ = to_ui.send(TrayMsg::Unavailable);
                 wake();
                 break;
@@ -232,13 +228,13 @@ fn run(to_ui: Sender<TrayMsg>, from_ui: Receiver<TrayState>, wake: Wake) {
                     handle.update(|tray| tray.state = state);
                 }
                 Err(RecvTimeoutError::Timeout) => {}
-                // The window dropped its sender, which only happens on the
+                // The agent dropped its sender, which only happens on the
                 // way out. Nothing to report: there is nobody to report to.
                 Err(RecvTimeoutError::Disconnected) => break,
             }
         },
         Err(e) => {
-            tracing::info!("tray icon unavailable ({e}); window close will quit");
+            tracing::info!("tray icon unavailable ({e})");
             let _ = to_ui.send(TrayMsg::Unavailable);
             wake();
         }

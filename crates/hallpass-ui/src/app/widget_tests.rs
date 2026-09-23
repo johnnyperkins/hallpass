@@ -1,425 +1,28 @@
-//! Tests of properties that need a real widget tree.
-//!
-//! Two kinds live here, and nothing else should. First, layout as a security
-//! property: which button keyboard traversal reaches first in the prompt
-//! window. Second, the paths that only exist because a widget was operated -
-//! a window closed, a checkbox clicked, Quit pressed - where the thing worth
-//! proving is that the operation reaches the state logic at all.
+//! Tests of properties that need a real widget tree: the paths that only
+//! exist because a widget was operated - a checkbox clicked, a heading
+//! sorted, a form saved - where the thing worth proving is that the
+//! operation reaches the state logic at all. The prompt window's layout
+//! tests live beside it, in `prompt_view` and `prompt_window`.
 //!
 //! `egui_kittest` reads the AccessKit tree, so none of this needs a GPU or a
 //! display. Everything downstream of these entry points is cheaper to test as
 //! state; see the sibling `tests` module.
 
-use egui_kittest::kittest::{NodeT as _, Queryable as _};
+use egui_kittest::kittest::Queryable as _;
 use egui_kittest::Harness;
 
-use hallpass_types::{PromptContext, PromptScope, RuleDuration};
-use std::path::PathBuf;
+use hallpass_types::RuleDuration;
 
 use super::tests::{conn, drain, runtime_config};
 use super::*;
 
-/// A prompt plus what its buttons answered, so a test can read the reply
-/// back out from behind the harness.
-struct PromptFixture {
-    prompt: PromptState,
-    answered: Vec<(u64, ClientMsg)>,
-}
-
-/// Fixed rather than wall clock: the countdown is display-only here, and a
-/// real clock would make the progress bar (and so the frame) differ per run.
-const NOW_MS: u64 = 1_700_000_000_000;
-
 const EXE: &str = "/usr/bin/curl";
 
-/// A fully populated prompt context: ancestry, hash, a hash-mismatch
-/// warning and a denial count all present at once.
-///
-/// The default for every fixture here on purpose. This module exists to hold
-/// the layout property that the viewport is a fixed 440x330 and the verdict
-/// buttons must stay reachable no matter how much the scrolling body wants,
-/// so the fixtures carry the largest body the daemon can produce rather than
-/// the smallest.
-/// Sized from the daemon's own caps rather than a hand-picked number, so
-/// "the largest body" stays true if a cap moves.
-fn ctx() -> PromptContext {
-    PromptContext {
-        ancestors: (0..hallpass_types::MAX_PROMPT_ANCESTORS)
-            .map(|i| PathBuf::from(format!("/usr/lib/ancestor-{i}/launcher")))
-            .collect(),
-        exe_sha256: Some("ab".repeat(32)),
-        hash_mismatch_rules: (0..hallpass_types::MAX_HASH_MISMATCH_RULES)
-            .map(|i| format!("pinned-rule-{i}"))
-            .collect(),
-        recent_denials: 7,
-    }
-}
-
-/// One prompt window's body, laid out on its own the way its viewport shows
-/// it, in front long enough for Allow to answer.
-fn prompt_harness() -> Harness<'static, PromptFixture> {
-    prompt_harness_fronted(NOW_MS - crate::prompt::ALLOW_ARM_MS)
-}
-
-/// [`prompt_harness`], with the prompt at the front of its window since
-/// `fronted_ms`.
-fn prompt_harness_fronted(fronted_ms: u64) -> Harness<'static, PromptFixture> {
-    let mut prompt = PromptState::new(
-        1,
-        conn(EXE, "93.184.216.34:443"),
-        NOW_MS + 30_000,
-        NOW_MS,
-        ctx(),
-    );
-    prompt.fronted_ms = Some(fronted_ms);
-    let state = PromptFixture {
-        prompt,
-        answered: Vec::new(),
-    };
-    Harness::builder()
-        .with_size(egui::vec2(440.0, 330.0))
-        .build_ui_state(
-            |ui, state: &mut PromptFixture| {
-                prompt_ui(ui, &mut state.prompt, NOW_MS, &[], &mut state.answered);
-            },
-            state,
-        )
-}
-
-/// An app holding `count` prompts from one application, plus the receiver
-/// the network thread would read.
-fn app_with_prompts(count: u64) -> (HallpassApp, tokio::sync::mpsc::UnboundedReceiver<ClientMsg>) {
+/// An app plus the receiver the network thread would read.
+fn app() -> (HallpassApp, tokio::sync::mpsc::UnboundedReceiver<ClientMsg>) {
     let (to_daemon, from_ui) = tokio::sync::mpsc::unbounded_channel();
     let (_to_ui, from_net) = std::sync::mpsc::channel();
-    let app = HallpassApp::with_channels(to_daemon, from_net);
-    // Real deadlines: the window drops prompts the daemon has already timed
-    // out, and it reads the clock to do it.
-    let now = hallpass_types::unix_ms_now();
-    app.prompts.lock().unwrap().pending = (1..=count)
-        .map(|id| {
-            PromptState::new(
-                id,
-                conn(EXE, &format!("1.1.1.{id}:443")),
-                now + 30_000,
-                now,
-                ctx(),
-            )
-        })
-        .collect();
-    (app, from_ui)
-}
-
-/// The buttons must survive the worst content the window can carry: a
-/// path at its display cap, a file name at the filesystem's, a command line
-/// at its cap, an application id at its cap, the full pending list, and the
-/// App-anywhere warning, all inside the fixed 440x330 viewport. Every one of
-/// those strings is chosen by the process being judged, so "the info pushed
-/// Allow and Deny off the window" is an unanswerable prompt an adversary can
-/// construct; the actions are pinned to a bottom panel and the info scrolls,
-/// and this clicks Deny through exactly that worst case to prove it stays
-/// reachable.
-///
-/// The file name and application id are the two that also reach the pinned
-/// panel, through the App-anywhere warning, so they are sized to wrap as
-/// many lines as they can: wide glyphs, with break points.
-#[test]
-fn buttons_survive_worst_case_content() {
-    // NAME_MAX: the longest file name the kernel will hand the daemon.
-    let file_name = "WWWW ".repeat(51);
-    let mut state = PromptFixture {
-        prompt: PromptState::new(
-            1,
-            conn(
-                &format!("/very/long/{}/{file_name}", "x".repeat(180)),
-                "93.184.216.34:443",
-            ),
-            NOW_MS + 30_000,
-            NOW_MS,
-            ctx(),
-        ),
-        answered: Vec::new(),
-    };
-    state.prompt.conn.cmdline = Some(format!("curl {}", "a".repeat(200)));
-    state.prompt.conn.app_id = Some(format!(
-        "flatpak:{}",
-        "WWW.".repeat(hallpass_types::MAX_APP_ID_NAME_BYTES / 4)
-    ));
-    state.prompt.scope = PromptScope::AppAnywhere; // adds the warning label
-    let rest: Vec<String> = (0..9).map(|i| format!("tcp 10.0.0.{i}:443")).collect();
-    let mut harness = Harness::builder()
-        .with_size(egui::vec2(440.0, 330.0))
-        .build_ui_state(
-            move |ui, state: &mut PromptFixture| {
-                prompt_ui(ui, &mut state.prompt, NOW_MS, &rest, &mut state.answered);
-            },
-            state,
-        );
-    // Settled first: the panel sizes itself from the frame before, so the
-    // first pass alone would not show where the buttons end up.
-    harness.run();
-    harness.get_by_label("Deny").click();
-    harness.run();
-    let expected = harness.state().prompt.reply(Verdict::Deny);
-    assert_eq!(
-        harness.state().answered,
-        vec![(1, expected)],
-        "Deny was not clickable under worst-case content"
-    );
-}
-
-/// A prompt for something never seen here has to say so where the operator
-/// is already looking, and a routine one must not.
-///
-/// A property of the laid-out tree rather than of the state: the flag is on
-/// the connection either way, and what this proves is that it reaches the
-/// window at all. The badge is deliberately not the only carrier - keyboard
-/// traversal never passes through it, so the details grid states it in words
-/// too, and both are asserted here.
-#[test]
-fn a_new_application_is_announced_in_the_prompt_window() {
-    let mut fixture = PromptFixture {
-        prompt: PromptState::new(
-            1,
-            conn(EXE, "93.184.216.34:443"),
-            NOW_MS + 30_000,
-            NOW_MS,
-            ctx(),
-        ),
-        answered: Vec::new(),
-    };
-    fixture.prompt.conn.first_seen = Some(hallpass_types::FirstSeen {
-        app: true,
-        dest: true,
-    });
-    let mut harness = Harness::builder()
-        .with_size(egui::vec2(440.0, 330.0))
-        .build_ui_state(
-            |ui, state: &mut PromptFixture| {
-                prompt_ui(ui, &mut state.prompt, NOW_MS, &[], &mut state.answered);
-            },
-            fixture,
-        );
-    harness.get_by_label("NEW");
-    harness.get_by_label("this application has not connected before");
-
-    // Nothing new, and tracking off, both render as an ordinary prompt: a
-    // window that said "seen before" would be making a claim the daemon may
-    // have no basis for.
-    for quiet in [
-        Some(hallpass_types::FirstSeen {
-            app: false,
-            dest: false,
-        }),
-        None,
-    ] {
-        harness.state_mut().prompt.conn.first_seen = quiet;
-        harness.run();
-        assert!(
-            harness.query_by_label("NEW").is_none(),
-            "an unremarkable connection was announced as new ({quiet:?})"
-        );
-    }
-}
-
-/// The context the daemon builds has to reach the window, and the loudest
-/// part of it has to be where the operator is already looking.
-///
-/// A hash-mismatch is the strongest thing this window ever says: a rule was
-/// written for this program and the binary asking now is not the one it
-/// pins. It sits above the separator with the identity lines rather than in
-/// the details grid, because it changes what the whole prompt is about.
-#[test]
-fn the_prompt_window_carries_the_daemon_context() {
-    let mut harness = prompt_harness();
-    let context = ctx();
-    // The sentences are the shared ones, so asserting the rendered label
-    // against them also pins this window and `hallpass-cli watch` to saying
-    // the same thing.
-    harness.get_by_label(&format!(
-        "Warning: {}",
-        context.hash_mismatch_describe().unwrap()
-    ));
-    harness.get_by_label(&context.denials_describe().unwrap());
-    harness.get_by_label("/usr/lib/ancestor-2/launcher");
-    harness.get_by_label(&"ab".repeat(32));
-
-    // An empty context renders an ordinary prompt. Zero denials in
-    // particular say nothing rather than "never denied": the daemon's
-    // history is bounded and lost on restart, so it does not know that.
-    harness.state_mut().prompt.context = PromptContext::default();
-    harness.run();
-    for absent in ["Started by", "Executable SHA-256", "Denied lately"] {
-        assert!(
-            harness.query_by_label(absent).is_none(),
-            "an empty context still rendered {absent:?}"
-        );
-    }
-}
-
-/// Deny has to be what keyboard traversal reaches first.
-///
-/// This window steals focus from whatever the operator was doing, and the
-/// answer given without reading it has to be the recoverable one: a wrong
-/// deny costs a retry, a wrong allow costs the connection the prompt existed
-/// to stop. Widget order is traversal order in egui, so this is a property
-/// of the laid-out tree and nothing else.
-#[test]
-fn deny_leads_keyboard_traversal() {
-    let mut harness = prompt_harness();
-    let mut reached = Vec::new();
-    // Enough presses to walk the whole panel: the pickers are segmented
-    // controls, so each option is its own focus stop, and the two verdict
-    // buttons are the last widgets added. The property is the order the
-    // two are reached in, not how many stops precede them.
-    for _ in 0..16 {
-        harness.key_press(egui::Key::Tab);
-        harness.run();
-        for label in ["Deny", "Allow"] {
-            if harness.get_by_label(label).accesskit_node().is_focused() {
-                reached.push(label);
-            }
-        }
-        // Traversal wraps, so stop once both have been seen or the order
-        // gets recorded twice.
-        if reached.len() == 2 {
-            break;
-        }
-    }
-    assert_eq!(
-        reached.first().copied(),
-        Some("Deny"),
-        "tab order reached {reached:?}"
-    );
-    assert!(
-        reached.contains(&"Allow"),
-        "traversal must still reach Allow: {reached:?}"
-    );
-}
-
-/// The reorder above moves the buttons past each other, so the wiring is
-/// worth pinning: each button answers with its own verdict, carrying the
-/// duration and scope the operator picked.
-#[test]
-fn each_button_answers_with_its_own_verdict() {
-    for (label, verdict) in [("Deny", Verdict::Deny), ("Allow", Verdict::Allow)] {
-        let mut harness = prompt_harness();
-        harness.get_by_label(label).click();
-        harness.run();
-        let expected = harness.state().prompt.reply(verdict);
-        assert_eq!(
-            harness.state().answered,
-            vec![(1, expected)],
-            "{label} answered with the wrong verdict"
-        );
-    }
-}
-
-/// A prompt that has only just come to the front does not take an Allow:
-/// the click was aimed at whatever sat there a moment ago.
-#[test]
-fn allow_does_not_answer_a_prompt_that_just_surfaced() {
-    let mut harness = prompt_harness_fronted(NOW_MS);
-    harness.get_by_label("Allow").click();
-    harness.run();
-    assert!(
-        harness.state().answered.is_empty(),
-        "an unread prompt was allowed"
-    );
-    harness.get_by_label("Deny").click();
-    harness.run();
-    assert_eq!(
-        harness.state().answered.len(),
-        1,
-        "Deny still answers at once"
-    );
-}
-
-/// Closing the window reaches the dismissal, and reaches it for every prompt
-/// the window covers rather than only the one on show. What dismissal means
-/// is `dismiss_prompts`, tested as state.
-#[test]
-fn closing_the_window_dismisses_every_prompt_it_covers() {
-    let (app, mut from_ui) = app_with_prompts(3);
-    let mut harness = Harness::builder()
-        .with_size(egui::vec2(600.0, 500.0))
-        .build_ui_state(
-            |ui, app: &mut HallpassApp| app.prompt_windows(ui.ctx()),
-            app,
-        );
-    // One window, really on screen, for all three: the front prompt names
-    // the application and the other two are listed as pending.
-    harness.get_by_label(EXE);
-    harness.get_by_label_contains("2 more request(s) pending");
-
-    // Under a test backend egui embeds child viewports in the root one, so
-    // the close arrives on the root's info; a single group keeps that
-    // faithful to one window being closed.
-    harness
-        .input_mut()
-        .viewports
-        .entry(egui::ViewportId::ROOT)
-        .or_default()
-        .events
-        .push(egui::ViewportEvent::Close);
-    harness.step();
-
-    assert_eq!(
-        drain(&mut from_ui),
-        (1..=3).map(prompt::close_reply).collect::<Vec<_>>(),
-        "a closed window left prompts for the daemon's default verdict"
-    );
-    assert!(harness.state().prompt_ids().is_empty());
-}
-
-/// Escape reaches the same dismissal the close button does, for the same
-/// prompts, with the same meaning: deny, once, for everything the window
-/// covers. A keyboard route that answered differently from the mouse one
-/// would be a second policy nobody documented.
-#[test]
-fn escape_dismisses_a_prompt_window_like_closing_it() {
-    let (app, mut from_ui) = app_with_prompts(2);
-    let mut harness = Harness::builder()
-        .with_size(egui::vec2(600.0, 500.0))
-        .build_ui_state(
-            |ui, app: &mut HallpassApp| app.prompt_windows(ui.ctx()),
-            app,
-        );
-    // Stepped rather than run: a live prompt asks for a repaint every
-    // 100ms to move its countdown, so `run` would never see the frame
-    // loop go quiet.
-    harness.step();
-
-    harness.key_press(egui::Key::Escape);
-    harness.step();
-
-    assert_eq!(
-        drain(&mut from_ui),
-        (1..=2).map(prompt::close_reply).collect::<Vec<_>>(),
-        "escape left prompts for the daemon's default verdict"
-    );
-    assert!(harness.state().prompt_ids().is_empty());
-}
-
-/// Quitting abandons every prompt on screen, so it answers them for the same
-/// reason closing one window does. Best effort by nature - the process may
-/// exit before the network thread writes the replies - but the queue must
-/// hold them, or the one certain outcome is the daemon's default verdict.
-#[test]
-fn quitting_denies_the_prompts_left_on_screen() {
-    let (app, mut from_ui) = app_with_prompts(2);
-    let mut harness = Harness::builder()
-        .with_size(egui::vec2(820.0, 520.0))
-        .build_ui_state(|ui, app: &mut HallpassApp| app.main_window(ui), app);
-
-    harness.get_by_label("Quit").click();
-    harness.run();
-
-    assert_eq!(
-        drain(&mut from_ui),
-        (1..=2).map(prompt::close_reply).collect::<Vec<_>>(),
-        "quitting left prompts to the daemon's default verdict"
-    );
-    assert!(harness.state().prompt_ids().is_empty());
+    (HallpassApp::with_channels(to_daemon, from_net), from_ui)
 }
 
 /// Apply in the settings tab sends the edited values to the daemon and
@@ -427,7 +30,7 @@ fn quitting_denies_the_prompts_left_on_screen() {
 /// answer to the refetch lands, the same contract the rules tab keeps.
 #[test]
 fn settings_apply_asks_the_daemon_instead_of_editing_the_form() {
-    let (mut app, mut from_ui) = app_with_prompts(0);
+    let (mut app, mut from_ui) = app();
     app.tab = Tab::Settings;
     app.daemon_config = Some(runtime_config(15, Verdict::Allow));
     app.settings_timeout = "45".to_string();
@@ -457,7 +60,7 @@ fn settings_apply_asks_the_daemon_instead_of_editing_the_form() {
 /// the timeout would be a settings edit nobody made.
 #[test]
 fn the_mode_toggle_asks_the_daemon_instead_of_flipping_the_switch() {
-    let (mut app, mut from_ui) = app_with_prompts(0);
+    let (mut app, mut from_ui) = app();
     let cfg = runtime_config(45, Verdict::Deny);
     app.daemon_config = Some(cfg);
     let mut harness = Harness::builder()
@@ -488,7 +91,7 @@ fn the_mode_toggle_asks_the_daemon_instead_of_flipping_the_switch() {
 /// empty-name parse error keeps the editor open and nothing is sent).
 #[test]
 fn editor_save_stays_reachable_on_a_short_viewport() {
-    let (mut app, mut from_ui) = app_with_prompts(0);
+    let (mut app, mut from_ui) = app();
     app.editor = Some(RuleEditor::add());
     let mut harness = Harness::builder()
         .with_size(egui::vec2(600.0, 240.0))
@@ -505,107 +108,6 @@ fn editor_save_stays_reachable_on_a_short_viewport() {
         drain(&mut from_ui).is_empty(),
         "an invalid form must not reach the daemon"
     );
-}
-
-/// Without a tray to come back through (`park_on_close` false: native
-/// Wayland, a hostless session, or these tests), the close button quits
-/// like Quit does: the prompts still on screen are denied-once rather
-/// than abandoned to the daemon's timeout, and the close is not
-/// cancelled. (An early version hid the window unconditionally; on
-/// Wayland's no-op hide the user experienced that as the close button
-/// not working, which is why parking is gated on a working tray.)
-#[test]
-fn closing_the_main_window_quits_and_answers_open_prompts() {
-    let (app, mut from_ui) = app_with_prompts(2);
-    let mut harness = Harness::builder()
-        .with_size(egui::vec2(820.0, 520.0))
-        .build_ui_state(|ui, app: &mut HallpassApp| app.main_window(ui), app);
-
-    harness
-        .input_mut()
-        .viewports
-        .entry(egui::ViewportId::ROOT)
-        .or_default()
-        .events
-        .push(egui::ViewportEvent::Close);
-    harness.step();
-
-    assert_eq!(
-        drain(&mut from_ui),
-        (1..=2).map(prompt::close_reply).collect::<Vec<_>>(),
-        "closing the window left prompts to the daemon's default verdict"
-    );
-    assert!(harness.state().prompt_ids().is_empty());
-}
-
-/// With a tray to come back through, close parks instead of quitting: the
-/// prompts stay pending and nothing reaches the daemon. Keeping the prompt
-/// surface alive across a close is the reason the tray exists.
-#[test]
-fn closing_with_a_tray_parks_and_keeps_prompts() {
-    let (mut app, mut from_ui) = app_with_prompts(2);
-    app.park_on_close = true;
-    let mut harness = Harness::builder()
-        .with_size(egui::vec2(820.0, 520.0))
-        .build_ui_state(|ui, app: &mut HallpassApp| app.main_window(ui), app);
-
-    harness
-        .input_mut()
-        .viewports
-        .entry(egui::ViewportId::ROOT)
-        .or_default()
-        .events
-        .push(egui::ViewportEvent::Close);
-    harness.step();
-
-    assert!(
-        drain(&mut from_ui).is_empty(),
-        "parking answered prompts it should have kept armed"
-    );
-    assert_eq!(harness.state().prompt_ids(), vec![1, 2]);
-}
-
-/// A quit already under way must not be re-intercepted by the park path:
-/// the teardown frames re-deliver the close request, and cancelling it
-/// would turn Quit into hide.
-#[test]
-fn quit_is_not_parked_even_with_a_tray() {
-    let (mut app, mut from_ui) = app_with_prompts(2);
-    app.park_on_close = true;
-    let ctx = egui::Context::default();
-    app.quit(&ctx);
-    let mut harness = Harness::builder()
-        .with_size(egui::vec2(820.0, 520.0))
-        .build_ui_state(|ui, app: &mut HallpassApp| app.main_window(ui), app);
-
-    harness
-        .input_mut()
-        .viewports
-        .entry(egui::ViewportId::ROOT)
-        .or_default()
-        .events
-        .push(egui::ViewportEvent::Close);
-    harness.step();
-
-    assert_eq!(
-        drain(&mut from_ui),
-        (1..=2).map(prompt::close_reply).collect::<Vec<_>>(),
-        "quit left prompts unanswered"
-    );
-    assert!(harness.state().prompt_ids().is_empty());
-}
-
-/// The tray reporting no StatusNotifier host flips the window back to
-/// quit-on-close; parking must never outlive the icon that un-parks it.
-#[test]
-fn tray_unavailable_falls_back_to_quit_on_close() {
-    let (mut app, _from_ui) = app_with_prompts(0);
-    let (to_ui, from_tray) = std::sync::mpsc::channel();
-    app.from_tray = Some(from_tray);
-    app.park_on_close = true;
-    to_ui.send(crate::tray::TrayMsg::Unavailable).unwrap();
-    app.drain_tray(&egui::Context::default());
-    assert!(!app.park_on_close);
 }
 
 /// The checkbox in the rules list asks the daemon; it does not edit the row.

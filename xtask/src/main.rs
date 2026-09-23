@@ -517,6 +517,10 @@ fn dev() -> Result<(), String> {
     eprintln!("  cargo run -q -p hallpass-cli -- --socket {socket} rules");
     eprintln!("  cargo run -q -p hallpass-cli -- --socket {socket} top");
     eprintln!("  cargo run -q -p hallpass-ui  -- --socket {socket}");
+    eprintln!("  cargo run -q -p hallpass-ui  -- agent --socket {socket}");
+    eprintln!();
+    eprintln!("the window takes no prompts; the agent does, and exits at once if an");
+    eprintln!("installed agent is already running for this user.");
     eprintln!();
     eprintln!("Ctrl-C stops the daemon.");
     eprintln!();

@@ -303,6 +303,24 @@ mod tests {
         ));
     }
 
+    /// Giving up a prompt denies, and denies once: it settles the connection
+    /// on screen without writing policy for any future one. Pinned as a
+    /// literal because every field is a decision - a wider scope or a lasting
+    /// duration would make dismissing a window an act of policy.
+    #[test]
+    fn a_dismissed_prompt_is_denied_for_this_connection_only() {
+        assert_eq!(
+            close_reply(7),
+            ClientMsg::PromptReply {
+                id: 7,
+                verdict: Verdict::Deny,
+                duration: RuleDuration::Once,
+                scope: PromptScope::ThisPort,
+                pin_exe: false,
+            }
+        );
+    }
+
     #[test]
     fn countdown_fraction_bounds() {
         // 10s window starting at t=1000ms.
