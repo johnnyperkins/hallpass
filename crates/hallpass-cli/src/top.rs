@@ -13,7 +13,7 @@ use hallpass_types::{sanitize_for_display, ClientMsg, ConnEvent, DaemonMsg, Verd
 use serde::Serialize;
 
 use crate::args::{GroupBy, TopOpts};
-use crate::client::{CliError, Client};
+use crate::client::{spawn_reader, CliError, Client};
 use crate::fmt::{self, Palette, Style};
 
 /// Events requested from the daemon's history to seed the view.
@@ -287,6 +287,11 @@ pub async fn top(
         })
         .await?;
 
+    // Reads on their own task: `read_msg` is not cancel-safe, and the ticker
+    // below wins the select every interval, so a frame arriving across a
+    // tick lost its first half and the stream came apart from there.
+    let mut rx = spawn_reader(client.into_stream());
+
     let interactive = std::io::stdout().is_terminal();
     let mut ticker =
         tokio::time::interval(std::time::Duration::from_secs(opts.interval_secs.max(1)));
@@ -294,7 +299,9 @@ pub async fn top(
     // without waiting out an interval.
     loop {
         tokio::select! {
-            msg = client.recv() => match msg? {
+            msg = rx.recv() => match msg.ok_or_else(|| {
+                CliError::Connect("daemon closed the connection".into())
+            })?? {
                 DaemonMsg::Event(ev) => agg.add(&ev, opts.group_by),
                 DaemonMsg::Err { message } => return Err(CliError::Daemon(message)),
                 _ => {}

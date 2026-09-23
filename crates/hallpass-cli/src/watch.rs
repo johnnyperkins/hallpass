@@ -14,9 +14,8 @@ use hallpass_types::{
     Verdict,
 };
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::sync::mpsc;
 
-use crate::client::{CliError, Client};
+use crate::client::{spawn_reader, CliError, Client};
 use crate::fmt;
 
 /// A prompt waiting to be answered.
@@ -191,17 +190,7 @@ pub async fn watch(mut client: Client) -> Result<(), CliError> {
     let (read_half, mut write_half) = client.into_stream().into_split();
 
     // read_msg is not cancel-safe, so pump daemon messages through a task.
-    let (tx, mut rx) = mpsc::channel::<Result<DaemonMsg, wire::WireError>>(16);
-    tokio::spawn(async move {
-        let mut r = read_half;
-        loop {
-            let msg = wire::read_msg::<DaemonMsg, _>(&mut r).await;
-            let stop = msg.is_err();
-            if tx.send(msg).await.is_err() || stop {
-                break;
-            }
-        }
-    });
+    let mut rx = spawn_reader(read_half);
 
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     let mut queue: VecDeque<Pending> = VecDeque::new();

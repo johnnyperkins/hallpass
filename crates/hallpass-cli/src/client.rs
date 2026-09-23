@@ -132,3 +132,27 @@ impl Client {
         }
     }
 }
+
+/// Read daemon messages on a task of their own and hand them over a channel.
+///
+/// `read_msg` is not cancel-safe: raced against anything else in a
+/// `select!`, a frame arriving across the other branch loses what was
+/// already read and the rest of the stream decodes from its middle. Selecting
+/// on the returned channel is safe. The task ends after passing on the first
+/// read error, or once the receiver is dropped.
+pub fn spawn_reader<R>(mut reader: R) -> tokio::sync::mpsc::Receiver<Result<DaemonMsg, WireError>>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    tokio::spawn(async move {
+        loop {
+            let msg = wire::read_msg::<DaemonMsg, _>(&mut reader).await;
+            let stop = msg.is_err();
+            if tx.send(msg).await.is_err() || stop {
+                break;
+            }
+        }
+    });
+    rx
+}
