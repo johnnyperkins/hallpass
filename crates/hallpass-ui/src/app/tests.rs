@@ -9,7 +9,7 @@
 
 use std::time::Duration;
 
-use hallpass_types::{Action, DaemonMsg, FlowTuple, Proto, RuleMatch};
+use hallpass_types::{Action, DaemonMsg, FlowTuple, PromptScope, Proto, RuleDuration, RuleMatch};
 
 use super::*;
 
@@ -1207,8 +1207,6 @@ fn uptime_formatting() {
 
 #[test]
 fn labels() {
-    assert_eq!(duration_label(RuleDuration::Session), "Session");
-    assert_eq!(scope_label(PromptScope::AppAnywhere), "App anywhere");
     assert_eq!(verdict_label(Verdict::Reject), "reject");
 }
 

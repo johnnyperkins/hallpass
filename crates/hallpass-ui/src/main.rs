@@ -9,6 +9,7 @@ mod editor;
 mod net;
 mod notify;
 mod prompt;
+mod prompt_view;
 mod theme;
 mod traffic;
 mod tray;

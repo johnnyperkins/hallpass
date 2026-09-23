@@ -13,7 +13,7 @@
 use egui_kittest::kittest::{NodeT as _, Queryable as _};
 use egui_kittest::Harness;
 
-use hallpass_types::PromptContext;
+use hallpass_types::{PromptContext, PromptScope, RuleDuration};
 use std::path::PathBuf;
 
 use super::tests::{conn, drain, runtime_config};
