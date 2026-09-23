@@ -306,7 +306,13 @@ async fn connect_and_serve(
                             let _ = to_notify.send(NotifyEvent::Gone { id: *id });
                         }
                         if let Err(e) = write_msg(&mut writer, &msg).await {
-                            send_ui(to_ui, wake, UiEvent::SendFailed { msg });
+                            // Same filter as the drain on reconnect: a
+                            // refresh is re-sent on Connected, so its loss
+                            // is not news. Its ack slot, if any, goes with
+                            // the Disconnected that follows this return.
+                            if reports_send_failure(&msg) {
+                                send_ui(to_ui, wake, UiEvent::SendFailed { msg });
+                            }
                             return Err(fail(format!("write: {e}")));
                         }
                     }
