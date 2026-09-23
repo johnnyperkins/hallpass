@@ -185,12 +185,19 @@ async fn connect(socket: &Path) -> Result<Client, Check> {
 /// A hint for a failed connection, sharpened by what systemd thinks of the
 /// unit when systemctl is available.
 fn unit_hint() -> String {
-    let state = Command::new("systemctl")
-        .args(["is-active", "hallpassd"])
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .ok()
+    // A fixed path, as for nft: doctor is routinely run under sudo, and a
+    // PATH lookup there runs whatever the invoking environment put first.
+    let state = ["/usr/bin/systemctl", "/bin/systemctl"]
+        .into_iter()
+        .find(|p| Path::new(p).is_file())
+        .and_then(|systemctl| {
+            Command::new(systemctl)
+                .args(["is-active", "hallpassd"])
+                .stdin(Stdio::null())
+                .stderr(Stdio::null())
+                .output()
+                .ok()
+        })
         .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string());
     match state.as_deref() {
         Some("active") => {
