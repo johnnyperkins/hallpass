@@ -189,7 +189,7 @@ async fn main() {
     // nfqueue::want_fail_open for why a live queue is the wrong place to
     // change it.
     let fail_open = nfqueue::want_fail_open(cfg.queue_bypass, cfg.mode.enforcing());
-    let (queue, bound_queues) = match nfqueue::bind(cfg.queue_num, fail_open) {
+    let (queues, bound_queues) = match nfqueue::bind(cfg.queue_num, fail_open) {
         Ok((q, bound)) => (Some(q), Some(bound)),
         Err(e) if cfg.queue_bypass => {
             // Without privileges (development runs) the bind fails and
@@ -368,20 +368,20 @@ async fn main() {
     // this run has a queue; with no packets there is nothing to observe, and
     // building it would leave a state file rewritten by a daemon that judged
     // nothing.
-    let (first_seen, first_seen_writer) = (queue.is_some() && cfg.first_seen)
+    let (first_seen, first_seen_writer) = (queues.is_some() && cfg.first_seen)
         .then(|| firstseen::start(cfg.first_seen_state.clone()))
         .unzip();
 
     // Blocking nfqueue loop on its own thread, over the queue bound
     // before the nftables install. None means interception is off for
     // this run (no privileges); rule management still works over IPC.
-    let queue_thread = queue.map(|queue| {
+    let queue_thread = queues.map(|queues| {
         // Started before the install below: everything the loop needs
         // (the rule store, the domain cache, the prompt table) is built
         // by this point, so the first packet the table produces meets a
         // daemon that can decide it.
         nfqueue::spawn(
-            queue,
+            queues,
             cfg.queue_num,
             nfqueue::QueueDeps {
                 attribution: AttributionChain::default_chain(Some(Arc::clone(&dns_cache))),

@@ -95,6 +95,12 @@ fn ruleset(queue_num: u16, verdict_bypass: bool) -> String {
     // whole ruleset fail to parse. `install` then leaves no table at all, so
     // nothing is filtered.
     //
+    // The input rule takes replies only (`ct state established`): a reply to a
+    // query this host sent is established by the query itself, and anything
+    // else from port 53 is traffic any host on the network can send at any
+    // rate. Queueing that as well made every such sender a load on the
+    // daemon, for packets the snoop validation would have discarded anyway.
+    //
     // `hallpass-cli doctor` verifies the output chain by token-matching the
     // listed rules ("meta skuid 0" + "accept" before "ct state new" +
     // "queue num"); reshaping those rules means updating its chain_order.
@@ -113,7 +119,7 @@ fn ruleset(queue_num: u16, verdict_bypass: bool) -> String {
          \t}}\n\
          \tchain input {{\n\
          \t\ttype filter hook input priority mangle; policy accept;\n\
-         \t\tudp sport 53 queue num {snoop} bypass\n\
+         \t\tudp sport 53 ct state established queue num {snoop} bypass\n\
          \t}}\n\
          }}\n"
     )
@@ -361,7 +367,7 @@ mod tests {
         assert!(r.contains(&format!("meta mark {REJECT_MARK} reject")));
         assert!(r.contains("udp dport 53 ct state != new queue num 4 bypass"));
         assert!(r.contains("type filter hook input priority mangle; policy accept;"));
-        assert!(r.contains("udp sport 53 queue num 4 bypass"));
+        assert!(r.contains("udp sport 53 ct state established queue num 4 bypass"));
     }
 
     /// A reinjected accept resumes at the next base chain, so the reject
@@ -471,6 +477,6 @@ mod tests {
         assert!(!r.contains("queue num 3 bypass"));
         // Snoop queues are observational; they always keep bypass.
         assert!(r.contains("udp dport 53 ct state != new queue num 4 bypass"));
-        assert!(r.contains("udp sport 53 queue num 4 bypass"));
+        assert!(r.contains("udp sport 53 ct state established queue num 4 bypass"));
     }
 }

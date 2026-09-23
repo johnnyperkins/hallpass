@@ -356,27 +356,42 @@ fn session_grant(conn: &Connection, ctx: &DecideCtx) -> Option<u64> {
 /// no event to say so; the kernel's own `queue_dropped` counter is the one
 /// trace, which is why the stats surface it together with the effective
 /// flag state ([`BoundQueues`]).
-pub fn bind(queue_num: u16, fail_open: bool) -> std::io::Result<(Queue, BoundQueues)> {
+///
+/// Each queue gets its own netlink socket. The kernel delivers a queued
+/// packet by writing it into the listener's socket buffer, and when that
+/// write fails it resolves the packet by the queue's fail-open flag, with no
+/// verdict and no event. The snoop queue is fed by inbound traffic from other
+/// hosts, so sharing one socket let anyone who can send this host UDP from
+/// port 53 fill the buffer the verdict queue is delivered through.
+pub fn bind(queue_num: u16, fail_open: bool) -> std::io::Result<(Queues, BoundQueues)> {
     let snoop_queue = crate::nft::snoop_queue(queue_num);
-    let mut queue = Queue::open()?;
-    queue.bind(queue_num)?;
-    queue.bind(snoop_queue)?;
-    let verdict_set = set_fail_open(&mut queue, queue_num, fail_open);
-    // The snoop queue is observational: its packets are accepted the moment
-    // they are read, so a full snoop queue must never cost a DNS reply. It
-    // keeps fail-open in every posture, matching its always-`bypass` rule.
-    let snoop_set = set_fail_open(&mut queue, snoop_queue, true);
+    let mut verdict = Queue::open()?;
+    verdict.bind(queue_num)?;
+    set_copy_range(&mut verdict, queue_num, VERDICT_COPY_RANGE);
+    let verdict_set = set_fail_open(&mut verdict, queue_num, fail_open);
     // The verdict queue only. The snoop queue's packets are accepted the
     // moment they are read, so nothing sits in it for a prompt window and
     // the reason for a deeper queue does not apply; giving it one would
     // quadruple the skbs the daemon can pin for no stated benefit, and its
     // length is not reported anywhere, so an operator reading a snoop depth
     // would have to guess which limit it was against.
-    let max_len = set_max_len(&mut queue, queue_num);
-    queue.set_nonblocking(true);
+    let max_len = set_max_len(&mut verdict, queue_num);
+    force_recv_buffer(&mut verdict, queue_num, VERDICT_RECV_BUFFER);
+    verdict.set_nonblocking(true);
+
+    let mut snoop = Queue::open()?;
+    snoop.bind(snoop_queue)?;
+    set_copy_range(&mut snoop, snoop_queue, SNOOP_COPY_RANGE);
+    // The snoop queue is observational: its packets are accepted the moment
+    // they are read, so a full snoop queue must never cost a DNS reply. It
+    // keeps fail-open in every posture, matching its always-`bypass` rule.
+    let snoop_set = set_fail_open(&mut snoop, snoop_queue, true);
+    force_recv_buffer(&mut snoop, snoop_queue, SNOOP_RECV_BUFFER);
+    snoop.set_nonblocking(true);
+
     tracing::info!(queue_num, snoop_queue, fail_open, max_len, "nfqueues bound");
     Ok((
-        queue,
+        Queues { verdict, snoop },
         BoundQueues {
             queue_num,
             // Effective state, not the request: asked-for-off and
@@ -386,6 +401,71 @@ pub fn bind(queue_num: u16, fail_open: bool) -> std::io::Result<(Queue, BoundQue
             verdict_max_len: max_len,
         },
     ))
+}
+
+/// The two bound queues, each on its own socket; see [`bind`].
+pub struct Queues {
+    pub verdict: Queue,
+    pub snoop: Queue,
+}
+
+/// Bytes of each verdict-queue packet copied to the daemon.
+///
+/// The kernel's default is the whole packet, up to 64 KiB, and every queued
+/// packet is charged against the socket's receive buffer at that size. A few
+/// maximum-size datagrams from any local process then filled the buffer, and
+/// the next packet, a connection that should have been judged, was resolved
+/// by the fail-open flag instead. Policy needs the headers, and the snoop
+/// path needs the question of a DNS query that is the first packet of its
+/// flow: at most 40 bytes of IPv6 header, a few extension headers, 8 of UDP
+/// and a query of a few hundred bytes. [`packet::parse`] reads a truncated
+/// copy leniently, so a larger packet still yields its flow.
+const VERDICT_COPY_RANGE: u16 = 1024;
+
+/// Bytes of each snoop-queue packet copied to the daemon: a DNS reply of up
+/// to 4096 bytes (the largest EDNS buffer resolvers commonly advertise) plus
+/// its headers. A longer reply annotates nothing at all: the consumer
+/// (`packet::udp_payload`) parses strictly and discards a truncated copy
+/// whole, not just its tail. The same holds for a first query past
+/// [`VERDICT_COPY_RANGE`], so its reply is never accepted either.
+const SNOOP_COPY_RANGE: u16 = 4096 + 256;
+
+/// Receive buffer for the verdict socket, sized so a full [`QUEUE_MAX_LEN`]
+/// of copies fits in it: each is charged at about 3 KiB of kernel memory
+/// (copy range, metadata and skb overhead). Overflow is then decided by the
+/// queue depth, which is reported, rather than by a socket buffer nobody
+/// sees. It is a ceiling, not an allocation.
+const VERDICT_RECV_BUFFER: usize = 16 * 1024 * 1024;
+
+/// Receive buffer for the snoop socket: the kernel's default queue depth of
+/// 1024 at the larger snoop copy range.
+const SNOOP_RECV_BUFFER: usize = 8 * 1024 * 1024;
+
+/// Shrink the copy range of `queue_num` to `range`. A failure leaves the
+/// 64 KiB range `nfq` sets at bind: correct, only easier to overflow.
+fn set_copy_range(queue: &mut Queue, queue_num: u16, range: u16) {
+    if let Err(e) = queue.set_copy_range(queue_num, range) {
+        tracing::warn!(
+            queue_num,
+            range,
+            "could not set the nfqueue copy range: {e}"
+        );
+    }
+}
+
+/// Raise the socket receive buffer past `net.core.rmem_max`. Needs
+/// CAP_NET_ADMIN, which binding a queue already does; a failure leaves the
+/// kernel default (about 208 KiB) and is worth knowing about.
+fn force_recv_buffer(queue: &mut Queue, queue_num: u16, bytes: usize) {
+    match queue.set_recv_buffer_size_force(bytes) {
+        Ok(got) => tracing::debug!(queue_num, bytes = got, "nfqueue receive buffer set"),
+        Err(e) => tracing::warn!(
+            queue_num,
+            bytes,
+            "could not raise the nfqueue receive buffer; a burst of queued packets \
+             can overflow it and be resolved by the fail-open flag: {e}"
+        ),
+    }
 }
 
 /// What [`bind`] established, for the stats snapshot: which queue numbers
@@ -522,7 +602,6 @@ const _: () = assert!(
 );
 
 pub fn run(mut queue: Queue, queue_num: u16, mut deps: QueueDeps) -> std::io::Result<()> {
-    let snoop_queue = crate::nft::snoop_queue(queue_num);
     let iface_map = crate::iface::IfaceMap::default();
     let mut held: HashMap<u64, nfq::Message> = HashMap::new();
     // Monotonic packet-hold sequence. u64 does not wrap in any real runtime
@@ -530,6 +609,7 @@ pub fn run(mut queue: Queue, queue_num: u16, mut deps: QueueDeps) -> std::io::Re
     // do not "fix" this into a wrapping counter that could collide live keys.
     let mut next_seq: u64 = 0;
     let mut recv_errors: u32 = 0;
+    let mut refused_verdicts: u64 = 0;
     let mut prompt_send_failures: u64 = 0;
     let mut fatal: Option<std::io::Error> = None;
     // Out of `deps` so `decide` can take it mutably while the rest of the
@@ -572,24 +652,6 @@ pub fn run(mut queue: Queue, queue_num: u16, mut deps: QueueDeps) -> std::io::Re
                 // capped by the queue's copy range, so the two differ for an
                 // oversized packet and parsing must tolerate the missing tail.
                 let parsed = packet::parse(msg.get_payload(), msg.get_original_len());
-
-                // Snoop-queue packets (established DNS queries, DNS replies)
-                // are only recorded, never held for a verdict.
-                if msg.get_queue_num() == snoop_queue {
-                    if let packet::Parsed::Flow(t) = parsed {
-                        // try_send: this runs on the verdict thread, which
-                        // must never block on the DNS consumer.
-                        if deps
-                            .dns_tx
-                            .try_send((t, msg.get_payload().to_vec()))
-                            .is_err()
-                        {
-                            deps.stats.record_dns_snoop_dropped();
-                        }
-                    }
-                    apply_verdict(&mut queue, msg, Verdict::Allow);
-                    continue;
-                }
 
                 // Transports the rule engine does not model (SCTP, ICMP,
                 // ...) and unparsable packets are never silently accepted:
@@ -800,6 +862,24 @@ pub fn run(mut queue: Queue, queue_num: u16, mut deps: QueueDeps) -> std::io::Re
             }
         }
 
+        // Not receive failures, and never counted as ones: each reports an
+        // earlier verdict the kernel refused, almost always ENOENT for a held
+        // packet it flushed while a prompt was open (its interface went
+        // down, or another ruleset reloaded). A prompt timing out after a VPN
+        // drop answers dozens of those at once, and counting them towards
+        // MAX_RECV_ERRORS let that take the daemon down.
+        if let Some((n, errno)) = queue.take_ack_errors() {
+            let before = refused_verdicts;
+            refused_verdicts = refused_verdicts.saturating_add(u64::from(n));
+            if before.checked_ilog2() != refused_verdicts.checked_ilog2() {
+                tracing::warn!(
+                    total = refused_verdicts,
+                    last = %std::io::Error::from_raw_os_error(errno),
+                    "the kernel refused verdicts for packets it no longer holds"
+                );
+            }
+        }
+
         if !busy {
             std::thread::sleep(IDLE_POLL);
         }
@@ -814,9 +894,6 @@ pub fn run(mut queue: Queue, queue_num: u16, mut deps: QueueDeps) -> std::io::Re
     if let Err(e) = queue.unbind(queue_num) {
         tracing::warn!(queue_num, "nfqueue unbind failed: {e}");
     }
-    if let Err(e) = queue.unbind(snoop_queue) {
-        tracing::warn!(snoop_queue, "nfqueue unbind failed: {e}");
-    }
     match fatal {
         Some(e) => Err(e),
         None => Ok(()),
@@ -828,17 +905,86 @@ pub fn run(mut queue: Queue, queue_num: u16, mut deps: QueueDeps) -> std::io::Re
 /// installed and nobody draining the queue, staying up would silently
 /// blackhole (fail-closed) or bypass (fail-open) all new traffic while
 /// looking healthy, so the loop signals `fatal_tx` and main shuts down.
-pub fn spawn(queue: Queue, queue_num: u16, deps: QueueDeps) -> std::thread::JoinHandle<()> {
+/// Start the verdict loop and the snoop loop, each on its own thread. The
+/// returned handle is the verdict thread's, which joins the snoop thread
+/// before it ends, so joining it waits for both.
+pub fn spawn(queues: Queues, queue_num: u16, deps: QueueDeps) -> std::thread::JoinHandle<()> {
     let fatal_tx = deps.fatal_tx.clone();
+    let snoop = {
+        let snoop_queue = crate::nft::snoop_queue(queue_num);
+        let dns_tx = deps.dns_tx.clone();
+        let stats = Arc::clone(&deps.stats);
+        let shutdown = Arc::clone(&deps.shutdown);
+        std::thread::Builder::new()
+            .name("nfqueue-snoop".into())
+            .spawn(move || run_snoop(queues.snoop, snoop_queue, &dns_tx, &stats, &shutdown))
+            .expect("spawn nfqueue snoop thread")
+    };
     std::thread::Builder::new()
         .name("nfqueue".into())
         .spawn(move || {
-            if let Err(e) = run(queue, queue_num, deps) {
+            if let Err(e) = run(queues.verdict, queue_num, deps) {
                 tracing::error!("nfqueue loop failed, stopping the daemon: {e}");
                 let _ = fatal_tx.send(());
             }
+            let _ = snoop.join();
         })
         .expect("spawn nfqueue thread")
+}
+
+/// Drain the snoop queue until `shutdown` is set: hand every packet to the
+/// DNS consumer and accept it at once.
+///
+/// Its own thread and socket, so nothing on this path can delay a verdict:
+/// the packets here come from other hosts, at a rate they choose. Failing
+/// persistently costs domain annotations, never a verdict, so it ends this
+/// loop rather than the daemon. Closing the socket unbinds the queue, and
+/// its nft rule carries `bypass`, so replies keep flowing unobserved.
+fn run_snoop(
+    mut queue: Queue,
+    snoop_queue: u16,
+    dns_tx: &Sender<(FlowTuple, Vec<u8>)>,
+    stats: &Counters,
+    shutdown: &AtomicBool,
+) {
+    let mut recv_errors: u32 = 0;
+    while !shutdown.load(Ordering::Relaxed) {
+        match queue.recv() {
+            Ok(msg) => {
+                recv_errors = 0;
+                if let packet::Parsed::Flow(t) =
+                    packet::parse(msg.get_payload(), msg.get_original_len())
+                {
+                    // try_send: the consumer is async and must not be able to
+                    // back this loop up into the kernel queue.
+                    if dns_tx.try_send((t, msg.get_payload().to_vec())).is_err() {
+                        stats.record_dns_snoop_dropped();
+                    }
+                }
+                apply_verdict(&mut queue, msg, Verdict::Allow);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(IDLE_POLL);
+            }
+            Err(e) => {
+                recv_errors += 1;
+                if recv_errors >= MAX_RECV_ERRORS {
+                    tracing::error!(
+                        snoop_queue,
+                        "DNS snoop queue keeps failing, no longer observing DNS replies: {e}"
+                    );
+                    return;
+                }
+                tracing::warn!(attempt = recv_errors, "nfqueue snoop recv failed: {e}");
+                std::thread::sleep(IDLE_POLL);
+            }
+        }
+        // Refused verdicts here only mean a reply the kernel already let go.
+        let _ = queue.take_ack_errors();
+    }
+    if let Err(e) = queue.unbind(snoop_queue) {
+        tracing::warn!(snoop_queue, "nfqueue unbind failed: {e}");
+    }
 }
 
 #[cfg(test)]

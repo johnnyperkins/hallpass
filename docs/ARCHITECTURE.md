@@ -41,7 +41,9 @@ The daemon installs one nftables table, `inet hallpass`, with three chains:
 - `reject_marked`, hook output, priority filter. Two rules that turn a packet
   carrying `REJECT_MARK` into a TCP reset or an ICMP unreachable.
 
-The snoop queue number is the verdict queue number plus one. Only `ct state
+The snoop queue number is the verdict queue number plus one. Each queue has
+its own netlink socket and thread, so traffic arriving on the snoop queue can
+never fill the buffer the verdict queue is delivered through. Only `ct state
 new` is judged, so established flows are never re-checked.
 
 There is deliberately no chain on the `forward` hook, so a packet this host
