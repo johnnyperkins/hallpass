@@ -651,10 +651,15 @@ who can delete the nftables table outright.
   `CapabilityBoundingSet` is narrowed to the seven capabilities it actually
   uses (`NET_ADMIN`, `DAC_READ_SEARCH`, `SYS_PTRACE`, `CHOWN`, `BPF`,
   `PERFMON`, `SYS_RESOURCE`), and `SystemCallFilter` allows only
-  `@system-service` plus `bpf` and `perf_event_open`. `SYS_PTRACE` is what
-  passes the kernel's ptrace access check on `/proc/<pid>/exe` for other
-  users' processes; the `ptrace` syscall itself stays outside the filter, so
-  the grant is `/proc` visibility, not live attach. `CAP_SYS_ADMIN` is
+  `@system-service` plus `bpf` and `perf_event_open`, minus
+  `process_vm_readv` and `process_vm_writev`. `SYS_PTRACE` is what passes
+  the kernel's ptrace access check on `/proc/<pid>/exe` for other users'
+  processes. The `ptrace` syscall stays outside the filter, but the same
+  check also opens `/proc/<pid>/mem` for writing, which no filter can
+  refuse, so a compromised daemon can still write into other processes:
+  the capability is needed, and it is not harmless. `DevicePolicy=closed`
+  keeps raw disks out of reach and `LimitNOFILE` gives attribution room to
+  keep opening `/proc`. `CAP_SYS_ADMIN` is
   deliberately excluded, which costs annotation, never enforcement: on
   kernels older than 5.8, where `bpf()` requires it, eBPF attribution falls
   back to procfs and logs why; and on kernel lines whose uprobe perf PMU
