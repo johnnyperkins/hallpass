@@ -494,6 +494,9 @@ impl HallpassApp {
     /// Drain messages from the network thread into UI state.
     fn drain_net(&mut self) {
         while let Ok(ev) = self.from_net.try_recv() {
+            if let UiEvent::Daemon(hallpass_types::DaemonMsg::Event(_)) = &ev {
+                crate::net::event_drained();
+            }
             match ev {
                 UiEvent::Connected => {
                     self.status = ConnStatus::Connected;

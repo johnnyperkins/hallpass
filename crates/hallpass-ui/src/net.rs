@@ -6,6 +6,7 @@
 //! - UI -> daemon: `tokio::sync::mpsc::UnboundedReceiver<ClientMsg>`.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::Sender;
 use std::time::Duration;
 
@@ -87,11 +88,38 @@ pub(crate) fn reports_send_failure(msg: &ClientMsg) -> bool {
 }
 
 fn send_ui(to_ui: &Sender<UiEvent>, ctx: &egui::Context, ev: UiEvent) -> bool {
+    // The channel to the window is unbounded, because a prompt must never be
+    // dropped on its way to the operator, and it is drained only while the
+    // window paints, which an unfocused or covered one may not do for a long
+    // time. Events are the one thing arriving at a rate someone else sets
+    // (any local process can open connections), so they alone are counted
+    // and shed past a bound; everything else always goes through.
+    if let UiEvent::Daemon(DaemonMsg::Event(_)) = &ev {
+        if QUEUED_EVENTS.fetch_add(1, Ordering::Relaxed) >= MAX_QUEUED_EVENTS {
+            QUEUED_EVENTS.fetch_sub(1, Ordering::Relaxed);
+            return true;
+        }
+    }
     let ok = to_ui.send(ev).is_ok();
     if ok {
         ctx.request_repaint();
     }
     ok
+}
+
+/// Events sent to the window and not yet drained; see [`send_ui`].
+static QUEUED_EVENTS: AtomicUsize = AtomicUsize::new(0);
+
+/// Most events waiting for the window at once. The event feed keeps far
+/// fewer than this, so nothing it would have shown is lost; only the memory
+/// a window that is not painting can be made to hold.
+const MAX_QUEUED_EVENTS: usize = 4096;
+
+/// Record that the window took one event off the channel.
+pub fn event_drained() {
+    let _ = QUEUED_EVENTS.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+        Some(n.saturating_sub(1))
+    });
 }
 
 /// Connection loop: connect, handshake, pump messages, reconnect on failure
