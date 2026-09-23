@@ -110,20 +110,27 @@ fn app_with_prompts(count: u64) -> (HallpassApp, tokio::sync::mpsc::UnboundedRec
 }
 
 /// The buttons must survive the worst content the window can carry: a
-/// path at its display cap, a command line at its cap, the full pending
-/// list, and the App-anywhere warning, all inside the fixed 440x330
-/// viewport. Every one of those strings is chosen by the process being
-/// judged, so "the info pushed Allow and Deny off the window" is an
-/// unanswerable prompt an adversary can construct; the actions are pinned
-/// to a bottom panel and the info scrolls, and this clicks Deny through
-/// exactly that worst case to prove it stays reachable.
+/// path at its display cap, a file name at the filesystem's, a command line
+/// at its cap, an application id at its cap, the full pending list, and the
+/// App-anywhere warning, all inside the fixed 440x330 viewport. Every one of
+/// those strings is chosen by the process being judged, so "the info pushed
+/// Allow and Deny off the window" is an unanswerable prompt an adversary can
+/// construct; the actions are pinned to a bottom panel and the info scrolls,
+/// and this clicks Deny through exactly that worst case to prove it stays
+/// reachable.
+///
+/// The file name and application id are the two that also reach the pinned
+/// panel, through the App-anywhere warning, so they are sized to wrap as
+/// many lines as they can: wide glyphs, with break points.
 #[test]
 fn buttons_survive_worst_case_content() {
+    // NAME_MAX: the longest file name the kernel will hand the daemon.
+    let file_name = "WWWW ".repeat(51);
     let mut state = PromptFixture {
         prompt: PromptState::new(
             1,
             conn(
-                &format!("/very/long/{}/curl", "x".repeat(180)),
+                &format!("/very/long/{}/{file_name}", "x".repeat(180)),
                 "93.184.216.34:443",
             ),
             NOW_MS + 30_000,
@@ -133,6 +140,10 @@ fn buttons_survive_worst_case_content() {
         answered: Vec::new(),
     };
     state.prompt.conn.cmdline = Some(format!("curl {}", "a".repeat(200)));
+    state.prompt.conn.app_id = Some(format!(
+        "flatpak:{}",
+        "WWW.".repeat(hallpass_types::MAX_APP_ID_NAME_BYTES / 4)
+    ));
     state.prompt.scope = PromptScope::AppAnywhere; // adds the warning label
     let rest: Vec<String> = (0..9).map(|i| format!("tcp 10.0.0.{i}:443")).collect();
     let mut harness = Harness::builder()
@@ -143,6 +154,9 @@ fn buttons_survive_worst_case_content() {
             },
             state,
         );
+    // Settled first: the panel sizes itself from the frame before, so the
+    // first pass alone would not show where the buttons end up.
+    harness.run();
     harness.get_by_label("Deny").click();
     harness.run();
     let expected = harness.state().prompt.reply(Verdict::Deny);

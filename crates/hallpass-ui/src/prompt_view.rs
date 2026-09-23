@@ -327,12 +327,18 @@ fn prompt_actions_ui(
     // says where the allow is narrower. Stating only the allow's scope
     // would understate what Deny does, and Deny is the button that leads
     // keyboard traversal.
+    //
+    // Both names are cut short here, and only here: this panel is the one
+    // part of the window that does not scroll, so text the judged process
+    // chose (a file name runs to 255 bytes, an application id to 104) could
+    // otherwise grow it past the viewport and take the buttons below it with
+    // them. The body above states both in full.
     if p.scope == PromptScope::AppAnywhere {
         ui.colored_label(
             REJECT_COLOR,
             format!(
                 "\u{26a0} \"App anywhere\" lets any process running {} reach any destination.",
-                prompt::exe_name(&p.conn)
+                prompt::truncate(&prompt::exe_name(&p.conn), PINNED_NAME_MAX)
             ),
         );
         if let Some(app) = &p.conn.app_id {
@@ -341,7 +347,7 @@ fn prompt_actions_ui(
                 format!(
                     "Allow is scoped to {}; Deny is not, and covers every application \
                      running from that path.",
-                    prompt::ui_text(app)
+                    prompt::truncate(app, PINNED_NAME_MAX)
                 ),
             );
         }
@@ -408,6 +414,12 @@ fn scope_label(s: PromptScope) -> &'static str {
 fn opt_num(n: Option<u32>) -> String {
     n.map_or_else(|| "?".to_string(), |v| v.to_string())
 }
+
+/// Bound for a name the judged process chose, quoted inside the pinned
+/// action panel. Short enough that both warnings together cannot crowd the
+/// verdict buttons out of the viewport; the scrolling body carries the
+/// names in full.
+const PINNED_NAME_MAX: usize = 40;
 
 #[cfg(test)]
 mod tests {
