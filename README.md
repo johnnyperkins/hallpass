@@ -118,6 +118,12 @@ systemd unit and desktop entry, autostart the UI, add you to the `hallpass`
 group, and `systemctl enable --now hallpassd`. Log out and back in once so the
 group membership and UI autostart take effect.
 
+It installs, as root, the binaries it just built in your checkout, so it is
+exactly as trustworthy as the account that ran the build: anything running as
+you between the build and the password prompt could have replaced them. Run
+it from an account you trust, and never as `sudo ./install.sh`, which would
+also run cargo and every dependency's build script as root.
+
 Two things it does that are worth reading before you run it:
 
 - **A fresh install starts from `etc/config.hardened.toml`.** Unmatched and
