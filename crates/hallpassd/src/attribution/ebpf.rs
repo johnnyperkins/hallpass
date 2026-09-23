@@ -374,7 +374,11 @@ impl Drop for EbpfAttributor {
 
 impl Attributor for EbpfAttributor {
     fn attribute(&self, tuple: &FlowTuple) -> Option<ProcInfo> {
-        let val = self.sock_map.get(&flow_key(tuple), 0).ok()?;
+        let key = flow_key(tuple);
+        let val = self.sock_map.get(&key, 0).ok().or_else(|| {
+            let wild = unbound_udp_key(tuple, key)?;
+            self.sock_map.get(&wild, 0).ok()
+        })?;
         // Read before the generation check, so a check that passes vouches
         // for the image this identity names: no exec landed between the
         // connect and the read.
@@ -481,6 +485,26 @@ fn flow_key(t: &FlowTuple) -> FlowKey {
             t.dst.port(),
         ),
     }
+}
+
+/// The key the kernel side records for a datagram sent from a UDP socket
+/// with no local address, or `None` for anything else.
+///
+/// The kprobe runs at `udp_sendmsg` entry and reads the source address from
+/// the socket, where an unbound or wildcard-bound socket holds 0.0.0.0 (or
+/// `::`): the kernel picks the real one later, while routing the datagram.
+/// So every `sendto()` on such a socket is recorded with a zero source and
+/// never matched the packet's tuple. The miss fell through to procfs, which
+/// resolves the owner after the fact with no exec generation to compare, so
+/// "send, then exec an allowed binary" won the race the generation check
+/// exists to refuse. TCP always has its source address by the time the
+/// connect probe returns, and a connected UDP socket gets one at connect.
+fn unbound_udp_key(tuple: &FlowTuple, mut key: FlowKey) -> Option<FlowKey> {
+    if tuple.proto != Proto::Udp {
+        return None;
+    }
+    key.saddr = [0u8; 16];
+    Some(key)
 }
 
 fn v6_octets(ip: IpAddr) -> [u8; 16] {
@@ -728,6 +752,27 @@ mod tests {
         assert!(readers[0].changed().await.is_ok());
         drop(stop);
         assert!(readers[1].changed().await.is_ok());
+    }
+
+    #[test]
+    fn unbound_udp_key_zeroes_only_the_source_address() {
+        let udp = FlowTuple {
+            proto: Proto::Udp,
+            src: "10.0.0.5:40000".parse().unwrap(),
+            dst: "10.0.0.9:53".parse().unwrap(),
+        };
+        let exact = flow_key(&udp);
+        let wild = unbound_udp_key(&udp, exact).unwrap();
+        assert_eq!(
+            wild,
+            FlowKey::v4(PROTO_UDP, [0; 4], 40000, [10, 0, 0, 9], 53),
+            "what the kernel side records for a sendto() on an unbound socket"
+        );
+        let tcp = FlowTuple {
+            proto: Proto::Tcp,
+            ..udp
+        };
+        assert_eq!(unbound_udp_key(&tcp, flow_key(&tcp)), None);
     }
 
     #[test]

@@ -170,6 +170,16 @@ s.connect_ex((host, port))
 os.execv(become, [become, "3"])
 "#;
 
+/// [`EXEC_RACER`] over UDP: one datagram from an unbound socket, then exec.
+const EXEC_RACER_UDP: &str = r#"import os, socket, sys
+
+host, port, become = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+os.set_inheritable(s.fileno(), True)
+s.sendto(b"x", (host, port))
+os.execv(become, [become, "3"])
+"#;
+
 /// Counting UDP collector for the syslog export tests. Publishes its
 /// running total by writing it to a file, replaced atomically so a reader
 /// polling the file never sees a half-written number, and at most every
@@ -2597,23 +2607,40 @@ fn lockdown_suppresses_untagged_allows_against_a_real_queue() {
 #[test]
 #[ignore = "requires root and network namespaces"]
 fn an_exec_after_connect_does_not_inherit_the_new_binarys_rule() {
-    const PORT: u16 = 19021;
+    assert_exec_race_refused("execrace", EXEC_RACER, 19021);
+}
+
+/// The same race over UDP, from a socket that was never bound or connected:
+/// `sendto()` then exec. The kernel side records such a datagram before the
+/// source address is chosen, so the record carries none, and until the
+/// lookup learned to ask for that key every such datagram missed it and
+/// fell to procfs, which has no exec generation and names whatever binary
+/// holds the socket by the time it looks.
+#[test]
+#[ignore = "requires root and network namespaces"]
+fn an_exec_after_sendto_does_not_inherit_the_new_binarys_rule() {
+    assert_exec_race_refused("execrace-udp", EXEC_RACER_UDP, 19052);
+}
+
+/// Body of the exec-race tests: `racer_src` gets the destination host, port
+/// and the binary to exec into, sends one packet and execs it.
+fn assert_exec_race_refused(tag: &str, racer_src: &str, port: u16) {
     if !cfg!(feature = "ebpf") {
-        eprintln!("SKIP e2e execrace: built without the ebpf feature");
+        eprintln!("SKIP e2e {tag}: built without the ebpf feature");
         return;
     }
-    let Some(mut env) = TestEnv::setup("execrace") else {
+    let Some(mut env) = TestEnv::setup(tag) else {
         return;
     };
     if !tool_available("python3", "--version") {
-        eprintln!("SKIP e2e execrace: python3 not found");
+        eprintln!("SKIP e2e {tag}: python3 not found");
         return;
     }
     let Some(sleep_bin) = tool_path("sleep") else {
-        eprintln!("SKIP e2e execrace: cannot resolve the sleep binary");
+        eprintln!("SKIP e2e {tag}: cannot resolve the sleep binary");
         return;
     };
-    env.start_listener(PORT);
+    env.start_listener(port);
 
     let sock_path = env.tmp.join("syslog.sock");
     let collector = UnixDatagram::bind(&sock_path).expect("bind syslog collector");
@@ -2624,10 +2651,10 @@ fn an_exec_after_connect_does_not_inherit_the_new_binarys_rule() {
     // The masquerade target: everything is denied except this one binary,
     // so inheriting its identity is worth something to an attacker and the
     // test can tell whether the inheritance happened.
-    let racer = env.write_aux("exec_racer.py", EXEC_RACER);
+    let racer = env.write_aux("exec_racer.py", racer_src);
     env.start_daemon_with(
         "deny",
-        &[&rule_with("e2e-execrace", Action::Allow, PORT, |m| {
+        &[&rule_with("e2e-execrace", Action::Allow, port, |m| {
             m.exe = Some(sleep_bin.clone())
         })],
         &format!(
@@ -2645,7 +2672,7 @@ fn an_exec_after_connect_does_not_inherit_the_new_binarys_rule() {
     // the procfs path resolves the executable after the fact by design.
     if !env.wait_for_log("eBPF attribution active", Duration::from_secs(5)) {
         eprintln!(
-            "SKIP e2e execrace: eBPF attribution never came up; daemon log:\n{}",
+            "SKIP e2e {tag}: eBPF attribution never came up; daemon log:\n{}",
             env.daemon_log()
         );
         return;
@@ -2657,13 +2684,13 @@ fn an_exec_after_connect_does_not_inherit_the_new_binarys_rule() {
             "python3",
             &racer.to_string_lossy(),
             SRV_IP,
-            &PORT.to_string(),
+            &port.to_string(),
             &sleep_bin.to_string_lossy(),
         ],
     );
     assert_ok(&out, "exec racer");
 
-    let dst = format!("\"dst\":\"{SRV_IP}:{PORT}\"");
+    let dst = format!("\"dst\":\"{SRV_IP}:{port}\"");
     let stolen = format!("\"exe\":\"{}\"", sleep_bin.display());
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut seen = Vec::new();
