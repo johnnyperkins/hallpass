@@ -20,7 +20,7 @@ use nfq::{Queue, Verdict as NfqVerdict};
 use tokio::sync::mpsc::{Sender, UnboundedReceiver, UnboundedSender};
 
 use crate::attribution::hash::ExeHashCache;
-use crate::attribution::AttributionChain;
+use crate::attribution::{AttributionChain, ExeId};
 use crate::dns::IpDomainCache;
 use crate::events::EventBus;
 use crate::packet;
@@ -197,7 +197,15 @@ enum Decision {
     Verdict(Verdict, String, Connection),
     /// Hold the packet and ask the prompt path, carrying the executable
     /// hash if one was computed while deciding.
-    Prompt(Connection, Option<String>),
+    Prompt(Connection, PromptExe),
+}
+
+/// The executable half of a prompt: its hash if deciding computed one, and
+/// the identity attribution named, which computing it later must match.
+#[cfg_attr(test, derive(Debug))]
+struct PromptExe {
+    sha256: Option<String>,
+    id: Option<ExeId>,
 }
 
 /// The read-only lookups `decide` consults, bundled so a new enrichment
@@ -224,7 +232,7 @@ fn decide(
     ctx: &DecideCtx,
     seen: Option<&mut crate::firstseen::Tracker>,
 ) -> Decision {
-    let mut conn = ctx.attribution.connection(tuple);
+    let (mut conn, exe_id) = ctx.attribution.connection(tuple);
     conn.domain = ctx.dns_cache.lookup(&conn.tuple.dst.ip());
     conn.iface = iface;
     // After the domain and the interface: the destination half is keyed on
@@ -252,7 +260,7 @@ fn decide(
     // off disk; only pay for it when a hash-pinning rule could apply.
     let set = ctx.rules.ruleset();
     let exe_sha256 = if set.wants_exe_hash_for(&conn) {
-        ctx.exe_hash.for_connection(&conn)
+        ctx.exe_hash.for_connection(&conn, exe_id)
     } else {
         None
     };
@@ -312,7 +320,13 @@ fn decide(
             // hashing here charged them a whole-binary read on the verdict
             // thread for a value they discard. See the prompting arm in
             // `run_queue`.
-            None => Decision::Prompt(conn, exe_sha256),
+            None => Decision::Prompt(
+                conn,
+                PromptExe {
+                    sha256: exe_sha256,
+                    id: exe_id,
+                },
+            ),
         },
     }
 }
@@ -808,13 +822,13 @@ pub fn run(mut queue: Queue, queue_num: u16, mut deps: QueueDeps) -> std::io::Re
                     // re-attempted per connection - two failed syscalls, not a
                     // read, and not worth negative-caching a file that may
                     // become readable.
-                    Decision::Prompt(conn, exe_sha256) => {
+                    Decision::Prompt(conn, exe) => {
                         let seq = next_seq;
                         next_seq += 1;
-                        let exe_sha256 = exe_sha256.or_else(|| {
+                        let exe_sha256 = exe.sha256.or_else(|| {
                             deps.prompt_handler
                                 .load(std::sync::atomic::Ordering::Relaxed)
-                                .then(|| deps.exe_hash.for_connection(&conn))
+                                .then(|| deps.exe_hash.for_connection(&conn, exe.id))
                                 .flatten()
                         });
                         if deps
@@ -1016,6 +1030,7 @@ mod tests {
                 pid: Some(1),
                 uid: 1000,
                 exe_path: Some(std::path::PathBuf::from(self.0)),
+                exe_id: None,
                 cmdline: None,
                 parent_exe: None,
                 app_id: None,
@@ -1037,6 +1052,7 @@ mod tests {
                 pid: Some(std::process::id()),
                 uid: crate::testutil::own_uid(),
                 exe_path: Some(std::path::PathBuf::from("/usr/bin/curl")),
+                exe_id: None,
                 cmdline: None,
                 parent_exe: None,
                 app_id: None,

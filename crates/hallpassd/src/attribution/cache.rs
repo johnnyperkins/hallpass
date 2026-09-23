@@ -88,6 +88,7 @@ mod tests {
             pid: Some(42),
             uid: 1000,
             exe_path: Some("/usr/bin/curl".into()),
+            exe_id: None,
             cmdline: None,
             parent_exe: None,
             app_id: None,

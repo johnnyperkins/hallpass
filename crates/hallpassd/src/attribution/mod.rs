@@ -14,6 +14,29 @@ use std::sync::Arc;
 
 use hallpass_types::{Connection, FlowTuple};
 
+/// The file a process was running when it was attributed, as (device,
+/// inode) of `/proc/<pid>/exe`.
+///
+/// Carried so the executable can be hashed later without hashing a
+/// different one: the hash is read after attribution, and a process that
+/// execs in between would otherwise have its new image hashed under the old
+/// one's name. See [`hash::ExeHashCache::for_connection`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExeId {
+    dev: u64,
+    ino: u64,
+}
+
+impl ExeId {
+    pub(crate) fn of(meta: &std::fs::Metadata) -> ExeId {
+        use std::os::unix::fs::MetadataExt;
+        ExeId {
+            dev: meta.dev(),
+            ino: meta.ino(),
+        }
+    }
+}
+
 /// Process metadata resolved for a flow.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcInfo {
@@ -23,6 +46,9 @@ pub struct ProcInfo {
     pub uid: u32,
     /// Executable path from /proc/pid/exe.
     pub exe_path: Option<PathBuf>,
+    /// The file `exe_path` named when it was read; `None` whenever
+    /// `exe_path` is.
+    pub exe_id: Option<ExeId>,
     /// Command line from /proc/pid/cmdline.
     pub cmdline: Option<String>,
     /// Executable path of the parent process, from /proc/ppid/exe.
@@ -116,7 +142,10 @@ impl AttributionChain {
 
     /// Build a [`Connection`] for `tuple` with whatever attribution is
     /// available. The domain is left unset; DNS snooping fills it in later.
-    pub fn connection(&self, tuple: FlowTuple) -> Connection {
+    ///
+    /// Returned with the identity of the executable it names, which the wire
+    /// type has no field for and hashing needs.
+    pub fn connection(&self, tuple: FlowTuple) -> (Connection, Option<ExeId>) {
         // Fields move out of the attribution rather than being cloned: this
         // runs per packet. Assigned by name so a field added to either type
         // is one line here instead of a positional tuple to keep aligned.
@@ -135,15 +164,17 @@ impl AttributionChain {
             // queue loop stamps it once the connection is fully enriched.
             first_seen: None,
         };
+        let mut exe_id = None;
         if let Some(i) = self.attribute(&tuple) {
             conn.uid = Some(i.uid);
             conn.pid = i.pid;
             conn.exe_path = i.exe_path;
+            exe_id = i.exe_id;
             conn.cmdline = i.cmdline;
             conn.parent_exe = i.parent_exe;
             conn.app_id = i.app_id;
         }
-        conn
+        (conn, exe_id)
     }
 }
 
@@ -197,8 +228,10 @@ fn cached_still_valid(proc_root: &Path, info: &ProcInfo) -> bool {
     if info.starttime.is_none() || procfs::starttime_of(proc_root, pid) != info.starttime {
         return false;
     }
-    let exe = proc_root.join(pid.to_string()).join("exe");
-    if std::fs::read_link(exe).ok() != info.exe_path {
+    // The same resolution the entry was made with, so a refused name stays
+    // refused and a checked one is checked again, down to the file.
+    let (exe, exe_id) = procfs::host_exe_id(proc_root, pid).unzip();
+    if exe != info.exe_path || exe_id.flatten() != info.exe_id {
         return false;
     }
     procfs::pid_holds_inode(proc_root, pid, inode)
@@ -269,6 +302,7 @@ mod tests {
             pid: Some(PID),
             uid: 1000,
             exe_path: Some(PathBuf::from(EXE)),
+            exe_id: None,
             cmdline: None,
             parent_exe: None,
             app_id: None,
@@ -374,7 +408,7 @@ mod tests {
     #[test]
     fn connection_from_unattributed_tuple() {
         let chain = AttributionChain::new(vec![Box::new(Fixed::new(None))]);
-        let conn = chain.connection(tuple());
+        let (conn, _) = chain.connection(tuple());
         assert_eq!(conn.uid, None);
         assert_eq!(conn.exe_path, None);
         assert_eq!(conn.tuple, tuple());

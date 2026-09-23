@@ -15,7 +15,7 @@ use std::sync::Mutex;
 use hallpass_types::{FlowTuple, Proto};
 
 use super::sockdiag::{DiagReply, DiagSocket};
-use super::{Attributor, ProcInfo};
+use super::{Attributor, ExeId, ProcInfo};
 
 /// One row of a /proc/net table.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -347,9 +347,9 @@ impl Attributor for ProcfsAttributor {
             .find_pid(proc_root, entry.inode)
             .0
             .and_then(|pid| verified_proc_details(proc_root, pid, entry.inode));
-        let (pid, exe_path, cmdline) = match verified {
-            Some((pid, exe, cmd)) => (Some(pid), exe, cmd),
-            None => (None, None, None),
+        let (pid, exe_path, cmdline, exe_id) = match verified {
+            Some((pid, exe, cmd, id)) => (Some(pid), exe, cmd, id),
+            None => (None, None, None, None),
         };
         // Only verified owners are remembered, so a guess that did not hold
         // up cannot steer the next lookup.
@@ -360,6 +360,7 @@ impl Attributor for ProcfsAttributor {
             pid,
             uid: entry.uid,
             exe_path,
+            exe_id,
             cmdline,
             parent_exe: pid.and_then(|p| parent_exe_of(proc_root, p)),
             app_id: pid.and_then(|p| app_id_of(proc_root, p)),
@@ -473,19 +474,19 @@ fn scan_pid_fds(proc_root: &Path, pid: u32, inode: u64, limit: usize) -> (bool, 
     (false, scanned)
 }
 
+/// (pid, exe, cmdline, the exe's identity) for a process that still holds
+/// the socket it was found by.
+type VerifiedDetails = (u32, Option<PathBuf>, Option<String>, Option<ExeId>);
+
 /// Read exe/cmdline for `pid`, then confirm the PID still holds the socket
 /// inode. Between the inode scan and the detail read the process can exit
 /// and the kernel reuse its PID; details from a recycled PID would show the
 /// wrong program in a prompt, so a failed recheck discards everything
 /// including the PID.
-fn verified_proc_details(
-    proc_root: &Path,
-    pid: u32,
-    inode: u64,
-) -> Option<(u32, Option<PathBuf>, Option<String>)> {
-    let (exe, cmdline) = read_proc_details(proc_root, pid);
+fn verified_proc_details(proc_root: &Path, pid: u32, inode: u64) -> Option<VerifiedDetails> {
+    let (exe, cmdline, exe_id) = read_proc_details_with_id(proc_root, pid);
     if pid_holds_inode(proc_root, pid, inode) {
-        Some((pid, exe, cmdline))
+        Some((pid, exe, cmdline, exe_id))
     } else {
         tracing::debug!(
             pid,
@@ -517,7 +518,7 @@ fn ppid_of(proc_root: &Path, pid: u32) -> Option<u32> {
 /// it is returned so a caller walking further can keep checking it.
 fn parent_step(proc_root: &Path, pid: u32) -> Option<(u32, PathBuf, u64)> {
     let (ppid, started) = parent_of(proc_root, pid)?;
-    let exe = std::fs::read_link(proc_root.join(ppid.to_string()).join("exe")).ok()?;
+    let exe = host_exe(proc_root, ppid)?;
     // Re-checked after the readlink as well as inside `parent_of`: the exe
     // just read has to belong to the incarnation being returned.
     let stable =
@@ -802,8 +803,17 @@ pub(super) const MAX_CMDLINE_BYTES: usize = 4096;
 /// Best-effort read of exe symlink and cmdline for a PID. Also used by
 /// the eBPF attributor to snapshot details on exec events.
 pub(super) fn read_proc_details(proc_root: &Path, pid: u32) -> (Option<PathBuf>, Option<String>) {
+    let (exe, cmdline, _) = read_proc_details_with_id(proc_root, pid);
+    (exe, cmdline)
+}
+
+/// [`read_proc_details`], with the identity of the executable it named.
+fn read_proc_details_with_id(
+    proc_root: &Path,
+    pid: u32,
+) -> (Option<PathBuf>, Option<String>, Option<ExeId>) {
     let base = proc_root.join(pid.to_string());
-    let exe = std::fs::read_link(base.join("exe")).ok();
+    let (exe, exe_id) = host_exe_id(proc_root, pid).unzip();
     // Read a bounded prefix, not the whole file: argv can run to ARG_MAX
     // (megabytes) and everything past the cap is cut by truncate_cmdline
     // anyway. Twice the cap so the argv has to be half NUL padding before
@@ -824,7 +834,100 @@ pub(super) fn read_proc_details(proc_root: &Path, pid: u32) -> (Option<PathBuf>,
                 .join(" ");
             (!joined.is_empty()).then(|| truncate_cmdline(joined))
         });
-    (exe, cmdline)
+    (exe, cmdline, exe_id.flatten())
+}
+
+/// `pid`'s executable path, if that path names the file it is running on
+/// this host.
+///
+/// The kernel spells `/proc/<pid>/exe` in the process's own mount namespace,
+/// and any user who can create a user namespace can create a mount namespace
+/// where `/usr/sbin/NetworkManager` is a file of their own: bind-mount it
+/// there, exec it, and the connection it makes from the host's network
+/// namespace reads as NetworkManager and inherits every `exe` rule written
+/// for it. So the path is only reported when resolving it in PID 1's mount
+/// namespace, through `/proc/1/root`, reaches the inode the process is
+/// running. That view is the host's, untouched by this daemon's own
+/// `ProtectHome` and `PrivateTmp`, and a process in a namespace that only
+/// narrows the host's view (every sandboxed systemd service) resolves to the
+/// same file and keeps its name.
+///
+/// A path that fails the check is dropped rather than reported: every rule
+/// operand compares against it, and a connection without an executable
+/// prompts instead of matching. That includes a container on the host's
+/// network, whose executable names a file inside the container.
+///
+/// Except a path under a top-level directory the host does not have at all,
+/// `/app` in a Flatpak sandbox being the one that matters. Nothing written
+/// for a host binary can name it, exactly or by glob, so reporting it lends
+/// no host rule to anyone, and withholding it left sandboxed applications
+/// with no executable, so answering their prompts could never write a rule.
+/// Such a path is only as trustworthy as the sandbox's own `app_id`, which
+/// is to say not a boundary; see the README.
+///
+/// A deleted executable (`" (deleted)"`, the binary replaced by a package
+/// upgrade while it runs) cannot be resolved by name at all. It is kept only
+/// when the process shares PID 1's mount namespace, where nothing could have
+/// been mounted over the path it was started from.
+pub(super) fn host_exe(proc_root: &Path, pid: u32) -> Option<PathBuf> {
+    host_exe_id(proc_root, pid).map(|(exe, _)| exe)
+}
+
+/// [`host_exe`], with the identity of the file it checked. The identity is
+/// always there outside tests; a fixture that skips the check has none.
+pub(super) fn host_exe_id(proc_root: &Path, pid: u32) -> Option<(PathBuf, Option<ExeId>)> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+
+    let exe = proc_root.join(pid.to_string()).join("exe");
+    let link = std::fs::read_link(&exe).ok()?;
+    let host_root = proc_root.join("1").join("root");
+    // A fake /proc in a test that is not about this check has no PID 1, and a
+    // plain symlink cannot stand in for the magic one anyway. A real /proc
+    // always has the entry, and a build that is not a test never skips.
+    if cfg!(test) && std::fs::symlink_metadata(&host_root).is_err() {
+        return Some((link, None));
+    }
+    // Following the magic link reaches the inode being run, whatever the
+    // path says.
+    let running = std::fs::metadata(&exe).ok()?;
+    let id = Some(ExeId::of(&running));
+    let same_file = |m: &std::fs::Metadata| m.dev() == running.dev() && m.ino() == running.ino();
+    let on_host = link
+        .strip_prefix("/")
+        .ok()
+        .and_then(|rel| std::fs::metadata(host_root.join(rel)).ok());
+    if on_host.as_ref().is_some_and(same_file) {
+        return Some((link, id));
+    }
+    let deleted = link.as_os_str().as_bytes().ends_with(b" (deleted)");
+    let mount_ns = |pid: &str| {
+        std::fs::metadata(proc_root.join(pid).join("ns").join("mnt"))
+            .ok()
+            .map(|m| (m.dev(), m.ino()))
+    };
+    if deleted && mount_ns(&pid.to_string()).is_some_and(|ns| Some(ns) == mount_ns("1")) {
+        return Some((link, id));
+    }
+    let top_level_absent = link
+        .strip_prefix("/")
+        .ok()
+        .and_then(|rel| rel.components().next())
+        .is_some_and(|first| {
+            matches!(
+                std::fs::symlink_metadata(host_root.join(first)),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound
+            )
+        });
+    if !deleted && top_level_absent {
+        return Some((link, id));
+    }
+    tracing::debug!(
+        pid,
+        exe = %link.display(),
+        "executable path does not name the running file on this host; not reporting it"
+    );
+    None
 }
 
 /// Cap a command line at [`MAX_CMDLINE_BYTES`], marking that it was cut.
@@ -1556,6 +1659,104 @@ mod tests {
         println!();
     }
 
+    /// A fake /proc with a process 50 running `running`, and PID 1's root at
+    /// `host_root`.
+    fn host_exe_fixture(tag: &str) -> (crate::testutil::TestDir, PathBuf, PathBuf) {
+        let td = crate::testutil::TestDir::new(tag);
+        let dir = td.path().to_path_buf();
+        let running = dir.join("tool");
+        std::fs::write(&running, b"running").unwrap();
+        std::fs::create_dir_all(dir.join("50/ns")).unwrap();
+        std::fs::create_dir_all(dir.join("1/ns")).unwrap();
+        std::os::unix::fs::symlink(&running, dir.join("50/exe")).unwrap();
+        (td, dir, running)
+    }
+
+    /// The name spoofed from a mount namespace: the path is right, the file
+    /// behind it is not the one the host has there.
+    #[test]
+    fn exe_is_reported_only_when_it_names_the_running_file_on_the_host() {
+        let (_td, dir, running) = host_exe_fixture("procfs-host-exe");
+
+        std::os::unix::fs::symlink("/", dir.join("1/root")).unwrap();
+        assert_eq!(
+            host_exe(&dir, 50),
+            Some(running.clone()),
+            "same file on the host"
+        );
+
+        // PID 1's root holds a different file at that path.
+        std::fs::remove_file(dir.join("1/root")).unwrap();
+        let host = dir.join("host");
+        let decoy = host.join(running.strip_prefix("/").unwrap());
+        std::fs::create_dir_all(decoy.parent().unwrap()).unwrap();
+        std::fs::write(&decoy, b"the real one").unwrap();
+        std::os::unix::fs::symlink(&host, dir.join("1/root")).unwrap();
+        assert_eq!(host_exe(&dir, 50), None, "another file at that path");
+
+        std::fs::remove_file(&decoy).unwrap();
+        assert_eq!(host_exe(&dir, 50), None, "nothing at that path");
+
+        // The parent walk and the details read go through the same check.
+        assert_eq!(read_proc_details(&dir, 50).0, None);
+    }
+
+    /// A path under a top-level directory the host lacks (a Flatpak's
+    /// `/app`) names no host file, so it is reported; one under a directory
+    /// the host has must be the host's file.
+    #[test]
+    fn a_sandbox_only_path_is_reported() {
+        let (_td, dir, _) = host_exe_fixture("procfs-sandbox-exe");
+        let host = dir.join("host");
+        std::fs::create_dir_all(host.join("usr/bin")).unwrap();
+        std::os::unix::fs::symlink(&host, dir.join("1/root")).unwrap();
+        // The fixture's `running` lives under the test dir, whose top-level
+        // directory exists in `host` only if created there.
+        let app = dir.join("app-bin");
+        std::fs::write(&app, b"sandboxed").unwrap();
+        std::fs::remove_file(dir.join("50/exe")).unwrap();
+        std::os::unix::fs::symlink(&app, dir.join("50/exe")).unwrap();
+        let top = app.strip_prefix("/").unwrap().components().next().unwrap();
+        assert!(!host.join(top).exists());
+        assert_eq!(
+            host_exe(&dir, 50),
+            Some(app.clone()),
+            "no such top level on the host"
+        );
+        std::fs::create_dir_all(host.join(top)).unwrap();
+        assert_eq!(
+            host_exe(&dir, 50),
+            None,
+            "the host has that directory, not that file"
+        );
+    }
+
+    /// A deleted executable has no path to resolve, so it is trusted only
+    /// where nothing could have been mounted over it.
+    #[test]
+    fn deleted_exe_is_kept_only_in_the_host_mount_namespace() {
+        let (_td, dir, _) = host_exe_fixture("procfs-deleted-exe");
+        let deleted = dir.join("tool (deleted)");
+        std::fs::write(&deleted, b"old build").unwrap();
+        std::fs::remove_file(dir.join("50/exe")).unwrap();
+        std::os::unix::fs::symlink(&deleted, dir.join("50/exe")).unwrap();
+        std::fs::create_dir_all(dir.join("empty-host")).unwrap();
+        std::os::unix::fs::symlink(dir.join("empty-host"), dir.join("1/root")).unwrap();
+
+        let host_ns = dir.join("mnt-host");
+        let other_ns = dir.join("mnt-other");
+        std::fs::write(&host_ns, b"").unwrap();
+        std::fs::write(&other_ns, b"").unwrap();
+        std::os::unix::fs::symlink(&host_ns, dir.join("1/ns/mnt")).unwrap();
+
+        std::os::unix::fs::symlink(&host_ns, dir.join("50/ns/mnt")).unwrap();
+        assert_eq!(host_exe(&dir, 50), Some(deleted.clone()));
+
+        std::fs::remove_file(dir.join("50/ns/mnt")).unwrap();
+        std::os::unix::fs::symlink(&other_ns, dir.join("50/ns/mnt")).unwrap();
+        assert_eq!(host_exe(&dir, 50), None);
+    }
+
     #[test]
     fn verified_details_require_pid_to_still_hold_inode() {
         let td = crate::testutil::TestDir::new("procfs-verify");
@@ -1565,7 +1766,7 @@ mod tests {
         std::os::unix::fs::symlink("socket:[123456]", fd_dir.join("3")).unwrap();
         std::os::unix::fs::symlink("/usr/bin/curl", dir.join("4242/exe")).unwrap();
 
-        let (pid, exe, _) = verified_proc_details(&dir, 4242, 123456).unwrap();
+        let (pid, exe, _, _) = verified_proc_details(&dir, 4242, 123456).unwrap();
         assert_eq!(pid, 4242);
         assert_eq!(exe, Some(PathBuf::from("/usr/bin/curl")));
 

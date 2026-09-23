@@ -2697,3 +2697,71 @@ fn an_exec_after_connect_does_not_inherit_the_new_binarys_rule() {
         return;
     }
 }
+
+/// An `exe` rule names a file on this host, not a path in whatever mount
+/// namespace a process built for itself. Inside `unshare -m` a copy of nc,
+/// same bytes and a different file, is bind-mounted over nc's own path and
+/// exec'd from there: the kernel reports the path the rule allows, and only
+/// checking it against the host's file tells the two apart. Any user with
+/// unprivileged user namespaces can build the same thing without root.
+///
+/// The control connection matters as much as the refusal: every client in
+/// these tests already runs in a private mount namespace of its own (`ip
+/// netns exec` makes one), so it proves the check still accepts a process
+/// whose namespace merely narrows the host's view.
+#[test]
+#[ignore = "requires root and network namespaces"]
+fn an_exe_rule_does_not_follow_its_path_into_another_mount_namespace() {
+    const REAL: u16 = 19050;
+    const COPY: u16 = 19051;
+    let Some(mut env) = TestEnv::setup("mntns") else {
+        return;
+    };
+    let Some(nc) = tool_path("nc") else {
+        eprintln!("SKIP e2e mntns: cannot resolve the nc binary");
+        return;
+    };
+    if !tool_available("unshare", "--version") {
+        eprintln!("SKIP e2e mntns: unshare not found");
+        return;
+    }
+    let copy = env.tmp.join("nc-copy");
+    std::fs::copy(&nc, &copy).expect("copy nc");
+    env.start_listener(REAL);
+    env.start_listener(COPY);
+    let allow_nc =
+        |name: &str, port: u16| rule_with(name, Action::Allow, port, |m| m.exe = Some(nc.clone()));
+    env.start_daemon(
+        "deny",
+        &[
+            &allow_nc("e2e-mntns-real", REAL),
+            &allow_nc("e2e-mntns-copy", COPY),
+        ],
+    );
+    env.assert_daemon_alive();
+
+    assert!(
+        env.connect(REAL),
+        "control: nc itself must match its own allow rule\ndaemon log:\n{}",
+        env.daemon_log()
+    );
+    let script = format!(
+        "mount --bind {copy} {nc} || exit 99; exec {nc} -z -w 3 {SRV_IP} {COPY}",
+        copy = copy.display(),
+        nc = nc.display(),
+    );
+    let out = ns_run(&env.ns_cli, &["unshare", "-m", "sh", "-c", &script]);
+    // Otherwise a mount that never happened reads as a refused connection.
+    assert_ne!(
+        out.status.code(),
+        Some(99),
+        "bind mount failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !out.status.success(),
+        "a copy mounted over nc's path inherited nc's allow rule\nstderr: {}\ndaemon log:\n{}",
+        String::from_utf8_lossy(&out.stderr),
+        env.daemon_log()
+    );
+}

@@ -743,6 +743,21 @@ who can delete the nftables table outright.
   underneath them, and a scoping convenience without eBPF. The same caveat
   applies for a different reason to `cmdline_contains` and `parent_exe`,
   which a process controls outright.
+- **An executable path is only reported when it names the host's file.** The
+  kernel spells `/proc/<pid>/exe` inside the process's own mount namespace,
+  so a user who can create one could mount their own binary over
+  `/usr/sbin/NetworkManager` and inherit its rules. The daemon resolves the
+  path through PID 1's root and reports it only when that reaches the inode
+  being run. Sandboxed services pass, since their namespaces narrow the
+  host's view without replacing its files. So does a path under a top-level
+  directory the host does not have at all, such as a Flatpak's `/app`: no
+  host rule can name it, and it is exactly as trustworthy as the `app_id`
+  beside it (see below). A process on the host's network whose executable is
+  a file inside a container does not, and neither does
+  a deleted executable in any namespace but PID 1's (a sandboxed service
+  still running a binary a package upgrade replaced): those connections
+  carry no executable, so `exe` rules cannot match them and they prompt or
+  take the default verdict until the process restarts.
 - **`app_id` names a cgroup, and a user names their own cgroups.** The
   packaged-application identity comes from `/proc/<pid>/cgroup`, which is
   whatever the launcher called the scope it started the process in. Any

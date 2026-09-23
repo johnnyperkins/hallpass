@@ -10,12 +10,13 @@
 
 use std::num::NonZeroUsize;
 use std::os::unix::fs::MetadataExt;
-use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use hallpass_types::Connection;
 use lru::LruCache;
 use sha2::{Digest, Sha256};
+
+use super::ExeId;
 
 /// File identity snapshot; a changed file changes this key. Shared with
 /// the rule-list cache, which invalidates the same way.
@@ -105,20 +106,34 @@ impl ExeHashCache {
         }
     }
 
-    /// SHA-256 of the executable behind `conn`, as lowercase hex.
+    /// SHA-256 of the executable behind `conn`, as lowercase hex, or `None`
+    /// when there is no executable this can vouch for.
     ///
-    /// Prefers `/proc/<pid>/exe`, which pins the inode the process is
+    /// Read through `/proc/<pid>/exe`, which pins the inode the process is
     /// actually executing: a binary renamed or overwritten after exec
-    /// hashes as what is running, not what now sits at its old path. Falls
-    /// back to the attributed path when the process is already gone.
-    pub fn for_connection(&self, conn: &Connection) -> Option<String> {
-        if let Some(pid) = conn.pid {
-            let proc_exe = PathBuf::from(format!("/proc/{pid}/exe"));
-            if let Some(hex) = self.sha256(&proc_exe) {
-                return Some(hex);
-            }
+    /// hashes as what is running, not what now sits at its old path. And
+    /// only when that is still `exe_id`, the file attribution named:
+    ///
+    /// - No executable name means no hash. Attribution withholds the name
+    ///   when it cannot vouch for it (the process exec'd after connecting,
+    ///   or its path names another file on this host), and hashing
+    ///   `/proc/<pid>/exe` anyway handed the refused image to every rule
+    ///   pinned by hash alone.
+    /// - A process that execs between attribution and this read is running
+    ///   something else by now, and hashing that would pin the new image's
+    ///   hash to a connection the old one made.
+    /// - A process that is gone has nothing left to hash. Falling back to
+    ///   the attributed path hashed whatever sits there now, which its
+    ///   owner can put back the moment the process exits.
+    pub fn for_connection(&self, conn: &Connection, exe_id: Option<ExeId>) -> Option<String> {
+        conn.exe_path.as_ref()?;
+        let (pid, exe_id) = (conn.pid?, exe_id?);
+        let file = std::fs::File::open(format!("/proc/{pid}/exe")).ok()?;
+        let meta = file.metadata().ok()?;
+        if ExeId::of(&meta) != exe_id {
+            return None;
         }
-        self.sha256(conn.exe_path.as_deref()?)
+        self.sha256_open(file, &meta)
     }
 
     /// SHA-256 of the file at `path` as lowercase hex, or `None` if it
@@ -129,10 +144,20 @@ impl ExeHashCache {
     /// so the cached key always describes the bytes actually hashed - a
     /// stat-then-open sequence could pair the old binary's identity with
     /// a replacement's hash if the path was swapped between the calls.
-    pub fn sha256(&self, path: &Path) -> Option<String> {
-        let mut file = std::fs::File::open(path).ok()?;
+    ///
+    /// Test-only: the daemon hashes through [`Self::for_connection`], never
+    /// by path, and the tests reach the cache through this.
+    #[cfg(test)]
+    pub fn sha256(&self, path: &std::path::Path) -> Option<String> {
+        let file = std::fs::File::open(path).ok()?;
         let meta = file.metadata().ok()?;
-        let id = FileId::of(&meta);
+        self.sha256_open(file, &meta)
+    }
+
+    /// SHA-256 of a file already open, with its metadata read from the same
+    /// descriptor, so the cached key describes the bytes hashed.
+    fn sha256_open(&self, mut file: std::fs::File, meta: &std::fs::Metadata) -> Option<String> {
+        let id = FileId::of(meta);
         if let Some(cached) = self.entries.lock().unwrap().get(&id) {
             return cached.clone();
         }
@@ -184,6 +209,7 @@ impl ExeHashCache {
 mod tests {
     use super::*;
     use crate::testutil::TestDir;
+    use std::path::Path;
 
     /// SHA-256 of the empty string, a well-known constant.
     const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
@@ -304,9 +330,12 @@ mod tests {
         assert_eq!(cache.sha256(&a).unwrap(), ha);
     }
 
+    /// Hashes the running image, and only the one attribution named:
+    /// without a name, with another file's identity, or with the process
+    /// gone, there is nothing this can vouch for.
     #[test]
-    fn for_connection_prefers_own_proc_exe() {
-        // Use our own pid: /proc/self-pid/exe is the test binary.
+    fn for_connection_hashes_only_the_attributed_image() {
+        let own = std::fs::metadata("/proc/self/exe").unwrap();
         let conn = Connection {
             tuple: hallpass_types::FlowTuple {
                 proto: hallpass_types::Proto::Tcp,
@@ -315,7 +344,7 @@ mod tests {
             },
             uid: None,
             pid: Some(std::process::id()),
-            exe_path: None,
+            exe_path: Some(std::env::current_exe().unwrap()),
             cmdline: None,
             parent_exe: None,
             domain: None,
@@ -324,13 +353,26 @@ mod tests {
             first_seen: None,
         };
         let cache = ExeHashCache::default();
-        let hash = cache.for_connection(&conn).unwrap();
-        assert_eq!(hash.len(), 64);
-        // Dead pid and no path: nothing to hash.
+        let id = Some(ExeId::of(&own));
+        assert_eq!(cache.for_connection(&conn, id).unwrap().len(), 64);
+
+        let dir = TestDir::new("hash-other-image");
+        let other = dir.write("other", b"x");
+        let other_id = Some(ExeId::of(&std::fs::metadata(other).unwrap()));
+        assert_eq!(cache.for_connection(&conn, other_id), None, "exec'd since");
+        assert_eq!(cache.for_connection(&conn, None), None, "no identity");
+
+        let unnamed = Connection {
+            exe_path: None,
+            ..conn.clone()
+        };
+        assert_eq!(cache.for_connection(&unnamed, id), None, "name withheld");
+
+        // Dead pid: the path is not hashed in its place.
         let gone = Connection {
             pid: Some(u32::MAX - 1),
             ..conn
         };
-        assert_eq!(cache.for_connection(&gone), None);
+        assert_eq!(cache.for_connection(&gone, id), None);
     }
 }

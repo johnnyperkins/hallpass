@@ -30,7 +30,7 @@ use tokio::sync::watch;
 use crate::dns::{IpDomainCache, SnoopedResponse};
 
 use super::btf::Btf;
-use super::{procfs, Attributor, ProcInfo};
+use super::{procfs, Attributor, ExeId, ProcInfo};
 
 /// The eBPF object, located by build.rs: an explicit `HALLPASS_EBPF_OBJ`,
 /// a prebuilt object vendored in the crate, or whatever `cargo xtask
@@ -281,10 +281,10 @@ impl EbpfAttributor {
         true
     }
 
-    /// Details for `pid`, with the start time they were read at. The
-    /// caller needs that start time too, so it is returned rather than
-    /// read a second time.
-    fn details_for(&self, pid: u32) -> (ProcDetails, Option<u64>) {
+    /// Details for `pid`, with the start time they were read at and the
+    /// identity of the executable they name. The caller needs both, so they
+    /// are returned rather than read a second time.
+    fn details_for(&self, pid: u32) -> (ProcDetails, Option<u64>, Option<ExeId>) {
         // Exit events are lossy and fork-without-exec emits no exec
         // event, so a cache hit may describe a previous occupant of
         // this pid; only serve it while the starttime still matches
@@ -304,17 +304,22 @@ impl EbpfAttributor {
         // Without this check, a process holding an `exe` allow rule that
         // execs into something else keeps handing that rule to the new
         // image for as long as the stale entry lives.
-        let now_exe = std::fs::read_link(Path::new("/proc").join(pid.to_string()).join("exe")).ok();
+        let (now_exe, now_id) = procfs::host_exe_id(Path::new("/proc"), pid).unzip();
+        let now_id = now_id.flatten();
         if let Some((d, cached_start)) = self.cache.lock().unwrap().get(&pid) {
             if now_start.is_some() && *cached_start == now_start && d.0 == now_exe {
-                return (d.clone(), now_start);
+                return (d.clone(), now_start, now_id);
             }
         }
         // Not seen via the exec tracepoint (started before the daemon)
         // or stale; snapshot now and remember it.
         let d = procfs::proc_snapshot(Path::new("/proc"), pid);
         self.cache.lock().unwrap().put(pid, (d.clone(), now_start));
-        (d, now_start)
+        // The identity describes the path read above; if the snapshot read a
+        // different one, the process exec'd in between and it describes
+        // neither for certain.
+        let id = now_id.filter(|_| d.0 == now_exe);
+        (d, now_start, id)
     }
 
     /// Application identity for `pid`, read once per process incarnation.
@@ -370,19 +375,23 @@ impl Drop for EbpfAttributor {
 impl Attributor for EbpfAttributor {
     fn attribute(&self, tuple: &FlowTuple) -> Option<ProcInfo> {
         let val = self.sock_map.get(&flow_key(tuple), 0).ok()?;
-        let ((exe_path, cmdline, parent_exe), starttime) = self.details_for(val.pid);
+        // Read before the generation check, so a check that passes vouches
+        // for the image this identity names: no exec landed between the
+        // connect and the read.
+        let ((exe_path, cmdline, parent_exe), starttime, exe_id) = self.details_for(val.pid);
         // Refused rather than reported when the process exec'd after it
-        // connected: both describe the image, and the image is exactly what
-        // changed. `parent_exe` describes the launcher, which an exec here
-        // does not touch, and is kept.
-        let (exe_path, cmdline) = match self.exec_raced(&val) {
-            true => (None, None),
-            false => (exe_path, cmdline),
+        // connected: all three describe the image, and the image is exactly
+        // what changed. `parent_exe` describes the launcher, which an exec
+        // here does not touch, and is kept.
+        let (exe_path, cmdline, exe_id) = match self.exec_raced(&val) {
+            true => (None, None, None),
+            false => (exe_path, cmdline, exe_id),
         };
         Some(ProcInfo {
             pid: Some(val.pid),
             uid: val.uid,
             exe_path,
+            exe_id,
             cmdline,
             parent_exe,
             // Resolved here rather than snapshotted at exec like the

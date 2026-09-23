@@ -11,7 +11,10 @@
 #
 # The grant is narrower than it looks. It names one binary, and that binary
 # already configures every interface on the host: an attacker who is
-# NetworkManager does not need this rule to reach the network.
+# NetworkManager does not need this rule to reach the network. Being it is
+# the hard part: the path is checked against the file the host has there, so
+# a process cannot claim it by mounting its own binary over the path in a
+# namespace of its own.
 #
 # It is also the one baseline rule worth deleting if you can. A host with a
 # static address and no connectivity check does not need it, and dropping
