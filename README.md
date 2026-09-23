@@ -389,6 +389,15 @@ daemon its own tail: an unanswered UDP flow stays `ct state new`, so each
 exported event would be decided as a new connection and emit the event that
 produces the next datagram.
 
+That exemption only reaches the daemon's own socket. With `kind = "local"`
+on a host whose syslog daemon forwards to a collector over UDP (rsyslog's
+`*.* @host`), the forwarded datagrams come from rsyslog, are judged like any
+other connection, and each decision is logged and forwarded again: the same
+loop, one hop longer. Give that forwarding its own rule and it still runs,
+since allowed events are exported too. Point `[syslog.target]` at the
+collector directly instead, or filter hallpassd's messages out of what the
+local syslog daemon forwards.
+
 ## Usage
 
 ```sh

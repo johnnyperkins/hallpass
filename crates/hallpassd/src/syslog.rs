@@ -76,12 +76,16 @@ const SEVERITY_WARNING: u8 = 4;
 /// registers its own PEN.
 const SD_ID: &str = "hallpass@32473";
 
-/// Per-field cap in characters. `cmdline` in particular is unbounded and
-/// process-controlled, and an oversized datagram is silently dropped by
-/// UDP collectors (and truncated mid-field by local syslogd), so a
-/// hostile command line must not be able to push the frame past what a
-/// collector accepts. Truncated values end in an ellipsis.
-const MAX_FIELD_CHARS: usize = 200;
+/// Per-field cap in bytes of escaped output. `cmdline` in particular is
+/// unbounded and process-controlled, and an oversized datagram is silently
+/// dropped by UDP collectors (and truncated mid-field by local syslogd), so
+/// a hostile command line must not be able to push the frame past what a
+/// collector accepts. Counted after escaping, not in characters: a field of
+/// 200 four-byte characters, or of 200 escapes, was several times the size
+/// its character count promised, and a process that wanted its own events
+/// dropped by a collector could arrange exactly that. Truncated values end
+/// in an ellipsis.
+const MAX_FIELD_BYTES: usize = 256;
 
 /// Which escaping rules a field value is written under.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -108,7 +112,7 @@ impl<'a> FieldWriter<'a> {
         FieldWriter {
             out,
             escape,
-            remaining: MAX_FIELD_CHARS,
+            remaining: MAX_FIELD_BYTES,
             truncated: false,
         }
     }
@@ -122,35 +126,46 @@ impl<'a> FieldWriter<'a> {
 
 impl std::fmt::Write for FieldWriter<'_> {
     fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        let mut piece = String::with_capacity(8);
         for c in s.chars() {
-            if self.remaining == 0 {
-                self.truncated = true;
-                return Ok(());
-            }
-            self.remaining -= 1;
+            piece.clear();
             // Control characters (and DEL) are never emitted literally in
             // either format: in structured data they would break framing.
             if (c as u32) < 0x20 || c as u32 == 0x7f {
                 match self.escape {
                     Escape::Sd => {
                         // rsyslog's own convention for an escaped byte.
-                        let _ = write!(self.out, "#{:03o}", c as u32);
+                        let _ = write!(piece, "#{:03o}", c as u32);
                     }
                     Escape::Json => {
-                        let _ = write!(self.out, "\\u{:04x}", c as u32);
+                        let _ = write!(piece, "\\u{:04x}", c as u32);
                     }
                 }
-                continue;
-            }
-            match (self.escape, c) {
-                (Escape::Sd, '"' | '\\' | ']') => {
-                    self.out.push('\\');
-                    self.out.push(c);
+            } else if hallpass_types::is_display_hazard(c) {
+                // The rest of what the CLI and GUI refuse to render: C1
+                // controls, line and paragraph separators, bidi overrides,
+                // invisible characters. Valid in both formats, but a
+                // collector or viewer that splits on U+2028 or NEL, or
+                // renders an override, shows a record other than this one.
+                piece.push('\u{fffd}');
+            } else {
+                match (self.escape, c) {
+                    (Escape::Sd, '"' | '\\' | ']') => {
+                        piece.push('\\');
+                        piece.push(c);
+                    }
+                    (Escape::Json, '"') => piece.push_str("\\\""),
+                    (Escape::Json, '\\') => piece.push_str("\\\\"),
+                    _ => piece.push(c),
                 }
-                (Escape::Json, '"') => self.out.push_str("\\\""),
-                (Escape::Json, '\\') => self.out.push_str("\\\\"),
-                _ => self.out.push(c),
             }
+            if piece.len() > self.remaining {
+                self.truncated = true;
+                self.remaining = 0;
+                return Ok(());
+            }
+            self.remaining -= piece.len();
+            self.out.push_str(&piece);
         }
         Ok(())
     }
@@ -501,14 +516,41 @@ mod tests {
         }
     }
 
+    /// Separators other than CR and LF, and text-reversing overrides, are
+    /// neutralized too: some collectors split on NEL or U+2028.
+    #[test]
+    fn unicode_separators_and_overrides_do_not_survive() {
+        for format in [SyslogFormat::Rfc5424, SyslogFormat::Json] {
+            let mut ev = event();
+            ev.conn.cmdline = Some("a\u{85}b\u{2028}c\u{202e}d\u{9b}e".to_string());
+            let line = format_event(&ev, format, "box", 7);
+            for hazard in ['\u{85}', '\u{2028}', '\u{202e}', '\u{9b}'] {
+                assert!(
+                    !line.contains(hazard),
+                    "{hazard:?} survived into {format:?}"
+                );
+            }
+        }
+    }
+
+    /// The cap holds in bytes, whatever the characters cost to write.
+    #[test]
+    fn a_field_of_wide_characters_is_capped_in_bytes() {
+        let mut ev = event();
+        ev.conn.cmdline = Some("\u{1f600}".repeat(1000));
+        let narrow = format_event(&event(), SyslogFormat::Json, "box", 7).len();
+        let wide = format_event(&ev, SyslogFormat::Json, "box", 7).len();
+        assert!(wide <= narrow + MAX_FIELD_BYTES + 16, "{wide} vs {narrow}");
+    }
+
     #[test]
     fn long_fields_are_truncated() {
         let mut ev = event();
         ev.conn.cmdline = Some("A".repeat(100_000));
         for format in [SyslogFormat::Rfc5424, SyslogFormat::Json] {
             let line = format_event(&ev, format, "box", 7);
-            assert!(line.contains(&"A".repeat(MAX_FIELD_CHARS)));
-            assert!(!line.contains(&"A".repeat(MAX_FIELD_CHARS + 1)));
+            assert!(line.contains(&"A".repeat(MAX_FIELD_BYTES)));
+            assert!(!line.contains(&"A".repeat(MAX_FIELD_BYTES + 1)));
             assert!(line.contains("..."));
             // Comfortably inside what a UDP collector must accept.
             assert!(
