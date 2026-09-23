@@ -54,9 +54,14 @@ impl RuleSet {
                 }
             })
             .collect();
+        // Ties go to the stricter rule, then to the name. By name alone, two
+        // prompt answers at the shared prompt priority were ordered by their
+        // decimal ids as text, so an allow numbered 10 shadowed a deny
+        // numbered 9 while an allow numbered 9 lost to a deny numbered 8.
         compiled.sort_by(|a, b| {
             b.priority
                 .cmp(&a.priority)
+                .then_with(|| strictness(a.action).cmp(&strictness(b.action)))
                 .then_with(|| a.name.cmp(&b.name))
         });
         let mut set = RuleSet {
@@ -256,8 +261,39 @@ impl RuleSet {
     }
 }
 
+/// Order among rules of equal priority: a refusal before an allow.
+fn strictness(action: hallpass_types::Action) -> u8 {
+    match action {
+        hallpass_types::Action::Reject => 0,
+        hallpass_types::Action::Deny => 1,
+        hallpass_types::Action::Allow => 2,
+    }
+}
+
 #[cfg(test)]
 mod tests {
+
+    /// Equal priority: the refusal wins, whatever the names say.
+    #[test]
+    fn a_tie_goes_to_the_stricter_rule() {
+        let rule = |name: &str, action| Rule {
+            name: name.into(),
+            action,
+            duration: RuleDuration::Forever,
+            priority: 50,
+            enabled: true,
+            tags: Vec::new(),
+            matcher: RuleMatch::default(),
+        };
+        let set = RuleSet::compile(&[
+            rule("prompt-curl-x-10", Action::Allow),
+            rule("prompt-curl-x-9", Action::Deny),
+        ]);
+        let conn = conn("/usr/bin/curl", "1.1.1.1:443", Proto::Tcp, None, 1000);
+        let (winner, verdict) = set.match_conn(&conn, None).unwrap();
+        assert_eq!(winner.name, "prompt-curl-x-9");
+        assert_eq!(verdict, Verdict::Deny);
+    }
     use super::*;
     use hallpass_types::{Action, FlowTuple, Proto, RuleDuration, RuleMatch};
     use std::path::PathBuf;
@@ -345,13 +381,22 @@ mod tests {
                 expect: Some(("high-deny", Verdict::Deny)),
             },
             Case {
-                name: "equal priority ties break by name",
+                name: "equal priority ties go to the refusal",
                 rules: vec![
                     rule("b-deny", Action::Deny, 5, true, RuleMatch::default()),
                     rule("a-allow", Action::Allow, 5, true, RuleMatch::default()),
                 ],
                 conn: curl(),
-                expect: Some(("a-allow", Verdict::Allow)),
+                expect: Some(("b-deny", Verdict::Deny)),
+            },
+            Case {
+                name: "equal priority and action ties break by name",
+                rules: vec![
+                    rule("b-deny", Action::Deny, 5, true, RuleMatch::default()),
+                    rule("a-deny", Action::Deny, 5, true, RuleMatch::default()),
+                ],
+                conn: curl(),
+                expect: Some(("a-deny", Verdict::Deny)),
             },
             Case {
                 name: "disabled rule skipped",

@@ -539,7 +539,8 @@ pub struct Rule {
     pub action: Action,
     /// Lifetime of the rule.
     pub duration: RuleDuration,
-    /// Priority; higher values are evaluated first.
+    /// Priority; higher values are evaluated first. Among equal priorities
+    /// a reject or deny is evaluated before an allow, then rules go by name.
     pub priority: u32,
     /// Whether the rule is currently active.
     pub enabled: bool,
