@@ -28,6 +28,11 @@ use crate::tray::TrayState;
 /// the request is a handful of counters over a unix socket.
 const STATS_POLL: Duration = Duration::from_secs(3);
 
+/// How long an agent this window started may run before a prompt slot still
+/// free means it is not going to take it: long enough for it to connect and
+/// claim, and for a few stats polls to see the claim.
+const AGENT_GRACE: Duration = Duration::from_secs(10);
+
 const MAX_EVENTS: usize = 1000;
 
 /// Events requested from the daemon's history when a connection comes up.
@@ -301,6 +306,13 @@ pub struct HallpassApp {
     /// The state the window icon was last painted for, so it is redrawn
     /// on change rather than every frame.
     icon_state: TrayState,
+    /// The daemon socket, handed to an agent started from this window.
+    socket: PathBuf,
+    /// An agent this window started and when, reaped once it exits.
+    agent: Option<(std::process::Child, std::time::Instant)>,
+    /// Why the last agent this window started is gone, shown beside the
+    /// button that starts another rather than as a daemon error.
+    agent_error: Option<String>,
 }
 
 impl HallpassApp {
@@ -317,13 +329,16 @@ impl HallpassApp {
         // network thread has no prompt lifecycle to tee.
         let (to_notify, _) = std::sync::mpsc::channel();
         net::spawn(
-            socket,
+            socket.clone(),
             to_ui,
             from_ui,
             crate::repaint(&cc.egui_ctx),
             to_notify,
         );
-        Self::with_channels(to_daemon, from_net)
+        Self {
+            socket,
+            ..Self::with_channels(to_daemon, from_net)
+        }
     }
 
     /// An app wired to nothing but this channel pair.
@@ -366,6 +381,9 @@ impl HallpassApp {
             settings_error: None,
             mode_reported: false,
             icon_state: TrayState::Unknown,
+            socket: PathBuf::new(),
+            agent: None,
+            agent_error: None,
         }
     }
 
@@ -962,6 +980,119 @@ impl HallpassApp {
             theme::banner(ui, Tone::Bad, "\u{26a0}", "LOCKDOWN", &l);
             ui.add_space(8.0);
         }
+        // This window takes no prompts, so on a host where the agent is not
+        // running it would otherwise look healthy while every connection no
+        // rule matches is decided with nothing on screen.
+        if let Some(text) = self.no_handler_banner() {
+            theme::banner(ui, Tone::Bad, "\u{26a0}", "NO PROMPTS", &text);
+            // Still running past the grace with the slot still free: it is
+            // not going to take it (one on a read-only socket never can), and
+            // a label saying "starting" for as long as it runs would hide that.
+            let stalled = self
+                .agent
+                .as_ref()
+                .is_some_and(|(_, at)| at.elapsed() >= AGENT_GRACE);
+            let label = match (&self.agent, stalled) {
+                (None, _) => "Start the prompt agent",
+                (Some(_), false) => "Starting the prompt agent...",
+                (Some(_), true) => "Prompt agent running",
+            };
+            if ui
+                .add_enabled(self.agent.is_none(), egui::Button::new(label))
+                .clicked()
+            {
+                self.start_agent();
+            }
+            let note = if stalled {
+                Some(
+                    "it has not taken the prompt slot, which it never can on a \
+                     read-only socket; its log says why",
+                )
+            } else {
+                self.agent_error.as_deref()
+            };
+            if let Some(note) = note {
+                ui.label(
+                    RichText::new(prompt::ui_text(note))
+                        .small()
+                        .color(DENY_COLOR),
+                );
+            }
+            ui.add_space(8.0);
+        } else {
+            // Whatever it said was about a slot that has since been taken,
+            // or a daemon this window is no longer speaking to.
+            self.agent_error = None;
+        }
+    }
+
+    /// The no-handler banner's text, when nobody holds the prompt slot on a
+    /// host that would prompt.
+    ///
+    /// Behind the same gate as the other two: a stale reply from a daemon
+    /// this window has lost says nothing about who holds the slot now. Not
+    /// in observe mode or under a posture, where nothing prompts anyway.
+    fn no_handler_banner(&self) -> Option<String> {
+        if !self.mode_is_known() || self.enforcing != Some(true) {
+            return None;
+        }
+        let stats = self.stats.as_ref()?;
+        if stats.prompt_handler_connected || stats.lockdown.is_some() {
+            return None;
+        }
+        // The slot being free is all `Stats` says: an agent may be running
+        // without it (on a read-only socket, or between an eviction and its
+        // reclaim), so the text claims no more than that.
+        let verdict = match self.daemon_config {
+            Some(c) => format!("the default verdict ({})", verdict_label(c.default_verdict)),
+            None => "the default verdict".to_string(),
+        };
+        Some(format!(
+            "no prompt handler is connected: connections no rule matches take {verdict} \
+             with nothing on screen"
+        ))
+    }
+
+    /// Start `hallpass-ui agent` for this socket, from this very image.
+    ///
+    /// The agent exits at once if one is already running for this user, and
+    /// otherwise claims the slot; the next stats poll clears the banner.
+    ///
+    /// In a process group of its own, with nothing on stdin: it outlives
+    /// this window, so it must not also die with the terminal this window
+    /// was started from (Ctrl+C, or the shell hanging up its jobs).
+    fn start_agent(&mut self) {
+        use std::os::unix::process::CommandExt as _;
+        self.agent_error = None;
+        match std::process::Command::new("/proc/self/exe")
+            .arg("agent")
+            .arg("--socket")
+            .arg(&self.socket)
+            .stdin(std::process::Stdio::null())
+            .process_group(0)
+            .spawn()
+        {
+            Ok(child) => self.agent = Some((child, std::time::Instant::now())),
+            Err(e) => self.agent_error = Some(format!("starting the prompt agent: {e}")),
+        }
+    }
+
+    /// Forget an agent this window started once it has exited, so the
+    /// button comes back, and say so while nobody holds the slot: it exits
+    /// at once when another agent already runs for this user or there is no
+    /// display, and a button that silently re-enables explains neither. One
+    /// that keeps running outlives this window, as the agent should.
+    fn reap_agent(&mut self) {
+        let Some((child, _)) = &mut self.agent else {
+            return;
+        };
+        let exited = match child.try_wait() {
+            Ok(None) => return,
+            Ok(Some(status)) => format!("the prompt agent exited ({status}); its log says why"),
+            Err(e) => format!("the prompt agent: {e}"),
+        };
+        self.agent = None;
+        self.agent_error = self.no_handler_banner().map(|_| exited);
     }
 
     /// The search field plus the outcome lens, shared by the two views
@@ -1951,6 +2082,7 @@ impl eframe::App for HallpassApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.drain_net();
+        self.reap_agent();
         // The posture banner and the mode both come from `Stats`, which
         // until now only the Stats tab refetched: a lockdown entered by
         // another client never appeared while the operator sat on Events,

@@ -988,6 +988,79 @@ fn a_posture_outranks_the_stored_mode_in_the_tray() {
     );
 }
 
+/// The window takes no prompts, so it is the one place that must say when
+/// nobody does: only when this daemon has answered, only when it would
+/// prompt at all, and never once the slot is held.
+#[test]
+fn the_window_says_when_nobody_takes_prompts() {
+    let mut t = TestApp::new();
+    let mut unhandled = stats(true);
+    unhandled.prompt_handler_connected = false;
+    t.daemon(DaemonMsg::Stats(unhandled.clone()));
+    assert!(t.app.no_handler_banner().is_none(), "not connected yet");
+
+    t.feed(UiEvent::Connected);
+    t.daemon(DaemonMsg::Stats(unhandled.clone()));
+    let text = t.app.no_handler_banner().expect("nobody takes prompts");
+    assert!(text.contains("default verdict"), "{text}");
+
+    let mut observing = unhandled.clone();
+    observing.enforcing = false;
+    t.daemon(DaemonMsg::Stats(observing));
+    assert!(
+        t.app.no_handler_banner().is_none(),
+        "observe mode never prompts"
+    );
+
+    let mut locked = unhandled.clone();
+    locked.lockdown = Some(hallpass_types::Lockdown {
+        tags: vec!["prod".into()],
+        since_ms: hallpass_types::unix_ms_now(),
+        rules_suppressed: 3,
+    });
+    t.daemon(DaemonMsg::Stats(locked));
+    assert!(
+        t.app.no_handler_banner().is_none(),
+        "a posture denies without prompting"
+    );
+
+    t.daemon(DaemonMsg::Stats(unhandled.clone()));
+    t.feed(UiEvent::Disconnected {
+        retry_in: Duration::from_secs(1),
+    });
+    t.feed(UiEvent::Connected);
+    assert!(
+        t.app.no_handler_banner().is_none(),
+        "the previous daemon's slot says nothing about this one's"
+    );
+
+    let mut handled = unhandled;
+    handled.prompt_handler_connected = true;
+    t.daemon(DaemonMsg::Stats(handled));
+    assert!(t.app.no_handler_banner().is_none());
+}
+
+/// An agent this window started that exits while nobody holds the slot
+/// says so beside the button, rather than the button silently coming back.
+#[test]
+fn an_agent_that_exits_without_the_slot_says_so() {
+    let mut t = TestApp::new();
+    t.feed(UiEvent::Connected);
+    t.daemon(DaemonMsg::Stats(stats(true)));
+    assert!(t.app.no_handler_banner().is_some());
+
+    let mut child = std::process::Command::new("false")
+        .spawn()
+        .expect("spawn false");
+    child.wait().expect("wait for false");
+    t.app.agent = Some((child, std::time::Instant::now()));
+    t.app.reap_agent();
+
+    assert!(t.app.agent.is_none(), "the button comes back");
+    let note = t.app.agent_error.as_deref().expect("the exit is reported");
+    assert!(note.contains("exited"), "{note}");
+}
+
 /// Opening a data tab refreshes what it shows, rather than rendering
 /// whatever was current when the window last asked. The traffic tab reads
 /// the enforcement flag for its wording, so it refreshes the stats too.
