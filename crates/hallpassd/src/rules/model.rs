@@ -16,12 +16,43 @@ pub enum DomainPattern {
 }
 
 impl DomainPattern {
-    fn parse(raw: &str) -> DomainPattern {
+    /// Parse a rule's `domain` operand, refusing anything no snooped name
+    /// could ever equal.
+    ///
+    /// Snooped names are lowercase ASCII (IDNs arrive in their `xn--` form)
+    /// with no trailing dot, so `example.org.`, `bücher.de`, `*example.org`
+    /// or `*` compiled fine and then never matched. On an allow that costs a
+    /// prompt; on a deny it is a block that silently is not there. Refused
+    /// here, the rule is skipped with a warning naming it, or the IPC add
+    /// fails with the reason. A trailing dot is the one spelling normalized
+    /// rather than refused, since it names the same thing.
+    fn parse(raw: &str) -> Result<DomainPattern, String> {
         let lower = raw.to_ascii_lowercase();
-        match lower.strip_prefix("*.") {
-            Some(suffix) => DomainPattern::Suffix(suffix.to_string()),
-            None => DomainPattern::Exact(lower),
+        let name = lower.strip_suffix('.').unwrap_or(&lower);
+        let (suffix, body) = match name.strip_prefix("*.") {
+            Some(rest) => (true, rest),
+            None => (false, name),
+        };
+        if !body.is_ascii() {
+            return Err(format!(
+                "{raw:?}: not ASCII; write an internationalized name in its xn-- form"
+            ));
         }
+        let valid_label = |l: &str| {
+            !l.is_empty()
+                && l.len() <= 63
+                && l.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        };
+        if body.is_empty() || body.len() > 253 || !body.split('.').all(valid_label) {
+            return Err(format!(
+                "{raw:?}: expected a domain name, or \"*.\" followed by one"
+            ));
+        }
+        Ok(match suffix {
+            true => DomainPattern::Suffix(body.to_string()),
+            false => DomainPattern::Exact(body.to_string()),
+        })
     }
 
     /// Case-insensitive match without allocating (per-packet path).
@@ -225,7 +256,12 @@ impl CompiledRule {
             dest,
             port: m.port,
             port_range: m.port_range,
-            domain: m.domain.as_deref().map(DomainPattern::parse),
+            domain: m
+                .domain
+                .as_deref()
+                .map(DomainPattern::parse)
+                .transpose()
+                .map_err(|e| format!("bad domain {e}"))?,
             user: m.user,
             proto: m.proto,
             domains_file,
@@ -1064,16 +1100,41 @@ mod tests {
 
     #[test]
     fn domain_pattern_semantics() {
-        let exact = DomainPattern::parse("Example.org");
+        let exact = DomainPattern::parse("Example.org").unwrap();
         assert!(exact.matches("example.org"));
         assert!(exact.matches("EXAMPLE.ORG"));
         assert!(!exact.matches("sub.example.org"));
 
-        let wild = DomainPattern::parse("*.example.org");
+        let wild = DomainPattern::parse("*.example.org").unwrap();
         assert!(wild.matches("example.org"));
         assert!(wild.matches("a.example.org"));
         assert!(wild.matches("a.b.example.org"));
         assert!(!wild.matches("evilexample.org"));
         assert!(!wild.matches("example.org.evil.com"));
+    }
+
+    /// A pattern no snooped name can equal is refused rather than compiled
+    /// into a rule that never matches; a trailing dot is the same name.
+    #[test]
+    fn domain_patterns_that_could_never_match_are_refused() {
+        let root = DomainPattern::parse("example.org.").unwrap();
+        assert!(root.matches("example.org"));
+        assert!(DomainPattern::parse("*.Example.ORG.")
+            .unwrap()
+            .matches("a.example.org"));
+        assert!(DomainPattern::parse("_dmarc.example.org").is_ok());
+        assert!(DomainPattern::parse("xn--bcher-kva.de").is_ok());
+        for bad in [
+            "bücher.de",
+            "*",
+            "*example.org",
+            "exa*mple.org",
+            "example..org",
+            "example.org ",
+            "",
+            ".",
+        ] {
+            assert!(DomainPattern::parse(bad).is_err(), "{bad:?} was accepted");
+        }
     }
 }
