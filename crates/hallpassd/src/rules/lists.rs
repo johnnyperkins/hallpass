@@ -16,7 +16,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::net::IpAddr;
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
 use std::sync::{Arc, LazyLock, Mutex};
 
@@ -74,7 +74,18 @@ impl<T> ListCache<T> {
     ) -> Result<Arc<T>, String> {
         // Identity and content both come from this fd: no window where the
         // trust-checked file and the parsed bytes could differ.
-        let mut file = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        // O_NONBLOCK: opening a FIFO blocks until a writer appears, before the
+        // regular-file check below could refuse it, and a rebuild that hangs
+        // there at startup hangs before the nftables install. Links are
+        // followed: a root-written rule may point its list through one (into
+        // a directory a blocklist updater owns, say), and a path that came
+        // over IPC is stored resolved, so no client-owned link is ever here.
+        // The trust check is on the file reached, from this descriptor.
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(super::store::O_NONBLOCK)
+            .open(path)
+            .map_err(|e| format!("{}: {e}", path.display()))?;
         let meta = file
             .metadata()
             .map_err(|e| format!("{}: {e}", path.display()))?;
@@ -277,6 +288,28 @@ mod tests {
             err.contains("not a regular file") || err.contains("Is a directory"),
             "{err}"
         );
+    }
+
+    /// A FIFO passes the ownership check, and opening one blocks until a
+    /// writer appears: before the regular-file check could refuse it, on the
+    /// thread loading rules. It must be refused without waiting.
+    #[test]
+    fn fifo_list_file_is_refused_without_blocking() {
+        let d = TestDir::new("lists-fifo");
+        let fifo = d.path().join("ips.list");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("run mkfifo");
+        assert!(made.success(), "mkfifo failed");
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(IpSet::load(&fifo));
+        });
+        let result = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("loading a FIFO blocked");
+        assert!(result.unwrap_err().contains("not a regular file"));
     }
 
     /// Parse errors name a line number, never its text. The error string

@@ -223,12 +223,19 @@ pub(crate) fn effective_uid() -> Option<u32> {
 ///
 /// Every rejection returns the same message: distinguishing "outside the
 /// directory" from "does not exist" would leave a path-existence oracle.
-fn list_paths_within(rule: &Rule, dir: &Path) -> Result<(), String> {
-    let m = &rule.matcher;
+///
+/// Each accepted path is replaced by the canonical one that was checked, and
+/// that is what the rule is compiled and persisted with. Checking the
+/// resolved path and keeping the one the client sent confined nothing: a
+/// symlink in a directory the client owns passes while it points into the
+/// rules directory, and every later rebuild reopens it wherever it points
+/// by then.
+fn confine_list_paths(rule: &mut Rule, dir: &Path) -> Result<(), String> {
+    let m = &mut rule.matcher;
     let fields = [
-        ("domains_file", m.domains_file.as_deref()),
-        ("ips_file", m.ips_file.as_deref()),
-        ("hashes_file", m.hashes_file.as_deref()),
+        ("domains_file", &mut m.domains_file),
+        ("ips_file", &mut m.ips_file),
+        ("hashes_file", &mut m.hashes_file),
     ];
     if fields.iter().all(|(_, p)| p.is_none()) {
         return Ok(());
@@ -245,6 +252,7 @@ fn list_paths_within(rule: &Rule, dir: &Path) -> Result<(), String> {
         if canon.parent() != Some(canon_dir.as_path()) {
             return Err(rejected());
         }
+        *path = canon;
     }
     Ok(())
 }
@@ -255,7 +263,7 @@ fn list_paths_within(rule: &Rule, dir: &Path) -> Result<(), String> {
 const O_NOFOLLOW: i32 = 0o400_000;
 
 /// `O_NONBLOCK` on Linux, spelled out for the same reason as [`O_NOFOLLOW`].
-const O_NONBLOCK: i32 = 0o4_000;
+pub(super) const O_NONBLOCK: i32 = 0o4_000;
 
 /// Whether [`read_trusted`] may open a path that is a symbolic link.
 ///
@@ -696,7 +704,7 @@ impl RuleStore {
     ///
     /// This is the entry point for rules that did not come from disk (IPC
     /// `RuleAdd` and prompt replies), so match-list paths are confined here.
-    pub fn add(&self, rule: Rule) -> Result<(), String> {
+    pub fn add(&self, mut rule: Rule) -> Result<(), String> {
         if rule.name.is_empty() {
             return Err("rule name must not be empty".into());
         }
@@ -725,7 +733,7 @@ impl RuleStore {
         // which normalizes instead).
         hallpass_types::validate_tags(&rule.tags)?;
         // Before compile: compiling opens the list files as root.
-        list_paths_within(&rule, &self.rules_dir)?;
+        confine_list_paths(&mut rule, &self.rules_dir)?;
         CompiledRule::compile(&rule)?;
         // Persist while holding the entries lock: the directory watcher's
         // reload_disk() takes the same lock, so it cannot observe the new
@@ -1372,6 +1380,37 @@ mod tests {
         store
             .add(rule_with_ips_file(&list))
             .expect("in-dir list accepted");
+    }
+
+    /// A path that reaches the rules directory through a symlink the client
+    /// controls is stored as the file it resolved to, so repointing the link
+    /// afterwards changes nothing the daemon opens. Stored as sent, the next
+    /// rebuild followed the link to wherever it pointed by then, any
+    /// root-owned file on the host.
+    #[test]
+    fn add_stores_the_list_path_it_checked() {
+        let (_td, dir) = tmpdir("list-link");
+        let rules_dir = trusted_dir(&dir.join("rules.d"));
+        let list = write(rules_dir.join("ips.list"), "10.0.0.1\n");
+        let client = dir.join("client");
+        std::fs::create_dir_all(&client).unwrap();
+        let link = client.join("l");
+        std::os::unix::fs::symlink(&list, &link).unwrap();
+
+        let store = RuleStore::new(rules_dir);
+        let mut r = rule_with_ips_file(&link);
+        r.duration = RuleDuration::Forever;
+        store
+            .add(r)
+            .expect("the link resolves inside the rules dir");
+
+        let stored = store.list();
+        let stored = stored.iter().find(|r| r.name == "listy").unwrap();
+        assert_eq!(
+            stored.matcher.ips_file.as_deref(),
+            Some(list.canonicalize().unwrap().as_path()),
+            "the rule keeps the resolved path, not the link"
+        );
     }
 
     #[test]

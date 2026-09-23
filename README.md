@@ -604,7 +604,10 @@ who can delete the nftables table outright.
   by root (or the daemon's own euid) and not group/other writable. Symlinks
   are skipped, and the ownership check and the parsed bytes come from the
   same file descriptor, so the file that was checked is the file that is
-  read. The same policy and mechanism apply to match-list files.
+  read. Match-list files get the same ownership check on the same
+  descriptor, but a root-written rule may reach its list through a symlink;
+  a list path sent over IPC must resolve into `rules.d` and is stored
+  resolved, so a client cannot re-aim it later.
 - **Policy directories**: the daemon checks that `/etc/hallpass` and the
   rules directory are root-owned and not group/world-writable, warns at error
   level when they are not, and refuses to start under `queue_bypass = false`.
