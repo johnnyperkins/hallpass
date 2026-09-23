@@ -196,8 +196,15 @@ pub async fn watch(mut client: Client) -> Result<(), CliError> {
     // Whether the Subscribe request has been acked.
     let mut subscribed = false;
 
+    // Which prompt is on screen and since when; see INPUT_GRACE.
+    let mut fronted: Option<(u64, std::time::Instant)> = None;
+
     println!("watching for connection prompts (Ctrl-C to quit)");
     loop {
+        let on_screen = current.as_ref().map(|(p, _)| p.id);
+        if on_screen != fronted.map(|(id, _)| id) {
+            fronted = on_screen.map(|id| (id, std::time::Instant::now()));
+        }
         tokio::select! {
             msg = rx.recv() => match msg {
                 None => {
@@ -267,6 +274,16 @@ pub async fn watch(mut client: Client) -> Result<(), CliError> {
                 Some(Ok(_)) => {}
             },
             line = lines.next_line() => match line {
+                Ok(Some(_))
+                    if matches!(current, Some((_, Stage::Verdict)))
+                        && fronted.is_some_and(|(_, at)| at.elapsed() < INPUT_GRACE) =>
+                {
+                    // Typed for the prompt that was here a moment ago.
+                    if let Some((p, _)) = &current {
+                        println!("prompt #{} replaced the one being answered; answer again", p.id);
+                    }
+                    println!("{VERDICT_HINT}");
+                }
                 Ok(Some(line)) => match current.take() {
                     Some((pending, stage)) if unix_ms_now() < pending.deadline_ms => {
                         current = step(&mut write_half, &mut queue, pending, stage, &line)
@@ -289,6 +306,17 @@ pub async fn watch(mut client: Client) -> Result<(), CliError> {
         }
     }
 }
+
+/// How long a prompt has to be on screen before a line of input answers it.
+///
+/// Answers carry no prompt id: a line is applied to whatever is current when
+/// it arrives. When the prompt being answered expired, or was answered by
+/// another client, the next one took its place at once, and the line typed
+/// for the first was applied to the second, which nobody had read. Worse, a
+/// scope answer and a verdict share letters (`a` is "app anywhere" and
+/// "allow"). A line arriving this soon after a new prompt appeared was
+/// typed before it appeared.
+const INPUT_GRACE: std::time::Duration = std::time::Duration::from_millis(700);
 
 /// Whether prompt `id` is already on screen or waiting in the queue.
 fn already_held(current: &Option<(Pending, Stage)>, queue: &VecDeque<Pending>, id: u64) -> bool {
