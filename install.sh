@@ -250,7 +250,25 @@ echo "     read-only. Note the event stream names every process on this host and
 echo "     its command line, root's included. Created empty; add with"
 echo "     'sudo usermod -aG hallpass-observer <user>'."
 echo "   - Log out and back in once so '$target_user' picks up the 'hallpass' group."
-echo "   - The Hallpass UI autostarts on next login and pops up connection prompts."
+echo "   - The prompt agent (tray icon, notifications, one window per prompting"
+echo "     app) autostarts on next login."
+# Offered only to a session that can already use it: the control socket is
+# 0660 root:hallpass, so an agent started from a shell not yet in the group
+# retries forever with nothing on screen, and one started from a root shell
+# would be root's. setsid, because an agent started with '&' dies when the
+# terminal hangs up its jobs.
+if [ "$(id -un)" = "$target_user" ]; then
+	case " $(id -nG) " in
+	*" hallpass "*)
+		echo "     'setsid -f hallpass-ui agent' starts it now, detached from this"
+		echo "     terminal."
+		;;
+	esac
+fi
+echo "     A hallpass-ui still running from an older install can hold the prompt"
+echo "     slot: quit it (its tray's Quit, or its window where there is no tray)"
+echo "     and the agent takes the slot within seconds. The app menu entry opens"
+echo "     the management window, which takes no prompts."
 echo "   - Terminal client: hallpass-cli status | rules | events | watch"
 echo "   - Full reference: man hallpass-cli (tab completion is installed for"
 echo "     each of bash, zsh and fish that this machine already has)."

@@ -114,9 +114,9 @@ HALLPASS_POSTURE=desktop ./install.sh # fail-open-on-crash config instead of the
 It builds the release binaries as your user, then uses `sudo` (prompting
 once) to install them to `/usr/bin`, drop the config and example rule into
 `/etc/hallpass` (an existing `config.toml` is never overwritten), install the
-systemd unit and desktop entry, autostart the UI, add you to the `hallpass`
-group, and `systemctl enable --now hallpassd`. Log out and back in once so the
-group membership and UI autostart take effect.
+systemd unit and desktop entry, autostart the prompt agent, add you to the
+`hallpass` group, and `systemctl enable --now hallpassd`. Log out and back in
+once so the group membership and the agent's autostart take effect.
 
 It installs, as root, the binaries it just built in your checkout, so it is
 exactly as trustworthy as the account that ran the build: anything running as
@@ -192,6 +192,9 @@ install -Dm644 etc/rules.d/20-system-networkmanager.toml /etc/hallpass/rules.d/2
 
 install -Dm644 etc/hallpassd.service     /etc/systemd/system/hallpassd.service
 install -Dm644 etc/hallpass-ui.desktop   /usr/share/applications/hallpass-ui.desktop
+# The prompt agent, started at login. Without it nothing takes prompts: the
+# app-menu entry above opens the management window, which does not.
+install -Dm644 etc/hallpass-ui-autostart.desktop /etc/xdg/autostart/hallpass-ui.desktop
 
 # Optional: members of the "hallpass" group control the daemon; members of
 # "hallpass-observer" reach the read-only socket and can change nothing.

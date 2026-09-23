@@ -2,9 +2,8 @@
 Type=Application
 Name=Hallpass Firewall
 GenericName=Application Firewall
-Comment=Interactive firewall connection prompts and rule management
+Comment=Firewall rules, live traffic and settings
 Exec=hallpass-ui
 Icon=security-high
 Terminal=false
 Categories=System;Security;Network;
-X-GNOME-Autostart-enabled=true
