@@ -56,16 +56,24 @@ fn ctx() -> PromptContext {
 }
 
 /// One prompt window's body, laid out on its own the way its viewport shows
-/// it.
+/// it, in front long enough for Allow to answer.
 fn prompt_harness() -> Harness<'static, PromptFixture> {
+    prompt_harness_fronted(NOW_MS - crate::prompt::ALLOW_ARM_MS)
+}
+
+/// [`prompt_harness`], with the prompt at the front of its window since
+/// `fronted_ms`.
+fn prompt_harness_fronted(fronted_ms: u64) -> Harness<'static, PromptFixture> {
+    let mut prompt = PromptState::new(
+        1,
+        conn(EXE, "93.184.216.34:443"),
+        NOW_MS + 30_000,
+        NOW_MS,
+        ctx(),
+    );
+    prompt.fronted_ms = Some(fronted_ms);
     let state = PromptFixture {
-        prompt: PromptState::new(
-            1,
-            conn(EXE, "93.184.216.34:443"),
-            NOW_MS + 30_000,
-            NOW_MS,
-            ctx(),
-        ),
+        prompt,
         answered: Vec::new(),
     };
     Harness::builder()
@@ -290,6 +298,26 @@ fn each_button_answers_with_its_own_verdict() {
             "{label} answered with the wrong verdict"
         );
     }
+}
+
+/// A prompt that has only just come to the front does not take an Allow:
+/// the click was aimed at whatever sat there a moment ago.
+#[test]
+fn allow_does_not_answer_a_prompt_that_just_surfaced() {
+    let mut harness = prompt_harness_fronted(NOW_MS);
+    harness.get_by_label("Allow").click();
+    harness.run();
+    assert!(
+        harness.state().answered.is_empty(),
+        "an unread prompt was allowed"
+    );
+    harness.get_by_label("Deny").click();
+    harness.run();
+    assert_eq!(
+        harness.state().answered.len(),
+        1,
+        "Deny still answers at once"
+    );
 }
 
 /// Closing the window reaches the dismissal, and reaches it for every prompt

@@ -526,7 +526,18 @@ window for rules, live events, and statistics. Deny leads the dialog's
 keyboard traversal, and closing a prompt window denies every connection it
 covers rather than leaving them to the timeout: dismissing a decision is a
 decision, and it is the one the operator can undo. The deny is `Once`, so it
-writes no rule. Only one client at a time can hold the prompt-handler role.
+writes no rule. Allow only answers once a prompt has been at the front of its
+window for a moment, so a click or keypress aimed at whatever was there
+before it cannot approve it. Only one client at a time can hold the
+prompt-handler role.
+
+Whenever an X11 display is available the GUI runs on it, XWayland included,
+because close-to-tray needs what the native Wayland backend lacks. The cost:
+any client of that X server can synthesize input (XTest) into the prompt
+window, including a sandboxed application given the X11 socket but not the
+hallpass socket. The arming delay does not stop a program that waits it out.
+On a desktop where that matters, run the GUI with `DISPLAY` unset so it uses
+native Wayland, where closing the window quits instead of hiding it.
 
 The management window reads as a status surface: the mark in its top-left
 corner carries the same colour as the tray icon (green enforcing, amber

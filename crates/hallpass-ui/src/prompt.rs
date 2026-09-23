@@ -80,6 +80,19 @@ impl PromptState {
         self.context.exe_sha256.is_some()
     }
 
+    /// Whether Allow answers yet at `now_ms`: only once this prompt has been
+    /// at the front of its window for [`ALLOW_ARM_MS`].
+    ///
+    /// A popup comes to the front with focus, and when one prompt is
+    /// answered the next takes its place in the same spot, so a click or a
+    /// keypress meant for something else, or the second half of a
+    /// double-click, landed on a connection nobody had read. Deny is not
+    /// held back: answered unread, it costs a retry.
+    pub fn allow_armed(&self, now_ms: u64) -> bool {
+        self.fronted_ms
+            .is_some_and(|fronted| now_ms >= fronted.saturating_add(ALLOW_ARM_MS))
+    }
+
     /// Build the reply message for the given verdict.
     pub fn reply(&self, verdict: Verdict) -> ClientMsg {
         ClientMsg::PromptReply {
@@ -89,8 +102,12 @@ impl PromptState {
             scope: self.scope,
             // Only an allow narrows by being pinned. A deny keyed on the path
             // should keep blocking whatever is written there, so the flag is
-            // dropped rather than sent and ignored.
-            pin_exe: self.pin_exe && verdict == Verdict::Allow && self.can_pin(),
+            // dropped rather than sent and ignored. Nor on Once, which writes
+            // no rule: the checkbox is hidden then but keeps its state.
+            pin_exe: self.pin_exe
+                && verdict == Verdict::Allow
+                && self.duration != RuleDuration::Once
+                && self.can_pin(),
         }
     }
 
@@ -105,6 +122,11 @@ impl PromptState {
         self.deadline_ms.saturating_sub(now_ms) / 1000
     }
 }
+
+/// How long a prompt has to be at the front before Allow answers; see
+/// [`PromptState::allow_armed`]. Long enough to outlast a reflex, short
+/// enough not to be noticed by someone reading.
+pub const ALLOW_ARM_MS: u64 = 700;
 
 /// The reply a closed prompt window sends for prompt `id`.
 ///
@@ -238,6 +260,39 @@ mod tests {
             app_id: None,
             first_seen: None,
         }
+    }
+
+    #[test]
+    fn allow_arms_only_after_the_prompt_has_been_in_front() {
+        let mut p = PromptState::new(1, conn(None, None), 60_000, 1_000, Default::default());
+        assert!(!p.allow_armed(50_000), "never fronted, never armed");
+        p.fronted_ms = Some(2_000);
+        assert!(!p.allow_armed(2_000));
+        assert!(!p.allow_armed(2_000 + ALLOW_ARM_MS - 1));
+        assert!(p.allow_armed(2_000 + ALLOW_ARM_MS));
+    }
+
+    #[test]
+    fn a_once_reply_never_pins() {
+        let mut p = PromptState::new(
+            1,
+            conn(None, Some("/usr/bin/curl")),
+            60_000,
+            0,
+            Default::default(),
+        );
+        p.context.exe_sha256 = Some("ab".repeat(32));
+        p.pin_exe = true;
+        p.duration = RuleDuration::Forever;
+        assert!(matches!(
+            p.reply(Verdict::Allow),
+            ClientMsg::PromptReply { pin_exe: true, .. }
+        ));
+        p.duration = RuleDuration::Once;
+        assert!(matches!(
+            p.reply(Verdict::Allow),
+            ClientMsg::PromptReply { pin_exe: false, .. }
+        ));
     }
 
     #[test]

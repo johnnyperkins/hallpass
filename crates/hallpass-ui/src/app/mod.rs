@@ -2803,11 +2803,20 @@ fn prompt_actions_ui(
         {
             answered.push((p.id, p.reply(Verdict::Deny)));
         }
+        // Disabled until armed; see `PromptState::allow_armed`.
+        let armed = p.allow_armed(now_ms);
         if ui
-            .add(theme::verdict_button("Allow", ALLOW_COLOR).min_size(egui::vec2(width, 32.0)))
+            .add_enabled(
+                armed,
+                theme::verdict_button("Allow", ALLOW_COLOR).min_size(egui::vec2(width, 32.0)),
+            )
             .clicked()
         {
             answered.push((p.id, p.reply(Verdict::Allow)));
+        }
+        if !armed {
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(prompt::ALLOW_ARM_MS));
         }
     });
     ui.add_space(4.0);
