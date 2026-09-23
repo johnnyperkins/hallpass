@@ -718,7 +718,19 @@ pub fn run(mut queue: Queue, queue_num: u16, mut deps: QueueDeps) -> std::io::Re
                     // and an ICMP tunnel survives the posture raised to stop
                     // it. There is no rule to pin these to, so a posture
                     // denies them outright.
-                    let unhandled = match deps.settings.locked_down() {
+                    //
+                    // UDP-Lite is refused whatever the policy says. Any
+                    // process can open a UDP-Lite socket and it carries
+                    // anything UDP carries, so under an allowing policy it
+                    // was UDP with no rule and no prompt. It cannot go to the
+                    // rule engine as UDP either: its ports are a space of
+                    // their own, and every attributor looks a flow up among
+                    // UDP sockets, so a UDP-Lite socket on the port of some
+                    // program's UDP socket would be judged as that program.
+                    // Nothing on a desktop speaks it.
+                    let udplite =
+                        matches!(parsed, packet::Parsed::OtherProto(packet::IPPROTO_UDPLITE));
+                    let unhandled = match deps.settings.locked_down() || udplite {
                         true => Verdict::Deny,
                         false => deps.unhandled_verdict,
                     };
@@ -732,7 +744,7 @@ pub fn run(mut queue: Queue, queue_num: u16, mut deps: QueueDeps) -> std::io::Re
                         // ping under the hardened policy.
                         tracing::info!(
                             ?parsed,
-                            verdict = deps.unhandled_verdict.as_str(),
+                            verdict = unhandled.as_str(),
                             "unhandled packet blocked by policy"
                         );
                     } else {

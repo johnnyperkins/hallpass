@@ -100,6 +100,9 @@ fn parse_truncated(payload: &[u8]) -> Parsed {
     }
 }
 
+/// IP protocol number of UDP-Lite (RFC 3828).
+pub const IPPROTO_UDPLITE: u8 = 136;
+
 /// Parse an IP packet into a [`FlowTuple`]. Returns `None` for anything
 /// that is not IPv4/IPv6 carrying TCP or UDP. Test convenience over
 /// [`parse`], which the packet path uses.
@@ -150,6 +153,18 @@ mod tests {
         assert_eq!(t.src, "10.0.0.1:43210".parse().unwrap());
         assert_eq!(t.dst, "93.184.216.34:443".parse().unwrap());
         assert!(!is_dns_response(&t));
+    }
+
+    /// UDP-Lite is not a UDP flow: it goes to the unhandled branch, which
+    /// denies it by protocol number.
+    #[test]
+    fn udplite_is_not_parsed_as_udp() {
+        let mut buf = Vec::new();
+        let datagram = [0x9c, 0x40, 0x14, 0xe9, 0x00, 0x08, 0x00, 0x00];
+        PacketBuilder::ipv4([10, 0, 0, 1], [10, 0, 0, 2], 64)
+            .write(&mut buf, etherparse::IpNumber(IPPROTO_UDPLITE), &datagram)
+            .unwrap();
+        assert_eq!(parse(&buf, buf.len()), Parsed::OtherProto(IPPROTO_UDPLITE));
     }
 
     #[test]
