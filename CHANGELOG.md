@@ -346,6 +346,37 @@ carries what an upgrade changes on a running host.
 
 ### Changed
 
+- **Executable paths are checked against the host's own file.** A process
+  whose `/proc/<pid>/exe` names a path the host has a different file at (a
+  bind mount in a private mount namespace, a container on the host network)
+  now carries no executable, so `exe` rules cannot match it and it prompts or
+  takes the default. Paths under a top-level directory the host lacks, such
+  as a Flatpak's `/app`, are reported as before. A deleted executable (a
+  binary replaced by an upgrade while it runs) keeps its name only in PID 1's
+  mount namespace: a sandboxed service running one loses its `exe` rules
+  until it restarts.
+- **UDP-Lite is always denied**, whatever `unhandled_proto_verdict` says.
+- **When enforcing with `unhandled_proto_verdict` other than `allow`, the
+  table drops `invalid` and `untracked` packets** (IPv6 neighbour discovery
+  and MLD excepted). Decided at startup, like the fail-open flag.
+- **A rule `domain` that no name could ever equal is refused**: Unicode
+  (use the `xn--` form), `*`, `*example.org`, empty labels. The rule is
+  skipped with a warning, or `rules add` fails with the reason. A trailing
+  dot is accepted and ignored.
+- **Equal-priority rules put reject and deny before allow**, then go by name.
+- **Rules written from a prompt carry the protocol for a port answer, and
+  the uid on an allow.** Another account's connection from the same binary
+  no longer joins a prompt, or matches an allow, meant for someone else's.
+- **Allow in the GUI prompt answers only after the prompt has been in front
+  for 700ms**; Deny is immediate. `hallpass-cli watch` ignores a line that
+  arrives within 700ms of a new prompt and asks again.
+- **IPC sockets hold at most 64 connections, 16 per uid**, and close a
+  connection that has not said Hello within 10 seconds.
+- **The unit sets `DevicePolicy=closed` and `LimitNOFILE=16384` and refuses
+  `process_vm_readv`/`process_vm_writev`.** Reinstall the unit to apply.
+- **`rules export` names, on stderr and in a header comment, any rule it had
+  to alter for display**, since those do not import back unchanged.
+
 - **Unmatched connections are denied by default.** `default_verdict` ships as
   `"deny"` instead of `"allow"`, and so does the built-in default a host with
   no config file falls back to. A connection that matches no rule and that
@@ -494,6 +525,40 @@ carries what an upgrade changes on a running host.
   alias for `conf/all` and the kernel consults the arrival interface's own.
 
 ### Fixed
+
+- **Connections could pass unjudged when the queue socket's buffer filled.**
+  Both queues shared one small buffer at a 64 KiB copy range, so a few large
+  local datagrams, or any host sending UDP from port 53, made the kernel
+  resolve the next packet by the fail-open flag. The snoop queue now has its
+  own socket and thread, copies are small, buffers are raised, and only
+  replies to this host's own DNS queries are snooped.
+- **A burst of refused verdicts stopped the daemon.** Prompts held across a
+  VPN drop or a ruleset reload answered with dozens of ENOENT errors at
+  once, which counted as receive failures and, under fail-open, left the
+  host unfiltered until the restart.
+- **The exec-race guard missed UDP sent from unbound sockets and rules
+  pinned by hash alone.** A `sendto()` then `exec` of an allowed binary, or
+  any exec racing a hash-only rule, could borrow that binary's rules.
+- **A hash could be taken of a file the process was not running.** With the
+  process gone, the path was hashed instead, and its owner could put the
+  original bytes back first.
+- **A list path added over IPC could be re-aimed through a symlink** at a
+  root-only file or a FIFO; the resolved path is stored, and a FIFO no
+  longer hangs startup.
+- **A denied DNS query still armed the snoop tracker**, so its server could
+  answer anyway. One answer caches at most 32 addresses, and a numeric
+  "name" no longer overwrites a cached domain.
+- **A dead prompt path allowed every unmatched connection, and held packets
+  were accepted at exit**; both now take `default_verdict`.
+- **The table was replaced in two steps**, leaving no filtering between them.
+- **A client that stopped reading replies could pin hundreds of megabytes**
+  in the daemon.
+- **Syslog export escaped only C0 controls** and capped fields in
+  characters; every display hazard is neutralized and caps count bytes.
+- **The GUI and `hallpass-cli top` could lose their place in the daemon's
+  stream**, breaking the session and emptying the prompt slot.
+- **`hallpass-cli watch` printed a process's whole command line**, enough to
+  scroll the executable off screen.
 
 - **`max_pending_prompts` above 512 is now rejected at config load.** The
   per-client IPC queue holds 512 messages, and a reconnecting prompt handler
