@@ -108,7 +108,13 @@ struct Agent {
     stats_asked: Option<Instant>,
     socket: PathBuf,
     /// The management window this agent started, if it is still open.
-    manager: Option<Child>,
+    manager: Option<Manager>,
+}
+
+/// A management window this agent started, and the link that raises it.
+struct Manager {
+    child: Child,
+    link: std::os::unix::net::UnixStream,
 }
 
 /// Run the agent until the tray's Quit.
@@ -245,11 +251,7 @@ impl Agent {
             self.stats_asked = Some(now);
             let _ = self.to_daemon.send(ClientMsg::Stats);
         }
-        if let Some(manager) = &mut self.manager {
-            if !matches!(manager.try_wait(), Ok(None)) {
-                self.manager = None;
-            }
-        }
+        self.reap_manager();
         let state = self.host.tray_state();
         if state != self.tray_state {
             self.tray_state = state;
@@ -369,19 +371,53 @@ impl Agent {
         false
     }
 
+    /// Forget the management window once its process has exited.
+    fn reap_manager(&mut self) {
+        if let Some(manager) = &mut self.manager {
+            if !matches!(manager.child.try_wait(), Ok(None)) {
+                self.manager = None;
+            }
+        }
+    }
+
     /// Open the management window, unless the one opened last is still up.
+    ///
+    /// An open one is asked for attention instead: on Wayland nothing can
+    /// raise another client's window, and a window cannot raise itself
+    /// either, but it can ask for attention, which the shell flags (on X11
+    /// it also takes focus). A window opened from the app menu has no link
+    /// and is not this agent's to raise; Show opens a second one.
     fn show_manager(&mut self) {
-        if self.manager.is_some() {
+        use std::os::unix::process::CommandExt as _;
+        // Not left to the next tick: a Show right after the window closed
+        // would otherwise go to a dead link and open nothing.
+        self.reap_manager();
+        if let Some(manager) = &mut self.manager {
+            // Best effort, on a non-blocking link: this thread routes the
+            // prompts and never waits on a window that is not reading.
+            let _ = link::write_frame(&mut manager.link, &ToWindow::Raise);
             return;
         }
-        match Command::new("/proc/self/exe")
-            .arg("--socket")
-            .arg(&self.socket)
-            .spawn()
-        {
-            Ok(child) => self.manager = Some(child),
-            Err(e) => tracing::warn!("starting the management window: {e}"),
+        let mut cmd = Command::new("/proc/self/exe");
+        // Its own process group, so a signal meant for the agent's (a
+        // terminal's Ctrl+C in development) does not take it down too.
+        cmd.arg("--socket").arg(&self.socket).process_group(0);
+        let (link, mut child) = match link::spawn(&mut cmd) {
+            Ok(started) => started,
+            Err(e) => {
+                tracing::warn!("starting the management window: {e}");
+                return;
+            }
+        };
+        if let Err(e) = link.set_nonblocking(true) {
+            // Started but not set up: reaped here, or it runs untracked and
+            // lingers as a zombie once closed.
+            tracing::warn!("starting the management window: {e}");
+            let _ = child.kill();
+            let _ = child.wait();
+            return;
         }
+        self.manager = Some(Manager { child, link });
     }
 
     /// Carry out the router's effects, and whatever carrying them out

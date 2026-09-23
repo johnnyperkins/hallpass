@@ -308,6 +308,8 @@ pub struct HallpassApp {
     icon_state: TrayState,
     /// The daemon socket, handed to an agent started from this window.
     socket: PathBuf,
+    /// Raise requests from the agent that opened this window, if one did.
+    raise: Option<Receiver<()>>,
     /// An agent this window started and when, reaped once it exits.
     agent: Option<(std::process::Child, std::time::Instant)>,
     /// Why the last agent this window started is gone, shown beside the
@@ -322,7 +324,13 @@ impl HallpassApp {
     /// the network thread wakes the event loop with. No tray and no
     /// notifications here: both belong to the agent, and this window is an
     /// ordinary client that holds no prompts.
-    pub fn new(cc: &eframe::CreationContext<'_>, socket: PathBuf) -> Self {
+    ///
+    /// `raise` is the link from the agent's tray when it opened this window.
+    pub fn new(
+        cc: &eframe::CreationContext<'_>,
+        socket: PathBuf,
+        raise: Option<std::os::unix::net::UnixStream>,
+    ) -> Self {
         let (to_daemon, from_ui) = tokio::sync::mpsc::unbounded_channel();
         let (to_ui, from_net) = std::sync::mpsc::channel();
         // Nobody listens: this client never subscribes to prompts, so the
@@ -337,6 +345,7 @@ impl HallpassApp {
         );
         Self {
             socket,
+            raise: raise.map(|link| spawn_raise_reader(link, crate::repaint(&cc.egui_ctx))),
             ..Self::with_channels(to_daemon, from_net)
         }
     }
@@ -382,6 +391,7 @@ impl HallpassApp {
             mode_reported: false,
             icon_state: TrayState::Unknown,
             socket: PathBuf::new(),
+            raise: None,
             agent: None,
             agent_error: None,
         }
@@ -2083,6 +2093,18 @@ impl eframe::App for HallpassApp {
         let ctx = ui.ctx().clone();
         self.drain_net();
         self.reap_agent();
+        if self
+            .raise
+            .as_ref()
+            .is_some_and(|r| r.try_iter().count() > 0)
+        {
+            // Focus works on X11; on Wayland the attention request is what
+            // gets the shell to flag the window.
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
+                egui::UserAttentionType::Informational,
+            ));
+        }
         // The posture banner and the mode both come from `Stats`, which
         // until now only the Stats tab refetched: a lockdown entered by
         // another client never appeared while the operator sat on Events,
@@ -2096,6 +2118,28 @@ impl eframe::App for HallpassApp {
         self.main_window(ui);
         self.editor_window(&ctx);
     }
+}
+
+/// Read the agent's raise requests off `link`. Ends quietly when the agent
+/// goes: the window is an ordinary client and does not need it.
+fn spawn_raise_reader(mut link: std::os::unix::net::UnixStream, wake: crate::Wake) -> Receiver<()> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let spawned = std::thread::Builder::new()
+        .name("agent-raise".into())
+        .spawn(move || {
+            while let Ok(Some(msg)) = crate::link::read_frame::<crate::link::ToWindow>(&mut link) {
+                if matches!(msg, crate::link::ToWindow::Raise) {
+                    if tx.send(()).is_err() {
+                        break;
+                    }
+                    wake();
+                }
+            }
+        });
+    if let Err(e) = spawned {
+        tracing::warn!("reading the agent link: {e}");
+    }
+    rx
 }
 
 // ---- small display helpers ----------------------------------------------

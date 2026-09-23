@@ -89,6 +89,10 @@ fn main() -> eframe::Result {
         }
     };
 
+    // Started by the agent's tray, stdin is a link it raises the window
+    // through; started any other way, there is none.
+    let raise = link::from_stdin().ok();
+
     let mut options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([820.0, 520.0])
@@ -111,7 +115,7 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "Hallpass",
         options,
-        Box::new(move |cc| Ok(Box::new(app::HallpassApp::new(cc, socket)))),
+        Box::new(move |cc| Ok(Box::new(app::HallpassApp::new(cc, socket, raise)))),
     )
 }
 

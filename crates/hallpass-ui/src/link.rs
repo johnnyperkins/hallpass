@@ -1,4 +1,6 @@
-//! The link between the prompt agent and one prompt window process.
+//! The link between the prompt agent and one window process it started: a
+//! prompt window, or the management window, which only ever hears
+//! [`ToWindow::Raise`] on it.
 //!
 //! A connected socket pair, one end kept by the agent and the other handed
 //! to the window as its stdin, which the window moves off fd 0 at once.

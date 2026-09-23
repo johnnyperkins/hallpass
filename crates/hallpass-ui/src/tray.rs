@@ -150,7 +150,9 @@ impl ksni::Tray for HallpassTray {
             .into(),
             MenuItem::Separator,
             StandardItem {
-                label: "Quit".into(),
+                // Says what quitting costs: the menu has no tooltip, and
+                // "Quit" alone reads as closing a window.
+                label: "Quit (stops prompts)".into(),
                 activate: Box::new(|tray: &mut Self| tray.send(TrayMsg::Quit)),
                 ..Default::default()
             }
