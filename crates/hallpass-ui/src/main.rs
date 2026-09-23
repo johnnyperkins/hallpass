@@ -5,14 +5,16 @@
 //! talk over channels (see [`net`]).
 
 mod app;
+mod backend;
 mod editor;
-// Used by the prompt agent and window, which land in the following commits.
+// Partly used until the prompt agent lands in a following commit.
 #[cfg_attr(not(test), expect(dead_code))]
 mod link;
 mod net;
 mod notify;
 mod prompt;
 mod prompt_view;
+mod prompt_window;
 // Used by the prompt agent, which lands in a following commit.
 #[cfg_attr(not(test), expect(dead_code))]
 mod router;
@@ -46,7 +48,15 @@ fn repaint(ctx: &egui::Context) -> Wake {
 /// Default daemon socket path.
 const DEFAULT_SOCKET: &str = "/run/hallpass/hallpass.sock";
 
-/// Command line, parsed by [`parse_args`].
+/// What this process is, parsed by [`parse_args`].
+enum Mode {
+    /// The management window (and, until the agent lands, the prompts).
+    Window(Args),
+    /// One prompt window, started by the agent with the link as stdin.
+    Prompt,
+}
+
+/// The management window's command line.
 struct Args {
     socket: PathBuf,
     /// Start parked in the tray instead of showing the window. The
@@ -63,11 +73,26 @@ fn main() -> eframe::Result {
         )
         .init();
 
-    let args = parse_args(std::env::args().skip(1)).unwrap_or_else(|e| {
+    let mode = parse_args(std::env::args().skip(1)).unwrap_or_else(|e| {
         eprintln!("{e}");
         eprintln!("usage: hallpass-ui [--socket PATH] [--hidden]");
         std::process::exit(2);
     });
+    let args = match mode {
+        Mode::Window(args) => args,
+        Mode::Prompt => {
+            let backend = backend::from_env().unwrap_or_else(|e| {
+                eprintln!("{e}");
+                std::process::exit(2);
+            });
+            let mut options = eframe::NativeOptions {
+                viewport: prompt_window::viewport(),
+                ..Default::default()
+            };
+            backend::apply(&mut options, backend);
+            return prompt_window::run(options);
+        }
+    };
 
     // Close-to-tray needs capabilities winit's Wayland backend does not
     // have: `Visible(false)` / `Visible(true)` are no-ops there, and a
@@ -96,10 +121,7 @@ fn main() -> eframe::Result {
         ..Default::default()
     };
     if x11 {
-        options.event_loop_builder = Some(Box::new(|builder| {
-            use winit::platform::x11::EventLoopBuilderExtX11;
-            builder.with_x11();
-        }));
+        backend::apply(&mut options, backend::Backend::X11);
     }
 
     eframe::run_native(
@@ -109,13 +131,21 @@ fn main() -> eframe::Result {
     )
 }
 
-/// Parse `--socket PATH` (or `--socket=PATH`) and `--hidden`.
-fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
+/// Parse `prompt` (alone), or `--socket PATH` (or `--socket=PATH`) and
+/// `--hidden`.
+fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Mode, String> {
+    let mut iter = args.into_iter().peekable();
+    if iter.peek().map(String::as_str) == Some("prompt") {
+        iter.next();
+        return match iter.next() {
+            None => Ok(Mode::Prompt),
+            Some(arg) => Err(format!("prompt takes no arguments: {arg}")),
+        };
+    }
     let mut parsed = Args {
         socket: PathBuf::from(DEFAULT_SOCKET),
         hidden: false,
     };
-    let mut iter = args.into_iter();
     while let Some(arg) = iter.next() {
         if arg == "--socket" {
             match iter.next() {
@@ -130,16 +160,23 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
             return Err(format!("unknown argument: {arg}"));
         }
     }
-    Ok(parsed)
+    Ok(Mode::Window(parsed))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn window_args(args: Vec<String>) -> Args {
+        match parse_args(args).unwrap() {
+            Mode::Window(args) => args,
+            Mode::Prompt => panic!("parsed as a prompt window"),
+        }
+    }
+
     #[test]
     fn args_default() {
-        let args = parse_args(Vec::new()).unwrap();
+        let args = window_args(Vec::new());
         assert_eq!(args.socket, PathBuf::from(DEFAULT_SOCKET));
         assert!(!args.hidden);
     }
@@ -147,25 +184,30 @@ mod tests {
     #[test]
     fn socket_arg_separate_and_equals() {
         let args = vec!["--socket".to_string(), "/tmp/s.sock".to_string()];
-        assert_eq!(
-            parse_args(args).unwrap().socket,
-            PathBuf::from("/tmp/s.sock")
-        );
+        assert_eq!(window_args(args).socket, PathBuf::from("/tmp/s.sock"));
         let args = vec!["--socket=/tmp/t.sock".to_string()];
-        assert_eq!(
-            parse_args(args).unwrap().socket,
-            PathBuf::from("/tmp/t.sock")
-        );
+        assert_eq!(window_args(args).socket, PathBuf::from("/tmp/t.sock"));
     }
 
     #[test]
     fn hidden_flag() {
-        assert!(parse_args(vec!["--hidden".to_string()]).unwrap().hidden);
+        assert!(window_args(vec!["--hidden".to_string()]).hidden);
     }
 
     #[test]
     fn arg_errors() {
         assert!(parse_args(vec!["--socket".to_string()]).is_err());
         assert!(parse_args(vec!["--bogus".to_string()]).is_err());
+    }
+
+    #[test]
+    fn prompt_mode_takes_nothing_else() {
+        assert!(matches!(
+            parse_args(vec!["prompt".to_string()]),
+            Ok(Mode::Prompt)
+        ));
+        assert!(parse_args(vec!["prompt".to_string(), "--hidden".to_string()]).is_err());
+        // Only as the first word: it is a mode, not a flag.
+        assert!(parse_args(vec!["--hidden".to_string(), "prompt".to_string()]).is_err());
     }
 }
