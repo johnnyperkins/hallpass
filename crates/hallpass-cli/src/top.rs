@@ -193,7 +193,10 @@ pub fn render(agg: &Aggregate, opts: TopOpts, pal: Palette) -> String {
         .iter()
         .map(|r| {
             [
-                r.key.clone(),
+                // Bounded like every path the CLI prints: the column is as
+                // wide as its longest cell, so one process run from a deep
+                // directory otherwise wrapped every row of the table.
+                fmt::path_display(std::path::Path::new(&r.key)),
                 r.total.to_string(),
                 r.allowed.to_string(),
                 r.blocked.to_string(),

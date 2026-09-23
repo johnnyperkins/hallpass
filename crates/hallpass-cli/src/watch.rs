@@ -116,11 +116,9 @@ fn format_prompt(p: &Pending, now_ms: u64) -> String {
     }
     if let Some(cmdline) = &c.cmdline {
         // A process writes its own argv, and this line sits right above the
-        // allow/deny question. Raw, it could erase and rewrite the exe line.
-        out.push_str(&format!(
-            "  cmdline: {}\n",
-            hallpass_types::sanitize_for_display(cmdline)
-        ));
+        // allow/deny question. Raw, it could erase and rewrite the exe line;
+        // unbounded, it could scroll it away. See `fmt::cmdline_display`.
+        out.push_str(&format!("  cmdline: {}\n", fmt::cmdline_display(cmdline)));
     }
     // What launched it, nearest parent first. Sanitized for the same reason
     // the command line is: every path here was chosen by whoever exec'd it,

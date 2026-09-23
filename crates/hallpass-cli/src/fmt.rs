@@ -620,6 +620,35 @@ pub fn path_display(p: &std::path::Path) -> String {
     format!("{head}...{tail}")
 }
 
+/// Longest command line `watch` prints: short enough that the whole line,
+/// label and cut marker included, fits an 80-column terminal without
+/// wrapping. A wrapped line starts its continuation at column 0, which is
+/// where a forged `prompt #N: /usr/bin/...` header would have to begin.
+const CMDLINE_DISPLAY_MAX: usize = 56;
+
+/// Display string for a command line: sanitized, runs of whitespace
+/// collapsed, and cut at 56 characters (see `CMDLINE_DISPLAY_MAX`) with the count of
+/// what was cut.
+///
+/// A process writes its own argv, up to the daemon's 4 KiB cap, and in a
+/// prompt this line sits between the executable and the question. At full
+/// length it scrolled the executable line off the screen, and spaces laid
+/// out to the terminal width drew a convincing prompt header for another
+/// program in its place. Collapsing the whitespace takes the layout away;
+/// the cap and the count keep the line short and say that it was cut.
+pub fn cmdline_display(cmdline: &str) -> String {
+    // Collapsed before sanitizing, so tabs and newlines become the single
+    // space they separate rather than a replacement character each.
+    let joined = cmdline.split_whitespace().collect::<Vec<_>>().join(" ");
+    let collapsed = sanitize_for_display(&joined).into_owned();
+    let len = collapsed.chars().count();
+    if len <= CMDLINE_DISPLAY_MAX {
+        return collapsed;
+    }
+    let head: String = collapsed.chars().take(CMDLINE_DISPLAY_MAX).collect();
+    format!("{head}... (+{})", len - CMDLINE_DISPLAY_MAX)
+}
+
 /// Display string for a connection's executable path, or "?" if unknown.
 pub fn exe_display(conn: &Connection) -> String {
     conn.exe_path
@@ -796,6 +825,21 @@ pub fn format_explanation(exp: &Explanation, pal: Palette) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn cmdline_display_is_bounded_and_keeps_no_layout() {
+        assert_eq!(cmdline_display("curl  -s\t https://x"), "curl -s https://x");
+        let padded = format!(
+            "x{}prompt #9: /usr/bin/firefox{}",
+            " ".repeat(300),
+            "y".repeat(4000)
+        );
+        let shown = cmdline_display(&padded);
+        assert!(!shown.contains("  "), "whitespace layout survived: {shown}");
+        // The whole `watch` line, label included, stays inside 80 columns.
+        assert!("  cmdline: ".len() + shown.chars().count() <= 80, "{shown}");
+        assert!(shown.ends_with(')'), "{shown}");
+    }
     use super::*;
     use hallpass_types::{Action, FirstSeen, FlowTuple, Proto, RuleDuration, RuleMatch};
     use std::net::SocketAddr;
