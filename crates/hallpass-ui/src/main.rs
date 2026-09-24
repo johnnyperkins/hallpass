@@ -76,6 +76,13 @@ fn main() -> eframe::Result {
         eprintln!("       hallpass-ui agent [--socket PATH]");
         std::process::exit(2);
     });
+    // Before any thread starts; see `backend::settle`. Every role needs it:
+    // an agent that cannot open a window would hold the prompt slot and let
+    // every prompt time out unseen.
+    let backend = backend::settle().unwrap_or_else(|e| {
+        eprintln!("hallpass-ui: {e}");
+        std::process::exit(2);
+    });
     let socket = match mode {
         Mode::Window(socket) => socket,
         Mode::Agent(socket) => std::process::exit(agent::run(socket)),
@@ -84,7 +91,7 @@ fn main() -> eframe::Result {
                 viewport: prompt_window::viewport(),
                 ..Default::default()
             };
-            backend::apply(&mut options, backend_or_exit());
+            backend::apply(&mut options, backend);
             return prompt_window::run(options);
         }
     };
@@ -110,21 +117,13 @@ fn main() -> eframe::Result {
     // The same pin as the prompt windows: this window can turn enforcement
     // off and write an allow-all rule, so it is no less worth reaching
     // through synthetic X input.
-    backend::apply(&mut options, backend_or_exit());
+    backend::apply(&mut options, backend);
 
     eframe::run_native(
         "Hallpass",
         options,
         Box::new(move |cc| Ok(Box::new(app::HallpassApp::new(cc, socket, raise)))),
     )
-}
-
-/// The backend for a window, or exit saying why there is none.
-fn backend_or_exit() -> backend::Backend {
-    backend::from_env().unwrap_or_else(|e| {
-        eprintln!("{e}");
-        std::process::exit(2);
-    })
 }
 
 /// Parse `prompt` (alone), or `agent` and/or `--socket PATH` (or

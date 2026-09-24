@@ -41,16 +41,17 @@ fn env_set(name: &str) -> bool {
     std::env::var_os(name).is_some_and(|v| !v.is_empty())
 }
 
-/// [`choose`] for this process's environment, warning when it lands on X11.
-///
-/// On Wayland it also drops `DISPLAY` from this process's environment, so
-/// nothing in it connects to the X server after all: egui's clipboard opened
+/// Choose this process's backend once, at startup, and make the choice
+/// stick: on Wayland, drop `DISPLAY` from the environment so nothing in
+/// this process connects to the X server after all. egui's clipboard opened
 /// an Xwayland connection from every window whenever `DISPLAY` was set
-/// (seen live 2026-09-24), and the prompt windows and management window this
-/// process starts inherit the environment. Callers run it before starting
-/// any thread: changing the environment while another thread reads it is
-/// undefined behaviour in libc.
-pub fn from_env() -> Result<Backend, &'static str> {
+/// (seen live 2026-09-23), and the prompt windows and management window
+/// this process starts inherit the environment.
+///
+/// Only `main` calls this, before it starts any thread: changing the
+/// environment while another thread reads it is undefined behaviour in
+/// libc. Everything else takes the value it returns.
+pub fn settle() -> Result<Backend, &'static str> {
     let backend = choose(env_set("WAYLAND_DISPLAY"), env_set("DISPLAY"))?;
     if backend == Backend::Wayland {
         std::env::remove_var("DISPLAY");

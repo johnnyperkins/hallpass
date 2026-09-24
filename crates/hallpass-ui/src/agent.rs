@@ -131,12 +131,6 @@ pub fn run(socket: PathBuf) -> i32 {
             return 1;
         }
     };
-    // Checked before taking the prompt slot: an agent that cannot open a
-    // window would hold it and let every prompt time out unseen.
-    if let Err(e) = crate::backend::from_env() {
-        eprintln!("hallpass-ui agent: {e}");
-        return 1;
-    }
 
     let (inputs, from_inputs) = mpsc::channel();
     let wake: crate::Wake = {
