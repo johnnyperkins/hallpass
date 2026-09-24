@@ -443,27 +443,12 @@ mod tests {
 
     use egui_kittest::kittest::{NodeT as _, Queryable as _};
     use egui_kittest::Harness;
-    use hallpass_types::{Connection, FlowTuple, PromptContext, Proto};
+    use hallpass_types::{Connection, PromptContext};
 
     use super::*;
 
     fn conn(exe: &str, dst: &str) -> Connection {
-        Connection {
-            tuple: FlowTuple {
-                proto: Proto::Tcp,
-                src: "10.0.0.1:40000".parse().expect("source address"),
-                dst: dst.parse().expect("destination address"),
-            },
-            uid: Some(1000),
-            pid: Some(4242),
-            exe_path: Some(PathBuf::from(exe)),
-            cmdline: None,
-            parent_exe: None,
-            domain: None,
-            iface: None,
-            app_id: None,
-            first_seen: None,
-        }
+        crate::testutil::conn(Some(exe), dst)
     }
 
     /// A prompt plus what its buttons answered, so a test can read the reply

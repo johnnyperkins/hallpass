@@ -163,26 +163,14 @@ pub fn from_stdin() -> io::Result<UnixStream> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hallpass_types::{FlowTuple, Proto};
 
     fn prompt() -> Prompt {
         Prompt {
             id: 7,
             conn: Connection {
-                tuple: FlowTuple {
-                    proto: Proto::Tcp,
-                    src: "10.0.0.2:50000".parse().unwrap(),
-                    dst: "93.184.216.34:443".parse().unwrap(),
-                },
-                uid: Some(1000),
-                pid: Some(4242),
-                exe_path: Some("/usr/bin/curl".into()),
                 cmdline: Some("curl https://example.org".into()),
-                parent_exe: None,
                 domain: Some("example.org".into()),
-                iface: None,
-                app_id: None,
-                first_seen: None,
+                ..crate::testutil::conn(Some("/usr/bin/curl"), "93.184.216.34:443")
             },
             deadline_ms: 1_700_000_030_000,
             context: PromptContext {

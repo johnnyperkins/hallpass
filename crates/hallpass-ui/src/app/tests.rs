@@ -9,7 +9,7 @@
 
 use std::time::Duration;
 
-use hallpass_types::{Action, DaemonMsg, FlowTuple, PromptScope, Proto, RuleDuration, RuleMatch};
+use hallpass_types::{Action, DaemonMsg, PromptScope, RuleDuration, RuleMatch};
 
 use super::*;
 
@@ -73,22 +73,7 @@ pub(super) fn drain(
 }
 
 pub(super) fn conn(exe: &str, dst: &str) -> Connection {
-    Connection {
-        tuple: FlowTuple {
-            proto: Proto::Tcp,
-            src: "10.0.0.1:40000".parse().expect("source address"),
-            dst: dst.parse().expect("destination address"),
-        },
-        uid: Some(1000),
-        pid: Some(4242),
-        exe_path: Some(std::path::PathBuf::from(exe)),
-        cmdline: None,
-        parent_exe: None,
-        domain: None,
-        iface: None,
-        app_id: None,
-        first_seen: None,
-    }
+    crate::testutil::conn(Some(exe), dst)
 }
 
 fn event(exe: &str, dst: &str, unix_ms: u64) -> ConnEvent {

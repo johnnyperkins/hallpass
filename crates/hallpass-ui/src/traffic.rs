@@ -275,26 +275,13 @@ pub fn matches_filter(ev: &ConnEvent, needle: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hallpass_types::{Connection, FlowTuple, Proto};
-    use std::path::PathBuf;
+    use hallpass_types::Connection;
 
     fn ev(exe: &str, dst: &str, verdict: Verdict, enforced: bool) -> ConnEvent {
         ConnEvent {
             conn: Connection {
-                tuple: FlowTuple {
-                    proto: Proto::Tcp,
-                    src: "10.0.0.1:40000".parse().unwrap(),
-                    dst: dst.parse().unwrap(),
-                },
-                uid: Some(1000),
                 pid: Some(1),
-                exe_path: Some(PathBuf::from(exe)),
-                cmdline: None,
-                parent_exe: None,
-                domain: None,
-                iface: None,
-                app_id: None,
-                first_seen: None,
+                ..crate::testutil::conn(Some(exe), dst)
             },
             verdict,
             rule_name: None,

@@ -361,29 +361,12 @@ impl Router {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hallpass_types::{
-        Connection, FlowTuple, PromptContext, PromptScope, Proto, RuleDuration, Verdict,
-    };
+    use hallpass_types::{PromptContext, PromptScope, RuleDuration, Verdict};
 
     fn prompt(id: u64, exe: Option<&str>) -> Prompt {
         Prompt {
             id,
-            conn: Connection {
-                tuple: FlowTuple {
-                    proto: Proto::Tcp,
-                    src: "10.0.0.2:50000".parse().unwrap(),
-                    dst: format!("1.1.1.{id}:443").parse().unwrap(),
-                },
-                uid: Some(1000),
-                pid: Some(4242),
-                exe_path: exe.map(PathBuf::from),
-                cmdline: None,
-                parent_exe: None,
-                domain: None,
-                iface: None,
-                app_id: None,
-                first_seen: None,
-            },
+            conn: crate::testutil::conn(exe, &format!("1.1.1.{id}:443")),
             deadline_ms: u64::MAX,
             context: PromptContext::default(),
         }

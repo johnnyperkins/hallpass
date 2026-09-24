@@ -312,7 +312,6 @@ pub fn spawn(rx: Receiver<NotifyEvent>) -> std::thread::JoinHandle<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hallpass_types::{FlowTuple, Proto};
 
     #[derive(Debug, PartialEq)]
     enum Call {
@@ -344,20 +343,9 @@ mod tests {
 
     fn conn(exe: Option<&str>, domain: Option<&str>) -> Connection {
         Connection {
-            tuple: FlowTuple {
-                proto: Proto::Tcp,
-                src: "10.0.0.1:40000".parse().unwrap(),
-                dst: "93.184.216.34:443".parse().unwrap(),
-            },
-            uid: Some(1000),
             pid: Some(1),
-            exe_path: exe.map(PathBuf::from),
-            cmdline: None,
-            parent_exe: None,
             domain: domain.map(String::from),
-            iface: None,
-            app_id: None,
-            first_seen: None,
+            ..crate::testutil::conn(exe, "93.184.216.34:443")
         }
     }
 

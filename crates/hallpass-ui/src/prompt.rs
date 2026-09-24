@@ -245,26 +245,12 @@ pub fn truncate(s: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hallpass_types::{FlowTuple, Proto};
-    use std::net::SocketAddr;
-    use std::path::PathBuf;
 
     fn conn(domain: Option<&str>, exe: Option<&str>) -> Connection {
         Connection {
-            tuple: FlowTuple {
-                proto: Proto::Tcp,
-                src: "10.0.0.2:50000".parse::<SocketAddr>().unwrap(),
-                dst: "93.184.216.34:443".parse::<SocketAddr>().unwrap(),
-            },
-            uid: Some(1000),
-            pid: Some(4242),
-            exe_path: exe.map(PathBuf::from),
             cmdline: Some("curl https://example.org".into()),
-            parent_exe: None,
             domain: domain.map(String::from),
-            iface: None,
-            app_id: None,
-            first_seen: None,
+            ..crate::testutil::conn(exe, "93.184.216.34:443")
         }
     }
 

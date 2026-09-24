@@ -22,6 +22,8 @@ mod prompt;
 mod prompt_view;
 mod prompt_window;
 mod router;
+#[cfg(test)]
+mod testutil;
 mod theme;
 mod traffic;
 mod tray;

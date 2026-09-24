@@ -639,20 +639,9 @@ mod tests {
 
     fn conn(exe: Option<&str>, domain: Option<&str>) -> Connection {
         Connection {
-            tuple: hallpass_types::FlowTuple {
-                proto: Proto::Tcp,
-                src: "10.0.0.1:40000".parse().unwrap(),
-                dst: "93.184.216.34:443".parse().unwrap(),
-            },
-            uid: Some(1000),
             pid: Some(1),
-            exe_path: exe.map(std::path::PathBuf::from),
-            cmdline: None,
-            parent_exe: None,
             domain: domain.map(String::from),
-            iface: None,
-            app_id: None,
-            first_seen: None,
+            ..crate::testutil::conn(exe, "93.184.216.34:443")
         }
     }
 

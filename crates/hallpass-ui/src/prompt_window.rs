@@ -236,12 +236,12 @@ pub fn viewport() -> egui::ViewportBuilder {
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
-    use std::path::PathBuf;
+
     use std::rc::Rc;
 
     use egui_kittest::kittest::Queryable as _;
     use egui_kittest::Harness;
-    use hallpass_types::{Connection, FlowTuple, PromptContext, Proto, Verdict};
+    use hallpass_types::{PromptContext, Verdict};
 
     use super::*;
     use crate::link::Prompt;
@@ -251,22 +251,7 @@ mod tests {
     fn show(id: u64) -> ToWindow {
         ToWindow::Show(Box::new(Prompt {
             id,
-            conn: Connection {
-                tuple: FlowTuple {
-                    proto: Proto::Tcp,
-                    src: "10.0.0.2:50000".parse().unwrap(),
-                    dst: format!("1.1.1.{id}:443").parse().unwrap(),
-                },
-                uid: Some(1000),
-                pid: Some(4242),
-                exe_path: Some(PathBuf::from(EXE)),
-                cmdline: None,
-                parent_exe: None,
-                domain: None,
-                iface: None,
-                app_id: None,
-                first_seen: None,
-            },
+            conn: crate::testutil::conn(Some(EXE), &format!("1.1.1.{id}:443")),
             // Real deadlines: the window drops what the daemon has already
             // timed out, and it reads the clock to do it.
             deadline_ms: hallpass_types::unix_ms_now() + 30_000,
