@@ -22,6 +22,9 @@ use crate::theme::{self, Tone, ALLOW_COLOR, DENY_COLOR, MUTED, REJECT_COLOR, TEX
 /// of the window, an unanswerable prompt an adversary can construct.
 /// The panel is laid out first so the actions own their space no matter
 /// how much the body wants, and the body scrolls inside what is left.
+///
+/// Returns this pass's answer, if a button gave one.
+#[must_use = "a dropped answer is a click that never reaches the daemon"]
 pub(crate) fn prompt_ui(
     ui: &mut egui::Ui,
     p: &mut PromptState,
@@ -382,7 +385,10 @@ fn prompt_actions_ui(ui: &mut egui::Ui, p: &mut PromptState, now_ms: u64) -> Opt
             )
             .clicked()
         {
-            answer = Some(p.reply(Verdict::Allow));
+            // Never over a Deny from the same pass: both can fire at once (an
+            // assistive-technology client clicks any node it names), and the
+            // answer that stands has to be the recoverable one.
+            answer.get_or_insert_with(|| p.reply(Verdict::Allow));
         }
         if !armed {
             // For the moment it arms, not a full arm period from now: a
@@ -727,6 +733,31 @@ mod tests {
                 "{label} answered with the wrong verdict"
             );
         }
+    }
+
+    /// Both buttons fired in one pass answer Deny. A pointer cannot do it,
+    /// but an assistive-technology client can click any node it names, as
+    /// many as it likes per frame.
+    #[test]
+    fn deny_stands_when_both_buttons_fire_in_one_pass() {
+        let mut harness = prompt_harness();
+        for label in ["Deny", "Allow"] {
+            let (target_node, target_tree) = harness.get_by_label(label).accesskit_node().locate();
+            harness
+                .input_mut()
+                .events
+                .push(egui::Event::AccessKitActionRequest(
+                    egui::accesskit::ActionRequest {
+                        target_node,
+                        target_tree,
+                        action: egui::accesskit::Action::Click,
+                        data: None,
+                    },
+                ));
+        }
+        harness.step();
+        let expected = harness.state().prompt.reply(Verdict::Deny);
+        assert_eq!(harness.state().answered, vec![expected]);
     }
 
     /// A prompt that has only just come to the front does not take an Allow:
