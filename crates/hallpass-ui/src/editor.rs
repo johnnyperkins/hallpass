@@ -639,7 +639,6 @@ mod tests {
 
     fn conn(exe: Option<&str>, domain: Option<&str>) -> Connection {
         Connection {
-            pid: Some(1),
             domain: domain.map(String::from),
             ..crate::testutil::conn(exe, "93.184.216.34:443")
         }

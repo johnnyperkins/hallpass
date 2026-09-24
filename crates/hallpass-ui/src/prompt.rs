@@ -248,7 +248,6 @@ mod tests {
 
     fn conn(domain: Option<&str>, exe: Option<&str>) -> Connection {
         Connection {
-            cmdline: Some("curl https://example.org".into()),
             domain: domain.map(String::from),
             ..crate::testutil::conn(exe, "93.184.216.34:443")
         }

@@ -275,14 +275,10 @@ pub fn matches_filter(ev: &ConnEvent, needle: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hallpass_types::Connection;
 
     fn ev(exe: &str, dst: &str, verdict: Verdict, enforced: bool) -> ConnEvent {
         ConnEvent {
-            conn: Connection {
-                pid: Some(1),
-                ..crate::testutil::conn(Some(exe), dst)
-            },
+            conn: crate::testutil::conn(Some(exe), dst),
             verdict,
             rule_name: None,
             unix_ms: 1_720_000_000_000,

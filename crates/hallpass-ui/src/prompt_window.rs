@@ -236,7 +236,6 @@ pub fn viewport() -> egui::ViewportBuilder {
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
-
     use std::rc::Rc;
 
     use egui_kittest::kittest::Queryable as _;

@@ -468,9 +468,8 @@ impl HallpassApp {
                             editor.ack_lost("connection lost; the rule was not saved");
                         }
                     }
-                    // The message is gone; for a prompt reply the daemon
-                    // falls back to its default verdict, so tell the user
-                    // instead of failing silently.
+                    // The message is gone; tell the user instead of failing
+                    // silently.
                     let what = match &msg {
                         ClientMsg::RuleAdd(_) => "a rule change".to_string(),
                         ClientMsg::RuleDelete { .. } => "a rule deletion".to_string(),
@@ -679,7 +678,7 @@ impl HallpassApp {
     fn tray_state(&self) -> TrayState {
         TrayState::claim(
             self.mode_is_known(),
-            self.lockdown_banner().is_some(),
+            self.stats.as_ref().is_some_and(|s| s.lockdown.is_some()),
             self.enforcing,
         )
     }
