@@ -175,6 +175,18 @@ the entire surface `hallpass-cli` and `hallpass-ui` are written against, so
 both can be developed and driven end to end without root. The task prints the
 socket path and the commands to point a client at it.
 
+It raises no prompts, though, since nothing is judged. For the prompt agent
+and its windows there is a stand-in daemon that does:
+
+```sh
+cargo run -p hallpass-ui --example demo_daemon    # prints its socket
+cargo run -p hallpass-ui -- agent --socket <that socket>
+```
+
+It raises a batch of prompts from three applications when the agent claims
+the slot, and prints every answer. The agent is one per user, so quit an
+installed one first.
+
 ## Commits
 
 Small, conventional commits (`fix(dns,prompt): ...`, `harden(ipc): ...`,
