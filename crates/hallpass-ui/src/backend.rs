@@ -42,8 +42,19 @@ fn env_set(name: &str) -> bool {
 }
 
 /// [`choose`] for this process's environment, warning when it lands on X11.
+///
+/// On Wayland it also drops `DISPLAY` from this process's environment, so
+/// nothing in it connects to the X server after all: egui's clipboard opened
+/// an Xwayland connection from every window whenever `DISPLAY` was set
+/// (seen live 2026-09-24), and the prompt windows and management window this
+/// process starts inherit the environment. Callers run it before starting
+/// any thread: changing the environment while another thread reads it is
+/// undefined behaviour in libc.
 pub fn from_env() -> Result<Backend, &'static str> {
     let backend = choose(env_set("WAYLAND_DISPLAY"), env_set("DISPLAY"))?;
+    if backend == Backend::Wayland {
+        std::env::remove_var("DISPLAY");
+    }
     if backend == Backend::X11 {
         tracing::warn!(
             "X11 session: any X client can send input to hallpass windows, \
