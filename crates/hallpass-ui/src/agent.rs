@@ -42,6 +42,63 @@ const TICK: Duration = Duration::from_millis(500);
 /// good, and one that does not read would pin its writer thread.
 const WINDOW_GRACE: Duration = Duration::from_secs(2);
 
+/// First wait after the daemon refuses the agent's claim on the prompt
+/// slot, doubling to [`CLAIM_BACKOFF_MAX`] while it keeps refusing.
+const CLAIM_BACKOFF_MIN: Duration = Duration::from_secs(3);
+const CLAIM_BACKOFF_MAX: Duration = Duration::from_secs(60);
+
+/// The agent's side of the daemon's Ok/Err stream: which request each
+/// answer is for, and when a refused slot claim may be tried again.
+///
+/// The agent sends two acked requests, slot claims and prompt replies, and
+/// answers come back in order. Without telling them apart, a refused claim
+/// (another client holds the slot, or this agent is pointed at the
+/// read-only socket) was retried on every stats reply that showed the slot
+/// empty, logging a refusal every few seconds for as long as it ran.
+#[derive(Debug, Default)]
+struct Claims {
+    /// One entry per request awaiting its Ok/Err, oldest first: true for a
+    /// slot claim, false for a prompt reply.
+    acks: VecDeque<bool>,
+    /// No claim prompted by a stats reply before this.
+    retry_after: Option<Instant>,
+    backoff: Duration,
+}
+
+impl Claims {
+    fn sent(&mut self, claim: bool) {
+        self.acks.push_back(claim);
+    }
+
+    /// Match an Ok/Err to its request. Returns whether it answered a claim.
+    fn answered(&mut self, ok: bool, now: Instant) -> bool {
+        let claim = self.acks.pop_front().unwrap_or(false);
+        if claim {
+            if ok {
+                self.retry_after = None;
+                self.backoff = Duration::ZERO;
+            } else {
+                self.backoff = (self.backoff * 2).clamp(CLAIM_BACKOFF_MIN, CLAIM_BACKOFF_MAX);
+                self.retry_after = Some(now + self.backoff);
+            }
+        }
+        claim
+    }
+
+    /// Whether a stats reply showing the slot empty should prompt a claim:
+    /// not while one is already on its way (the daemon would refuse the
+    /// second as taken, by this agent), and not inside the backoff.
+    fn may_claim(&self, now: Instant) -> bool {
+        !self.acks.contains(&true) && self.retry_after.is_none_or(|at| now >= at)
+    }
+
+    /// The connection is gone and every answer with it; a new daemon starts
+    /// with a clean slate.
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
 /// What wakes the agent.
 enum Input {
     /// The daemon link or the tray has something on its channel.
@@ -109,6 +166,7 @@ struct Agent {
     socket: PathBuf,
     /// The management window this agent started, if it is still open.
     manager: Option<Manager>,
+    claims: Claims,
 }
 
 /// A management window this agent started, and the link that raises it.
@@ -156,6 +214,7 @@ pub fn run(socket: PathBuf) -> i32 {
         stats_asked: None,
         socket,
         manager: None,
+        claims: Claims::default(),
     };
     agent.serve(&from_inputs);
 
@@ -261,10 +320,12 @@ impl Agent {
                 UiEvent::Connected => {
                     self.host.connected();
                     self.stats_asked = None;
+                    self.claims.reset();
                     self.claim_slot();
                 }
                 UiEvent::Disconnected { .. } => {
                     self.host.disconnected();
+                    self.claims.reset();
                     let effects = self.router.disconnected();
                     self.apply(effects);
                 }
@@ -302,7 +363,7 @@ impl Agent {
                 // it took the slot back was lost (it is best effort). Claim
                 // it now that it is free, rather than leave every
                 // connection to the default for as long as the agent runs.
-                if !stats.prompt_handler_connected {
+                if !stats.prompt_handler_connected && self.claims.may_claim(Instant::now()) {
                     self.claim_slot();
                 }
                 self.host.stats = Some(stats);
@@ -315,8 +376,19 @@ impl Agent {
                 self.claim_slot();
                 Vec::new()
             }
+            DaemonMsg::Ok => {
+                self.claims.answered(true, Instant::now());
+                Vec::new()
+            }
             DaemonMsg::Err { message } => {
-                tracing::warn!("daemon refused a request: {message}");
+                if self.claims.answered(false, Instant::now()) {
+                    tracing::warn!(
+                        retry_in = ?self.claims.backoff,
+                        "daemon refused the prompt slot: {message}"
+                    );
+                } else {
+                    tracing::warn!("daemon refused a prompt answer: {message}");
+                }
                 Vec::new()
             }
             _ => Vec::new(),
@@ -326,11 +398,17 @@ impl Agent {
 
     /// Ask for the prompt slot. The slot only: the agent shows no event
     /// feed.
-    fn claim_slot(&self) {
-        let _ = self.to_daemon.send(ClientMsg::Subscribe {
-            events: false,
-            prompts: true,
-        });
+    fn claim_slot(&mut self) {
+        if self
+            .to_daemon
+            .send(ClientMsg::Subscribe {
+                events: false,
+                prompts: true,
+            })
+            .is_ok()
+        {
+            self.claims.sent(true);
+        }
     }
 
     /// Wind the agent down to the one part that must outlive it: the
@@ -421,7 +499,10 @@ impl Agent {
         while let Some(effect) = queue.pop_front() {
             match effect {
                 Effect::Daemon(msg) => {
-                    let _ = self.to_daemon.send(*msg);
+                    // Every daemon effect is a prompt reply, answered Ok/Err.
+                    if self.to_daemon.send(*msg).is_ok() {
+                        self.claims.sent(false);
+                    }
                 }
                 Effect::Spawn(w) => {
                     if let Err(e) = self.spawn_window(w) {
@@ -550,6 +631,54 @@ mod tests {
             enforcing,
             ..Default::default()
         }
+    }
+
+    /// A refused claim waits before the next, longer each time, and an
+    /// accepted one ends the wait; answers to prompt replies in between are
+    /// not mistaken for the claim's.
+    #[test]
+    fn a_refused_claim_backs_off_and_an_accepted_one_resets() {
+        let t0 = Instant::now();
+        let mut c = Claims::default();
+        assert!(c.may_claim(t0));
+
+        c.sent(true);
+        assert!(!c.may_claim(t0), "one claim at a time");
+        c.sent(false);
+        assert!(c.answered(false, t0), "the first answer is the claim's");
+        assert!(!c.answered(true, t0), "the second is the reply's");
+        assert!(!c.may_claim(t0 + CLAIM_BACKOFF_MIN - Duration::from_millis(1)));
+        assert!(c.may_claim(t0 + CLAIM_BACKOFF_MIN));
+
+        let t1 = t0 + CLAIM_BACKOFF_MIN;
+        c.sent(true);
+        c.answered(false, t1);
+        assert!(!c.may_claim(t1 + CLAIM_BACKOFF_MIN), "doubled");
+        assert!(c.may_claim(t1 + CLAIM_BACKOFF_MIN * 2));
+
+        for _ in 0..10 {
+            c.sent(true);
+            c.answered(false, t1);
+        }
+        assert_eq!(c.backoff, CLAIM_BACKOFF_MAX, "capped");
+
+        c.sent(true);
+        c.answered(true, t1);
+        assert!(c.may_claim(t1), "accepted: no wait");
+    }
+
+    /// A reconnect is a new daemon: the old one's refusals say nothing
+    /// about it, and its unanswered requests never will be.
+    #[test]
+    fn a_reconnect_forgets_refusals_and_pending_answers() {
+        let t0 = Instant::now();
+        let mut c = Claims::default();
+        c.sent(true);
+        c.answered(false, t0);
+        c.sent(true);
+        c.reset();
+        assert!(c.may_claim(t0));
+        assert!(!c.answered(false, t0), "nothing left to match");
     }
 
     #[test]
