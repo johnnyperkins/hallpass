@@ -47,6 +47,15 @@ const WINDOW_GRACE: Duration = Duration::from_secs(2);
 const CLAIM_BACKOFF_MIN: Duration = Duration::from_secs(3);
 const CLAIM_BACKOFF_MAX: Duration = Duration::from_secs(60);
 
+/// A request the daemon answers with Ok or Err.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ack {
+    /// A claim on the prompt slot.
+    Claim,
+    /// A prompt reply.
+    Reply,
+}
+
 /// The agent's side of the daemon's Ok/Err stream: which request each
 /// answer is for, and when a refused slot claim may be tried again.
 ///
@@ -57,22 +66,21 @@ const CLAIM_BACKOFF_MAX: Duration = Duration::from_secs(60);
 /// empty, logging a refusal every few seconds for as long as it ran.
 #[derive(Debug, Default)]
 struct Claims {
-    /// One entry per request awaiting its Ok/Err, oldest first: true for a
-    /// slot claim, false for a prompt reply.
-    acks: VecDeque<bool>,
+    /// One entry per request awaiting its Ok/Err, oldest first.
+    acks: VecDeque<Ack>,
     /// No claim prompted by a stats reply before this.
     retry_after: Option<Instant>,
     backoff: Duration,
 }
 
 impl Claims {
-    fn sent(&mut self, claim: bool) {
-        self.acks.push_back(claim);
+    fn sent(&mut self, ack: Ack) {
+        self.acks.push_back(ack);
     }
 
     /// Match an Ok/Err to its request. Returns whether it answered a claim.
     fn answered(&mut self, ok: bool, now: Instant) -> bool {
-        let claim = self.acks.pop_front().unwrap_or(false);
+        let claim = self.acks.pop_front() == Some(Ack::Claim);
         if claim {
             if ok {
                 self.retry_after = None;
@@ -85,11 +93,16 @@ impl Claims {
         claim
     }
 
+    /// Whether a claim is on its way. A second one would be refused as
+    /// taken, by this agent.
+    fn in_flight(&self) -> bool {
+        self.acks.contains(&Ack::Claim)
+    }
+
     /// Whether a stats reply showing the slot empty should prompt a claim:
-    /// not while one is already on its way (the daemon would refuse the
-    /// second as taken, by this agent), and not inside the backoff.
+    /// not while one is in flight, and not inside the backoff.
     fn may_claim(&self, now: Instant) -> bool {
-        !self.acks.contains(&true) && self.retry_after.is_none_or(|at| now >= at)
+        !self.in_flight() && self.retry_after.is_none_or(|at| now >= at)
     }
 
     /// The connection is gone and every answer with it; a new daemon starts
@@ -371,9 +384,14 @@ impl Agent {
             }
             // Taken back after prompts went unanswered. This agent is alive
             // and reading, so the operator was away, not the agent: claim it
-            // again rather than leave every connection to the default.
+            // again rather than leave every connection to the default. Once:
+            // the daemon writes replies ahead of this notice, so a stats
+            // reply showing the slot empty can overtake it and have claimed
+            // already.
             DaemonMsg::PromptHandlerRevoked => {
-                self.claim_slot();
+                if !self.claims.in_flight() {
+                    self.claim_slot();
+                }
                 Vec::new()
             }
             DaemonMsg::Ok => {
@@ -382,10 +400,20 @@ impl Agent {
             }
             DaemonMsg::Err { message } => {
                 if self.claims.answered(false, Instant::now()) {
-                    tracing::warn!(
-                        retry_in = ?self.claims.backoff,
-                        "daemon refused the prompt slot: {message}"
-                    );
+                    // Said once per run of refusals; the retries after it
+                    // (up to one a minute, forever on the read-only socket)
+                    // add nothing but lines.
+                    if self.claims.backoff == CLAIM_BACKOFF_MIN {
+                        tracing::warn!(
+                            "daemon refused the prompt slot: {message}; retrying \
+                             while it stays free"
+                        );
+                    } else {
+                        tracing::debug!(
+                            retry_in = ?self.claims.backoff,
+                            "daemon refused the prompt slot again: {message}"
+                        );
+                    }
                 } else {
                     tracing::warn!("daemon refused a prompt answer: {message}");
                 }
@@ -407,7 +435,7 @@ impl Agent {
             })
             .is_ok()
         {
-            self.claims.sent(true);
+            self.claims.sent(Ack::Claim);
         }
     }
 
@@ -499,9 +527,12 @@ impl Agent {
         while let Some(effect) = queue.pop_front() {
             match effect {
                 Effect::Daemon(msg) => {
-                    // Every daemon effect is a prompt reply, answered Ok/Err.
-                    if self.to_daemon.send(*msg).is_ok() {
-                        self.claims.sent(false);
+                    // Recorded by what it is, not assumed: anything else
+                    // taking a slot would pair every later answer with the
+                    // wrong request.
+                    let reply = matches!(*msg, ClientMsg::PromptReply { .. });
+                    if self.to_daemon.send(*msg).is_ok() && reply {
+                        self.claims.sent(Ack::Reply);
                     }
                 }
                 Effect::Spawn(w) => {
@@ -642,27 +673,27 @@ mod tests {
         let mut c = Claims::default();
         assert!(c.may_claim(t0));
 
-        c.sent(true);
+        c.sent(Ack::Claim);
         assert!(!c.may_claim(t0), "one claim at a time");
-        c.sent(false);
+        c.sent(Ack::Reply);
         assert!(c.answered(false, t0), "the first answer is the claim's");
         assert!(!c.answered(true, t0), "the second is the reply's");
         assert!(!c.may_claim(t0 + CLAIM_BACKOFF_MIN - Duration::from_millis(1)));
         assert!(c.may_claim(t0 + CLAIM_BACKOFF_MIN));
 
         let t1 = t0 + CLAIM_BACKOFF_MIN;
-        c.sent(true);
+        c.sent(Ack::Claim);
         c.answered(false, t1);
         assert!(!c.may_claim(t1 + CLAIM_BACKOFF_MIN), "doubled");
         assert!(c.may_claim(t1 + CLAIM_BACKOFF_MIN * 2));
 
         for _ in 0..10 {
-            c.sent(true);
+            c.sent(Ack::Claim);
             c.answered(false, t1);
         }
         assert_eq!(c.backoff, CLAIM_BACKOFF_MAX, "capped");
 
-        c.sent(true);
+        c.sent(Ack::Claim);
         c.answered(true, t1);
         assert!(c.may_claim(t1), "accepted: no wait");
     }
@@ -673,9 +704,9 @@ mod tests {
     fn a_reconnect_forgets_refusals_and_pending_answers() {
         let t0 = Instant::now();
         let mut c = Claims::default();
-        c.sent(true);
+        c.sent(Ack::Claim);
         c.answered(false, t0);
-        c.sent(true);
+        c.sent(Ack::Claim);
         c.reset();
         assert!(c.may_claim(t0));
         assert!(!c.answered(false, t0), "nothing left to match");

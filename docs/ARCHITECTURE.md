@@ -571,7 +571,9 @@ and on XWayland any X client could type into it.
 - **`hallpass-ui agent`** holds the prompt-handler slot, the tray and the
   notifications, and draws nothing. Everything it hears arrives on one
   channel and is handled on one thread. It reclaims the slot after
-  `PromptHandlerRevoked`, and whenever a stats reply says nobody holds it.
+  `PromptHandlerRevoked`, and whenever a stats reply says nobody holds it,
+  one claim at a time and backing off from 3s to 60s while the daemon
+  refuses them.
   A lock in `$XDG_RUNTIME_DIR` keeps it to one per user.
 - **`hallpass-ui prompt`** is one application's queue (executable plus app
   id; unattributed prompts are never grouped) in its own toplevel. It has no
