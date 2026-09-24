@@ -20,6 +20,9 @@ pub enum WireError {
     /// The frame payload exceeds [`MAX_FRAME_SIZE`].
     #[error("frame size {0} exceeds maximum of {MAX_FRAME_SIZE} bytes")]
     FrameTooLarge(usize),
+    /// The payload held a whole message and then more bytes.
+    #[error("{0} trailing byte(s) after the message")]
+    TrailingBytes(usize),
     /// Postcard serialization or deserialization failed.
     #[error("postcard codec error: {0}")]
     Codec(#[from] postcard::Error),
@@ -45,11 +48,20 @@ pub fn encode<T: Serialize>(msg: &T) -> Result<Vec<u8>> {
 }
 
 /// Decode a single frame payload (without the length prefix) into a message.
+///
+/// The payload must be exactly one message. `postcard::from_bytes` stops
+/// where the message ends and ignores the rest, so a frame carrying a valid
+/// message followed by junk would otherwise be accepted as that message:
+/// a frame is one message or it is malformed, never both.
 pub fn decode<T: DeserializeOwned>(payload: &[u8]) -> Result<T> {
     if payload.len() > MAX_FRAME_SIZE {
         return Err(WireError::FrameTooLarge(payload.len()));
     }
-    Ok(postcard::from_bytes(payload)?)
+    let (msg, rest) = postcard::take_from_bytes(payload)?;
+    if !rest.is_empty() {
+        return Err(WireError::TrailingBytes(rest.len()));
+    }
+    Ok(msg)
 }
 
 /// Read one length-prefixed message from an async reader.
@@ -697,11 +709,12 @@ mod tests {
     /// Postcard writes struct fields positionally and enum variants by
     /// index, with no names in the bytes, so a reordered variant or an added
     /// field is decoded as *something else* by a peer built before the
-    /// change rather than rejected. [`PROTOCOL_VERSION`] is what turns that
-    /// into the handshake's clean refusal, and until this test nothing made
-    /// forgetting the bump fail: the round trips above encode and decode
-    /// through the same layout, so they stay green through any change made
-    /// to both sides at once, which is every change.
+    /// change rather than rejected, or at best (a field appended last) fails
+    /// mid-session as trailing bytes. [`PROTOCOL_VERSION`] is what turns
+    /// either into the handshake's clean refusal, and until this test
+    /// nothing made forgetting the bump fail: the round trips above encode
+    /// and decode through the same layout, so they stay green through any
+    /// change made to both sides at once, which is every change.
     ///
     /// The byte comparison catches an added, removed or retyped field. The
     /// separate assertion that each message's first byte is its own position
@@ -925,6 +938,26 @@ mod tests {
         let mut cursor = std::io::Cursor::new(buf);
         let err = read_msg::<ClientMsg, _>(&mut cursor).await.unwrap_err();
         assert!(matches!(err, WireError::FrameTooLarge(_)));
+    }
+
+    /// A frame is one message: a valid one with anything after it is
+    /// malformed, not that message, and the stream it came on is broken.
+    #[tokio::test]
+    async fn a_frame_with_bytes_after_its_message_is_rejected() {
+        let mut payload = postcard::to_stdvec(&ClientMsg::RuleList).unwrap();
+        assert_eq!(decode::<ClientMsg>(&payload).unwrap(), ClientMsg::RuleList);
+        payload.push(0);
+        assert!(matches!(
+            decode::<ClientMsg>(&payload),
+            Err(WireError::TrailingBytes(1))
+        ));
+        let mut buf = (payload.len() as u32).to_le_bytes().to_vec();
+        buf.extend_from_slice(&payload);
+        let mut cursor = std::io::Cursor::new(buf);
+        assert!(matches!(
+            read_msg::<ClientMsg, _>(&mut cursor).await,
+            Err(WireError::TrailingBytes(1))
+        ));
     }
 
     #[test]

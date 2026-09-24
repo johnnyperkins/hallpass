@@ -601,9 +601,12 @@ non-empty, and X11 only when it is the only display.
 
 Clients speak postcard over a Unix socket, framed with a 4-byte
 little-endian length prefix. Frames over 1 MiB are refused on encode, on
-decode, and on read before anything is allocated. The first message on a
-connection must be `Hello`, and its version must equal `PROTOCOL_VERSION`
-exactly; anything else gets an error and the connection closes.
+decode, and on read before anything is allocated. A frame holds exactly one
+message: bytes left over after it make the frame malformed rather than being
+ignored. The first message on a connection must be `Hello`, and its version
+must equal `PROTOCOL_VERSION` exactly; anything else gets an error and the
+connection closes. `Hello`, `HelloAck` and `Err` are the frames builds of
+different versions must both decode, so their shapes never change.
 
 Two rules follow from postcard's encoding, and both used to be easy to
 violate without a test noticing.
@@ -616,12 +619,13 @@ are only ever appended, and any reorder or removal is a version bump.
 
 **Adding a struct field requires bumping `PROTOCOL_VERSION`.** Postcard
 encodes struct fields positionally, again with no names. An old peer decoding
-a new layout produces garbage rather than an error. This is why v2 exists
-(`RuleMatch::exe_sha256`) and why v3 exists (`ConnEvent::enforced` plus three
-`Stats` fields); the request/reply pairs added alongside v3 would not have
-needed a bump on their own, being appended variants. The current version is
-v16 (`Stats::verdict_queue_max_len`); every bump is documented at
-`PROTOCOL_VERSION` with what forced it.
+a new layout produces garbage rather than an error, or at best, for a field
+appended last, drops the connection mid-session over the trailing bytes. This
+is why v2 exists (`RuleMatch::exe_sha256`) and why v3 exists
+(`ConnEvent::enforced` plus three `Stats` fields); the request/reply pairs
+added alongside v3 would not have needed a bump on their own, being appended
+variants. The current version is v17 (`ClientMsg::PromptReply::pin_exe`); every
+bump is documented at `PROTOCOL_VERSION` with what forced it.
 
 **What now enforces both.** `client_wire_layout_is_frozen` and
 `daemon_wire_layout_is_frozen` hold one fixture per variant of each enum

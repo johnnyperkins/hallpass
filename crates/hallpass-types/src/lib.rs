@@ -111,10 +111,11 @@ use serde::{Deserialize, Serialize};
 ///
 /// v17: [`ClientMsg::PromptReply::pin_exe`], so an operator answering a
 /// prompt can pin the rule to the binary they approved rather than to the
-/// path it happened to sit at. A field added to an existing variant, which
-/// postcard writes positionally: an older daemon would read the new field's
-/// byte as the start of the next message, so the bump is what turns that into
-/// the handshake's refusal.
+/// path it happened to sit at. A field appended to an existing variant,
+/// which postcard writes positionally: a daemon built before it decoded the
+/// reply and ignored the new field's byte at the end of the frame, silently
+/// dropping the pin the operator asked for, so the bump is what turns that
+/// into the handshake's refusal.
 pub const PROTOCOL_VERSION: u32 = 17;
 
 /// Prefix reserved for the synthetic rule name a session grant reports.
@@ -1671,6 +1672,11 @@ pub enum PromptScope {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ClientMsg {
     /// Handshake; must be the first message on a connection.
+    ///
+    /// Frozen at variant 0 with this one field, for good: builds of
+    /// different versions must both decode it, and a frame is decoded
+    /// exactly, so a field appended here would make an older daemon drop the
+    /// connection instead of answering with the version mismatch.
     Hello {
         /// Client's protocol version; see [`PROTOCOL_VERSION`].
         version: u32,
@@ -1811,6 +1817,9 @@ pub enum ClientMsg {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DaemonMsg {
     /// Handshake acknowledgement.
+    ///
+    /// Frozen like [`ClientMsg::Hello`], and for the same reason, as is
+    /// [`DaemonMsg::Err`], which carries the mismatch refusal.
     HelloAck {
         /// Daemon's protocol version; see [`PROTOCOL_VERSION`].
         version: u32,
