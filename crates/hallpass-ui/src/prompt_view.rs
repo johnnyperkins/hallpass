@@ -27,8 +27,7 @@ pub(crate) fn prompt_ui(
     p: &mut PromptState,
     now_ms: u64,
     rest: &[String],
-    answered: &mut Vec<(u64, ClientMsg)>,
-) {
+) -> Option<ClientMsg> {
     theme::ensure_installed(ui.ctx());
     // First pass with this prompt in front: restart the visible countdown
     // from now. Its deadline is unchanged (see PromptState::fronted_ms), so
@@ -43,16 +42,15 @@ pub(crate) fn prompt_ui(
     // Salted by prompt id like the details grid: two apps prompting at
     // once means two of these windows live in one pass, and their panels
     // must not collide on one id.
-    egui::Panel::bottom(egui::Id::new(("prompt-actions", p.id)))
+    let answer = egui::Panel::bottom(egui::Id::new(("prompt-actions", p.id)))
         .frame(
             egui::Frame::new()
                 .fill(theme::SURFACE)
                 .inner_margin(egui::Margin::symmetric(10, 8)),
         )
         .show_separator_line(false)
-        .show(ui, |ui| {
-            prompt_actions_ui(ui, p, now_ms, answered);
-        });
+        .show(ui, |ui| prompt_actions_ui(ui, p, now_ms))
+        .inner;
     egui::CentralPanel::default()
         .frame(
             egui::Frame::new()
@@ -66,6 +64,7 @@ pub(crate) fn prompt_ui(
                     prompt_info_ui(ui, p, rest);
                 });
         });
+    answer
 }
 
 /// The scrolling half: everything the operator reads to decide.
@@ -270,12 +269,8 @@ fn prompt_tone(p: &PromptState) -> Tone {
 /// verdict buttons, and the countdown. The warning lives here rather than
 /// in the scrolling body because it must be on screen at the moment the
 /// scope it warns about is selected.
-fn prompt_actions_ui(
-    ui: &mut egui::Ui,
-    p: &mut PromptState,
-    now_ms: u64,
-    answered: &mut Vec<(u64, ClientMsg)>,
-) {
+fn prompt_actions_ui(ui: &mut egui::Ui, p: &mut PromptState, now_ms: u64) -> Option<ClientMsg> {
+    let mut answer = None;
     ui.horizontal(|ui| {
         ui.label(RichText::new("For").small().color(MUTED));
         for d in [
@@ -376,7 +371,7 @@ fn prompt_actions_ui(
             .add(theme::verdict_button("Deny", DENY_COLOR).min_size(egui::vec2(width, 32.0)))
             .clicked()
         {
-            answered.push((p.id, p.reply(Verdict::Deny)));
+            answer = Some(p.reply(Verdict::Deny));
         }
         // Disabled until armed; see `PromptState::allow_armed`.
         let armed = p.allow_armed(now_ms);
@@ -387,7 +382,7 @@ fn prompt_actions_ui(
             )
             .clicked()
         {
-            answered.push((p.id, p.reply(Verdict::Allow)));
+            answer = Some(p.reply(Verdict::Allow));
         }
         if !armed {
             // For the moment it arms, not a full arm period from now: a
@@ -408,6 +403,7 @@ fn prompt_actions_ui(
         frac,
         &format!("{}s until default verdict", p.remaining_secs(now_ms)),
     );
+    answer
 }
 
 fn duration_label(d: RuleDuration) -> &'static str {
@@ -474,7 +470,7 @@ mod tests {
     /// back out from behind the harness.
     struct PromptFixture {
         prompt: PromptState,
-        answered: Vec<(u64, ClientMsg)>,
+        answered: Vec<ClientMsg>,
     }
 
     /// Fixed rather than wall clock: the countdown is display-only here, and a
@@ -531,7 +527,9 @@ mod tests {
             .with_size(egui::vec2(440.0, 330.0))
             .build_ui_state(
                 |ui, state: &mut PromptFixture| {
-                    prompt_ui(ui, &mut state.prompt, NOW_MS, &[], &mut state.answered);
+                    state
+                        .answered
+                        .extend(prompt_ui(ui, &mut state.prompt, NOW_MS, &[]));
                 },
                 state,
             )
@@ -578,7 +576,9 @@ mod tests {
             .with_size(egui::vec2(440.0, 330.0))
             .build_ui_state(
                 move |ui, state: &mut PromptFixture| {
-                    prompt_ui(ui, &mut state.prompt, NOW_MS, &rest, &mut state.answered);
+                    state
+                        .answered
+                        .extend(prompt_ui(ui, &mut state.prompt, NOW_MS, &rest));
                 },
                 state,
             );
@@ -590,7 +590,7 @@ mod tests {
         let expected = harness.state().prompt.reply(Verdict::Deny);
         assert_eq!(
             harness.state().answered,
-            vec![(1, expected)],
+            vec![expected],
             "Deny was not clickable under worst-case content"
         );
     }
@@ -623,7 +623,9 @@ mod tests {
             .with_size(egui::vec2(440.0, 330.0))
             .build_ui_state(
                 |ui, state: &mut PromptFixture| {
-                    prompt_ui(ui, &mut state.prompt, NOW_MS, &[], &mut state.answered);
+                    state
+                        .answered
+                        .extend(prompt_ui(ui, &mut state.prompt, NOW_MS, &[]));
                 },
                 fixture,
             );
@@ -736,7 +738,7 @@ mod tests {
             let expected = harness.state().prompt.reply(verdict);
             assert_eq!(
                 harness.state().answered,
-                vec![(1, expected)],
+                vec![expected],
                 "{label} answered with the wrong verdict"
             );
         }

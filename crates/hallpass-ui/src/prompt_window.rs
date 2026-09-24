@@ -123,13 +123,11 @@ impl PromptWindow {
                 .iter()
                 .map(|p| format!("{} {}", p.conn.tuple.proto, prompt::format_dest(&p.conn)))
                 .collect();
-            let mut answered = Vec::new();
-            prompt_ui(ui, &mut self.prompts[0], now_ms, &rest, &mut answered);
-            for (id, reply) in answered {
-                self.prompts.retain(|p| p.id != id);
-                if let Some(answer) = FromWindow::answer(reply) {
-                    self.send(&answer);
-                }
+            // An answer is always the front prompt's: it is the only one drawn.
+            let answer = prompt_ui(ui, &mut self.prompts[0], now_ms, &rest);
+            if let Some(answer) = answer.and_then(FromWindow::answer) {
+                self.prompts.remove(0);
+                self.send(&answer);
             }
         }
 
