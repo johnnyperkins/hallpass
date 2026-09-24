@@ -5,9 +5,10 @@
 //! scratch socket and answers just enough for the agent and the management
 //! window: the handshake, the prompt slot, stats, config and empty lists.
 //! Every `--every` seconds (default 20) it raises a batch of prompts: three
-//! from one program, one from a packaged app, one unattributed. Answers are
-//! printed; a prompt nobody answers expires on its deadline like the real
-//! one.
+//! from one program, one from a packaged app, one unattributed. A connection
+//! still pending is not raised again, as the daemon coalesces a repeat into
+//! the prompt already on screen. Answers are printed; a prompt nobody
+//! answers expires on its deadline like the real one.
 //!
 //! ```text
 //! cargo run -p hallpass-ui --example demo_daemon -- [--socket PATH] [--every SECS]
@@ -18,7 +19,8 @@
 //! quit that one from its tray first.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -43,12 +45,24 @@ struct State {
     next_id: u64,
 }
 
+impl State {
+    /// Whether a handler holds the slot and can still be written to. One
+    /// whose writer died keeps its entry until its reader notices; it holds
+    /// nothing, as the daemon counts it.
+    fn has_handler(&self) -> bool {
+        self.handler.as_ref().is_some_and(|h| !h.is_closed())
+    }
+}
+
 type Shared = Arc<Mutex<State>>;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     let mut args = std::env::args().skip(1);
+    // Empty counts as unset, as it does for the dev daemon's scratch dir:
+    // joined, it makes a relative path that works from this directory only.
     let mut socket = std::env::var_os("XDG_RUNTIME_DIR")
+        .filter(|dir| !dir.is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir)
         .join("hallpass-demo.sock");
@@ -65,7 +79,7 @@ async fn main() {
             other => panic!("unknown argument: {other}"),
         }
     }
-    let _ = std::fs::remove_file(&socket);
+    clear_stale(&socket);
     let listener = UnixListener::bind(&socket).expect("binding the demo socket");
     println!("demo daemon on {}", socket.display());
     println!(
@@ -88,13 +102,39 @@ async fn main() {
     }
 }
 
+/// Remove a socket an earlier run left behind, and nothing else: a file
+/// that is not a socket, or a socket something still answers on (another
+/// demo, or a real daemon's when `--socket` names it), is refused rather
+/// than unlinked from under its owner.
+fn clear_stale(socket: &Path) {
+    use std::os::unix::fs::FileTypeExt as _;
+    let Ok(meta) = std::fs::symlink_metadata(socket) else {
+        return;
+    };
+    assert!(
+        meta.file_type().is_socket(),
+        "{} exists and is not a socket",
+        socket.display()
+    );
+    match std::os::unix::net::UnixStream::connect(socket) {
+        Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
+            std::fs::remove_file(socket).expect("removing the stale demo socket");
+        }
+        Ok(_) => panic!("something already listens on {}", socket.display()),
+        Err(e) => panic!("{}: {e}", socket.display()),
+    }
+}
+
 /// Raise a batch as soon as a handler holds the slot, then every `every`
 /// while one does.
 async fn raise_batches(state: Shared, every: Duration) {
     let mut last: Option<std::time::Instant> = None;
     loop {
-        let has_handler = state.lock().unwrap().handler.is_some();
-        if has_handler && last.is_none_or(|t| t.elapsed() >= every) {
+        let has_handler = state.lock().unwrap().has_handler();
+        if !has_handler {
+            // The next handler to claim the slot gets its batch at once.
+            last = None;
+        } else if last.is_none_or(|t| t.elapsed() >= every) {
             last = Some(std::time::Instant::now());
             let batch = [
                 (Some("/usr/bin/curl"), None, "93.184.216.34:443", false),
@@ -117,7 +157,20 @@ async fn raise_batches(state: Shared, every: Duration) {
 }
 
 fn raise(state: &Shared, exe: Option<&str>, app_id: Option<&str>, dst: &str, new: bool) {
+    let exe_path = exe.map(PathBuf::from);
+    let app_id = app_id.map(String::from);
+    let dst: SocketAddr = dst.parse().unwrap();
     let mut st = state.lock().unwrap();
+    // The daemon keys a prompt on the program and the destination, and a
+    // repeat joins the one pending rather than raising a second: two
+    // identical prompts on screen is a state the GUI never meets.
+    let already = st.pending.values().any(|msg| {
+        matches!(msg, DaemonMsg::PromptRequest { conn, .. }
+            if conn.exe_path == exe_path && conn.app_id == app_id && conn.tuple.dst == dst)
+    });
+    if already {
+        return;
+    }
     st.next_id += 1;
     let id = st.next_id;
     let deadline_ms = hallpass_types::unix_ms_now() + TIMEOUT.as_millis() as u64;
@@ -127,16 +180,16 @@ fn raise(state: &Shared, exe: Option<&str>, app_id: Option<&str>, dst: &str, new
             tuple: FlowTuple {
                 proto: Proto::Tcp,
                 src: "10.0.0.2:50000".parse().unwrap(),
-                dst: dst.parse().unwrap(),
+                dst,
             },
             uid: Some(1000),
             pid: Some(4000 + id as u32),
-            exe_path: exe.map(PathBuf::from),
+            exe_path,
             cmdline: exe.map(|e| format!("{e} --demo")),
             parent_exe: None,
             domain: None,
             iface: None,
-            app_id: app_id.map(String::from),
+            app_id,
             first_seen: new.then_some(FirstSeen {
                 app: true,
                 dest: true,
@@ -197,21 +250,19 @@ fn handle(
             version: PROTOCOL_VERSION,
         },
         ClientMsg::Subscribe { prompts: false, .. } => DaemonMsg::Ok,
-        ClientMsg::Subscribe { prompts: true, .. } => match &st.handler {
-            Some(h) if !h.is_closed() => DaemonMsg::Err {
-                message: "a prompt handler is already connected".into(),
-            },
-            _ => {
-                println!("prompt handler connected");
-                // The Ok first, then the re-delivery, as the daemon orders it.
-                let _ = tx.send(DaemonMsg::Ok);
-                for msg in st.pending.values() {
-                    let _ = tx.send(msg.clone());
-                }
-                st.handler = Some(tx.clone());
-                return None;
-            }
+        ClientMsg::Subscribe { prompts: true, .. } if st.has_handler() => DaemonMsg::Err {
+            message: "a prompt handler is already connected".into(),
         },
+        ClientMsg::Subscribe { prompts: true, .. } => {
+            println!("prompt handler connected");
+            // The Ok first, then the re-delivery, as the daemon orders it.
+            let _ = tx.send(DaemonMsg::Ok);
+            for msg in st.pending.values() {
+                let _ = tx.send(msg.clone());
+            }
+            st.handler = Some(tx.clone());
+            return None;
+        }
         ClientMsg::PromptReply {
             id,
             verdict,
@@ -230,7 +281,7 @@ fn handle(
         }
         ClientMsg::Stats => DaemonMsg::Stats(Stats {
             enforcing: true,
-            prompt_handler_connected: st.handler.as_ref().is_some_and(|h| !h.is_closed()),
+            prompt_handler_connected: st.has_handler(),
             ..Stats::default()
         }),
         ClientMsg::ConfigGet => DaemonMsg::Config(RuntimeConfig {
