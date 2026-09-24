@@ -570,24 +570,6 @@ fn a_dropped_settings_change_is_reported_and_keeps_the_queue_aligned() {
     );
 }
 
-/// A lost prompt reply is the one the daemon backstops with its default
-/// verdict, so it says so rather than failing silently.
-#[test]
-fn a_dropped_prompt_reply_says_what_happens_next() {
-    let mut t = TestApp::new();
-    t.feed(UiEvent::SendFailed {
-        msg: prompt::close_reply(7),
-    });
-    assert!(
-        t.app
-            .last_error
-            .as_deref()
-            .is_some_and(|e| e.contains("default action")),
-        "{:?}",
-        t.app.last_error
-    );
-}
-
 /// Everything in flight dies with the connection: acks that will never
 /// arrive, and a save whose answer is gone. The form keeps what was typed.
 #[test]

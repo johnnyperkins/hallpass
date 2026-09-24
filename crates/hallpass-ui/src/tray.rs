@@ -60,6 +60,23 @@ impl TrayState {
         }
     }
 
+    /// What may be claimed about a host, from what its daemon has said.
+    ///
+    /// The one rule both the tray and the management window's mark follow,
+    /// so they cannot make different claims about one host: nothing unless
+    /// the daemon on the current connection has answered (`known`), and a
+    /// lockdown posture outranks the stored mode, since a locked-down host
+    /// with a stored observe mode is locked down, not blocking nothing.
+    pub fn claim(known: bool, lockdown: bool, enforcing: Option<bool>) -> TrayState {
+        match (known, lockdown, enforcing) {
+            (false, _, _) => TrayState::Unknown,
+            (true, true, _) => TrayState::Lockdown,
+            (true, false, Some(true)) => TrayState::Enforcing,
+            (true, false, Some(false)) => TrayState::Observing,
+            (true, false, None) => TrayState::Unknown,
+        }
+    }
+
     /// The one-line statement behind the icon. Shared with the window's
     /// own status mark, so the two cannot describe one host differently.
     pub fn summary(self) -> &'static str {

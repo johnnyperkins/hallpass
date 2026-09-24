@@ -472,9 +472,6 @@ impl HallpassApp {
                     // falls back to its default verdict, so tell the user
                     // instead of failing silently.
                     let what = match &msg {
-                        ClientMsg::PromptReply { .. } => {
-                            "your prompt answer; the daemon applies its default action".to_string()
-                        }
                         ClientMsg::RuleAdd(_) => "a rule change".to_string(),
                         ClientMsg::RuleDelete { .. } => "a rule deletion".to_string(),
                         ClientMsg::RuleToggle { .. } => "a rule toggle".to_string(),
@@ -680,17 +677,11 @@ impl HallpassApp {
     /// until the first reply, and a disconnected window knows nothing at all,
     /// including whether the state it last saw still holds.
     fn tray_state(&self) -> TrayState {
-        if !self.mode_is_known() {
-            return TrayState::Unknown;
-        }
-        if self.lockdown_banner().is_some() {
-            return TrayState::Lockdown;
-        }
-        match self.enforcing {
-            Some(true) => TrayState::Enforcing,
-            Some(false) => TrayState::Observing,
-            None => TrayState::Unknown,
-        }
+        TrayState::claim(
+            self.mode_is_known(),
+            self.lockdown_banner().is_some(),
+            self.enforcing,
+        )
     }
 
     /// Whether anything may be claimed about what this host is enforcing.

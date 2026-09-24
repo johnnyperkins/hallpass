@@ -144,12 +144,12 @@ impl HostState {
     }
 
     fn tray_state(&self) -> TrayState {
-        match (&self.stats, self.connected) {
-            (Some(stats), true) if stats.lockdown.is_some() => TrayState::Lockdown,
-            (Some(stats), true) if stats.enforcing => TrayState::Enforcing,
-            (Some(_), true) => TrayState::Observing,
-            _ => TrayState::Unknown,
-        }
+        let stats = self.stats.as_ref().filter(|_| self.connected);
+        TrayState::claim(
+            stats.is_some(),
+            stats.is_some_and(|s| s.lockdown.is_some()),
+            stats.map(|s| s.enforcing),
+        )
     }
 }
 
