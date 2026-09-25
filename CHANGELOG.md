@@ -1,630 +1,214 @@
 # Changelog
 
-Operator-facing changes. Commit bodies carry the full reasoning; this file
-carries what an upgrade changes on a running host.
+What an upgrade changes on a running host; commit bodies carry the reasoning.
 
 ## Unreleased
 
+The wire protocol is now v17. Daemon, CLI and UI must be upgraded and
+restarted together; a version mismatch is refused at connect.
+
 ### Added
 
-- **A read-only socket, so watching the firewall no longer means being
-  trusted to turn it off.** The daemon serves `/run/hallpass/observe.sock`
-  alongside the control socket, `0660 root:hallpass-observer`, speaking the
-  same protocol and giving the same answers. It serves stats, the event stream
-  and history, the rule list and hit counts, `explain`, and the config and
-  lockdown state; it refuses rule edits, `config set`, lockdown changes,
-  prompt replies, session grants and the prompt-handler slot, with an error
-  naming what was refused. Point a client at it with `hallpass-cli --socket
-  /run/hallpass/observe.sock`.
-
-  Read-only is not the same as harmless: the event stream describes every
-  process on this host, root's included, with the executable path, command
-  line, uid and destination. A member of the group can watch what every other
-  user is running and talking to. Worth knowing before adding an account.
-
-  **Upgrade notes.** `install.sh` creates the `hallpass-observer` group and
-  adds nobody to it; add a monitoring account with `sudo usermod -aG
-  hallpass-observer <user>`. `/run/hallpass` moves from mode 0750 to 0751, and
-  the shipped unit's `RuntimeDirectoryMode` with it, so an observer who is not
-  in `hallpass` can traverse the directory to reach the socket meant for them;
-  others gain traversal of a known path, not the ability to list the directory,
-  and each socket's own 0660 and group still decide who may connect. A host
-  that keeps its old unit file keeps 0750, where the read-only socket exists
-  but is unreachable except by `hallpass` members and root. `hallpass-cli
-  doctor` reports both sockets, the directory mode, and which tier the running
-  session can reach.
-
-  `install.sh` now ends in an explicit `systemctl restart hallpassd`.
-  `enable --now` is a no-op on a unit that is already running, so re-running
-  the installer over a live install used to leave the old daemon serving the
-  new binaries - every client failing the wire handshake, no read-only socket
-  bound at all, and `/run/hallpass` keeping its old mode, because systemd only
-  applies a changed `RuntimeDirectoryMode` when it recreates the directory.
-
-- **Prompts can pin the rule to the binary you approved, not the path it sat
-  at (wire protocol v17).** Tick "Pin binary" in the GUI, or answer the new
-  pin question in `hallpass-cli watch`, and the rule carries the executable's
-  SHA-256 as well as its path: it stops matching the moment the file there is
-  replaced. Worth it for anything you can write yourself - a home directory, a
-  build tree, `/opt` - where an allow keyed on a path alone silently carries
-  over to whatever is written next. The pinned rule needs answering again
-  after the program updates, which is the point. Offered only on an allow (a
-  deny should keep blocking whatever is put at that path) and only when the
-  prompt shows a hash; a reply asking to pin one that has none creates no rule
-  at all rather than the broader unpinned one. The UI and CLI are wire peers
-  and must be restarted with the daemon.
-
-- **The daemon refuses to trust a policy directory anyone else can write.**
-  `/etc/hallpass` and the rules directory are now checked for root ownership
-  and group/world write at startup, reported at error level, and fatal under
-  `queue_bypass = false`. Every per-file check already there assumed this:
-  unlinking a file needs write on the *directory*, not on the file, so on a
-  group-writable `rules.d` any member of that group could delete root's deny
-  rules without touching a file those checks would ever look at - and a
-  vanished rule file reads as an ordinary delete, so nothing was skipped,
-  nothing counted, and the shrunken set applied as policy. Sticky directories
-  are accepted. `hallpass-cli doctor` reports the same check as `policy-dirs`.
-
-- **With the `ebpf` feature, a process can no longer inherit another binary's
-  allow rule by exec'ing after it connects.** A socket descriptor survives
-  `execve`, so a process could start a non-blocking `connect()`, immediately
-  become a different binary, and be attributed to that one instead, retrying
-  until it won the race. Neither the pid nor the process start time can see
-  that happen; both survive exec too.
-
-  The kernel programs now stamp the running image's generation into the flow
-  record at connect and the daemon compares it when it resolves the
-  executable, refusing to name one that has moved. So a masquerade gets a
-  connection carrying no executable, decided by the prompt or the default
-  verdict, rather than one wearing the identity it exec'd into. Requires
-  rebuilding the eBPF object: a prebuilt one from before this change fails to
-  load, and the daemon says so rather than falling back silently.
-
-  Two things it does not do. The honest name is refused along with the
-  dishonest one, so a deny rule keyed on `exe` can still be stepped out of,
-  though the connection now asks instead of being quietly allowed under the
-  wrong name. And attribution still falls back to procfs when the kernel has
-  no record of the flow, which has no generation to compare. `exe`,
-  `exe_glob` and `exe_sha256` remain scoping conveniences rather than
-  boundaries on the procfs-only build; the README says which is which.
-
-- **The daemon sets the kernel's verdict-queue length instead of inheriting
-  it (wire protocol v16).** It was on the kernel's own default of 1024, out
-  of which the daemon spends up to 256 slots on packets held for prompt
-  replies, so a quarter of the queue could be unavailable to traffic that
-  could still be judged. It now asks for 4096, and `status`, `doctor` and the
-  GUI report the length in force beside the live depth, because a depth with
-  no limit next to it has no scale.
-
-  This buys burst headroom and nothing more. A queue drains at the rate the
-  daemon decides packets, so a sustained arrival rate above that fills any
-  depth; what raises the drain rate is eBPF attribution, not a bigger buffer.
-  The cost is kernel memory, since every queued packet is held until it is
-  decided. The snoop queue is deliberately left on the kernel's default: its
-  packets are accepted the moment they are read, so nothing sits in it.
-
-  Nothing to configure, and nothing to do on upgrade. If your kernel refuses
-  the request the daemon logs it at startup, keeps running on the default,
-  and reports the length as unavailable rather than claiming one.
-
-- **`hallpass-cli lockdown on --tag core`: a whole-host posture (wire
-  protocol v15).** While it is on, only allow rules carrying a pinned tag
-  decide connections, everything else is denied without a prompt, and the
-  daemon enforces regardless of the mode it was in. Deny rules are never
-  suppressed - a posture exists to permit less, and suppressing a block would
-  permit more. Loopback is exempt, because it never leaves the host and
-  refusing it would cost the resolver stub and every local service.
-
-  It is a posture, not a rule edit: nothing on disk changes, so lifting it
-  restores every rule exactly as you left it, including any you disabled
-  while it was on. It is persisted at `/var/lib/hallpass/posture.toml` and
-  re-read at startup, so a package upgrade's restart does not silently lift
-  it, and it is reported by `lockdown`, `status`, `doctor` and a GUI banner.
-  `explain` reports a stopped rule as suppressed rather than disabled.
-
-  Two limits worth knowing: only new connections are judged, so flows already
-  open keep running; and unless something pinned covers DNS the host cannot
-  resolve names, which also stops `domain` rules matching. `lockdown on`
-  prints what survives, warns when nothing covers DNS, and refuses when
-  nothing survives at all unless you pass `--force`.
-
-- **Rule tags and bulk toggle (wire protocol v14).** A rule can carry
-  `tags = ["work", "vpn"]`, and `hallpass-cli rules toggle --tag work off`
-  enables or disables the whole set as one change - one lock, one recompile,
-  so no connection is judged against half of it. `hallpass-cli rules --tag
-  work` lists a set, `rules add --tag` and the GUI editor's Tags field write
-  them, and the rule table grows a TAGS column only once some rule carries
-  one. The GUI's Rules tab gets the same three: the column, a tag picker that
-  narrows the table, and Enable all / Disable all for the picked tag (shown
-  only once one is picked, since they act on the set rather than on what is
-  displayed). Tags label rules; they never match connections. A rule already
-  in the requested state is left alone, a tag no rule carries is an error from
-  both the listing and the toggle, and a rule whose file cannot be written
-  keeps the state it had and is named in the CLI's non-zero exit. An unusable
-  tag in a rules.d file never costs that rule its enforcement: the tag is
-  dropped with a journal warning and the rule still filters, while `rules
-  add`, an IPC add and the GUI editor refuse one outright.
-
-  Two things to know before using it. Rule files written before this keep
-  loading unchanged (`tags` defaults to empty), but a file this version
-  *writes* carries `tags = []` and an older daemon refuses unknown keys, so
-  **downgrading after any rule has been added, toggled or approved needs
-  those lines removed** or those rules are skipped on the older build. And
-  adding a rule under an existing name still replaces it wholesale, so
-  re-adding to change tags restates everything: pass the new `--enabled
-  true|false` to keep a disabled rule disabled, and note that importing a
-  document exported before this version strips tags off the rules it
-  restores.
-- **`hallpass-cli run -- <cmd>`: one-off network grants (wire protocol
-  v13).** A build, an installer or a test suite either meant answering a
-  prompt per connection or writing a permanent allow rule for a one-off.
-  `run` wraps the command instead: while it runs, connections from it and
-  everything it spawns that no rule matches are allowed rather than
-  prompted, and the grant ends when it exits (including on `kill -9`, since
-  the daemon ties it to the wrapper's control connection). The command's
-  exit status is the wrapper's, and SIGINT/SIGTERM are forwarded to it.
-  Allowed connections report `run-session:<id>` in the rule-name field every
-  client already shows, `hallpass-cli sessions` lists what is open, and
-  `suggest` leaves these connections out of the rules it proposes so a
-  one-off does not become policy. An explicit rule still decides: a deny
-  denies inside a session, coverage is limited to the user that opened it
-  (so `sudo` inside one still prompts), and anything ambiguous prompts.
-- **Richer prompt context (wire protocol v12).** A prompt showed the
-  connection and little else, so deciding one often meant going elsewhere to
-  find out what the program was. Prompt requests now carry four more facts,
-  each shown by both the GUI dialog and `hallpass-cli watch`: what launched
-  the process (its ancestors' executables, nearest parent first), its
-  executable's SHA-256, how many decisions still in the daemon's history said
-  no to this same application, and the names of any enabled rules this binary
-  fails only on the executable hash. That last one is the loud case: a rule
-  was written for this program at this destination and the binary asking now
-  does not have the hash it pins, which is precisely what `exe_sha256` exists
-  to catch and which previously surfaced only as an unexplained prompt. The
-  hash shown is the one the daemon computed while deciding the packet, so it
-  appears when a hash-pinning rule could have applied and not otherwise.
-  Prompt-only by design: none of it rides `events`, `--json` or syslog
-  export, which describe decisions rather than ask about them, and the
-  denial count would be meaningless stamped on a decision it precedes.
-  Nothing here reaches a verdict. Every field is best effort and absent on
-  its own when it cannot be established, so a prompt showing none of them
-  means the daemon could not find out more, not that there is nothing to
-  find. Zero denials likewise means "nothing in what is still remembered":
-  the history is capped and lost on restart.
-  No configuration and no new state on disk. The protocol bump means daemon,
-  CLI and UI must be upgraded together.
-
-- **First-seen highlighting (wire protocol v11).** Every prompt looked the
-  same whether the program asking had been running here for a year or had
-  never connected before, which is the single fact most likely to change the
-  answer. Connections now carry `first_seen`: whether this is the first
-  connection the daemon has recorded from this application, and whether it
-  is the first time that application has reached this destination (by domain
-  when one is known, by address otherwise). The GUI prompt shows a NEW badge
-  and a line saying which, `hallpass-cli watch` prints the same sentence,
-  `events` appends `new=app`, `new=dest` or `new=app,dest` to the line,
-  `--json` carries the pair, and syslog export gains a `first_seen` field.
-  Never a verdict, and never a claim about the past: the record is capped
-  and rewritten at most once a minute, so everything it forgets reads as new
-  a second time rather than a first-ever connection reading as routine.
-  On by default; the state lives in `/var/lib/hallpass/seen.toml`
-  (root-only, created by the unit's `StateDirectory`) and `first_seen =
-  false` turns it off and writes nothing. Existing installs should re-run
-  `install.sh` so the unit picks up the state directory: without it the
-  daemon warns once and keeps the record in memory, losing it on restart.
-  The protocol bump means daemon, CLI and UI must be upgraded together.
-
-- **Packaged applications are named, and matchable (wire protocol v10).**
-  A Flatpak or Snap application's executable path resolves inside its own
-  sandbox, so `/proc/<pid>/exe` reads as a path that is not on this host and
-  that other applications of the same packaging system share: those
-  connections could not be scoped to one application at all. The daemon now
-  reads the process's cgroup at attribution time and carries the identity it
-  finds (`flatpak:org.mozilla.firefox`, `snap:firefox`) on every connection.
-  Rules gain a matching `app_id` operand (`hallpass-cli rules add --app-id`,
-  `explain --app-id`, and a field in the GUI rule editor), both prompt
-  handlers show the application, syslog export carries it, and an *allow*
-  generated from a prompt reply, from a traffic row, or by `suggest` pins it
-  alongside the executable so one answer cannot cover a different
-  application that happens to run from the same sandbox path. A deny stays
-  scoped to the executable alone: the operand only narrows, and a block that
-  quietly stopped applying because an application turned up without a
-  recognized cgroup scope is the wrong way to fail. A cgroup name is chosen by
-  whoever created the cgroup, and any user can start a command under a scope
-  of their choosing, so `app_id` scopes rules the way `cmdline_contains` does
-  and is not a boundary; pair it with `exe` or `exe_sha256` where that
-  matters. The protocol bump means daemon, CLI and UI must be upgraded
-  together.
-
-- **Flow accounting: how much each connection moved (wire protocol v9).**
-  The daemon decides a connection from its first packet and never saw its
-  volume. With `flow_accounting = true` it joins the conntrack destroy
-  multicast group and, as each flow ends, records the bytes and packets
-  the kernel counted for it. Each teardown is logged with the executable
-  the daemon attributed to the flow and how much it sent and received, and
-  `Stats` gains aggregate totals (`flows_accounted`, `flow_bytes`,
-  `flow_packets`) shown by `hallpass-cli status` and the GUI. The destroy
-  group carries every host teardown, so only flows matching a connection
-  still in the daemon's decision history are counted: the totals are
-  hallpass-governed traffic, not whole-host volume. Needs
-  `net.netfilter.nf_conntrack_acct=1` and `nf_conntrack_events=1`; a
-  startup warning names either if it is off. Observe-only: it reads
-  notifications the kernel sends anyway and never affects a verdict. Off
-  by default. The protocol bump means daemon, CLI and UI must be upgraded
-  together.
-
-- **`hallpass-cli suggest`: propose rules from what actually happened.**
-  Observe mode answers "what would this policy break"; suggest answers
-  the next question, "what rules do I write". It folds the daemon's
-  recent allowed, attributed connections into the narrowest allow rules
-  that keep that traffic flowing (one per executable, protocol, port and
-  destination; per-host domains collapse to `*.suffix` at three or more
-  hosts), printed as the same TOML document `rules export` writes, for
-  review and `rules import`. Nothing is applied, unattributed traffic is
-  never folded, and the header warns that domain rules are convenience,
-  not boundary. `--exe` narrows to one application; the proposal caps at
-  200 rules and says when it dropped smaller groups.
-
-- **Table flushes are now visible in `status` (wire protocol v8).** The
-  watchdog has always repaired an externally flushed nftables table
-  within seconds, but the only evidence was a journal line: `status`
-  looked healthy on a host that had been repeatedly unfiltered. `Stats`
-  now carries `nft_flushes` (times the watchdog found the table gone)
-  and the time of the most recent one, rendered by `hallpass-cli status`
-  (highlighted when nonzero), the GUI stats tab, and a `doctor` warning;
-  every flush is a window in which connections went unfiltered, and the
-  timestamp separates "active problem" from "once, weeks ago" without
-  opening the journal. The count is detections, not successful repairs:
-  whether a repair failed is in the journal (and fatal under a
-  fail-closed posture). The protocol bump means daemon, CLI and UI must
-  be upgraded together; a version mismatch is refused at connect.
-
-- **Deny rules now apply to established flows (`kill_established`).**
-  Enforcement only queues `ct state new`, so until now a deny rule added
-  while a connection was already up (a VPN, a websocket, a long upload)
-  did not touch it: the rule quietly applied to the *next* connection
-  only. On every ruleset change (and on an observe-to-enforce flip) the
-  daemon now deletes the conntrack entries of flows the changed ruleset
-  explicitly denies, which makes each flow's next packet `ct state new`
-  again; it re-enters the verdict queue and the deny rule catches it
-  there. Nothing is decided outside the normal path, flows the ruleset
-  leaves unmatched are never touched (no prompt storms from a rule
-  edit), and observe mode kills nothing. Each kill is logged with the
-  rule that caused it. Best-effort by design: candidates come from the
-  daemon's recent-decision ring (newest 1024 decisions, since daemon
-  start), so flows older than that window or predating the daemon keep
-  running until they end; hash-pinned rules cannot identify flows to
-  kill; and a flow whose peer keeps transmitting can re-establish its
-  conntrack entry from the unfiltered inbound side and survive the kill
-  until it goes quiet. Opt out with `kill_established = false` in
-  config.toml.
-- **`hallpass-cli doctor`.** One command for the post-install and
-  post-deploy checklist: daemon reachable and speaking the CLI's wire
-  protocol, queues bound with drop counters at zero, observe mode and a
-  missing prompt handler surfaced, socket permissions, hallpass group
-  membership (including "added on disk but this session predates it"),
-  the nftables output chain shape (root only), and kernel BTF. Exits
-  non-zero exactly when something failed, so scripts can gate on it.
-
-- **Kernel queue counters in `status` (wire protocol v7).** The daemon's
-  own counters cannot see a packet the kernel resolves because an nfqueue
-  is full: it never reaches userspace, so no event and no daemon counter
-  moves for it. `status` now reports the kernel's per-queue counters
-  (drops, delivery failures, current depth) for the verdict and DNS snoop
-  queues, read from `/proc/net/netfilter/nfnetlink_queue` on request,
-  plus each queue's effective fail-open flag, known at bind. The flag is
-  how the counters read: the kernel counts only what it drops, and a
-  queue whose fail-open flag is on resolves overflow by passing packets
-  through unjudged and counted nowhere, with the queue depth as the only
-  pressure signal. So on a fail-open host the drop counters staying at
-  zero is health, and a nonzero there means the fail-open flag did not
-  take at bind and traffic is being dropped. A counter that cannot be
-  read shows `unavailable`, never zero. The protocol bump means daemon,
-  CLI and UI must be upgraded together; a version mismatch is refused at
-  connect.
-- **`hallpass-cli config`.** The runtime settings (`prompt_timeout_secs`,
-  `default_verdict`, enforce/observe mode) previously had a GUI surface
-  only; on a headless host they could not be changed at all without
-  editing config.toml and restarting. `hallpass-cli config` shows them,
-  `hallpass-cli config set --timeout N --default deny --observe|--enforce`
-  changes them at runtime. Changes last until the daemon restarts;
-  config.toml stays the operator's file. `--observe` disables enforcement
-  host-wide and therefore requires `--yes`.
-
-- **Tray icon for the UI.** The prompt agent shows a status icon
-  (StatusNotifierItem; on stock GNOME this needs the AppIndicator
-  extension, which Ubuntu ships enabled). Its menu opens the management
-  window, and its Quit denies the prompts on screen once, releases the
-  prompt-handler slot, and exits; prompts still queued unseen take the
-  default verdict. Prompts and notifications work without it. The
-  management window is one per user and daemon socket: opening it again,
-  from the tray or the app menu, asks the open one for attention instead,
-  and opens a second only when the open one cannot answer (minimized, on
-  Wayland).
+- **Read-only socket.** `/run/hallpass/observe.sock` (`0660
+  root:hallpass-observer`) serves stats, events, history, rules and hit
+  counts, `explain`, and config and lockdown state, and refuses every change.
+  Use it with `hallpass-cli --socket /run/hallpass/observe.sock`. Members still
+  see every process's executable, command line, uid and destination.
+  Upgrade: reinstall the unit (`/run/hallpass` moves from 0750 to 0751; the old
+  unit leaves the socket unreachable), then add accounts with `sudo usermod
+  -aG hallpass-observer <user>`. `install.sh` now ends with `systemctl restart
+  hallpassd`, so re-running it over a live install actually loads the new
+  binaries.
+- **Pin a prompt answer to the binary (wire v17).** "Pin binary" in the GUI,
+  or the pin question in `hallpass-cli watch`, adds the executable's SHA-256 to
+  the rule, so it stops matching once the file is replaced. Offered only on an
+  allow and only when the prompt shows a hash.
+- **Policy directory ownership check.** `/etc/hallpass` and the rules
+  directory must be root-owned and not group/world writable (sticky
+  directories are accepted). A failure is logged at error level, is fatal under
+  `queue_bypass = false`, and shows in `hallpass-cli doctor` as `policy-dirs`.
+- **Exec-after-connect guard (`ebpf` feature).** A process that execs after
+  starting a connection gets no executable instead of the new binary's
+  identity, so it prompts or takes the default verdict. Attribution that falls
+  back to procfs is not covered. Upgrade: rebuild the eBPF object; an old one
+  fails to load.
+- **Verdict queue length set to 4096 (wire v16).** Previously the kernel
+  default of 1024. `status`, `doctor` and the GUI show the length beside the
+  live depth; if the kernel refuses, the daemon logs it and keeps the default.
+- **`hallpass-cli lockdown on --tag core` (wire v15).** While on, only allow
+  rules with a pinned tag decide, everything else is denied without a prompt,
+  and the daemon enforces whatever its mode. Deny rules and loopback are
+  unaffected, and only new connections are judged. The posture persists in
+  `/var/lib/hallpass/posture.toml` across restarts; lifting it restores every
+  rule as it was. `lockdown on` warns when nothing covers DNS and refuses when
+  no rule survives, unless given `--force`.
+- **Rule tags (wire v14).** `tags = ["work"]` in a rule, `rules add --tag`,
+  `hallpass-cli rules --tag work`, and `rules toggle --tag work off` to flip a
+  set in one change. The GUI Rules tab gets a TAGS column, a tag picker and
+  Enable all / Disable all. Tags never match connections. Upgrade: files this
+  version writes carry `tags = []`, which an older daemon refuses, so remove
+  those lines before downgrading. Re-adding a rule restates it wholesale (pass
+  `--enabled`), and importing a pre-tags export drops tags.
+- **`hallpass-cli run -- <cmd>` (wire v13).** Unmatched connections from the
+  command and its children are allowed until it exits, including on `kill -9`.
+  Explicit rules still decide, coverage is limited to the opening user, and
+  allowed connections show `run-session:<id>`. `hallpass-cli sessions` lists
+  open grants, and `suggest` ignores their traffic.
+- **Richer prompts (wire v12).** Prompts in the GUI and `hallpass-cli watch`
+  show the process's ancestors, its executable's SHA-256, how many recent
+  decisions denied the same application, and any enabled rule it fails only on
+  `exe_sha256`. Each field is best effort, and none of it appears in `events`,
+  `--json` or syslog.
+- **First-seen flags (wire v11).** Connections carry whether the application,
+  and the application-to-destination pair, is new to the daemon's record: a
+  NEW badge in the GUI, a line in `watch`, `new=app,dest` in `events`, and a
+  `first_seen` field in `--json` and syslog. On by default, stored in
+  `/var/lib/hallpass/seen.toml`; `first_seen = false` turns it off. Upgrade:
+  re-run `install.sh` so the unit gets its `StateDirectory`, or the record is
+  kept in memory only.
+- **Flatpak and Snap application identity (wire v10).** Connections carry
+  `flatpak:<id>` or `snap:<name>` from the process's cgroup, and rules gain an
+  `app_id` operand (`rules add --app-id`, `explain --app-id`, GUI editor).
+  Allows written from prompts, traffic rows or `suggest` pin it. It is not a
+  boundary; pair it with `exe` or `exe_sha256`.
+- **Flow accounting (wire v9).** With `flow_accounting = true`, each ended flow
+  is logged with its executable and bytes, and `status` and the GUI show
+  totals for hallpass-governed traffic. Needs
+  `net.netfilter.nf_conntrack_acct=1` and `nf_conntrack_events=1`. Off by
+  default; never affects a verdict.
+- **`hallpass-cli suggest`.** Proposes narrow allow rules from recent allowed,
+  attributed traffic as a `rules export` document for review and `rules
+  import`. Applies nothing; `--exe` narrows to one application, capped at 200
+  rules.
+- **Table flush count in `status` (wire v8).** `nft_flushes` and the time of
+  the last one appear in `status`, the GUI and a `doctor` warning. It counts
+  detections, not successful repairs.
+- **Deny rules reach established flows (`kill_established`).** On a ruleset
+  change or observe-to-enforce flip, the daemon deletes conntrack entries of
+  recent flows the new ruleset denies, so their next packet is judged again.
+  Best effort: only the newest 1024 decisions are candidates, and hash-pinned
+  rules cannot select flows. Opt out with `kill_established = false`.
+- **`hallpass-cli doctor`.** Checks daemon reachability and wire version,
+  queues and drop counters, observe mode, a missing prompt handler, socket
+  permissions, group membership, the nftables chain (root only), kernel BTF,
+  and host forwarding (routed traffic is not filtered). Exits non-zero when a
+  check fails.
+- **Kernel queue counters in `status` (wire v7).** Drops, delivery failures and
+  depth for the verdict and DNS snoop queues, plus each queue's fail-open flag.
+  On a fail-open queue a nonzero drop count means the flag did not take. An
+  unreadable counter shows `unavailable`.
+- **`hallpass-cli config`.** Shows and sets `prompt_timeout_secs`,
+  `default_verdict` and enforce/observe mode at runtime (`config set --timeout
+  N --default deny --observe|--enforce`). Changes last until restart;
+  `--observe` requires `--yes`.
+- **Tray icon.** The prompt agent shows a StatusNotifierItem icon (stock GNOME
+  needs the AppIndicator extension) that distinguishes enforcing, lockdown,
+  observe mode and waiting for the daemon. Quit denies on-screen prompts once
+  and releases the prompt-handler slot. The management window is one per user
+  and socket.
 
 ### Changed
 
-- **The desktop GUI is now a windowless agent plus separate windows, all on
-  native Wayland.** Under XWayland, where the GUI used to run whenever
-  `DISPLAY` was set, any X client could synthesize input into a prompt or the
-  management window: a sandboxed application given only the X11 socket could
-  answer prompts or turn enforcement off. Shown live against two prompts.
-  `hallpass-ui agent`, autostarted at login, now holds the prompt-handler
-  role, the tray icon and the notifications, and opens one window per
-  application with prompts waiting; `hallpass-ui` alone opens the management
-  window, which takes no prompts but starts the agent when nobody does, and
-  says why when that cannot work. Both pin native
-  Wayland whenever the session has it. On Wayland no hallpass window can
-  stay on top, and whether a new prompt window gets focus is the
-  compositor's call; it asks for attention and the notification is the
-  interrupt.
-
-  **Upgrade notes.** `--hidden` is gone: `install.sh` replaces the autostart
-  entry with one that runs `hallpass-ui agent`, but a per-user copy in
-  `~/.config/autostart` that still passes `--hidden` now starts nothing.
-  `install.sh` stops a `hallpass-ui` left running from before (the old
-  single-process UI or an older agent) and starts the new agent, when the
-  installing session is already in the `hallpass` group; otherwise the agent
-  starts at the next login, or when the management window is opened.
-  `hallpass-cli doctor`'s no-handler hint now names the agent.
-- **Executable paths are checked against the host's own file.** A process
-  whose `/proc/<pid>/exe` names a path the host has a different file at (a
-  bind mount in a private mount namespace, a container on the host network)
-  now carries no executable, so `exe` rules cannot match it and it prompts or
-  takes the default. Paths under a top-level directory the host lacks, such
-  as a Flatpak's `/app`, are reported as before. A deleted executable (a
-  binary replaced by an upgrade while it runs) keeps its name only in PID 1's
-  mount namespace: a sandboxed service running one loses its `exe` rules
-  until it restarts.
+- **Unmatched connections are denied by default.** `default_verdict` now ships
+  and defaults to `"deny"`, which also applies with no prompt handler attached,
+  before login, and when a held-packet budget is spent. `queue_bypass` still
+  ships `true`. Upgrade: a config that omits `default_verdict` flips to deny;
+  one that states `"allow"` keeps it.
+- **Baseline rules for boot-time daemons.** `20-system-resolved.toml`,
+  `20-system-timesyncd.toml`, `20-system-timesyncd-dns.toml` and
+  `20-system-networkmanager.toml` ship enabled at priority 20, each scoped to
+  its binary, so a deny default still boots with DNS, time and an address.
+  `install.sh` installs each only when its binary exists, with the path
+  canonicalized, and keeps local edits or deletions across reinstalls.
+- **LLMNR is denied by default.** `20-deny-llmnr.toml` blocks port 5355 for
+  any executable. Delete it if you rely on LLMNR, or set `LLMNR=no` in
+  `/etc/systemd/resolved.conf`. mDNS (5353) is not covered and will prompt.
+- **`install.sh` writes the hardened config on a fresh install** (deny
+  default, unmodelled transports denied, `queue_bypass = false`).
+  `HALLPASS_POSTURE=desktop ./install.sh` keeps the permissive config. An
+  existing `/etc/hallpass/config.toml` is never replaced.
+- **Prompts wait 30 seconds by default, up from 15.** The hardened profile
+  stays at 10. Upgrade: an existing config keeps its `prompt_timeout_secs`.
+- **The desktop profile holds 128 pending prompts, up from 64.** Past the cap a
+  connection takes the default verdict without a prompt.
+- **The GUI is a windowless agent plus separate windows, on native Wayland.**
+  `hallpass-ui agent` (autostarted) holds prompts, tray and notifications and
+  opens one prompt window per application; `hallpass-ui` opens the management
+  window. On Wayland, prompt windows cannot stay on top. Upgrade: `--hidden` is
+  gone, so a `~/.config/autostart` copy that passes it starts nothing.
+  `install.sh` replaces the autostart entry and restarts a running UI when the
+  installing session is in `hallpass`.
+- **GUI redesign.** Colour verdict chips, an activity strip, per-row
+  allowed/blocked bars, headline stats, and a state-coloured mark and window
+  icon. Prompts get segmented pickers, a colour countdown, and `Esc` to deny
+  once. New keys: `Ctrl+1`-`Ctrl+5` for tabs, `Ctrl+F` for the filter; an
+  All/Allowed/Blocked lens and sortable traffic columns. Always dark.
+- **Executable paths are checked against the host's file.** A process whose
+  `/proc/<pid>/exe` path holds a different file on the host (private mount
+  namespace, host-network container) gets no executable. A sandboxed service
+  running a deleted (upgraded) binary loses its `exe` rules until restarted.
 - **UDP-Lite is always denied**, whatever `unhandled_proto_verdict` says.
 - **When enforcing with `unhandled_proto_verdict` other than `allow`, the
-  table drops `invalid` and `untracked` packets** (IPv6 neighbour discovery
-  and MLD excepted). Decided at startup, like the fail-open flag.
-- **A rule `domain` that no name could ever equal is refused**: Unicode
-  (use the `xn--` form), `*`, `*example.org`, empty labels. The rule is
-  skipped with a warning, or `rules add` fails with the reason. A trailing
-  dot is accepted and ignored.
-- **Equal-priority rules put reject and deny before allow**, then go by name.
-- **Rules written from a prompt carry the protocol for a port answer, and
-  the uid on an allow.** Another account's connection from the same binary
-  no longer joins a prompt, or matches an allow, meant for someone else's.
-- **Allow in the GUI prompt answers only after the prompt has been in front
-  for 700ms**; Deny is immediate. `hallpass-cli watch` ignores a line that
-  arrives within 700ms of a new prompt and asks again.
-- **IPC sockets hold at most 64 connections, 16 per uid**, and close a
-  connection that has not said Hello within 10 seconds.
+  table drops `invalid` and `untracked` packets** (IPv6 neighbour discovery and
+  MLD excepted). Decided at startup.
+- **A rule `domain` no name can equal is refused**: Unicode (use `xn--`), `*`,
+  `*example.org`, empty labels. A trailing dot is ignored.
+- **Equal-priority rules order reject and deny before allow**, then by name.
+- **Prompt-written rules carry the protocol for a port answer, and the uid on
+  an allow**, so another account's connections no longer share them.
+- **GUI Allow works only after the prompt has been in front for 700ms**; Deny
+  is immediate. `hallpass-cli watch` ignores input within 700ms of a new
+  prompt.
+- **IPC sockets hold at most 64 connections, 16 per uid**, and close one that
+  sends no Hello within 10 seconds.
 - **The unit sets `DevicePolicy=closed` and `LimitNOFILE=16384` and refuses
-  `process_vm_readv`/`process_vm_writev`.** Reinstall the unit to apply.
-- **`rules export` names, on stderr and in a header comment, any rule it had
-  to alter for display**, since those do not import back unchanged.
-
-- **Unmatched connections are denied by default.** `default_verdict` ships as
-  `"deny"` instead of `"allow"`, and so does the built-in default a host with
-  no config file falls back to. A connection that matches no rule and that
-  nobody answers is now blocked.
-
-  That covers more than an ignored prompt. The same verdict applies with no
-  GUI and no `hallpass-cli watch` attached, between boot and login, after a
-  handler crashes, and when either held-packet budget is spent. Allowing in
-  those states meant the tool stopped working silently, and one of them is
-  reachable by anything that can crash the handler.
-
-  This is the policy axis only. `queue_bypass` still ships `true`, so a daemon
-  that is dead rather than undecided still lets traffic through instead of
-  bricking the network. `etc/config.hardened.toml` closes that too.
-
-  **Upgrade notes.** An existing `/etc/hallpass/config.toml` is never
-  rewritten by the installer, so a host whose file *states*
-  `default_verdict = "allow"` keeps allow until that line is edited. A file
-  that omits the key does not: every field falls back to the built-in default,
-  which this release changes, so such a host flips to deny on upgrade. Check
-  for the line before upgrading an unattended one. New installs get deny along
-  with the baseline rules below, and an upgrade gets those rules too, since
-  none of them is on the host yet. Read the two entries together: deny without
-  the baseline is a host that boots without DNS.
-
-- **Baseline rules for the daemons that run before anyone can answer.**
-  `etc/rules.d/` gains `20-system-resolved.toml`, `20-system-timesyncd.toml`,
-  `20-system-timesyncd-dns.toml` and `20-system-networkmanager.toml`, shipped
-  enabled, so a deny default does not leave a booting host without name
-  resolution, a clock, or an address.
-
-  Each is scoped to a binary rather than to a port, because a rule matching
-  port 53 alone lets every local process speak DNS to any host it picks.
-  Priority 20 sits below the 50 that answering a prompt writes, so anything
-  decided later overrides them. Applications are unaffected either way: they
-  ask the resolver stub over loopback, which is exempt before any rule is
-  consulted. `20-system-networkmanager.toml` is the one broad grant, exe-only,
-  and it says in the file why and when to delete it.
-
-  `install.sh` writes each only when the binary it names exists, so a chrony
-  host gets no dead timesyncd rule, and guards them like the example rule, so
-  editing or deleting one survives a reinstall. It also canonicalizes the path
-  in the installed copy: the daemon compares `exe` against what
-  `/proc/<pid>/exe` reports, which the kernel resolves fully, so on a
-  distribution where `/usr/sbin` links to `/usr/bin` a rule naming
-  `/usr/sbin/NetworkManager` would list correctly and match nothing.
-
-- **LLMNR is denied by default.** `etc/rules.d/20-deny-llmnr.toml` blocks port
-  5355. LLMNR resolves a bare hostname by asking the local network segment,
-  nothing authenticates the reply, and whoever answers first is believed, so
-  anyone sharing a network can claim to be the name you asked for. Disabling
-  it is standard hardening, and distributions differ on whether
-  systemd-resolved ships it on.
-
-  A rule rather than a prompt, because the alternative reappears for as long
-  as resolved keeps trying, and a prompt dismissed daily is one that stops
-  being read. Unlike the allow rules beside it this one names no executable:
-  a block should cover whatever speaks the protocol. Delete the file if you
-  resolve local hostnames only LLMNR knows, or set `LLMNR=no` in
-  `/etc/systemd/resolved.conf` to stop the queries at the source.
-
-  mDNS (port 5353, the `.local` names Avahi serves) is deliberately not
-  covered either way. It is a preference rather than something the host needs
-  to boot, so it prompts once and the answer is yours. Expect that prompt on a
-  desktop running `avahi-daemon`.
-
-- **The desktop profile holds 128 pending prompts, up from 64.** Past the cap
-  a connection takes the default verdict without raising a prompt at all.
-  Under the old allow default that overflow was a silent pass; under deny it
-  is a silent block, so a burst of new connections - a browser starting with
-  many tabs, a package update fanning out to mirrors - could be denied without
-  anyone being asked. This matches what `etc/config.hardened.toml` already
-  used, and for the same reason. The real ceiling on held packets is the
-  daemon's own budget rather than this number, so the cost is small.
-
-- **A prompt now waits 30 seconds by default, up from 15.** The window asks
-  for a duration and a scope as well as a verdict, and 15 seconds was short
-  enough that reading an unfamiliar executable path and then setting those
-  pickers could run out the clock - the default verdict landing under an
-  operator who was still deciding, which is the outcome the prompt exists to
-  avoid. The cost is paid by prompts nobody answers: the packet is held for
-  the whole wait, so an unattended connection now sits twice as long before
-  the default verdict resolves it. Hosts that want the old behaviour set
-  `prompt_timeout_secs` in `/etc/hallpass/config.toml` or change it at
-  runtime in the GUI's Settings tab or with `hallpass-cli config set
-  --timeout-secs`. The hardened profile is unchanged at 10 seconds, where a
-  stalled prompt handler blocking quickly is the point.
-
-  **Upgrade notes.** This is the built-in default and the value in the
-  shipped `etc/config.toml`. An existing install keeps whatever is already
-  in `/etc/hallpass/config.toml`; the new default reaches a host only where
-  that file is absent or leaves the key unset.
-
-- **The GUI has one palette and reads as a status surface.** Everything the
-  window says about a connection is now said in colour first: verdicts are
-  chips in a fixed green/red/amber, an activity strip above the event feed
-  shows when the denies happened rather than only that they did, every
-  traffic row carries a bar for its allowed/blocked mix, and the Stats tab
-  leads with four headline numbers over cards grouped by what fails
-  together. The mark in the top-left corner takes the colour of whatever
-  the host is doing, from the same state the tray icon reads, so a glance
-  answers "is this thing on" without a tab change. Observe mode, a
-  lockdown posture and a daemon error are notices with a coloured edge
-  instead of a line of red text. The prompt window keeps its layout (the
-  actions stay pinned, the process description scrolls) and gains a header
-  band coloured by what the daemon found out about the process, segmented
-  duration and scope pickers that show what is selected without being
-  opened, and a countdown that warms from green to red as the default
-  verdict approaches, and `Esc` dismisses it exactly as the close button
-  does (deny, once, for every prompt that window covers). New: `Ctrl+1` to
-  `Ctrl+5` switch tabs, `Ctrl+F` jumps to the filter, an All/Allowed/
-  Blocked lens narrows the feed and the traffic view by outcome, the
-  traffic column headings sort (busiest first by default; click a heading
-  to rank by blocked, by peers, by last seen), and any value a column had
-  to clip is on its row's hover. The window now has an icon - the same
-  mark, in the colour of what the host is doing, so the taskbar entry
-  carries the state too (X11; Wayland shows the desktop entry's icon
-  instead). The window is dark whatever the desktop theme is: the palette
-  is calibrated against one background, and the three verdict colours have
-  to stay apart from each other at a glance.
-- **`install.sh` now writes the hardened config on a fresh install.**
-  Unmatched and unanswered connections are denied, unmodelled transports are
-  denied, and enforcement survives a dead daemon (`queue_bypass = false`).
-  `HALLPASS_POSTURE=desktop ./install.sh` keeps the previous permissive
-  config. An existing `/etc/hallpass/config.toml` is never replaced either
-  way, so this changes nothing on an upgrade.
-- The installer and README now state what joining the `hallpass` group means:
-  a member can disable enforcement, lift a lockdown posture, delete any rule,
-  or take the prompt-handler slot.
-- **The tray icon now says whether anything is being enforced.** The prompt
-  agent autostarts with no window, so a host enforcing nothing showed the
-  same icon as one enforcing everything; the icon and its tooltip now
-  distinguish enforcing, a lockdown posture, observe mode, and "waiting for
-  the daemon". Nothing is claimed until the daemon on the current
-  connection has said so, so a reconnect no longer re-asserts the previous
-  daemon's mode, and a posture lifted while the window was disconnected no
-  longer reappears with it.
-- **`hallpass-cli doctor` reports a `forwarding` check.** Hallpass filters the
-  `output` and `input` hooks only, so traffic this host *routes* - containers,
-  VMs, bridged namespaces - is not seen and not matched against any rule. That
-  is a scope decision rather than an unfinished one (a forwarded packet has no
-  local process, so every `exe`, `app_id`, `cmdline_contains` and `user`
-  operand is inapplicable to it), and it is now delivered as a warning on any
-  host that actually forwards, naming the interfaces and bridges, instead of
-  waiting to be read in the README. The whole `conf/<iface>/forwarding` tree is
-  read, not `net.ipv4.ip_forward` alone, because the global knob is only an
-  alias for `conf/all` and the kernel consults the arrival interface's own.
-
-### Fixed
-
-- **Connections could pass unjudged when the queue socket's buffer filled.**
-  Both queues shared one small buffer at a 64 KiB copy range, so a few large
-  local datagrams, or any host sending UDP from port 53, made the kernel
-  resolve the next packet by the fail-open flag. The snoop queue now has its
-  own socket and thread, copies are small, buffers are raised, and only
-  replies to this host's own DNS queries are snooped.
-- **A burst of refused verdicts stopped the daemon.** Prompts held across a
-  VPN drop or a ruleset reload answered with dozens of ENOENT errors at
-  once, which counted as receive failures and, under fail-open, left the
-  host unfiltered until the restart.
-- **The exec-race guard missed UDP sent from unbound sockets and rules
-  pinned by hash alone.** A `sendto()` then `exec` of an allowed binary, or
-  any exec racing a hash-only rule, could borrow that binary's rules.
-- **A hash could be taken of a file the process was not running.** With the
-  process gone, the path was hashed instead, and its owner could put the
-  original bytes back first.
-- **A list path added over IPC could be re-aimed through a symlink** at a
-  root-only file or a FIFO; the resolved path is stored, and a FIFO no
-  longer hangs startup.
-- **A denied DNS query still armed the snoop tracker**, so its server could
-  answer anyway. One answer caches at most 32 addresses, and a numeric
-  "name" no longer overwrites a cached domain.
-- **A dead prompt path allowed every unmatched connection, and held packets
-  were accepted at exit**; both now take `default_verdict`.
-- **The table was replaced in two steps**, leaving no filtering between them.
-- **A client that stopped reading replies could pin hundreds of megabytes**
-  in the daemon.
-- **Syslog export escaped only C0 controls** and capped fields in
-  characters; every display hazard is neutralized and caps count bytes.
-- **The GUI and `hallpass-cli top` could lose their place in the daemon's
-  stream**, breaking the session and emptying the prompt slot.
-- **`hallpass-cli watch` printed a process's whole command line**, enough to
-  scroll the executable off screen.
-
-- **`max_pending_prompts` above 512 is now rejected at config load.** The
-  per-client IPC queue holds 512 messages, and a reconnecting prompt handler
-  is re-sent every pending prompt into it in one sweep: a deeper pending
-  table silently dropped the overflow, and those prompts sat invisible until
-  their timeouts applied `default_verdict`. A config that set a larger value
-  was buying capacity that was never really there; it now fails validation
-  and the daemon says so at startup instead.
-- **Hashing an executable could be stalled by growing the file mid-read.**
-  The size cap was checked before an uncapped read-to-EOF, so a process
-  appending to its own binary during the hash kept the packet-decision
-  thread reading for as long as the writer kept writing - a stalled packet
-  for every other connection on the host. The read itself is now capped; a
-  file that outgrows its metadata mid-read is refused like the size check
-  refuses it.
-- **A prompt rule that pinned a binary hash resolved no other prompts.**
-  Answering one of several stacked prompts for the same application with
-  "allow, forever, this app anywhere" and the pin ticked wrote the rule but
-  left the siblings open until they timed out into `default_verdict` - the
-  opposite verdict on a hardened host. Not deployed in any release.
-- **Observe mode hashed a binary for every unmatched connection and threw the
-  result away.** The hash a prompt needs so it can offer to pin was computed on
-  the packet-decision thread for connections that never raise a prompt: observe
-  mode, a spent held-packet budget, and any host with no GUI or `hallpass-cli
-  watch` attached. It is now paid only where a prompt is actually raised.
-- A prompt answered with a pin and duration `Once` no longer logs a warning
-  about a rule that was never going to be written, and a deny can no longer be
-  pinned even by a future caller that forgets to filter it.
-- Fixed a dependency advisory (RUSTSEC-2026-0257, `webbrowser` argument
-  injection) pulled in through the GUI's window stack.
+  `process_vm_readv`/`process_vm_writev`.** Upgrade: reinstall the unit.
+- **`rules export` names any rule it altered for display**, on stderr and in a
+  header comment.
+- **The installer and docs state what `hallpass` group membership grants**:
+  disabling enforcement, lifting lockdown, deleting rules, taking the prompt
+  slot. See [docs/security.md](docs/security.md).
 - **`exe_glob` wildcards no longer cross `/`.** `*` and `?` stop at a path
-  separator, the way a shell's do, and a subtree is written `**`. Existing
-  patterns narrow: `exe_glob = "/opt/vendor/*"`, which previously covered
-  the entire subtree at any depth, now matches only that one directory
-  level. For an allow rule the narrowing is loud, since a binary that
-  matched yesterday starts prompting. For a deny rule it is silent and it
-  is the dangerous half: a deny written for a subtree now blocks only the
-  top level, and nothing on the host says so. Wherever a subtree was
-  meant, add a second star: `/opt/vendor/*` becomes `/opt/vendor/**`.
-  Audit the loaded ruleset with:
+  separator; use `**` for a subtree. Upgrade: `/opt/vendor/*` now matches one
+  level only, which silently narrows deny rules; change such patterns to
+  `/opt/vendor/**`. Audit with:
 
   ```sh
   hallpass-cli --json rules | \
     jq '.[] | select(.match.exe_glob) | {name, action, glob: .match.exe_glob}'
   ```
 
-  The daemon also logs a hint at rule load when a glob ends in `/*`, the
-  one shape where the narrowing bites silently.
+  The daemon logs a hint for any glob ending in `/*`.
+
+### Fixed
+
+- **Connections could pass unjudged when the queue socket buffer filled.** The
+  snoop queue now has its own socket, and only replies to this host's DNS
+  queries are snooped.
+- **A burst of refused verdicts stopped the daemon**, leaving a fail-open host
+  unfiltered.
+- **The exec-race guard missed UDP from unbound sockets and hash-only rules.**
+- **A hash could be taken of a file the process was not running.**
+- **A list path added over IPC could be re-aimed through a symlink**, and a
+  FIFO no longer hangs startup.
+- **A denied DNS query still armed the snoop tracker.** One answer caches at
+  most 32 addresses, and a numeric name no longer overwrites a cached domain.
+- **A dead prompt path allowed every unmatched connection, and held packets
+  were accepted at exit**; both now take `default_verdict`.
+- **The table was replaced in two steps**, leaving a gap with no filtering.
+- **A client that stopped reading replies could pin hundreds of megabytes** in
+  the daemon.
+- **Syslog export escaped only C0 controls**; all display hazards are now
+  neutralized and field caps count bytes.
+- **The GUI and `hallpass-cli top` could lose their place in the stream**,
+  emptying the prompt slot.
+- **`hallpass-cli watch` printed a process's whole command line.**
+- **`max_pending_prompts` above 512 is rejected at config load.** Larger
+  values silently lost prompts on handler reconnect. Upgrade: a config setting
+  it higher now fails validation at startup.
+- **Growing a binary during hashing could stall packet decisions.** The read
+  is now capped.
+- **Executables were hashed for connections that never prompt**, such as in
+  observe mode; the hash is now computed only when a prompt is raised.
+- **RUSTSEC-2026-0257** (`webbrowser` argument injection) in the GUI's
+  dependencies.
