@@ -24,7 +24,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::mpsc::Receiver;
 
-use hallpass_types::Connection;
+use hallpass_types::{Connection, FirstSeen};
 
 use crate::prompt;
 
@@ -118,7 +118,7 @@ fn escape_markup(s: &str) -> String {
 /// rest counted. Every field is chosen by the process being judged, so
 /// everything goes through the same sanitizers the prompt window uses,
 /// plus the markup escape.
-fn banner_text(entries: &[Entry]) -> (String, String) {
+fn banner_text(entries: &[Entry]) -> (&'static str, String) {
     let front = &entries[0];
     let name = escape_markup(&prompt::exe_name(&front.conn));
     let dest = escape_markup(&prompt::format_dest(&front.conn));
@@ -135,13 +135,12 @@ fn banner_text(entries: &[Entry]) -> (String, String) {
     // exists for - the operator is not looking at the screen.
     let anything_new = entries
         .iter()
-        .any(|e| e.conn.first_seen.and_then(|f| f.tag()).is_some());
+        .any(|e| e.conn.first_seen.and_then(FirstSeen::tag).is_some());
     let summary = if anything_new {
         "Connection request (NEW)"
     } else {
         "Connection request"
-    }
-    .to_string();
+    };
     let body = if entries.len() == 1 {
         format!("{name} wants to connect to {dest}")
     } else {
@@ -157,7 +156,9 @@ fn banner_text(entries: &[Entry]) -> (String, String) {
 /// retires itself with the prompts even if every close signal is lost.
 fn remaining_ms(entries: &[Entry], now_ms: u64) -> u32 {
     let last = entries.iter().map(|e| e.deadline_ms).max().unwrap_or(0);
-    last.saturating_sub(now_ms).min(u32::MAX as u64).max(1_000) as u32
+    last.saturating_sub(now_ms)
+        .min(u64::from(u32::MAX))
+        .max(1_000) as u32
 }
 
 impl<S: Sink> Tracker<S> {
@@ -205,33 +206,29 @@ impl<S: Sink> Tracker<S> {
         let (summary, body) = banner_text(&group.entries);
         let timeout = remaining_ms(&group.entries, now_ms);
         match group.banner.as_mut() {
-            Some(handle) => self.sink.update(handle, &summary, &body, timeout),
-            None => group.banner = self.sink.show(&summary, &body, timeout),
+            Some(handle) => self.sink.update(handle, summary, &body, timeout),
+            None => group.banner = self.sink.show(summary, &body, timeout),
         }
     }
 
     fn gone(&mut self, id: u64, now_ms: u64) {
-        let Some(key) = self
+        let Some((key, group)) = self
             .groups
-            .iter()
+            .iter_mut()
             .find(|(_, g)| g.entries.iter().any(|e| e.id == id))
-            .map(|(k, _)| k.clone())
         else {
             return; // answered before this client connected, or never shown
         };
-        let group = self.groups.get_mut(&key).expect("key from this map");
         group.entries.retain(|e| e.id != id);
         if group.entries.is_empty() {
-            let group = self.groups.remove(&key).expect("key from this map");
-            if let Some(handle) = group.banner {
+            let key = key.clone();
+            if let Some(handle) = self.groups.remove(&key).and_then(|g| g.banner) {
                 self.sink.close(handle);
             }
-        } else {
+        } else if let Some(handle) = group.banner.as_mut() {
             let (summary, body) = banner_text(&group.entries);
             let timeout = remaining_ms(&group.entries, now_ms);
-            if let Some(handle) = group.banner.as_mut() {
-                self.sink.update(handle, &summary, &body, timeout);
-            }
+            self.sink.update(handle, summary, &body, timeout);
         }
     }
 
@@ -265,11 +262,11 @@ impl Sink for DbusSink {
         match shown {
             Ok(handle) => Some(handle),
             Err(e) => {
-                if !self.warned {
+                if self.warned {
+                    tracing::debug!("desktop notification failed: {e}");
+                } else {
                     self.warned = true;
                     tracing::warn!("desktop notifications unavailable: {e}");
-                } else {
-                    tracing::debug!("desktop notification failed: {e}");
                 }
                 None
             }

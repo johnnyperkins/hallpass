@@ -227,8 +227,7 @@ async fn serve(stream: UnixStream, state: Shared) {
         }
     });
     while let Ok(msg) = read_msg::<ClientMsg, _>(&mut reader).await {
-        let reply = handle(msg, &tx, &state);
-        if let Some(reply) = reply {
+        if let Some(reply) = handle(msg, &tx, &state) {
             let _ = tx.send(reply);
         }
     }

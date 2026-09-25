@@ -207,8 +207,10 @@ pub fn exe_name(conn: &Connection) -> String {
     conn.exe_path
         .as_deref()
         .and_then(|p| p.file_name())
-        .map(|n| sanitize_for_display(&n.to_string_lossy()).into_owned())
-        .unwrap_or_else(|| "unknown".to_string())
+        .map_or_else(
+            || "unknown".to_string(),
+            |n| sanitize_for_display(&n.to_string_lossy()).into_owned(),
+        )
 }
 
 /// Default bound for a daemon-supplied string used as a label or title.
@@ -233,13 +235,11 @@ pub fn ui_text(s: &str) -> String {
 /// truncation itself counts characters, so hazards must go before the cut.
 pub fn truncate(s: &str, max_chars: usize) -> String {
     let s = sanitize_for_display(s);
-    let s = s.as_ref();
     if s.chars().count() <= max_chars {
-        s.to_string()
-    } else {
-        let cut: String = s.chars().take(max_chars.saturating_sub(3)).collect();
-        format!("{cut}...")
+        return s.into_owned();
     }
+    let cut: String = s.chars().take(max_chars.saturating_sub(3)).collect();
+    format!("{cut}...")
 }
 
 #[cfg(test)]

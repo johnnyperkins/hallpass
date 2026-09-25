@@ -6,7 +6,7 @@
 //!   no window at all) notices.
 //! - UI -> daemon: `tokio::sync::mpsc::UnboundedReceiver<ClientMsg>`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::Sender;
 use std::time::Duration;
@@ -97,11 +97,11 @@ fn send_ui(to_ui: &Sender<UiEvent>, wake: &Wake, ev: UiEvent) -> bool {
     // while it paints, which an unfocused or covered one may not do for a
     // long time; so they alone are counted and shed past a bound, and
     // everything else always goes through.
-    if let UiEvent::Daemon(DaemonMsg::Event(_)) = &ev {
-        if QUEUED_EVENTS.fetch_add(1, Ordering::Relaxed) >= MAX_QUEUED_EVENTS {
-            QUEUED_EVENTS.fetch_sub(1, Ordering::Relaxed);
-            return true;
-        }
+    if matches!(ev, UiEvent::Daemon(DaemonMsg::Event(_)))
+        && QUEUED_EVENTS.fetch_add(1, Ordering::Relaxed) >= MAX_QUEUED_EVENTS
+    {
+        QUEUED_EVENTS.fetch_sub(1, Ordering::Relaxed);
+        return true;
     }
     let ok = to_ui.send(ev).is_ok();
     if ok {
@@ -136,37 +136,30 @@ async fn run(
 ) {
     let mut backoff = BACKOFF_MIN;
     loop {
-        match connect_and_serve(&socket, &to_ui, &mut from_ui, &wake, &to_notify).await {
-            Ok(()) => {
-                // UI channel closed: app is exiting.
-                return;
-            }
-            Err(e) => {
-                // A session that got as far as a handshake resets the backoff
-                // so a drop after a long-lived session retries from 1s again.
-                if e.handshaken {
-                    backoff = BACKOFF_MIN;
-                }
-                // Every pending prompt died with the connection; their
-                // banners must not outlive them. The daemon re-delivers
-                // survivors on reconnect, which re-raises the banners.
-                let _ = to_notify.send(NotifyEvent::Disconnected);
-                tracing::warn!("daemon connection failed: {}", e.message);
-                let denied = e.denied;
-                if !send_ui(
-                    &to_ui,
-                    &wake,
-                    UiEvent::Disconnected {
-                        retry_in: backoff,
-                        denied,
-                    },
-                ) {
-                    return;
-                }
-                tokio::time::sleep(backoff).await;
-                backoff = (backoff * 2).min(BACKOFF_MAX);
-            }
+        let Err(e) = connect_and_serve(&socket, &to_ui, &mut from_ui, &wake, &to_notify).await
+        else {
+            // UI channel closed: app is exiting.
+            return;
+        };
+        // A session that got as far as a handshake resets the backoff so a
+        // drop after a long-lived session retries from 1s again.
+        if e.handshaken {
+            backoff = BACKOFF_MIN;
         }
+        // Every pending prompt died with the connection; their banners must
+        // not outlive them. The daemon re-delivers survivors on reconnect,
+        // which re-raises the banners.
+        let _ = to_notify.send(NotifyEvent::Disconnected);
+        tracing::warn!("daemon connection failed: {}", e.message);
+        let disconnected = UiEvent::Disconnected {
+            retry_in: backoff,
+            denied: e.denied,
+        };
+        if !send_ui(&to_ui, &wake, disconnected) {
+            return;
+        }
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(BACKOFF_MAX);
     }
 }
 
@@ -203,7 +196,7 @@ impl Drop for AbortOnDrop {
 /// Returns `Ok(())` only when the UI side has shut down. Any socket-level
 /// failure returns `Err` so the caller retries.
 async fn connect_and_serve(
-    socket: &PathBuf,
+    socket: &Path,
     to_ui: &Sender<UiEvent>,
     from_ui: &mut UnboundedReceiver<ClientMsg>,
     wake: &Wake,

@@ -213,7 +213,7 @@ pub fn buckets<'a>(events: impl Iterator<Item = &'a ConnEvent>, columns: usize) 
     for (ms, verdict, enforced) in stamped {
         // The newest event lands in the last column rather than one past
         // it, which is what the saturating index below is for.
-        let i = ((ms - first) as u128 * columns as u128 / span as u128) as usize;
+        let i = (u128::from(ms - first) * columns as u128 / u128::from(span)) as usize;
         let slot = &mut out[i.min(columns - 1)];
         match (verdict, enforced) {
             (Verdict::Allow, _) => slot.allowed += 1,

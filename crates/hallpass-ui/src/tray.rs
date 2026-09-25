@@ -200,13 +200,12 @@ pub fn spawn(wake: Wake) -> Tray {
             // A panic inside ksni is reported like any other loss of the
             // icon, so the agent does not keep pushing state to nobody.
             let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                run(to_ui.clone(), from_ui, wake.clone());
+                run(&to_ui, &from_ui, &wake);
             }))
             .is_err();
             if panicked {
                 tracing::warn!("tray thread panicked; no tray icon");
-                let _ = to_ui.send(TrayMsg::Unavailable);
-                wake();
+                unavailable(&to_ui, &wake);
             }
         })
         .expect("spawning the tray thread");
@@ -216,7 +215,13 @@ pub fn spawn(wake: Wake) -> Tray {
     }
 }
 
-fn run(to_ui: Sender<TrayMsg>, from_ui: Receiver<TrayState>, wake: Wake) {
+/// Tell the agent it has no icon.
+fn unavailable(to_ui: &Sender<TrayMsg>, wake: &Wake) {
+    let _ = to_ui.send(TrayMsg::Unavailable);
+    wake();
+}
+
+fn run(to_ui: &Sender<TrayMsg>, from_ui: &Receiver<TrayState>, wake: &Wake) {
     use ksni::blocking::TrayMethods;
     let tray = HallpassTray {
         to_ui: to_ui.clone(),
@@ -238,8 +243,7 @@ fn run(to_ui: Sender<TrayMsg>, from_ui: Receiver<TrayState>, wake: Wake) {
             // starve the liveness check it shares this thread with.
             if handle.is_closed() {
                 tracing::warn!("tray service ended; no tray icon");
-                let _ = to_ui.send(TrayMsg::Unavailable);
-                wake();
+                unavailable(to_ui, wake);
                 break;
             }
             match from_ui.recv_timeout(HEALTH_POLL) {
@@ -254,8 +258,7 @@ fn run(to_ui: Sender<TrayMsg>, from_ui: Receiver<TrayState>, wake: Wake) {
         },
         Err(e) => {
             tracing::info!("tray icon unavailable ({e})");
-            let _ = to_ui.send(TrayMsg::Unavailable);
-            wake();
+            unavailable(to_ui, wake);
         }
     }
 }

@@ -53,14 +53,12 @@ fn env_set(name: &str) -> bool {
 /// libc. Everything else takes the value it returns.
 pub fn settle() -> Result<Backend, &'static str> {
     let backend = choose(env_set("WAYLAND_DISPLAY"), env_set("DISPLAY"))?;
-    if backend == Backend::Wayland {
-        std::env::remove_var("DISPLAY");
-    }
-    if backend == Backend::X11 {
-        tracing::warn!(
+    match backend {
+        Backend::Wayland => std::env::remove_var("DISPLAY"),
+        Backend::X11 => tracing::warn!(
             "X11 session: any X client can send input to hallpass windows, \
              as it can to every other window here"
-        );
+        ),
     }
     Ok(backend)
 }
