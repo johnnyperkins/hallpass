@@ -35,11 +35,9 @@ use hallpass_ebpf_common::{
     PROTO_TCP, PROTO_UDP,
 };
 
-// struct sock_common / msghdr field offsets. Loader-patched globals
-// (hallpassd resolves the real values from kernel BTF and overrides them
-// by symbol name; unpatched, these x86_64 CONFIG_NET_NS=y defaults
-// apply). Read only through `off()` so the compiler cannot fold the
-// defaults into the code.
+// struct sock_common / msghdr field offsets, patched by symbol name by the
+// loader (see the crate docs). Read only through `off()` so the compiler
+// cannot fold the defaults into the code.
 #[no_mangle]
 static OFF_SKC_DADDR: u32 = 0; // __be32
 #[no_mangle]
@@ -175,11 +173,10 @@ fn current_flow_val() -> FlowVal {
 /// The generation to stamp on a flow this process is opening now.
 ///
 /// A process that has not exec'd since these programs loaded has no entry,
-/// and one is claimed for it here rather than stamping the zero the lookup
-/// returned. Zero has to stay reserved for "no entry": a stamp that can
-/// equal an absent lookup is a stamp an eviction can forge agreement with.
-/// The claimed value is stamped whether or not the insert lands, so a full
-/// or racing map costs a refusal (nothing to agree with later) and never a
+/// so one is claimed for it here rather than stamping the zero the lookup
+/// returned: zero stays reserved for "no entry" (see [`EXEC_GEN`]). The
+/// claimed value is stamped whether or not the insert lands, so a full or
+/// racing map costs a refusal (nothing to agree with later) and never a
 /// false agreement.
 fn exec_gen_of(pid: u32) -> u64 {
     if let Some(gen) = unsafe { EXEC_GEN.get(pid) } {
@@ -265,9 +262,8 @@ pub fn tcp_connect_enter(ctx: ProbeContext) -> u32 {
 #[kretprobe]
 pub fn tcp_connect_ret(ctx: RetProbeContext) -> u32 {
     let id = bpf_get_current_pid_tgid();
-    let sk = match unsafe { PROC_SCRATCH.get(id) } {
-        Some(sk) => *sk,
-        None => return 0,
+    let Some(&sk) = (unsafe { PROC_SCRATCH.get(id) }) else {
+        return 0;
     };
     let _ = PROC_SCRATCH.remove(id);
     if ctx.ret::<i32>() != 0 {
@@ -456,7 +452,7 @@ fn take_out_param(
     Some((ev, result))
 }
 
-/// Read `len` address bytes from `addr` and emit one event.
+/// Read one `family` address from `addr` and emit it as an event.
 #[inline(always)]
 fn emit_addr(ev: &mut DnsEvent, family: u8, addr: u64) {
     let ok = unsafe {
@@ -495,30 +491,28 @@ pub fn getaddrinfo_ret(ctx: RetProbeContext) -> u32 {
         if ai == 0 {
             break;
         }
-        let family: i32 = match unsafe { read_user(ai, AI_FAMILY) } {
-            Ok(f) => f,
-            Err(()) => return 0,
+        let Ok(family) = (unsafe { read_user::<i32>(ai, AI_FAMILY) }) else {
+            return 0;
         };
-        let sa: u64 = match unsafe { read_user(ai, AI_ADDR) } {
-            Ok(p) => p,
-            Err(()) => return 0,
+        let Ok(sa) = (unsafe { read_user::<u64>(ai, AI_ADDR) }) else {
+            return 0;
         };
         if sa != 0 {
             // sockaddr_in/sockaddr_in6 keep the address past the family
             // and port fields.
             let off = match family as u8 {
-                AF_INET => SIN_ADDR,
-                AF_INET6 => SIN6_ADDR,
-                _ => usize::MAX,
+                AF_INET => Some(SIN_ADDR),
+                AF_INET6 => Some(SIN6_ADDR),
+                _ => None,
             };
-            if off != usize::MAX {
+            if let Some(off) = off {
                 emit_addr(ev, family as u8, sa + off as u64);
             }
         }
-        ai = match unsafe { read_user(ai, AI_NEXT) } {
-            Ok(p) => p,
-            Err(()) => return 0,
+        let Ok(next) = (unsafe { read_user::<u64>(ai, AI_NEXT) }) else {
+            return 0;
         };
+        ai = next;
     }
     0
 }
@@ -573,9 +567,8 @@ fn emit_hostent(ev: &mut DnsEvent, hostent: u64) -> u32 {
         return 0;
     }
     for i in 0..MAX_ADDRS {
-        let addr: u64 = match unsafe { read_user(list, i * 8) } {
-            Ok(p) => p,
-            Err(()) => return 0,
+        let Ok(addr) = (unsafe { read_user::<u64>(list, i * 8) }) else {
+            return 0;
         };
         if addr == 0 {
             break;
@@ -666,14 +659,15 @@ pub fn sched_process_exec(_ctx: TracePointContext) -> u32 {
 #[tracepoint]
 pub fn sched_process_exit(_ctx: TracePointContext) -> u32 {
     let id = bpf_get_current_pid_tgid();
+    let tgid = (id >> 32) as u32;
     // The tracepoint fires per thread; only whole-process exit matters.
-    if (id >> 32) as u32 == id as u32 {
+    if tgid == id as u32 {
         // Dropped so a recycled pid claims a fresh generation rather than
         // inheriting one from whoever held the number before it. Losing
         // this (the handler can be missed) costs a refused executable,
         // never a wrongly accepted one: the stale entry cannot equal what
         // the new process's own connect stamps.
-        let _ = EXEC_GEN.remove((id >> 32) as u32);
+        let _ = EXEC_GEN.remove(tgid);
         emit_event(EVENT_EXIT);
     }
     0

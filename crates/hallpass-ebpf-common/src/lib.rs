@@ -55,7 +55,7 @@ impl FlowKey {
         let mut d = [0u8; 16];
         s[..4].copy_from_slice(&saddr);
         d[..4].copy_from_slice(&daddr);
-        FlowKey {
+        Self {
             saddr: s,
             daddr: d,
             sport,
@@ -68,7 +68,7 @@ impl FlowKey {
 
     /// Build an IPv6 key from network-order address octets.
     pub fn v6(proto: u8, saddr: [u8; 16], sport: u16, daddr: [u8; 16], dport: u16) -> Self {
-        FlowKey {
+        Self {
             saddr,
             daddr,
             sport,
@@ -129,11 +129,11 @@ impl ExecEvent {
 
     /// Decode from ring buffer bytes without unsafe transmutes, so the
     /// userspace side stays deny(unsafe_code)-clean.
-    pub fn from_bytes(bytes: &[u8]) -> Option<ExecEvent> {
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
         if bytes.len() < Self::SIZE {
             return None;
         }
-        Some(ExecEvent {
+        Some(Self {
             pid: u32::from_ne_bytes(bytes[0..4].try_into().ok()?),
             kind: u32::from_ne_bytes(bytes[4..8].try_into().ok()?),
         })
@@ -172,12 +172,15 @@ impl DnsEvent {
         if bytes.len() < Self::SIZE {
             return None;
         }
-        let family = bytes[16];
-        let name_len = u32::from_ne_bytes(bytes[20..24].try_into().ok()?) as usize;
+        const FAMILY: usize = core::mem::offset_of!(DnsEvent, family);
+        const NAME_LEN: usize = core::mem::offset_of!(DnsEvent, name_len);
+        const NAME: usize = core::mem::offset_of!(DnsEvent, name);
+        let family = bytes[FAMILY];
+        let name_len = u32::from_ne_bytes(bytes[NAME_LEN..NAME_LEN + 4].try_into().ok()?) as usize;
         if name_len > DNS_NAME_CAP {
             return None;
         }
-        let name = core::str::from_utf8(&bytes[24..24 + name_len]).ok()?;
+        let name = core::str::from_utf8(&bytes[NAME..NAME + name_len]).ok()?;
         let ip: core::net::IpAddr = match family {
             AF_INET => {
                 let o: [u8; 4] = bytes[..4].try_into().ok()?;
@@ -218,6 +221,7 @@ mod tests {
         // as whatever the map slot last held.
         assert_eq!(core::mem::size_of::<FlowVal>(), 16);
         assert_eq!(core::mem::size_of::<ExecEvent>(), ExecEvent::SIZE);
+        assert_eq!(core::mem::size_of::<DnsEvent>(), DnsEvent::SIZE);
     }
 
     #[test]
