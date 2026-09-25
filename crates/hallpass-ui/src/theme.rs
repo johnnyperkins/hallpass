@@ -15,6 +15,7 @@
 //! background is not something this window can promise.
 
 use eframe::egui::{self, Color32, CornerRadius, Margin, Response, RichText, Stroke, Ui, Vec2};
+use hallpass_types::Verdict;
 
 // ---- palette -------------------------------------------------------------
 
@@ -81,15 +82,27 @@ impl Tone {
     }
 }
 
+/// The colour a verdict is drawn in, wherever it is drawn.
+pub fn verdict_color(v: Verdict) -> Color32 {
+    match v {
+        Verdict::Allow => ALLOW_COLOR,
+        Verdict::Deny => DENY_COLOR,
+        Verdict::Reject => REJECT_COLOR,
+    }
+}
+
+/// The glyph in front of every warning.
+pub const WARNING_SIGN: &str = "\u{26a0}";
+
 /// `color` as a background: its own hue, dimmed onto the dark surface.
-pub fn tint(color: Color32) -> Color32 {
+fn tint(color: Color32) -> Color32 {
     BG.lerp_to_gamma(color, TINT)
 }
 
 /// The same wash at half strength, for a whole panel rather than a chip.
 /// At full strength a large area of tinted red or amber turns muddy and
 /// stops reading as its own colour.
-pub fn tint_soft(color: Color32) -> Color32 {
+fn tint_soft(color: Color32) -> Color32 {
     BG.lerp_to_gamma(color, TINT / 2.0)
 }
 
@@ -110,18 +123,23 @@ pub fn band<R>(ui: &mut Ui, color: Color32, add: impl FnOnce(&mut Ui) -> R) -> R
         ui.set_width(ui.available_width());
         add(ui)
     });
-    let rect = out.response.rect;
+    paint_edge(ui, out.response.rect, CARD_RADIUS - 2, color);
+    out.inner
+}
+
+/// The coloured left edge of a band or banner, painted over the frame just
+/// drawn: a rounded rect cannot carry one thick side on its own.
+fn paint_edge(ui: &Ui, rect: egui::Rect, radius: u8, color: Color32) {
     ui.painter().rect_filled(
         egui::Rect::from_min_size(rect.min, Vec2::new(3.0, rect.height())),
         CornerRadius {
-            nw: CARD_RADIUS - 2,
-            sw: CARD_RADIUS - 2,
+            nw: radius,
+            sw: radius,
             ne: 0,
             se: 0,
         },
         color,
     );
-    out.inner
 }
 
 // ---- style ---------------------------------------------------------------
@@ -144,7 +162,17 @@ pub fn ensure_installed(ctx: &egui::Context) {
 
 /// The weight bold text is set in, on the variable interface face. egui's
 /// `strong` only brightens the colour; this is what makes a title a title.
-pub const SEMIBOLD: f32 = 600.0;
+const SEMIBOLD: f32 = 600.0;
+
+/// Text in the semibold weight titles are set in.
+pub fn semibold(text: impl Into<String>) -> RichText {
+    RichText::new(text).strong().variation("wght", SEMIBOLD)
+}
+
+/// The small muted heading every card, tile and table column starts with.
+pub fn caption(text: impl Into<String>) -> RichText {
+    semibold(text).small().color(MUTED)
+}
 
 /// Put Inter in front of egui's own proportional fonts.
 ///
@@ -226,46 +254,31 @@ fn install(ctx: &egui::Context) {
     // The one thing a hover must always do here is say "this is live":
     // rows are dense and the pointer is often the only thing telling an
     // operator which one they are about to act on.
-    v.widgets.noninteractive = egui::style::WidgetVisuals {
-        bg_fill: SURFACE,
-        weak_bg_fill: SURFACE,
-        bg_stroke: Stroke::new(1.0, HAIRLINE),
-        fg_stroke: Stroke::new(1.0, TEXT),
-        corner_radius: CornerRadius::same(CONTROL_RADIUS),
-        expansion: 0.0,
-    };
-    v.widgets.inactive = egui::style::WidgetVisuals {
-        bg_fill: SURFACE_CONTROL,
-        weak_bg_fill: SURFACE_CONTROL,
-        bg_stroke: Stroke::new(1.0, HAIRLINE),
-        fg_stroke: Stroke::new(1.0, Color32::from_rgb(0xc5, 0xcd, 0xdd)),
-        corner_radius: CornerRadius::same(CONTROL_RADIUS),
-        expansion: 0.0,
-    };
-    v.widgets.hovered = egui::style::WidgetVisuals {
-        bg_fill: Color32::from_rgb(0x2c, 0x35, 0x46),
-        weak_bg_fill: Color32::from_rgb(0x2c, 0x35, 0x46),
-        bg_stroke: Stroke::new(1.0, ACCENT.gamma_multiply(0.55)),
-        fg_stroke: Stroke::new(1.0, TEXT),
-        corner_radius: CornerRadius::same(CONTROL_RADIUS),
-        expansion: 1.0,
-    };
-    v.widgets.active = egui::style::WidgetVisuals {
-        bg_fill: Color32::from_rgb(0x35, 0x40, 0x55),
-        weak_bg_fill: Color32::from_rgb(0x35, 0x40, 0x55),
-        bg_stroke: Stroke::new(1.0, ACCENT),
-        fg_stroke: Stroke::new(1.0, Color32::WHITE),
-        corner_radius: CornerRadius::same(CONTROL_RADIUS),
-        expansion: 0.0,
-    };
-    v.widgets.open = egui::style::WidgetVisuals {
-        bg_fill: SURFACE_CONTROL,
-        weak_bg_fill: SURFACE_CONTROL,
-        bg_stroke: Stroke::new(1.0, ACCENT.gamma_multiply(0.7)),
-        fg_stroke: Stroke::new(1.0, TEXT),
-        corner_radius: CornerRadius::same(CONTROL_RADIUS),
-        expansion: 0.0,
-    };
+    v.widgets.noninteractive = widget_visuals(SURFACE, Stroke::new(1.0, HAIRLINE), TEXT, 0.0);
+    v.widgets.inactive = widget_visuals(
+        SURFACE_CONTROL,
+        Stroke::new(1.0, HAIRLINE),
+        Color32::from_rgb(0xc5, 0xcd, 0xdd),
+        0.0,
+    );
+    v.widgets.hovered = widget_visuals(
+        Color32::from_rgb(0x2c, 0x35, 0x46),
+        Stroke::new(1.0, ACCENT.gamma_multiply(0.55)),
+        TEXT,
+        1.0,
+    );
+    v.widgets.active = widget_visuals(
+        Color32::from_rgb(0x35, 0x40, 0x55),
+        Stroke::new(1.0, ACCENT),
+        Color32::WHITE,
+        0.0,
+    );
+    v.widgets.open = widget_visuals(
+        SURFACE_CONTROL,
+        Stroke::new(1.0, ACCENT.gamma_multiply(0.7)),
+        TEXT,
+        0.0,
+    );
 
     // Both themes, then dark: a desktop set to light must not hand this
     // window a light background with a palette calibrated against a dark
@@ -275,8 +288,25 @@ fn install(ctx: &egui::Context) {
     ctx.set_theme(egui::ThemePreference::Dark);
 }
 
+/// One state of egui's own widgets, in this window's shapes.
+fn widget_visuals(
+    fill: Color32,
+    stroke: Stroke,
+    text: Color32,
+    expansion: f32,
+) -> egui::style::WidgetVisuals {
+    egui::style::WidgetVisuals {
+        bg_fill: fill,
+        weak_bg_fill: fill,
+        bg_stroke: stroke,
+        fg_stroke: Stroke::new(1.0, text),
+        corner_radius: CornerRadius::same(CONTROL_RADIUS),
+        expansion,
+    }
+}
+
 /// The frame a card is drawn in: a raised surface with a hairline.
-pub fn card_frame() -> egui::Frame {
+fn card_frame() -> egui::Frame {
     egui::Frame::new()
         .fill(SURFACE_RAISED)
         .stroke(Stroke::new(1.0, HAIRLINE))
@@ -296,14 +326,7 @@ pub fn card<R>(ui: &mut Ui, title: &str, add: impl FnOnce(&mut Ui) -> R) -> R {
             // stretch every button inside it to the card's full width.
             ui.vertical(|ui| {
                 if !title.is_empty() {
-                    ui.label(
-                        egui::RichText::new(title)
-                            .small()
-                            .color(MUTED)
-                            .strong()
-                            .variation("wght", SEMIBOLD)
-                            .line_height(Some(16.0)),
-                    );
+                    ui.label(caption(title).line_height(Some(16.0)));
                     ui.add_space(2.0);
                 }
                 add(ui)
@@ -315,50 +338,58 @@ pub fn card<R>(ui: &mut Ui, title: &str, add: impl FnOnce(&mut Ui) -> R) -> R {
 
 // ---- small painted parts -------------------------------------------------
 
+/// A one-point rule across `x` at `y`: the edge that ends a surface.
+pub fn hairline(ui: &Ui, x: impl Into<egui::Rangef>, y: f32) {
+    ui.painter().hline(x, y, Stroke::new(1.0, HAIRLINE));
+}
+
 /// A filled chip: a short word in its own colour, on a dim wash of it.
 ///
 /// Carries an accessible label, because in the tables a pill is the only
 /// thing saying what happened to a connection.
 pub fn pill(ui: &mut Ui, text: &str, color: Color32) -> Response {
-    pill_sized(ui, text, color, egui::TextStyle::Small.resolve(ui.style()))
-}
-
-fn pill_sized(ui: &mut Ui, text: &str, color: Color32, font: egui::FontId) -> Response {
-    let galley = ui.painter().layout_no_wrap(text.to_owned(), font, color);
-    let pad = Vec2::new(7.0, 2.0);
-    let (rect, response) = ui.allocate_exact_size(galley.size() + pad * 2.0, egui::Sense::hover());
-    if ui.is_rect_visible(rect) {
-        ui.painter()
-            .rect_filled(rect, CornerRadius::same(CONTROL_RADIUS - 2), tint(color));
-        ui.painter().galley(rect.min + pad, galley, color);
-    }
-    let label = text.to_owned();
-    response
-        .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, label.clone()));
-    response
+    chip(ui, text, color, Vec2::new(7.0, 2.0), |painter, rect| {
+        painter.rect_filled(rect, CornerRadius::same(CONTROL_RADIUS - 2), tint(color));
+    })
 }
 
 /// A pill with no fill: for things that are true but unremarkable (a tag,
 /// a protocol), where a wash of colour would compete with the verdicts.
 pub fn ghost_pill(ui: &mut Ui, text: &str) -> Response {
-    let font = egui::TextStyle::Small.resolve(ui.style());
-    let galley = ui.painter().layout_no_wrap(text.to_owned(), font, MUTED);
-    let pad = Vec2::new(6.0, 2.0);
-    let (rect, response) = ui.allocate_exact_size(galley.size() + pad * 2.0, egui::Sense::hover());
-    if ui.is_rect_visible(rect) {
-        ui.painter().rect(
+    chip(ui, text, MUTED, Vec2::new(6.0, 2.0), |painter, rect| {
+        painter.rect(
             rect,
             CornerRadius::same(CONTROL_RADIUS - 2),
             Color32::TRANSPARENT,
             Stroke::new(1.0, HAIRLINE),
             egui::StrokeKind::Inside,
         );
-        ui.painter().galley(rect.min + pad, galley, MUTED);
+    })
+}
+
+/// Small text in `color` inside `pad`, over whatever `background` paints.
+fn chip(
+    ui: &mut Ui,
+    text: &str,
+    color: Color32,
+    pad: Vec2,
+    background: impl FnOnce(&egui::Painter, egui::Rect),
+) -> Response {
+    let font = egui::TextStyle::Small.resolve(ui.style());
+    let galley = ui.painter().layout_no_wrap(text.to_owned(), font, color);
+    let (rect, response) = ui.allocate_exact_size(galley.size() + pad * 2.0, egui::Sense::hover());
+    if ui.is_rect_visible(rect) {
+        background(ui.painter(), rect);
+        ui.painter().galley(rect.min + pad, galley, color);
     }
-    let label = text.to_owned();
+    announce(&response, egui::WidgetType::Label, text);
     response
-        .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, label.clone()));
-    response
+}
+
+/// Name a painted widget to accessibility (and to the widget tests), as
+/// the stock widget it stands in for would be.
+fn announce(response: &Response, kind: egui::WidgetType, label: &str) {
+    response.widget_info(|| egui::WidgetInfo::labeled(kind, true, label));
 }
 
 /// A full-width notice with a coloured edge: the whole-host facts (a
@@ -385,37 +416,16 @@ pub fn banner(ui: &mut Ui, tone: Tone, glyph: &str, title: &str, body: &str) {
             ui.set_width(ui.available_width());
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing.x = 6.0;
-                ui.label(
-                    egui::RichText::new(glyph)
-                        .color(color)
-                        .strong()
-                        .variation("wght", SEMIBOLD),
-                );
-                ui.label(
-                    egui::RichText::new(title)
-                        .color(color)
-                        .strong()
-                        .variation("wght", SEMIBOLD),
-                );
+                ui.label(semibold(glyph).color(color));
+                ui.label(semibold(title).color(color));
                 if !body.is_empty() {
-                    ui.label(egui::RichText::new(body).color(TEXT));
+                    ui.label(RichText::new(body).color(TEXT));
                 }
             });
         })
         .response
         .rect;
-    // The edge, painted over the frame that was just drawn: a rounded
-    // rect cannot carry one thick side on its own.
-    ui.painter().rect_filled(
-        egui::Rect::from_min_size(rect.min, Vec2::new(3.0, rect.height())),
-        CornerRadius {
-            nw: CARD_RADIUS,
-            sw: CARD_RADIUS,
-            ne: 0,
-            se: 0,
-        },
-        color,
-    );
+    paint_edge(ui, rect, CARD_RADIUS, color);
 }
 
 /// A status dot with a soft halo: the daemon link, where the colour is
@@ -590,13 +600,7 @@ pub fn stat_tile(ui: &mut Ui, width: f32, label: &str, value: &str, color: Color
             ui.set_width(width);
             ui.vertical(|ui| {
                 ui.spacing_mut().item_spacing.y = 2.0;
-                ui.label(
-                    RichText::new(label)
-                        .small()
-                        .color(MUTED)
-                        .strong()
-                        .variation("wght", SEMIBOLD),
-                );
+                ui.label(caption(label));
                 ui.label(
                     RichText::new(value)
                         .color(color)
@@ -652,66 +656,51 @@ fn switch_impl(ui: &mut Ui, on: &mut bool, label: &str, visible_label: bool) -> 
     }
     let enabled = ui.is_enabled();
     let is_on = *on;
-    let text = label.to_owned();
     response.widget_info(|| {
-        egui::WidgetInfo::selected(egui::WidgetType::Checkbox, enabled, is_on, text.clone())
+        egui::WidgetInfo::selected(egui::WidgetType::Checkbox, enabled, is_on, label)
     });
+    if !ui.is_rect_visible(rect) {
+        return response;
+    }
 
-    if ui.is_rect_visible(rect) {
-        let how_on = ui.ctx().animate_bool_responsive(response.id, *on);
-        let track_rect = egui::Rect::from_min_size(
-            egui::pos2(rect.left(), rect.center().y - track.y / 2.0),
-            track,
+    let how_on = ui.ctx().animate_bool_responsive(response.id, *on);
+    let track_rect = egui::Rect::from_min_size(
+        egui::pos2(rect.left(), rect.center().y - track.y / 2.0),
+        track,
+    );
+    let on_fill = ALLOW_COLOR.gamma_multiply(if enabled { 0.9 } else { 0.4 });
+    ui.painter().rect(
+        track_rect,
+        CornerRadius::same((track.y / 2.0) as u8),
+        SURFACE_CONTROL.lerp_to_gamma(on_fill, how_on),
+        Stroke::new(1.0, if response.hovered() { ACCENT } else { HAIRLINE }),
+        egui::StrokeKind::Inside,
+    );
+    let knob_x = egui::lerp(
+        (track_rect.left() + track.y / 2.0)..=(track_rect.right() - track.y / 2.0),
+        how_on,
+    );
+    let knob = egui::pos2(knob_x, track_rect.center().y);
+    ui.painter().circle_filled(
+        knob + Vec2::new(0.0, 1.0),
+        track.y / 2.0 - 2.0,
+        Color32::from_black_alpha(70),
+    );
+    ui.painter().circle_filled(
+        knob,
+        track.y / 2.0 - 2.5,
+        if enabled { Color32::WHITE } else { MUTED },
+    );
+    if response.has_focus() {
+        focus_ring(ui, track_rect, (track.y / 2.0) as u8);
+    }
+    if visible_label {
+        let pos = egui::pos2(
+            track_rect.right() + 7.0,
+            rect.center().y - galley.size().y / 2.0,
         );
-        let off_fill = SURFACE_CONTROL;
-        let on_fill = if enabled {
-            ALLOW_COLOR.gamma_multiply(0.9)
-        } else {
-            ALLOW_COLOR.gamma_multiply(0.4)
-        };
-        let fill = off_fill.lerp_to_gamma(on_fill, how_on);
-        ui.painter().rect(
-            track_rect,
-            CornerRadius::same((track.y / 2.0) as u8),
-            fill,
-            Stroke::new(1.0, if response.hovered() { ACCENT } else { HAIRLINE }),
-            egui::StrokeKind::Inside,
-        );
-        let knob_x = egui::lerp(
-            (track_rect.left() + track.y / 2.0)..=(track_rect.right() - track.y / 2.0),
-            how_on,
-        );
-        let knob = egui::pos2(knob_x, track_rect.center().y);
-        ui.painter().circle_filled(
-            knob + Vec2::new(0.0, 1.0),
-            track.y / 2.0 - 2.0,
-            Color32::from_black_alpha(70),
-        );
-        ui.painter().circle_filled(
-            knob,
-            track.y / 2.0 - 2.5,
-            if enabled { Color32::WHITE } else { MUTED },
-        );
-        if response.has_focus() {
-            focus_ring(ui, track_rect, (track.y / 2.0) as u8);
-        }
-        if !visible_label {
-            return response;
-        }
-        let text_color = if enabled { TEXT } else { MUTED };
-        let galley = ui.painter().layout_no_wrap(
-            label.to_owned(),
-            egui::TextStyle::Body.resolve(ui.style()),
-            text_color,
-        );
-        ui.painter().galley(
-            egui::pos2(
-                track_rect.right() + 7.0,
-                rect.center().y - galley.size().y / 2.0,
-            ),
-            galley,
-            text_color,
-        );
+        ui.painter()
+            .galley(pos, galley, if enabled { TEXT } else { MUTED });
     }
     response
 }
@@ -745,8 +734,24 @@ struct Slide {
     shown_color: Color32,
 }
 
+/// A [`segmented`] control over `options`, each drawn with the label and
+/// colour `face` gives it and `current` selected. Returns the option clicked
+/// this pass, if any, which may be `current` again.
+pub fn pick<'a, T: Copy + PartialEq>(
+    ui: &mut Ui,
+    id_salt: impl std::hash::Hash + std::fmt::Debug,
+    current: T,
+    options: &[T],
+    kind: Segments,
+    face: impl Fn(T) -> (&'a str, Color32),
+) -> Option<T> {
+    let items: Vec<_> = options.iter().map(|&o| face(o)).collect();
+    let selected = options.iter().position(|&o| o == current).unwrap_or(0);
+    segmented(ui, id_salt, &items, selected, kind).map(|i| options[i])
+}
+
 /// A row of options with one highlight that slides to whichever is picked.
-/// Returns the option clicked this pass, if any.
+/// Returns the index of the option clicked this pass, if any.
 ///
 /// One moving indicator rather than a fill per option: the eye follows the
 /// motion from the old choice to the new one, so a click that landed on the
@@ -757,7 +762,7 @@ struct Slide {
 ///
 /// Every option is its own focus stop and is announced as a selectable
 /// label, the same as the separate buttons this replaces.
-pub fn segmented(
+fn segmented(
     ui: &mut Ui,
     id_salt: impl std::hash::Hash + std::fmt::Debug,
     items: &[(&str, Color32)],
@@ -796,16 +801,15 @@ pub fn segmented(
     let enabled = ui.is_enabled();
     let mut clicked = None;
     let mut responses = Vec::with_capacity(items.len());
-    for (i, rect) in rects.iter().enumerate() {
+    for (i, (rect, (label, _))) in rects.iter().zip(items).enumerate() {
         let response = ui.interact(*rect, id.with(i), egui::Sense::click());
-        let label = items[i].0.to_owned();
         let is_selected = i == selected;
         response.widget_info(|| {
             egui::WidgetInfo::selected(
                 egui::WidgetType::SelectableLabel,
                 enabled,
                 is_selected,
-                label.clone(),
+                label,
             )
         });
         if response.clicked() {
@@ -818,41 +822,13 @@ pub fn segmented(
     }
 
     let selected = selected.min(items.len() - 1);
-    let target = rects[selected].translate(-outer.min.to_vec2());
-    let target_color = items[selected].1;
-    let now = ui.input(|i| i.time);
-    let animate = ui.style().animation_time > 0.0;
-    let mut slide = ui
-        .data(|d| d.get_temp::<Slide>(id))
-        .filter(|_| animate)
-        .unwrap_or(Slide {
-            to: selected,
-            start: f64::NEG_INFINITY,
-            from: target,
-            from_color: target_color,
-            shown: target,
-            shown_color: target_color,
-        });
-    if slide.to != selected {
-        slide = Slide {
-            to: selected,
-            start: now,
-            from: slide.shown,
-            from_color: slide.shown_color,
-            ..slide
-        };
-    }
-    let t = ((now - slide.start) / SLIDE_SECS).clamp(0.0, 1.0) as f32;
-    let eased = 1.0 - (1.0 - t).powi(3);
-    slide.shown = egui::Rect::from_min_max(
-        slide.from.min.lerp(target.min, eased),
-        slide.from.max.lerp(target.max, eased),
+    let slide = slide_to(
+        ui,
+        id,
+        selected,
+        rects[selected].translate(-outer.min.to_vec2()),
+        items[selected].1,
     );
-    slide.shown_color = slide.from_color.lerp_to_gamma(target_color, eased);
-    ui.data_mut(|d| d.insert_temp(id, slide));
-    if t < 1.0 {
-        ui.ctx().request_repaint();
-    }
 
     let painter = ui.painter();
     if kind == Segments::Picker {
@@ -900,6 +876,7 @@ pub fn segmented(
             );
         }
     }
+    let nudge = if kind == Segments::Tabs { -1.0 } else { 0.0 };
     for (i, (galley, response)) in galleys.into_iter().zip(&responses).enumerate() {
         let text = if i == selected {
             TEXT
@@ -913,7 +890,6 @@ pub fn segmented(
         } else {
             text.gamma_multiply(0.5)
         };
-        let nudge = if kind == Segments::Tabs { -1.0 } else { 0.0 };
         painter.galley(
             rects[i].center() - galley.size() / 2.0 + Vec2::new(0.0, nudge),
             galley,
@@ -924,6 +900,45 @@ pub fn segmented(
         }
     }
     clicked
+}
+
+/// Move the indicator stored under `id` one frame towards `target`, the
+/// rect of option `to` relative to the control, and store it again.
+fn slide_to(ui: &Ui, id: egui::Id, to: usize, target: egui::Rect, target_color: Color32) -> Slide {
+    let now = ui.input(|i| i.time);
+    let animate = ui.style().animation_time > 0.0;
+    let mut slide = ui
+        .data(|d| d.get_temp::<Slide>(id))
+        .filter(|_| animate)
+        .unwrap_or(Slide {
+            to,
+            start: f64::NEG_INFINITY,
+            from: target,
+            from_color: target_color,
+            shown: target,
+            shown_color: target_color,
+        });
+    if slide.to != to {
+        slide = Slide {
+            to,
+            start: now,
+            from: slide.shown,
+            from_color: slide.shown_color,
+            ..slide
+        };
+    }
+    let t = ((now - slide.start) / SLIDE_SECS).clamp(0.0, 1.0) as f32;
+    let eased = 1.0 - (1.0 - t).powi(3);
+    slide.shown = egui::Rect::from_min_max(
+        slide.from.min.lerp(target.min, eased),
+        slide.from.max.lerp(target.max, eased),
+    );
+    slide.shown_color = slide.from_color.lerp_to_gamma(target_color, eased);
+    ui.data_mut(|d| d.insert_temp(id, slide));
+    if t < 1.0 {
+        ui.ctx().request_repaint();
+    }
+    slide
 }
 
 /// The keyboard focus outline every painted control here draws, so a
@@ -949,9 +964,7 @@ pub fn ghost_button(ui: &mut Ui, text: &str, color: Color32, hot: bool) -> Respo
         .layout_no_wrap(text.to_owned(), font, Color32::PLACEHOLDER);
     let pad = Vec2::new(8.0, 3.0);
     let (rect, response) = ui.allocate_exact_size(galley.size() + pad * 2.0, egui::Sense::click());
-    let label = text.to_owned();
-    response
-        .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label.clone()));
+    announce(&response, egui::WidgetType::Button, text);
     if ui.is_rect_visible(rect) {
         let how_hot = ui
             .ctx()
@@ -981,16 +994,11 @@ pub fn ghost_button(ui: &mut Ui, text: &str, color: Color32, hot: bool) -> Respo
 
 /// The one button on a screen that does what the screen is for.
 pub fn primary_button(text: &str) -> egui::Button<'static> {
-    egui::Button::new(
-        RichText::new(text)
-            .color(Color32::WHITE)
-            .strong()
-            .variation("wght", SEMIBOLD),
-    )
-    .fill(ACCENT.gamma_multiply(0.85))
-    .stroke(Stroke::new(1.0, ACCENT))
-    .corner_radius(CornerRadius::same(CONTROL_RADIUS))
-    .min_size(Vec2::new(84.0, 28.0))
+    egui::Button::new(semibold(text).color(Color32::WHITE))
+        .fill(ACCENT.gamma_multiply(0.85))
+        .stroke(Stroke::new(1.0, ACCENT))
+        .corner_radius(CornerRadius::same(CONTROL_RADIUS))
+        .min_size(Vec2::new(84.0, 28.0))
 }
 
 /// The search field: a magnifier inside it, and a clear control once
@@ -1070,35 +1078,30 @@ pub fn sort_header(ui: &mut Ui, title: &str, direction: Option<bool>) -> Respons
     let font = egui::TextStyle::Small.resolve(ui.style());
     let galley = ui
         .painter()
-        .layout_no_wrap(text.clone(), font.clone(), Color32::PLACEHOLDER);
+        .layout_no_wrap(text.clone(), font, Color32::PLACEHOLDER);
+    let text_size = galley.size();
     // Room for the marker whether or not this column carries it, so the
     // headings do not shift sideways when the sort moves.
-    let size = Vec2::new(
-        galley.size().x + 16.0,
-        galley.size().y.max(ui.available_height()),
-    );
+    let size = Vec2::new(text_size.x + 16.0, text_size.y.max(ui.available_height()));
     let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
-    let label = text.clone();
-    response
-        .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label.clone()));
+    announce(&response, egui::WidgetType::Button, &text);
     if ui.is_rect_visible(rect) {
         let color = match (direction.is_some(), response.hovered()) {
             (_, true) => TEXT,
             (true, _) => ACCENT,
             (false, _) => MUTED,
         };
-        let galley = ui.painter().layout_no_wrap(text, font, color);
         let text_left = rect.left() + 2.0;
         ui.painter().galley(
-            egui::pos2(text_left, rect.center().y - galley.size().y / 2.0),
-            galley.clone(),
+            egui::pos2(text_left, rect.center().y - text_size.y / 2.0),
+            galley,
             color,
         );
         // Painted rather than written: the bundled fonts have no
         // dependable triangle, and a heading that renders as a hollow box
         // is worse than no marker at all.
         if let Some(descending) = direction {
-            let x = text_left + galley.size().x + 5.0;
+            let x = text_left + text_size.x + 5.0;
             let y = rect.center().y;
             let (a, b, tip) = if descending {
                 (
@@ -1126,17 +1129,11 @@ pub fn sort_header(ui: &mut Ui, title: &str, direction: Option<bool>) -> Respons
 /// A verdict button for the prompt window: big, filled, and unmistakably
 /// the thing to press.
 pub fn verdict_button(text: &str, color: Color32) -> egui::Button<'static> {
-    egui::Button::new(
-        egui::RichText::new(text)
-            .color(Color32::WHITE)
-            .strong()
-            .variation("wght", SEMIBOLD)
-            .size(14.5),
-    )
-    .fill(color)
-    .stroke(Stroke::new(1.0, color.gamma_multiply(1.3)))
-    .corner_radius(CornerRadius::same(CONTROL_RADIUS + 1))
-    .min_size(Vec2::new(118.0, 34.0))
+    egui::Button::new(semibold(text).color(Color32::WHITE).size(14.5))
+        .fill(color)
+        .stroke(Stroke::new(1.0, color.gamma_multiply(1.3)))
+        .corner_radius(CornerRadius::same(CONTROL_RADIUS + 1))
+        .min_size(Vec2::new(118.0, 34.0))
 }
 
 /// The countdown under a prompt: a thin bar that drains and warms as the
@@ -1165,10 +1162,7 @@ pub fn countdown(ui: &mut Ui, fraction: f32, text: &str) {
         Vec2::new(ui.available_width(), height),
         egui::Sense::hover(),
     );
-    let label = text.to_owned();
-    response.widget_info(|| {
-        egui::WidgetInfo::labeled(egui::WidgetType::ProgressIndicator, true, label.clone())
-    });
+    announce(&response, egui::WidgetType::ProgressIndicator, text);
     if !ui.is_rect_visible(rect) {
         return;
     }
@@ -1267,7 +1261,7 @@ pub fn icon(color: Color32) -> egui::IconData {
         Vec2::new(SIZE as f32 - 6.0, SIZE as f32 - 4.0),
     );
     let (outline, bolt) = shield(rect);
-    let inner: Vec<egui::Pos2> = shrink_towards(&outline, 0.88);
+    let inner = shrink_towards(&outline, 0.88);
     let mut rgba = Vec::with_capacity((SIZE * SIZE * 4) as usize);
     for y in 0..SIZE {
         for x in 0..SIZE {
@@ -1295,17 +1289,8 @@ pub fn icon(color: Color32) -> egui::IconData {
             } else {
                 // Mixed by which part won the pixel, so an edge sample
                 // next to a body sample blends instead of stepping.
-                let mix = |a: Color32, b: Color32, t: f32| a.lerp_to_gamma(b, t);
                 let lit = spark + edge;
-                mix(
-                    ground,
-                    color,
-                    if coverage > 0.0 {
-                        lit / (lit + body).max(1.0)
-                    } else {
-                        0.0
-                    },
-                )
+                ground.lerp_to_gamma(color, lit / (lit + body).max(1.0))
             };
             let [r, g, b, _] = pixel.to_array();
             rgba.extend_from_slice(&[r, g, b, (coverage * 255.0) as u8]);
@@ -1346,13 +1331,7 @@ fn contains(poly: &[egui::Pos2], p: egui::Pos2) -> bool {
 /// The wordmark: spaced capitals, because this is a title and not a
 /// sentence.
 pub fn wordmark(ui: &mut Ui) {
-    ui.label(
-        egui::RichText::new("H A L L P A S S")
-            .color(TEXT)
-            .strong()
-            .variation("wght", SEMIBOLD)
-            .size(13.0),
-    );
+    ui.label(semibold("H A L L P A S S").color(TEXT).size(13.0));
 }
 
 /// A key/value line in the detail cards: the key at the left, the value
@@ -1384,13 +1363,13 @@ pub fn stat_row(ui: &mut Ui, key: &str, value: impl FnOnce(&mut Ui)) {
 
 /// The mono style every number here is written in, so columns of digits
 /// line up and a count never re-flows as it grows.
-pub fn num(text: impl Into<String>) -> egui::RichText {
-    egui::RichText::new(text.into()).monospace().color(TEXT)
+pub fn num(text: impl Into<String>) -> RichText {
+    RichText::new(text).monospace().color(TEXT)
 }
 
 /// The same, dimmed: numbers that are context rather than the answer.
-pub fn num_muted(text: impl Into<String>) -> egui::RichText {
-    egui::RichText::new(text.into()).monospace().color(MUTED)
+pub fn num_muted(text: impl Into<String>) -> RichText {
+    RichText::new(text).monospace().color(MUTED)
 }
 
 #[cfg(test)]

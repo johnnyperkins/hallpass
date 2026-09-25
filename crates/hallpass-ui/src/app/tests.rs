@@ -9,8 +9,10 @@
 
 use std::time::Duration;
 
-use hallpass_types::{Action, DaemonMsg, PromptScope, RuleDuration, RuleMatch};
+use hallpass_types::{Action, Connection, PromptScope, RuleDuration, RuleMatch};
 
+use super::format::{format_uptime, grouped};
+use super::prompt_agent::AGENT_GRACE;
 use super::*;
 
 /// An app plus the ends of its channel pair the network thread would own.
@@ -1270,9 +1272,10 @@ fn grouped_counts() {
     assert_eq!(grouped(u64::MAX), "18,446,744,073,709,551,615");
 }
 
+/// The word the rules table and the settings picker show for a verdict.
 #[test]
 fn labels() {
-    assert_eq!(verdict_label(Verdict::Reject), "reject");
+    assert_eq!(Verdict::Reject.as_str(), "reject");
 }
 
 /// An unenforced deny is amber, not red: nothing was stopped, and colouring

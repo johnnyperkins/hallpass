@@ -6,8 +6,12 @@
 //! every other rule source and its error comes back over IPC, so nothing
 //! here is a trust boundary.
 
-use eframe::egui::{self, ComboBox, TextEdit};
-use hallpass_types::{Action, Connection, Proto, Rule, RuleDuration, RuleMatch};
+use eframe::egui::{self, ComboBox, RichText, TextEdit};
+use hallpass_types::{
+    sanitize_for_display, Action, Connection, Proto, Rule, RuleDuration, RuleMatch,
+};
+
+use crate::theme::{self, MUTED};
 
 /// Duration choice in the form; `Timed` carries its timespan text.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -95,7 +99,7 @@ fn parse_tags(text: &str) -> Result<Vec<String>, String> {
 impl RuleEditor {
     /// An empty form for a new rule.
     pub fn add() -> Self {
-        RuleEditor {
+        Self {
             editing: None,
             name: String::new(),
             action: Action::Deny,
@@ -140,34 +144,31 @@ impl RuleEditor {
     /// process chose its own executable path, and it lands in a field the
     /// operator edits and then reads back.
     pub fn from_connection(conn: &Connection) -> Self {
-        let mut e = Self::add();
-        let exe = conn
-            .exe_path
-            .as_ref()
-            .map(|p| hallpass_types::sanitize_for_display(&p.display().to_string()).into_owned())
-            .unwrap_or_default();
-        let stem = conn
-            .exe_path
-            .as_ref()
+        let clean = |s: &str| sanitize_for_display(s).into_owned();
+        let exe = conn.exe_path.as_deref();
+        let stem = exe
             .and_then(|p| p.file_name())
-            .map(|n| hallpass_types::sanitize_for_display(&n.to_string_lossy()).into_owned())
-            .unwrap_or_else(|| "connection".to_string());
-        e.name = format!("{stem}-{}", conn.tuple.dst.port());
-        e.exe = exe;
+            .map_or_else(|| "connection".to_string(), |n| clean(&n.to_string_lossy()));
+        let port = conn.tuple.dst.port();
+        let mut e = Self::add();
+        e.name = format!("{stem}-{port}");
+        e.exe = exe
+            .map(|p| clean(&p.display().to_string()))
+            .unwrap_or_default();
         // Carried for the same reason the daemon pins it on a rule made
         // from a prompt reply: a sandboxed application's executable path is
         // shared by every application of that packaging system, so exe
         // alone would write a rule that answers for all of them.
         if let Some(app) = &conn.app_id {
-            e.app_id = hallpass_types::sanitize_for_display(app).into_owned();
+            e.app_id = clean(app);
         }
-        e.port = conn.tuple.dst.port().to_string();
+        e.port = port.to_string();
         e.proto = Some(conn.tuple.proto);
         // Prefer the domain over the address: an address is one of however
         // many a name resolves to today, so a rule pinned to it silently
         // stops covering the thing the operator meant.
         match &conn.domain {
-            Some(domain) => e.domain = hallpass_types::sanitize_for_display(domain).into_owned(),
+            Some(domain) => e.domain = clean(domain),
             None => e.dest = conn.tuple.dst.ip().to_string(),
         }
         e
@@ -323,7 +324,7 @@ impl RuleEditor {
     /// the daemon acks; see [`RuleEditor::ack_err`] and
     /// [`RuleEditor::ack_lost`] for the paths that keep it open.
     pub fn window(&mut self, ctx: &egui::Context) -> (bool, Option<Rule>) {
-        crate::theme::ensure_installed(ctx);
+        theme::ensure_installed(ctx);
         let mut open = true;
         let mut saved = None;
         let title = match &self.editing {
@@ -407,7 +408,7 @@ impl RuleEditor {
                 .id_salt("rule-editor-error")
                 .max_height(40.0)
                 .show(ui, |ui| {
-                    crate::theme::banner(ui, crate::theme::Tone::Bad, "\u{26a0}", err, "");
+                    theme::banner(ui, theme::Tone::Bad, theme::WARNING_SIGN, err, "");
                 });
         }
         ui.add_space(6.0);
@@ -415,7 +416,7 @@ impl RuleEditor {
             if ui
                 .add_enabled(
                     !self.awaiting,
-                    crate::theme::primary_button("Save").min_size(egui::vec2(90.0, 28.0)),
+                    theme::primary_button("Save").min_size(egui::vec2(90.0, 28.0)),
                 )
                 .clicked()
             {
@@ -428,7 +429,7 @@ impl RuleEditor {
                 }
             }
             if self.awaiting {
-                ui.label(egui::RichText::new("Saving...").color(crate::theme::MUTED));
+                ui.label(RichText::new("Saving...").color(MUTED));
             }
         });
     }
@@ -448,17 +449,15 @@ impl RuleEditor {
 
                 field_label(ui, "Action");
                 ui.horizontal(|ui| {
-                    const ACTIONS: [Action; 3] = [Action::Allow, Action::Deny, Action::Reject];
-                    let items = ACTIONS.map(|a| (a.as_str(), action_color(a)));
-                    let current = ACTIONS.iter().position(|a| *a == self.action).unwrap_or(0);
-                    if let Some(i) = crate::theme::segmented(
+                    if let Some(action) = theme::pick(
                         ui,
                         "rule-action",
-                        &items,
-                        current,
-                        crate::theme::Segments::Picker,
+                        self.action,
+                        &[Action::Allow, Action::Deny, Action::Reject],
+                        theme::Segments::Picker,
+                        |a| (a.as_str(), theme::verdict_color(a.into())),
                     ) {
-                        self.action = ACTIONS[i];
+                        self.action = action;
                     }
                 });
                 ui.end_row();
@@ -492,7 +491,7 @@ impl RuleEditor {
                 ui.end_row();
 
                 field_label(ui, "Enabled");
-                crate::theme::switch_bare(ui, &mut self.enabled, "Enabled");
+                theme::switch_bare(ui, &mut self.enabled, "Enabled");
                 ui.end_row();
 
                 // Above the separator, with the rest of the rule's own
@@ -509,17 +508,11 @@ impl RuleEditor {
             });
 
         ui.add_space(8.0);
+        ui.label(theme::caption("MATCH CRITERIA"));
         ui.label(
-            egui::RichText::new("MATCH CRITERIA")
+            RichText::new("All set fields must match; leave blank to ignore.")
                 .small()
-                .strong()
-                .variation("wght", crate::theme::SEMIBOLD)
-                .color(crate::theme::MUTED),
-        );
-        ui.label(
-            egui::RichText::new("All set fields must match; leave blank to ignore.")
-                .small()
-                .color(crate::theme::MUTED),
+                .color(MUTED),
         );
         ui.add_space(4.0);
 
@@ -537,9 +530,7 @@ impl RuleEditor {
                     ("Domain", &mut self.domain, "example.org or *.example.org"),
                     ("User (uid)", &mut self.user, "1000"),
                 ] {
-                    field_label(ui, label);
-                    ui.add(TextEdit::singleline(field).hint_text(hint));
-                    ui.end_row();
+                    text_row(ui, label, field, hint);
                 }
 
                 field_label(ui, "Protocol");
@@ -571,9 +562,7 @@ impl RuleEditor {
                     ("Interface", &mut self.iface, "wg0"),
                     ("App id", &mut self.app_id, "flatpak:org.mozilla.firefox"),
                 ] {
-                    field_label(ui, label);
-                    ui.add(TextEdit::singleline(field).hint_text(hint));
-                    ui.end_row();
+                    text_row(ui, label, field, hint);
                 }
             });
 
@@ -588,7 +577,7 @@ impl RuleEditor {
         // warning rather than a rule.
         if self.action != Action::Allow && !self.app_id.trim().is_empty() {
             ui.colored_label(
-                crate::theme::REJECT_COLOR,
+                theme::REJECT_COLOR,
                 "\u{26a0} An app id narrows this rule. A deny carrying one stops applying \
                  whenever the application runs outside its packaging scope; leave it blank \
                  to block the executable however it is launched.",
@@ -597,9 +586,9 @@ impl RuleEditor {
 
         if self.editing.is_some() && self.duration == DurationChoice::Timed {
             ui.label(
-                egui::RichText::new("Saving a timed rule restarts its clock from now.")
+                RichText::new("Saving a timed rule restarts its clock from now.")
                     .small()
-                    .color(crate::theme::MUTED),
+                    .color(MUTED),
             );
         }
     }
@@ -608,16 +597,15 @@ impl RuleEditor {
 /// A form label: muted, so the eye lands on the values rather than on the
 /// two dozen field names beside them.
 fn field_label(ui: &mut egui::Ui, text: &str) {
-    ui.label(egui::RichText::new(text).color(crate::theme::MUTED));
+    ui.label(RichText::new(text).color(MUTED));
 }
 
-/// The verdict palette, for the action picker's own chip.
-fn action_color(action: Action) -> egui::Color32 {
-    match action {
-        Action::Allow => crate::theme::ALLOW_COLOR,
-        Action::Deny => crate::theme::DENY_COLOR,
-        Action::Reject => crate::theme::REJECT_COLOR,
-    }
+/// One free-text field of the match grid: its label, and the field with an
+/// example of what goes in it.
+fn text_row(ui: &mut egui::Ui, label: &str, field: &mut String, hint: &str) {
+    field_label(ui, label);
+    ui.add(TextEdit::singleline(field).hint_text(hint));
+    ui.end_row();
 }
 
 fn proto_label(p: Option<Proto>) -> String {

@@ -6,7 +6,7 @@
 //! what its buttons answered.
 
 use eframe::egui::{self, RichText};
-use hallpass_types::{ClientMsg, PromptScope, RuleDuration, Verdict};
+use hallpass_types::{ClientMsg, FirstSeen, PromptScope, RuleDuration, Verdict};
 
 use crate::prompt::{self, PromptState};
 use crate::theme::{self, Tone, ALLOW_COLOR, DENY_COLOR, MUTED, REJECT_COLOR, TEXT};
@@ -14,6 +14,12 @@ use crate::theme::{self, Tone, ALLOW_COLOR, DENY_COLOR, MUTED, REJECT_COLOR, TEX
 /// How many of the other pending prompts the list under the front one
 /// names; the rest are counted. A prompt past this is not on screen.
 pub(crate) const REST_SHOWN: usize = 5;
+
+/// Bound for a name the judged process chose, quoted inside the pinned
+/// action panel. Short enough that both warnings together cannot crowd the
+/// verdict buttons out of the viewport; the scrolling body carries the
+/// names in full.
+const PINNED_NAME_MAX: usize = 40;
 
 /// Body of a prompt window: the app's oldest pending prompt, plus
 /// its other pending destinations (`rest`), which a host- or app-wide
@@ -118,16 +124,14 @@ fn prompt_summary_ui(ui: &mut egui::Ui, p: &PromptState) {
                 // the daemon is not tracking, which is why there is no
                 // "seen before" badge to pair with it: it would be a claim
                 // the daemon may have no basis for.
-                if let Some(what) = conn.first_seen.and_then(|f| f.describe()) {
+                if let Some(what) = conn.first_seen.and_then(FirstSeen::describe) {
                     theme::pill(ui, "NEW", REJECT_COLOR).on_hover_text(what);
                 }
                 theme::ghost_pill(ui, &conn.tuple.proto.to_string());
                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                     ui.add(
                         egui::Label::new(
-                            RichText::new(prompt::exe_name(conn))
-                                .strong()
-                                .variation("wght", theme::SEMIBOLD)
+                            theme::semibold(prompt::exe_name(conn))
                                 .size(18.0)
                                 .color(TEXT),
                         )
@@ -157,10 +161,6 @@ fn prompt_summary_ui(ui: &mut egui::Ui, p: &PromptState) {
 /// The scrolling half: everything else the operator reads to decide.
 fn prompt_info_ui(ui: &mut egui::Ui, p: &PromptState, rest: &[String]) {
     let conn = &p.conn;
-    // Read once and used by both the summary's badge and the details row
-    // below, from the same connection, so the two cannot disagree.
-    let whats_new = conn.first_seen.and_then(|f| f.describe());
-
     // First, and its own band rather than a line of text: it says a rule was
     // written for this program and the binary running now is not the one
     // that rule pins, which changes what the whole window is about. The
@@ -169,9 +169,7 @@ fn prompt_info_ui(ui: &mut egui::Ui, p: &PromptState, rest: &[String]) {
     if let Some(what) = p.context.hash_mismatch_describe() {
         theme::band(ui, DENY_COLOR, |ui| {
             ui.label(
-                RichText::new(format!("Warning: {}", prompt::sentence_text(&what)))
-                    .strong()
-                    .variation("wght", theme::SEMIBOLD)
+                theme::semibold(format!("Warning: {}", prompt::sentence_text(&what)))
                     .color(DENY_COLOR),
             );
         });
@@ -196,73 +194,7 @@ fn prompt_info_ui(ui: &mut egui::Ui, p: &PromptState, rest: &[String]) {
         );
     }
     ui.add_space(6.0);
-
-    egui::Grid::new(("prompt_details", p.id))
-        .num_columns(2)
-        .striped(false)
-        .spacing([10.0, 4.0])
-        .show(ui, |ui| {
-            // The summary names the destination; this adds the address
-            // behind a name, and the name in full where the summary cut it.
-            if conn.domain.is_some() {
-                ui.label(RichText::new("Destination").color(MUTED));
-                ui.label(theme::num(prompt::format_dest(conn)));
-                ui.end_row();
-            }
-            ui.label(RichText::new("User / process").color(MUTED));
-            ui.label(theme::num(format!(
-                "uid {} / pid {}",
-                opt_num(conn.uid),
-                opt_num(conn.pid)
-            )));
-            ui.end_row();
-            // Only for a packaged application, which is where the executable
-            // path above says little: it resolves inside the sandbox, so it
-            // names neither a file on this host nor the application uniquely.
-            if let Some(app) = &conn.app_id {
-                ui.label(RichText::new("Application").color(MUTED));
-                ui.label(theme::num(prompt::ui_text(app)));
-                ui.end_row();
-            }
-            // With the identity rows rather than the history ones below:
-            // "what started this" is the question an operator meeting an
-            // unfamiliar program asks straight after "what is it". Stacked
-            // nearest parent first, one per line, because a chain joined
-            // into one cell wraps into an unreadable run in a 440px window.
-            if !p.context.ancestors.is_empty() {
-                ui.label(RichText::new("Started by").color(MUTED));
-                ui.vertical(|ui| {
-                    for exe in &p.context.ancestors {
-                        ui.label(
-                            RichText::new(prompt::path_text(exe))
-                                .small()
-                                .monospace()
-                                .color(TEXT),
-                        );
-                    }
-                });
-                ui.end_row();
-            }
-            // The badge above says something is new; this says what, since
-            // the two cases lead to different answers. A hover tooltip is
-            // not enough on its own: the keyboard path to the buttons never
-            // passes through it.
-            if let Some(what) = whats_new {
-                ui.label(RichText::new("First seen").color(MUTED));
-                ui.colored_label(REJECT_COLOR, what);
-                ui.end_row();
-            }
-            // Beside the first-seen row, because the two are the halves of
-            // one question and can disagree loudly: a familiar application
-            // that has been refused ten times is a different prompt from a
-            // first sighting. Absent rather than a zero, which the shared
-            // sentence decides for both clients.
-            if let Some(what) = p.context.denials_describe() {
-                ui.label(RichText::new("Denied lately").color(MUTED));
-                ui.colored_label(DENY_COLOR, what);
-                ui.end_row();
-            }
-        });
+    details_grid(ui, p);
     // Below the grid and full width: 64 hex digits do not fit beside a
     // label column, and this is the one line here meant to be read
     // character by character (or copied into an `exe_sha256` rule).
@@ -281,36 +213,113 @@ fn prompt_info_ui(ui: &mut egui::Ui, p: &PromptState, rest: &[String]) {
     }
     if !rest.is_empty() {
         ui.add_space(6.0);
-        theme::card(ui, "", |ui| {
-            ui.set_width(ui.available_width());
-            ui.label(
-                RichText::new(format!(
-                    "{} more request(s) pending from this app:",
-                    rest.len()
-                ))
-                .small()
-                .color(TEXT),
-            );
-            // A handful is informative; a browser's full endpoint list is not.
-            for dest in rest.iter().take(REST_SHOWN) {
-                ui.label(RichText::new(dest).small().monospace().color(MUTED));
-            }
-            if rest.len() > REST_SHOWN {
-                ui.label(
-                    RichText::new(format!("...and {} more", rest.len() - REST_SHOWN))
-                        .small()
-                        .color(MUTED),
-                );
-            }
-            ui.label(
-                RichText::new(
-                    "Answering \"This host\" or \"App anywhere\" also settles the covered ones.",
-                )
-                .small()
-                .color(MUTED),
-            );
-        });
+        pending_list(ui, rest);
     }
+}
+
+/// Who is asking and what is known about them, one fact per row.
+fn details_grid(ui: &mut egui::Ui, p: &PromptState) {
+    let conn = &p.conn;
+    egui::Grid::new(("prompt_details", p.id))
+        .num_columns(2)
+        .striped(false)
+        .spacing([10.0, 4.0])
+        .show(ui, |ui| {
+            // The summary names the destination; this adds the address
+            // behind a name, and the name in full where the summary cut it.
+            if conn.domain.is_some() {
+                detail_row(ui, "Destination", |ui| {
+                    ui.label(theme::num(prompt::format_dest(conn)));
+                });
+            }
+            detail_row(ui, "User / process", |ui| {
+                ui.label(theme::num(format!(
+                    "uid {} / pid {}",
+                    opt_num(conn.uid),
+                    opt_num(conn.pid)
+                )));
+            });
+            // Only for a packaged application, which is where the executable
+            // path above says little: it resolves inside the sandbox, so it
+            // names neither a file on this host nor the application uniquely.
+            if let Some(app) = &conn.app_id {
+                detail_row(ui, "Application", |ui| {
+                    ui.label(theme::num(prompt::ui_text(app)));
+                });
+            }
+            // With the identity rows rather than the history ones below:
+            // "what started this" is the question an operator meeting an
+            // unfamiliar program asks straight after "what is it". Stacked
+            // nearest parent first, one per line, because a chain joined
+            // into one cell wraps into an unreadable run in a 440px window.
+            if !p.context.ancestors.is_empty() {
+                detail_row(ui, "Started by", |ui| {
+                    ui.vertical(|ui| {
+                        for exe in &p.context.ancestors {
+                            ui.label(
+                                RichText::new(prompt::path_text(exe))
+                                    .small()
+                                    .monospace()
+                                    .color(TEXT),
+                            );
+                        }
+                    });
+                });
+            }
+            // The badge above says something is new; this says what, since
+            // the two cases lead to different answers. A hover tooltip is
+            // not enough on its own: the keyboard path to the buttons never
+            // passes through it.
+            if let Some(what) = conn.first_seen.and_then(FirstSeen::describe) {
+                detail_row(ui, "First seen", |ui| {
+                    ui.colored_label(REJECT_COLOR, what);
+                });
+            }
+            // Beside the first-seen row, because the two are the halves of
+            // one question and can disagree loudly: a familiar application
+            // that has been refused ten times is a different prompt from a
+            // first sighting. Absent rather than a zero, which the shared
+            // sentence decides for both clients.
+            if let Some(what) = p.context.denials_describe() {
+                detail_row(ui, "Denied lately", |ui| {
+                    ui.colored_label(DENY_COLOR, what);
+                });
+            }
+        });
+}
+
+/// The app's other pending destinations, which a host- or app-wide answer
+/// settles in the same stroke.
+fn pending_list(ui: &mut egui::Ui, rest: &[String]) {
+    theme::card(ui, "", |ui| {
+        ui.set_width(ui.available_width());
+        ui.label(
+            RichText::new(format!(
+                "{} more request(s) pending from this app:",
+                rest.len()
+            ))
+            .small()
+            .color(TEXT),
+        );
+        // A handful is informative; a browser's full endpoint list is not.
+        for dest in rest.iter().take(REST_SHOWN) {
+            ui.label(RichText::new(dest).small().monospace().color(MUTED));
+        }
+        if rest.len() > REST_SHOWN {
+            ui.label(
+                RichText::new(format!("...and {} more", rest.len() - REST_SHOWN))
+                    .small()
+                    .color(MUTED),
+            );
+        }
+        ui.label(
+            RichText::new(
+                "Answering \"This host\" or \"App anywhere\" also settles the covered ones.",
+            )
+            .small()
+            .color(MUTED),
+        );
+    });
 }
 
 /// How loudly this prompt should present itself.
@@ -324,7 +333,7 @@ fn prompt_tone(p: &PromptState) -> Tone {
     if p.context.hash_mismatch_describe().is_some() {
         return Tone::Bad;
     }
-    let new_here = p.conn.first_seen.and_then(|f| f.describe()).is_some();
+    let new_here = p.conn.first_seen.and_then(FirstSeen::describe).is_some();
     if new_here || p.context.denials_describe().is_some() {
         return Tone::Warn;
     }
@@ -341,27 +350,39 @@ fn prompt_actions_ui(
     now_ms: u64,
     default: Option<Verdict>,
 ) -> Option<ClientMsg> {
-    let mut answer = None;
+    answer_pickers(ui, p);
+    ui.add_space(4.0);
+    if p.scope == PromptScope::AppAnywhere {
+        app_anywhere_warning(ui, p);
+        ui.add_space(4.0);
+    }
+    let answer = verdict_buttons(ui, p, now_ms);
+    ui.add_space(4.0);
+    let frac = p.remaining_fraction(now_ms);
+    theme::countdown(ui, frac, &countdown_text(default, p.remaining_secs(now_ms)));
+    answer
+}
+
+/// What the answer covers: for how long, and to where.
+fn answer_pickers(ui: &mut egui::Ui, p: &mut PromptState) {
     ui.horizontal(|ui| {
         picker_label(ui, "For");
         // Segmented rather than a drop-down: both pickers are two clicks
         // deep in a window that answers itself on a timer, and what they
         // are set to has to be readable without opening anything.
-        const DURATIONS: [RuleDuration; 3] = [
-            RuleDuration::Once,
-            RuleDuration::Session,
-            RuleDuration::Forever,
-        ];
-        let items = DURATIONS.map(|d| (duration_label(d), theme::ACCENT));
-        let current = DURATIONS.iter().position(|d| *d == p.duration).unwrap_or(0);
-        if let Some(i) = theme::segmented(
+        if let Some(duration) = theme::pick(
             ui,
             ("duration", p.id),
-            &items,
-            current,
+            p.duration,
+            &[
+                RuleDuration::Once,
+                RuleDuration::Session,
+                RuleDuration::Forever,
+            ],
             theme::Segments::Picker,
+            |d| (duration_label(d), theme::ACCENT),
         ) {
-            p.duration = DURATIONS[i];
+            p.duration = duration;
         }
         // Only when the daemon computed a hash for this prompt: it pins the
         // value shown here and nothing else, so a prompt without one has
@@ -385,36 +406,34 @@ fn prompt_actions_ui(
     });
     ui.horizontal(|ui| {
         picker_label(ui, "To");
-        const SCOPES: [PromptScope; 3] = [
-            PromptScope::ThisPort,
-            PromptScope::ThisHost,
-            PromptScope::AppAnywhere,
-        ];
         // The widest scope in the warning's colour, so the indicator says
         // what the warning under it is about before it is read.
-        let items = SCOPES.map(|sc| {
-            (
-                scope_label(sc),
-                if sc == PromptScope::AppAnywhere {
+        if let Some(scope) = theme::pick(
+            ui,
+            ("scope", p.id),
+            p.scope,
+            &[
+                PromptScope::ThisPort,
+                PromptScope::ThisHost,
+                PromptScope::AppAnywhere,
+            ],
+            theme::Segments::Picker,
+            |sc| {
+                let color = if sc == PromptScope::AppAnywhere {
                     REJECT_COLOR
                 } else {
                     theme::ACCENT
-                },
-            )
-        });
-        let current = SCOPES.iter().position(|sc| *sc == p.scope).unwrap_or(0);
-        if let Some(i) = theme::segmented(
-            ui,
-            ("scope", p.id),
-            &items,
-            current,
-            theme::Segments::Picker,
+                };
+                (scope_label(sc), color)
+            },
         ) {
-            p.scope = SCOPES[i];
+            p.scope = scope;
         }
     });
-    ui.add_space(4.0);
+}
 
+/// The warning the widest scope earns.
+fn app_anywhere_warning(ui: &mut egui::Ui, p: &PromptState) {
     // Attribution is advisory (procfs races, eBPF offset guesses, cache
     // TTLs), and an "App anywhere" allow rule is only as strong as the exe
     // match: any process that execs the same binary inherits it. Warn before
@@ -433,27 +452,29 @@ fn prompt_actions_ui(
     // chose (a file name runs to 255 bytes, an application id to 104) could
     // otherwise grow it past the viewport and take the buttons below it with
     // them. The body above states both in full.
-    if p.scope == PromptScope::AppAnywhere {
+    ui.colored_label(
+        REJECT_COLOR,
+        format!(
+            "{} \"App anywhere\" lets any process running {} reach any destination.",
+            theme::WARNING_SIGN,
+            prompt::truncate(&prompt::exe_name(&p.conn), PINNED_NAME_MAX)
+        ),
+    );
+    if let Some(app) = &p.conn.app_id {
         ui.colored_label(
             REJECT_COLOR,
             format!(
-                "\u{26a0} \"App anywhere\" lets any process running {} reach any destination.",
-                prompt::truncate(&prompt::exe_name(&p.conn), PINNED_NAME_MAX)
+                "Allow is scoped to {}; Deny is not, and covers every application \
+                 running from that path.",
+                prompt::truncate(app, PINNED_NAME_MAX)
             ),
         );
-        if let Some(app) = &p.conn.app_id {
-            ui.colored_label(
-                REJECT_COLOR,
-                format!(
-                    "Allow is scoped to {}; Deny is not, and covers every application \
-                     running from that path.",
-                    prompt::truncate(app, PINNED_NAME_MAX)
-                ),
-            );
-        }
-        ui.add_space(4.0);
     }
+}
 
+/// Deny and Allow. Returns the answer given this pass, if any.
+fn verdict_buttons(ui: &mut egui::Ui, p: &PromptState, now_ms: u64) -> Option<ClientMsg> {
+    let mut answer = None;
     ui.horizontal(|ui| {
         let width = (ui.available_width() - ui.spacing().item_spacing.x) / 2.0;
         // Deny is added first, so it leads keyboard traversal: egui hands
@@ -493,11 +514,14 @@ fn prompt_actions_ui(
                 .request_repaint_after(std::time::Duration::from_millis(wait));
         }
     });
-    ui.add_space(4.0);
-
-    let frac = p.remaining_fraction(now_ms);
-    theme::countdown(ui, frac, &countdown_text(default, p.remaining_secs(now_ms)));
     answer
+}
+
+/// One line of the details grid: what it is, and its value.
+fn detail_row(ui: &mut egui::Ui, key: &str, value: impl FnOnce(&mut egui::Ui)) {
+    ui.label(RichText::new(key).color(MUTED));
+    value(ui);
+    ui.end_row();
 }
 
 /// The word in front of a picker, in a column of its own so both pickers
@@ -542,12 +566,6 @@ fn scope_label(s: PromptScope) -> &'static str {
 fn opt_num(n: Option<u32>) -> String {
     n.map_or_else(|| "?".to_string(), |v| v.to_string())
 }
-
-/// Bound for a name the judged process chose, quoted inside the pinned
-/// action panel. Short enough that both warnings together cannot crowd the
-/// verdict buttons out of the viewport; the scrolling body carries the
-/// names in full.
-const PINNED_NAME_MAX: usize = 40;
 
 #[cfg(test)]
 mod tests {
