@@ -35,21 +35,24 @@ mod syslog;
 #[cfg(test)]
 mod testutil;
 
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use hallpass_types::FlowTuple;
 use tokio::signal::unix::{signal, SignalKind};
-
-/// Depth of the observed-DNS queue between the verdict thread and the snoop
-/// consumer. Deep enough to absorb a normal resolution burst, shallow enough
-/// that a flood costs bounded memory instead of the process.
-const DNS_SNOOP_QUEUE_CAP: usize = 1024;
+use tokio::sync::mpsc;
 
 use crate::attribution::AttributionChain;
 use crate::events::EventBus;
 use crate::prompt::PromptTable;
 use crate::rules::store::RuleStore;
 use crate::stats::Counters;
+
+/// Depth of the observed-DNS queue between the verdict thread and the snoop
+/// consumer. Deep enough to absorb a normal resolution burst, shallow enough
+/// that a flood costs bounded memory instead of the process.
+const DNS_SNOOP_QUEUE_CAP: usize = 1024;
 
 /// Check the two directories the daemon trusts policy from, reporting
 /// whether both passed.
@@ -63,9 +66,9 @@ use crate::stats::Counters;
 /// Reported at error level whatever the posture, because the finding is the
 /// same either way; only whether it stops the daemon differs, and the caller
 /// decides that from `queue_bypass`.
-fn policy_dirs_trusted(config_path: &std::path::Path, rules_dir: &std::path::Path) -> bool {
+fn policy_dirs_trusted(config_path: &Path, rules_dir: &Path) -> bool {
     let mut ok = true;
-    let config_dir = config_path.parent().unwrap_or(std::path::Path::new("."));
+    let config_dir = config_path.parent().unwrap_or(Path::new("."));
     for (what, dir) in [
         ("config directory", config_dir),
         ("rules directory", rules_dir),
@@ -78,15 +81,94 @@ fn policy_dirs_trusted(config_path: &std::path::Path, rules_dir: &std::path::Pat
     ok
 }
 
-#[tokio::main]
-async fn main() {
+/// Make a panic stop the table watchdog, tear the nftables table down when
+/// `teardown` (fail-open mode), and exit.
+///
+/// Fail-open mode: a panic must not leave the table (and thus queued
+/// packets) behind. Fail-closed mode is the opposite: the table IS the
+/// enforcement, so a panicking daemon leaves it up (the bypass-less queue
+/// drops new connections) until a restart or an explicit teardown.
+/// Teardown is idempotent, and exiting is safer than running with
+/// interception half torn down.
+fn arm_panic_hook(shutdown: Arc<AtomicBool>, teardown: bool) {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        // Before the teardown, or the watchdog can put the table back as the
+        // process dies.
+        shutdown.store(true, Ordering::Relaxed);
+        if teardown {
+            nft::teardown();
+        }
+        default_hook(info);
+        std::process::exit(101);
+    }));
+}
+
+/// The DNS snoop consumer: record outbound queries, then absorb only the
+/// responses that answer one (matching addresses, transaction ID and
+/// question name), so spoofed replies cannot poison the domain cache the
+/// queue thread reads when it builds a Connection.
+fn spawn_dns_snoop(
+    mut rx: mpsc::Receiver<(FlowTuple, Vec<u8>)>,
+    cache: Arc<dns::IpDomainCache>,
+    stats: Arc<Counters>,
+) {
+    tokio::spawn(async move {
+        let tracker = dns::QueryTracker::new(dns::TRACKER_CAPACITY);
+        while let Some((tuple, pkt)) = rx.recv().await {
+            let Some(payload) = packet::udp_payload(&pkt) else {
+                continue;
+            };
+            if packet::is_dns_response(&tuple) {
+                let Some(resp) = dns::parse_response(payload) else {
+                    continue;
+                };
+                if tracker.validate(tuple.dst, tuple.src, &resp) {
+                    tracing::debug!(
+                        domain = %resp.query_name,
+                        addrs = resp.addrs.len(),
+                        "dns response snooped"
+                    );
+                    cache.absorb(&resp);
+                } else {
+                    stats.record_dns_spoof_rejected();
+                    tracing::debug!(
+                        domain = %resp.query_name,
+                        from = %tuple.src,
+                        "ignoring unsolicited dns response"
+                    );
+                }
+            } else if packet::is_dns_query(&tuple) {
+                if let Some(q) = dns::parse_query(payload) {
+                    tracker.observe(tuple.src, tuple.dst, &q);
+                }
+            }
+        }
+    });
+}
+
+/// Unlink a socket this process bound, tolerating one already gone.
+fn remove_socket(path: &Path) {
+    if let Err(e) = std::fs::remove_file(path) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!("failed to remove socket {}: {e}", path.display());
+        }
+    }
+}
+
+/// Log to stderr at `RUST_LOG`, or `info` when that is unset or invalid.
+fn init_tracing() {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
+}
 
+/// Parse the command line and load the config it names, exiting on either
+/// failure: 2 for a bad command line, 1 for a config that cannot be used.
+fn load_config() -> (config::ConfigArg, config::Config) {
     let config_arg = match config::parse_args(std::env::args().skip(1)) {
         Ok(a) => a,
         Err(e) => {
@@ -94,13 +176,45 @@ async fn main() {
             std::process::exit(2);
         }
     };
-    let cfg = match config::Config::load(&config_arg) {
-        Ok(c) => c,
+    match config::Config::load(&config_arg) {
+        Ok(cfg) => (config_arg, cfg),
         Err(e) => {
             tracing::error!("failed to load config: {e}");
             std::process::exit(1);
         }
-    };
+    }
+}
+
+/// Wait for SIGTERM, SIGINT, or a fatal queue-loop error. True for the
+/// last, which the exit status has to report.
+async fn wait_for_stop(fatal_rx: &mut mpsc::UnboundedReceiver<()>) -> bool {
+    let mut sigterm = signal(SignalKind::terminate()).expect("install SIGTERM handler");
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {
+            tracing::info!("SIGINT received");
+            false
+        }
+        _ = sigterm.recv() => {
+            tracing::info!("SIGTERM received");
+            false
+        }
+        // `Some(())`, not `_`: a closed channel is not a dead loop. The
+        // sender lives in `QueueDeps`, which is never built when the queue
+        // could not be bound, so `recv()` returns None at once in exactly
+        // the unprivileged development run this path exists to support. A
+        // non-matching pattern disables this branch and leaves the signal
+        // branches waiting: with no queue there is nothing that can die.
+        Some(()) = fatal_rx.recv() => {
+            tracing::error!("nfqueue loop died, shutting down");
+            true
+        }
+    }
+}
+
+#[tokio::main]
+async fn main() {
+    init_tracing();
+    let (config_arg, cfg) = load_config();
     tracing::info!(?cfg, "hallpassd starting");
 
     if !cfg.mode.enforcing() {
@@ -203,34 +317,14 @@ async fn main() {
         }
     };
 
-    // Fail-open mode: a panic must not leave the nft table (and thus queued
-    // packets) behind. Fail-closed mode is the opposite: the table IS the
-    // enforcement, so a panicking daemon leaves it up (bypass-less queue
-    // drops new connections) until a restart or an explicit teardown.
-    // Teardown is idempotent; exiting is safer than running with
-    // interception half torn down.
-    //
+    // Created here rather than next to the queue thread because the panic
+    // hook needs it.
+    let shutdown = Arc::new(AtomicBool::new(false));
     // Armed here rather than next to the install below, because the hook has
     // to be in place before the table can exist: a panic in the setup between
     // the two would otherwise leave a queue nobody drains behind under
     // fail-open, which is the state this hook exists to prevent.
-    // Created here rather than next to the queue thread because the panic
-    // hook below needs it: the hook tears the table down, and the table
-    // watchdog must be told to stop before that happens or it can put the
-    // table back as the process dies.
-    let shutdown = Arc::new(AtomicBool::new(false));
-
-    let default_hook = std::panic::take_hook();
-    let teardown_on_panic = cfg.queue_bypass;
-    let panic_shutdown = Arc::clone(&shutdown);
-    std::panic::set_hook(Box::new(move |info| {
-        panic_shutdown.store(true, Ordering::Relaxed);
-        if teardown_on_panic {
-            nft::teardown();
-        }
-        default_hook(info);
-        std::process::exit(101);
-    }));
+    arm_panic_hook(Arc::clone(&shutdown), cfg.queue_bypass);
 
     // The prompt timeout, default verdict and mode, changeable over IPC
     // for as long as the process lives; the config file remains the state
@@ -283,8 +377,8 @@ async fn main() {
     }
 
     // Channels between the queue thread and the async side.
-    let (prompt_tx, mut prompt_rx) = tokio::sync::mpsc::unbounded_channel::<nfqueue::PromptTask>();
-    let (verdict_tx, verdict_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (prompt_tx, mut prompt_rx) = mpsc::unbounded_channel::<nfqueue::PromptTask>();
+    let (verdict_tx, verdict_rx) = mpsc::unbounded_channel();
     // Bounded, unlike the two above. Those carry one item per packet the
     // daemon is already holding, so the kernel queue length bounds them. This
     // one carries observed DNS traffic, and the input snoop rule queues any
@@ -293,17 +387,15 @@ async fn main() {
     // item (parse plus cache locking) than the producer. Unbounded, that grew
     // until the OOM killer took a root daemon, which under queue_bypass=false
     // blackholes every new connection on the host.
-    let (dns_tx, mut dns_rx) =
-        tokio::sync::mpsc::channel::<(hallpass_types::FlowTuple, Vec<u8>)>(DNS_SNOOP_QUEUE_CAP);
+    let (dns_tx, dns_rx) = mpsc::channel(DNS_SNOOP_QUEUE_CAP);
     // Signalled by the queue thread when its loop dies on a persistent
     // error: the daemon must then shut down (tearing nftables down on the
     // way) rather than keep queueing traffic nobody drains.
-    let (fatal_tx, mut fatal_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+    let (fatal_tx, mut fatal_rx) = mpsc::unbounded_channel::<()>();
     // Second sender, for the table watchdog: with no table there is nothing
     // to enforce with, so under a fail-closed posture it shuts the daemon
     // down the same way a dead queue loop does.
     let fatal_tx_watchdog = fatal_tx.clone();
-    let mut nft_watchdog: Option<tokio::task::JoinHandle<()>> = None;
 
     let prompts = Arc::new(PromptTable::new(
         verdict_tx,
@@ -314,44 +406,8 @@ async fn main() {
         cfg.max_pending_prompts,
     ));
 
-    // DNS snoop consumer: record outbound queries, then only absorb
-    // responses that answer one (matching addresses, transaction ID, and
-    // question name), so spoofed replies cannot poison the domain cache.
-    // The queue thread reads the cache when it builds a Connection.
     let dns_cache = Arc::new(dns::IpDomainCache::new(dns::CACHE_CAPACITY));
-    let snoop_cache = Arc::clone(&dns_cache);
-    let snoop_stats = Arc::clone(&counters);
-    tokio::spawn(async move {
-        let tracker = dns::QueryTracker::new(dns::TRACKER_CAPACITY);
-        while let Some((tuple, pkt)) = dns_rx.recv().await {
-            let Some(payload) = packet::udp_payload(&pkt) else {
-                continue;
-            };
-            if packet::is_dns_response(&tuple) {
-                if let Some(resp) = dns::parse_response(payload) {
-                    if tracker.validate(tuple.dst, tuple.src, &resp) {
-                        tracing::debug!(
-                            domain = %resp.query_name,
-                            addrs = resp.addrs.len(),
-                            "dns response snooped"
-                        );
-                        snoop_cache.absorb(&resp);
-                    } else {
-                        snoop_stats.record_dns_spoof_rejected();
-                        tracing::debug!(
-                            domain = %resp.query_name,
-                            from = %tuple.src,
-                            "ignoring unsolicited dns response"
-                        );
-                    }
-                }
-            } else if packet::is_dns_query(&tuple) {
-                if let Some(q) = dns::parse_query(payload) {
-                    tracker.observe(tuple.src, tuple.dst, &q);
-                }
-            }
-        }
-    });
+    spawn_dns_snoop(dns_rx, Arc::clone(&dns_cache), Arc::clone(&counters));
 
     // Prompt dispatcher: unmatched connections from the queue thread.
     let dispatcher_prompts = Arc::clone(&prompts);
@@ -409,18 +465,15 @@ async fn main() {
     // opens a window in which packets are queued and nobody is taking
     // them: those are resolved by the `bypass` flag alone, which under
     // fail-open silently allows what a rule would deny and under
-    // fail-closed drops what a rule would allow. That window used to
-    // cover `RuleStore::new`, which reads every rule file and every
-    // domain, IP and hash list in `rules.d`, so its length was bounded by
-    // nothing the daemon controls.
+    // fail-closed drops what a rule would allow, for as long as loading
+    // `rules.d` and its lists takes.
     //
-    // The cost of moving it here is that the host stays unfiltered until
-    // this line, which is deliberate: that is the state the machine is
-    // already in before the daemon starts at all, and it ends here. The
-    // other order produced a state nothing else produces, an installed
-    // table with no verdicts behind it, which reads as healthy from
-    // outside (the journal says the ruleset is installed) while policy is
-    // not being applied to a single packet.
+    // The cost is that the host stays unfiltered until this line, which is
+    // deliberate: that is the state the machine is in before the daemon
+    // starts at all. The other order produced an installed table with no
+    // verdicts behind it, which reads as healthy from outside while policy
+    // is not being applied to a single packet.
+    //
     // Packets conntrack cannot place never reach the queue; see nft::ruleset.
     // Only when starting enforcing: observe mode promises that nothing this
     // daemon does changes what reaches the wire, and the unhandled path
@@ -428,34 +481,35 @@ async fn main() {
     // mode toggle does not reinstall the table, so it applies at restart.
     let drop_unjudgeable =
         cfg.mode.enforcing() && cfg.unhandled_proto_verdict != hallpass_types::Verdict::Allow;
-    let nft_installed = match &queue_thread {
-        None => false,
-        Some(_) => match nft::install(cfg.queue_num, cfg.queue_bypass, drop_unjudgeable) {
+    let nft_watchdog = if queue_thread.is_some() {
+        match nft::install(cfg.queue_num, cfg.queue_bypass, drop_unjudgeable) {
             Ok(()) => {
                 tracing::info!("nftables ruleset installed");
-                nft_watchdog = Some(nft::spawn_watchdog(
+                Some(nft::spawn_watchdog(
                     cfg.queue_num,
                     cfg.queue_bypass,
                     drop_unjudgeable,
                     Arc::clone(&shutdown),
                     fatal_tx_watchdog,
                     Arc::clone(&counters),
-                ));
-                true
+                ))
             }
             Err(e) if cfg.queue_bypass => {
                 tracing::error!("nftables install failed, continuing without interception: {e}");
-                false
+                None
             }
             Err(e) => {
                 // Fail-closed posture: running unenforced would silently
-                // contradict the operator's declared choice. Refuse to
-                // start.
+                // contradict the operator's declared choice.
                 tracing::error!("nftables install failed and queue_bypass is off: {e}");
                 std::process::exit(1);
             }
-        },
+        }
+    } else {
+        None
     };
+    // A watchdog is spawned exactly when the install succeeded.
+    let nft_installed = nft_watchdog.is_some();
 
     // Synthetic traffic, only in a build that opted into it at compile
     // time. Started after the real workers so it can never mask one
@@ -498,39 +552,15 @@ async fn main() {
     // control socket would be a monitoring surface that cannot be trusted to
     // describe the host it is watching.
     let observe_task = observe_listener.map(|listener| {
-        let deps = observe_deps;
         tokio::spawn(async move {
-            if let Err(e) = ipc::server::serve(listener, deps, ipc::server::Tier::Observe).await {
+            let tier = ipc::server::Tier::Observe;
+            if let Err(e) = ipc::server::serve(listener, observe_deps, tier).await {
                 tracing::error!("read-only IPC server failed: {e}");
             }
         })
     });
 
-    // Wait for SIGTERM, SIGINT, or a fatal queue-loop error.
-    let mut sigterm = signal(SignalKind::terminate()).expect("install SIGTERM handler");
-    let fatal = tokio::select! {
-        _ = tokio::signal::ctrl_c() => {
-            tracing::info!("SIGINT received");
-            false
-        }
-        _ = sigterm.recv() => {
-            tracing::info!("SIGTERM received");
-            false
-        }
-        // `Some(())`, not `_`: a closed channel is not a dead loop. The
-        // sender lives in `QueueDeps`, which is never built when the queue
-        // could not be bound, so `recv()` returned None immediately and the
-        // daemon shut itself down the instant it started. That is exactly
-        // the unprivileged development run this code path exists to
-        // support, and the error it logged on the way out named a loop that
-        // had never been started. A non-matching pattern disables this
-        // branch and leaves the two signal branches waiting, which is the
-        // wanted behaviour: with no queue there is nothing that can die.
-        Some(()) = fatal_rx.recv() => {
-            tracing::error!("nfqueue loop died, shutting down");
-            true
-        }
-    };
+    let fatal = wait_for_stop(&mut fatal_rx).await;
 
     tracing::info!("shutting down");
     shutdown.store(true, Ordering::Relaxed);
@@ -542,17 +572,11 @@ async fn main() {
     }
     // Same rule as the panic hook: in fail-closed mode the table IS the
     // enforcement, so a daemon dying unexpectedly must leave it standing.
-    // Tearing it down here handed an operator who chose queue_bypass = false
-    // the opposite of what that setting promises.
     let keep_table_for_enforcement = fatal && !cfg.queue_bypass;
-    if nft_installed && !keep_table_for_enforcement {
-        nft::teardown();
-    } else if keep_table_for_enforcement {
-        // Only claim enforcement holds if the table is actually there. The
+    if keep_table_for_enforcement {
+        // Only claim enforcement holds if the table is actually there: the
         // watchdog signals the same fatal channel the queue loop does, and
-        // it fires precisely when the table is gone, so the unconditional
-        // version of this line told an operator their host was still
-        // protected at the exact moment it was not.
+        // it fires precisely when the table is gone.
         if nft::table_present() {
             tracing::warn!(
                 "leaving nftables table installed: fail-closed enforcement holds until restart"
@@ -563,27 +587,20 @@ async fn main() {
                  unfiltered until the daemon is restarted"
             );
         }
+    } else if nft_installed {
+        nft::teardown();
     }
     // Only what this process actually bound. The read-only socket is
     // survivable when its bind fails, and one way it can fail is something
-    // else already occupying that path - an admin-placed file, a leftover
-    // from another tool. Unlinking it on the way out would delete a file this
-    // daemon never created and never owned.
-    let bound_observe = observe_task.is_some();
+    // else already occupying that path; unlinking it on the way out would
+    // delete a file this daemon never created.
+    let mut sockets: Vec<&PathBuf> = vec![&cfg.socket_path];
     if let Some(t) = observe_task {
         t.abort();
+        sockets.push(&observe_path);
     }
-    let sockets: &[&std::path::PathBuf] = if bound_observe {
-        &[&cfg.socket_path, &observe_path]
-    } else {
-        &[&cfg.socket_path]
-    };
     for path in sockets {
-        if let Err(e) = std::fs::remove_file(path) {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                tracing::warn!("failed to remove socket {}: {e}", path.display());
-            }
-        }
+        remove_socket(path);
     }
     if let Some(t) = queue_thread {
         let _ = t.join();
