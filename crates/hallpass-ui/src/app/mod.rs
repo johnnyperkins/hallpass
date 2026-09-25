@@ -353,6 +353,9 @@ pub struct HallpassApp {
     /// to fade in (egui's clock), for the fade between tabs.
     drawn_tab: Option<Tab>,
     tab_fade_from: f64,
+    /// Keeps the window's size for the next launch. None in tests, which
+    /// must not write to the operator's state directory.
+    geometry: Option<crate::geometry::Tracker>,
 }
 
 impl HallpassApp {
@@ -368,6 +371,7 @@ impl HallpassApp {
         cc: &eframe::CreationContext<'_>,
         socket: PathBuf,
         raise: Option<crate::instance::Holder>,
+        geometry: crate::geometry::Geometry,
     ) -> Self {
         // Before the first frame, so it is not laid out once in egui's
         // default font and then again in this window's.
@@ -387,6 +391,7 @@ impl HallpassApp {
         Self {
             socket,
             raise: raise.map(|holder| holder.serve(crate::repaint(&cc.egui_ctx))),
+            geometry: Some(crate::geometry::Tracker::new(geometry)),
             ..Self::with_channels(to_daemon, from_net)
         }
     }
@@ -441,6 +446,7 @@ impl HallpassApp {
             denied: false,
             drawn_tab: None,
             tab_fade_from: f64::NEG_INFINITY,
+            geometry: None,
         }
     }
 
@@ -2444,6 +2450,9 @@ impl eframe::App for HallpassApp {
         // After the drain and the poll, so the icon reflects what this frame
         // knows rather than what the last one did.
         self.sync_icon(&ctx);
+        if let Some(geometry) = &mut self.geometry {
+            geometry.observe(&ctx);
+        }
         self.main_window(ui);
         self.editor_window(&ctx);
     }

@@ -16,6 +16,7 @@ mod app;
 mod backend;
 mod columns;
 mod editor;
+mod geometry;
 mod instance;
 mod link;
 mod net;
@@ -125,10 +126,13 @@ fn main() -> eframe::Result {
         }
     };
 
+    // The size the operator left it at, or the default on a first launch.
+    let geometry = geometry::load();
     let mut options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1000.0, 640.0])
-            .with_min_inner_size([480.0, 320.0])
+            .with_inner_size(geometry.size)
+            .with_min_inner_size(geometry::MIN)
+            .with_maximized(geometry.maximized)
             .with_app_id("hallpass-ui")
             // The mark, painted rather than shipped as a file. Grey until
             // the daemon has said what the host is doing; the window
@@ -147,7 +151,7 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "Hallpass",
         options,
-        Box::new(move |cc| Ok(Box::new(app::HallpassApp::new(cc, socket, raise)))),
+        Box::new(move |cc| Ok(Box::new(app::HallpassApp::new(cc, socket, raise, geometry)))),
     )
 }
 
