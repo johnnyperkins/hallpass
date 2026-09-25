@@ -37,6 +37,22 @@ const TYPE_A: u16 = 1;
 const TYPE_CNAME: u16 = 5;
 const TYPE_AAAA: u16 = 28;
 
+/// Longest dotted name either snooper will cache.
+pub(crate) const MAX_NAME_LEN: usize = 253;
+
+/// A byte no cached domain may contain: control characters and whitespace.
+///
+/// Shared by both snoopers, the wire parser here and the libc uprobe path,
+/// so they agree on what a cached domain may contain. No real hostname
+/// carries one, and the name travels into rule matching, logs and both
+/// clients' prompt displays: a label of newlines pushes the prompt window's
+/// allow/deny buttons out of view, and an escape sequence rewrites a
+/// terminal line. Refusing the name keeps it out of the cache entirely,
+/// which is safer than escaping it at every consumer.
+pub(crate) fn is_hostile_name_byte(b: u8) -> bool {
+    b <= b' ' || b == 0x7f
+}
+
 /// One parsed DNS response: the original query name and every A/AAAA
 /// address that (directly or via a CNAME chain) answers it, with the
 /// record TTL in seconds.
@@ -87,9 +103,7 @@ fn read_name(buf: &[u8], mut pos: usize) -> Option<(String, usize)> {
                 return None;
             }
             let target = ((len & 0x3F) << 8) | *buf.get(pos + 1)? as usize;
-            if end.is_none() {
-                end = Some(pos + 2);
-            }
+            end.get_or_insert(pos + 2);
             pos = target;
             continue;
         }
@@ -104,24 +118,15 @@ fn read_name(buf: &[u8], mut pos: usize) -> Option<(String, usize)> {
         }
         // DNS names on the wire are ASCII (IDNs arrive punycoded);
         // non-ASCII bytes map byte-for-byte, which keeps comparisons
-        // consistent even for out-of-spec labels.
-        //
-        // Control and whitespace bytes are the exception and reject the whole
-        // name, matching normalize_domain() on the uprobe path so both
-        // snoopers agree on what a cached domain may contain. No real hostname
-        // carries one, and the parsed name travels into rule matching, logs,
-        // and both clients' prompt displays: a label of newlines rendered into
-        // the fixed-size prompt window pushes the allow/deny buttons out of
-        // view, and an escape sequence rewrites a terminal line. Refusing here
-        // keeps such a reply out of the cache entirely, which is safer than
-        // carrying it and having to escape it at every consumer.
+        // consistent even for out-of-spec labels. Control and whitespace
+        // bytes reject the whole name; see is_hostile_name_byte.
         for &b in label {
-            if b <= b' ' || b == 0x7f {
+            if is_hostile_name_byte(b) {
                 return None;
             }
             name.push(b.to_ascii_lowercase() as char);
         }
-        if name.len() > 253 {
+        if name.len() > MAX_NAME_LEN {
             return None;
         }
         pos += 1 + len;
@@ -129,13 +134,6 @@ fn read_name(buf: &[u8], mut pos: usize) -> Option<(String, usize)> {
     Some((name, end.unwrap_or(pos)))
 }
 
-/// Parse a DNS message that should be a successful response. Returns
-/// `None` for queries, error responses, and anything malformed.
-///
-/// All A/AAAA answers whose owner is the query name or is reachable from
-/// it through CNAME records are attributed to the ORIGINAL query name:
-/// that is the name the application asked for and the one rules and
-/// prompts should see.
 /// Parse a DNS message that should be an outbound query: QR clear and at
 /// least one question. Returns the transaction ID and the first question
 /// name so the response can later be validated against it.
@@ -152,6 +150,13 @@ pub fn parse_query(msg: &[u8]) -> Option<SnoopedQuery> {
     Some(SnoopedQuery { id, query_name })
 }
 
+/// Parse a DNS message that should be a successful response. Returns
+/// `None` for queries, error responses, and anything malformed.
+///
+/// All A/AAAA answers whose owner is the query name or is reachable from
+/// it through CNAME records are attributed to the ORIGINAL query name:
+/// that is the name the application asked for and the one rules and
+/// prompts should see.
 pub fn parse_response(msg: &[u8]) -> Option<SnoopedResponse> {
     let id = read_u16(msg, 0)?;
     let flags = read_u16(msg, 2)?;
@@ -208,43 +213,7 @@ pub fn parse_response(msg: &[u8]) -> Option<SnoopedResponse> {
         pos = rdata_pos + rdlen;
     }
 
-    // Follow the CNAME chain from the query name once, through an index.
-    //
-    // This used to be a fixpoint over the edge list, re-scanning every edge
-    // until the alias set stopped growing. Its own termination argument was
-    // the worst case: a chain listed in reverse order adds one alias per
-    // pass, so n edges cost n passes. Nothing bounded n but the packet size
-    // (~4700 edges fit a 64KB response with compression pointers), and this
-    // runs before the response has been validated against an observed query
-    // - an unsolicited datagram from source port 53 is enough - so a crafted
-    // reply bought seconds of CPU on the runtime that also serves prompts
-    // and IPC. Measured at 1.63s for one 64KB packet before this change.
-    //
-    // One pass to index, then each name expanded once: linear, and a chain
-    // that loops back on itself stops at the first name already seen.
-    //
-    // The index holds every target of an owner, not just one. A name with
-    // two CNAMEs violates RFC 1034 and a correct server does not send it,
-    // but misconfigured zones do, and keeping only one target would silently
-    // drop the addresses under the other branch: a domain rule that quietly
-    // stops matching is worse than the work of following both.
-    let mut index: HashMap<&str, Vec<&str>> = HashMap::new();
-    for (owner, target) in &cnames {
-        index
-            .entry(owner.as_str())
-            .or_default()
-            .push(target.as_str());
-    }
-    let mut aliases: HashSet<&str> = HashSet::from([query_name.as_str()]);
-    let mut queue = vec![query_name.as_str()];
-    while let Some(name) = queue.pop() {
-        for target in index.get(name).into_iter().flatten() {
-            if aliases.insert(target) {
-                queue.push(target);
-            }
-        }
-    }
-
+    let aliases = aliases_of(&query_name, &cnames);
     let addrs: Vec<(IpAddr, u32)> = records
         .iter()
         .filter(|(owner, _, _)| aliases.contains(owner.as_str()))
@@ -258,6 +227,51 @@ pub fn parse_response(msg: &[u8]) -> Option<SnoopedResponse> {
         query_name,
         addrs,
     })
+}
+
+/// `query_name` and every name it reaches through the `(owner, target)`
+/// CNAME edges.
+///
+/// One pass to index the edges, then each name expanded once: linear, and
+/// a chain that loops back on itself stops at the first name already seen.
+/// This used to be a fixpoint re-scanning every edge until the alias set
+/// stopped growing, which a chain listed in reverse order drives to one
+/// alias per pass, n passes for n edges. Only the packet size bounded n
+/// (~4700 edges fit a 64KB response with compression pointers), and this
+/// runs before the response is validated against an observed query - an
+/// unsolicited datagram from source port 53 is enough - so a crafted reply
+/// bought seconds of CPU (1.63s measured for one packet) on the runtime
+/// that also serves prompts and IPC.
+///
+/// The index holds every target of an owner, not just one. Two CNAMEs at
+/// one owner violate RFC 1034 but misconfigured zones send them, and
+/// following only one would silently drop the addresses under the other:
+/// a domain rule that quietly stops matching is worse than the work of
+/// following both.
+fn aliases_of<'a>(query_name: &'a str, cnames: &'a [(String, String)]) -> HashSet<&'a str> {
+    let mut index: HashMap<&str, Vec<&str>> = HashMap::new();
+    for (owner, target) in cnames {
+        index
+            .entry(owner.as_str())
+            .or_default()
+            .push(target.as_str());
+    }
+    let mut aliases = HashSet::from([query_name]);
+    let mut queue = vec![query_name];
+    while let Some(name) = queue.pop() {
+        for target in index.get(name).into_iter().flatten() {
+            if aliases.insert(target) {
+                queue.push(target);
+            }
+        }
+    }
+    aliases
+}
+
+/// A capacity-bounded LRU behind a mutex; a capacity of 0 is treated as 1.
+fn bounded_lru<K: std::hash::Hash + Eq, V>(capacity: usize) -> Mutex<LruCache<K, V>> {
+    let capacity = NonZeroUsize::new(capacity.max(1)).expect("at least 1");
+    Mutex::new(LruCache::new(capacity))
 }
 
 /// Key identifying one outstanding query: who asked whom, with which
@@ -280,8 +294,8 @@ pub struct QueryTracker {
 
 impl QueryTracker {
     pub fn new(capacity: usize) -> Self {
-        QueryTracker {
-            inner: Mutex::new(LruCache::new(NonZeroUsize::new(capacity.max(1)).unwrap())),
+        Self {
+            inner: bounded_lru(capacity),
         }
     }
 
@@ -320,10 +334,11 @@ impl QueryTracker {
             id: resp.id,
             name: resp.query_name.clone(),
         };
-        match self.inner.lock().unwrap().pop(&key) {
-            Some(expires) => expires > now,
-            None => false,
-        }
+        self.inner
+            .lock()
+            .unwrap()
+            .pop(&key)
+            .is_some_and(|expires| expires > now)
     }
 }
 
@@ -341,8 +356,8 @@ pub struct IpDomainCache {
 
 impl IpDomainCache {
     pub fn new(capacity: usize) -> Self {
-        IpDomainCache {
-            inner: Mutex::new(LruCache::new(NonZeroUsize::new(capacity.max(1)).unwrap())),
+        Self {
+            inner: bounded_lru(capacity),
         }
     }
 
@@ -399,6 +414,7 @@ impl IpDomainCache {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
 
     #[test]
     fn absorb_takes_a_bounded_number_of_addresses() {
@@ -437,7 +453,6 @@ mod tests {
         });
         assert_eq!(cache.lookup(&ip).as_deref(), Some("github.com"));
     }
-    use super::*;
 
     /// Encode a dotted name into uncompressed wire format.
     fn wire_name(name: &str) -> Vec<u8> {
@@ -474,6 +489,11 @@ mod tests {
         out.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
         out.extend_from_slice(rdata);
         out
+    }
+
+    /// CNAME record from `owner` to `target`, both uncompressed.
+    fn cname(owner: &str, target: &str) -> Vec<u8> {
+        record(wire_name(owner), TYPE_CNAME, 300, &wire_name(target))
     }
 
     /// Pointer back to the question name at offset 12.
@@ -620,12 +640,7 @@ mod tests {
             300,
             &wire_name("edge.cdn.net"),
         ));
-        msg.extend(record(
-            wire_name("edge.cdn.net"),
-            TYPE_CNAME,
-            300,
-            &wire_name("lb1.cdn.net"),
-        ));
+        msg.extend(cname("edge.cdn.net", "lb1.cdn.net"));
         msg.extend(record(wire_name("lb1.cdn.net"), TYPE_A, 30, &[1, 2, 3, 4]));
         msg.extend(record(wire_name("lb1.cdn.net"), TYPE_A, 30, &[1, 2, 3, 5]));
         let resp = parse_response(&msg).unwrap();
@@ -653,19 +668,9 @@ mod tests {
         let mut msg = header(0x8180, 1, (LINKS + 1) as u16);
         msg.extend(question("start.example.org"));
         for i in (1..LINKS).rev() {
-            msg.extend(record(
-                wire_name(&name(i)),
-                TYPE_CNAME,
-                300,
-                &wire_name(&name(i + 1)),
-            ));
+            msg.extend(cname(&name(i), &name(i + 1)));
         }
-        msg.extend(record(
-            wire_name("start.example.org"),
-            TYPE_CNAME,
-            300,
-            &wire_name(&name(1)),
-        ));
+        msg.extend(cname("start.example.org", &name(1)));
         msg.extend(record(wire_name(&name(LINKS)), TYPE_A, 30, &[7, 7, 7, 7]));
 
         let start = std::time::Instant::now();
@@ -689,18 +694,8 @@ mod tests {
     fn both_branches_of_a_duplicated_cname_owner_are_followed() {
         let mut msg = header(0x8180, 1, 4);
         msg.extend(question("split.example.org"));
-        msg.extend(record(
-            wire_name("split.example.org"),
-            TYPE_CNAME,
-            300,
-            &wire_name("a.example.org"),
-        ));
-        msg.extend(record(
-            wire_name("split.example.org"),
-            TYPE_CNAME,
-            300,
-            &wire_name("b.example.org"),
-        ));
+        msg.extend(cname("split.example.org", "a.example.org"));
+        msg.extend(cname("split.example.org", "b.example.org"));
         msg.extend(record(
             wire_name("a.example.org"),
             TYPE_A,
@@ -730,18 +725,8 @@ mod tests {
     fn a_looping_cname_chain_terminates() {
         let mut msg = header(0x8180, 1, 3);
         msg.extend(question("a.example.org"));
-        msg.extend(record(
-            wire_name("a.example.org"),
-            TYPE_CNAME,
-            300,
-            &wire_name("b.example.org"),
-        ));
-        msg.extend(record(
-            wire_name("b.example.org"),
-            TYPE_CNAME,
-            300,
-            &wire_name("a.example.org"),
-        ));
+        msg.extend(cname("a.example.org", "b.example.org"));
+        msg.extend(cname("b.example.org", "a.example.org"));
         msg.extend(record(
             wire_name("b.example.org"),
             TYPE_A,

@@ -9,14 +9,15 @@
 //! warning and the constructor returns None: the chain then behaves
 //! exactly as before, with procfs alone.
 
+use std::hash::Hash;
 use std::net::IpAddr;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use aya::maps::{HashMap as FlowMap, MapData, RingBuf};
+use aya::maps::{HashMap as FlowMap, Map, MapData, RingBuf};
 use aya::programs::uprobe::UProbeScope;
-use aya::programs::{KProbe, TracePoint, UProbe};
+use aya::programs::{KProbe, Program, ProgramError, TracePoint, UProbe};
 use aya::{Ebpf, EbpfLoader};
 use hallpass_ebpf_common::{
     DnsEvent, ExecEvent, FlowKey, FlowVal, EVENT_EXEC, PROTO_TCP, PROTO_UDP,
@@ -27,7 +28,7 @@ use tokio::io::unix::AsyncFd;
 use tokio::io::Interest;
 use tokio::sync::watch;
 
-use crate::dns::{IpDomainCache, SnoopedResponse};
+use crate::dns::{is_hostile_name_byte, IpDomainCache, SnoopedResponse, MAX_NAME_LEN};
 
 use super::btf::Btf;
 use super::{procfs, Attributor, ExeId, ProcInfo};
@@ -37,8 +38,7 @@ use super::{procfs, Attributor, ExeId, ProcInfo};
 /// build-ebpf` produced, in that order.
 static EBPF_OBJ: &[u8] = aya::include_bytes_aligned!(env!("HALLPASS_EBPF_OBJ"));
 
-/// Details snapshotted at exec time, plus the starttime of the process
-/// they were read from.
+/// Details snapshotted at exec time: exe, cmdline, parent exe.
 type ProcDetails = (Option<PathBuf>, Option<String>, Option<PathBuf>);
 
 /// pid -> details snapshotted at exec time. Exit events are the primary
@@ -91,37 +91,20 @@ impl EbpfAttributor {
     ///
     /// Must be called from within a tokio runtime: the ring-buffer
     /// readers are spawned tasks driven by epoll readiness.
-    pub fn new(dns_cache: Option<Arc<IpDomainCache>>) -> Option<EbpfAttributor> {
+    pub fn new(dns_cache: Option<Arc<IpDomainCache>>) -> Option<Self> {
         match Self::load(dns_cache) {
             Ok(a) => {
                 tracing::info!("eBPF attribution active");
                 Some(a)
             }
             Err(e) => {
-                // The embedded object is located by build.rs and can be one
-                // somebody vendored, so "your object is older than this
-                // binary" is a real and otherwise baffling way to land here:
-                // it reads exactly like a kernel that refuses eBPF, and the
-                // host quietly loses the exec-race guard with it. The map
-                // errors that say so are worth naming rather than passing
-                // through as one more load failure.
-                let stale = e.contains("EXEC_GEN") || e.contains("invalid value size");
-                if stale {
-                    tracing::warn!(
-                        "eBPF attribution unavailable, using procfs fallback: {e}. This looks \
-                         like an embedded object built before the daemon: rebuild it with \
-                         `cargo xtask build-ebpf`, or replace the prebuilt one, and note that \
-                         exe rules are only scoping conveniences until it loads"
-                    );
-                } else {
-                    tracing::warn!("eBPF attribution unavailable, using procfs fallback: {e}");
-                }
+                warn_unavailable(&e);
                 None
             }
         }
     }
 
-    fn load(dns_cache: Option<Arc<IpDomainCache>>) -> Result<EbpfAttributor, String> {
+    fn load(dns_cache: Option<Arc<IpDomainCache>>) -> Result<Self, String> {
         // Patch kernel struct offsets resolved from BTF into the programs
         // before the verifier sees them; see resolve_offsets().
         let offs = resolve_offsets();
@@ -148,29 +131,15 @@ impl EbpfAttributor {
         attach_tracepoint(&mut ebpf, "sched_process_exec")?;
         attach_tracepoint(&mut ebpf, "sched_process_exit")?;
 
-        let sock_map = FlowMap::try_from(
-            ebpf.take_map("SOCK_MAP")
-                .ok_or("SOCK_MAP missing from object")?,
-        )
-        .map_err(|e| format!("SOCK_MAP: {e}"))?;
+        let sock_map = take_map(&mut ebpf, "SOCK_MAP")?;
         // Sizes are checked against the object's own map definitions here,
         // so a `FlowVal` that gained a field without the embedded object
         // being rebuilt fails to load loudly instead of reading a stamp
         // the kernel side never wrote.
-        let exec_gen = FlowMap::try_from(
-            ebpf.take_map("EXEC_GEN")
-                .ok_or("EXEC_GEN missing from object")?,
-        )
-        .map_err(|e| format!("EXEC_GEN: {e}"))?;
-        let ring = RingBuf::try_from(
-            ebpf.take_map("EVENTS")
-                .ok_or("EVENTS missing from object")?,
-        )
-        .map_err(|e| format!("EVENTS: {e}"))?;
+        let exec_gen = take_map(&mut ebpf, "EXEC_GEN")?;
+        let ring = take_map(&mut ebpf, "EVENTS")?;
 
-        let cache: ProcCache = Arc::new(Mutex::new(LruCache::new(
-            NonZeroUsize::new(PID_CACHE_CAP).expect("nonzero capacity"),
-        )));
+        let cache: ProcCache = Arc::new(Mutex::new(lru(PID_CACHE_CAP)));
         let (stop, stop_rx) = watch::channel(false);
         spawn_event_reader(ring, Arc::clone(&cache), stop_rx.clone());
 
@@ -180,11 +149,7 @@ impl EbpfAttributor {
         if let Some(dns) = dns_cache {
             match attach_dns_uprobes(&mut ebpf) {
                 Ok(()) => {
-                    let dns_ring = RingBuf::try_from(
-                        ebpf.take_map("DNS_EVENTS")
-                            .ok_or("DNS_EVENTS missing from object")?,
-                    )
-                    .map_err(|e| format!("DNS_EVENTS: {e}"))?;
+                    let dns_ring = take_map(&mut ebpf, "DNS_EVENTS")?;
                     spawn_dns_reader(dns_ring, dns, stop_rx);
                     tracing::info!("libc DNS snoop active (getaddrinfo, gethostbyname family)");
                 }
@@ -208,17 +173,13 @@ impl EbpfAttributor {
                 }
             }
         }
-        Ok(EbpfAttributor {
+        Ok(Self {
             _ebpf: ebpf,
             sock_map,
             exec_gen,
             cache,
-            raced_seen: Mutex::new(LruCache::new(
-                NonZeroUsize::new(RACED_LOG_CAP).expect("nonzero capacity"),
-            )),
-            app_ids: Mutex::new(LruCache::new(
-                NonZeroUsize::new(PID_CACHE_CAP).expect("nonzero capacity"),
-            )),
+            raced_seen: Mutex::new(lru(RACED_LOG_CAP)),
+            app_ids: Mutex::new(lru(PID_CACHE_CAP)),
             stop,
         })
     }
@@ -252,7 +213,7 @@ impl EbpfAttributor {
     /// whole source misses, and the chain falls through to procfs, which
     /// resolves the executable after the fact with no counter at all. That
     /// is the fallback working as designed - eBPF misses legitimate flows
-    /// too - and it is why the README calls this a narrowing rather than a
+    /// too - and it is why docs/security.md calls this a narrowing rather than a
     /// closure.
     fn exec_raced(&self, val: &FlowVal) -> bool {
         // A missing entry reads as 0, which the kernel side never stamps:
@@ -387,9 +348,10 @@ impl Attributor for EbpfAttributor {
         // connected: all three describe the image, and the image is exactly
         // what changed. `parent_exe` describes the launcher, which an exec
         // here does not touch, and is kept.
-        let (exe_path, cmdline, exe_id) = match self.exec_raced(&val) {
-            true => (None, None, None),
-            false => (exe_path, cmdline, exe_id),
+        let (exe_path, cmdline, exe_id) = if self.exec_raced(&val) {
+            (None, None, None)
+        } else {
+            (exe_path, cmdline, exe_id)
         };
         Some(ProcInfo {
             pid: Some(val.pid),
@@ -415,6 +377,54 @@ impl Attributor for EbpfAttributor {
             socket_inode: None,
         })
     }
+}
+
+/// Warn that eBPF attribution did not load, naming the stale-object case.
+///
+/// The embedded object is located by build.rs and can be one somebody
+/// vendored, so "your object is older than this binary" is a real and
+/// otherwise baffling way to land here: it reads exactly like a kernel that
+/// refuses eBPF, and the host quietly loses the exec-race guard with it.
+/// The map errors that say so are worth naming rather than passing through
+/// as one more load failure.
+fn warn_unavailable(e: &str) {
+    if e.contains("EXEC_GEN") || e.contains("invalid value size") {
+        tracing::warn!(
+            "eBPF attribution unavailable, using procfs fallback: {e}. This looks \
+             like an embedded object built before the daemon: rebuild it with \
+             `cargo xtask build-ebpf`, or replace the prebuilt one, and note that \
+             exe rules are only scoping conveniences until it loads"
+        );
+    } else {
+        tracing::warn!("eBPF attribution unavailable, using procfs fallback: {e}");
+    }
+}
+
+fn lru<K: Hash + Eq, V>(capacity: usize) -> LruCache<K, V> {
+    LruCache::new(NonZeroUsize::new(capacity).expect("nonzero capacity"))
+}
+
+/// Take map `name` out of the object as a typed map.
+fn take_map<T>(ebpf: &mut Ebpf, name: &str) -> Result<T, String>
+where
+    T: TryFrom<Map>,
+    T::Error: std::fmt::Display,
+{
+    let map = ebpf
+        .take_map(name)
+        .ok_or_else(|| format!("{name} missing from object"))?;
+    T::try_from(map).map_err(|e| format!("{name}: {e}"))
+}
+
+/// Program `name` in the object, as its concrete program type.
+fn program_mut<'a, P>(ebpf: &'a mut Ebpf, name: &str) -> Result<&'a mut P, String>
+where
+    &'a mut P: TryFrom<&'a mut Program, Error = ProgramError>,
+{
+    ebpf.program_mut(name)
+        .ok_or_else(|| format!("program {name} missing"))?
+        .try_into()
+        .map_err(|e| format!("{name}: {e}"))
 }
 
 /// Kernel struct offsets for the eBPF programs, resolved from the running
@@ -455,12 +465,13 @@ fn resolve_offsets() -> Vec<(&'static str, u32)> {
             btf.struct_field_offset("msghdr", "msg_name"),
         ),
     ] {
-        match offset {
-            Some(o) => resolved.push((symbol, o)),
-            None => tracing::warn!(
+        if let Some(o) = offset {
+            resolved.push((symbol, o));
+        } else {
+            tracing::warn!(
                 symbol,
                 "BTF offset unresolved; compiled-in x86_64 default applies"
-            ),
+            );
         }
     }
     resolved
@@ -515,11 +526,7 @@ fn v6_octets(ip: IpAddr) -> [u8; 16] {
 }
 
 fn attach_kprobe(ebpf: &mut Ebpf, prog: &str, fns: &[&str]) -> Result<(), String> {
-    let p: &mut KProbe = ebpf
-        .program_mut(prog)
-        .ok_or_else(|| format!("program {prog} missing"))?
-        .try_into()
-        .map_err(|e| format!("{prog}: {e}"))?;
+    let p: &mut KProbe = program_mut(ebpf, prog)?;
     p.load().map_err(|e| format!("load {prog}: {e}"))?;
     for f in fns {
         p.attach(f, 0)
@@ -570,19 +577,11 @@ fn attach_uprobe_pair(ebpf: &mut Ebpf, progs: [&str; 2], symbols: &[&str]) -> Re
     // next to a return probe that failed to load would trap every call in
     // every process and stash scratch entries nothing ever consumes.
     for prog in progs {
-        let p: &mut UProbe = ebpf
-            .program_mut(prog)
-            .ok_or_else(|| format!("program {prog} missing"))?
-            .try_into()
-            .map_err(|e| format!("{prog}: {e}"))?;
+        let p: &mut UProbe = program_mut(ebpf, prog)?;
         p.load().map_err(|e| format!("load {prog}: {e}"))?;
     }
     for prog in progs {
-        let p: &mut UProbe = ebpf
-            .program_mut(prog)
-            .ok_or_else(|| format!("program {prog} missing"))?
-            .try_into()
-            .map_err(|e| format!("{prog}: {e}"))?;
+        let p: &mut UProbe = program_mut(ebpf, prog)?;
         let mut last_err = None;
         let mut attached = 0;
         for symbol in symbols {
@@ -599,11 +598,7 @@ fn attach_uprobe_pair(ebpf: &mut Ebpf, progs: [&str; 2], symbols: &[&str]) -> Re
 }
 
 fn attach_tracepoint(ebpf: &mut Ebpf, name: &str) -> Result<(), String> {
-    let p: &mut TracePoint = ebpf
-        .program_mut(name)
-        .ok_or_else(|| format!("program {name} missing"))?
-        .try_into()
-        .map_err(|e| format!("{name}: {e}"))?;
+    let p: &mut TracePoint = program_mut(ebpf, name)?;
     p.load().map_err(|e| format!("load {name}: {e}"))?;
     p.attach("sched", name)
         .map_err(|e| format!("attach {name}: {e}"))?;
@@ -644,12 +639,14 @@ fn spawn_dns_reader(ring: RingBuf<MapData>, dns: Arc<IpDomainCache>, stop: StopR
 }
 
 /// Lowercase, strip a trailing dot, and reject a name with control or
-/// whitespace characters (log-injection and match-evasion guard) or an
-/// implausible length. Matches the plaintext snooper's expectation that a
-/// cached domain is the exact name a rule would carry.
+/// whitespace characters or an implausible length, by the same test the
+/// wire snooper applies (see [`is_hostile_name_byte`]), so a cached domain
+/// is the exact name a rule would carry whichever path recorded it.
 fn normalize_domain(raw: &str) -> Option<String> {
     let trimmed = raw.strip_suffix('.').unwrap_or(raw);
-    if trimmed.is_empty() || trimmed.len() > 253 || trimmed.bytes().any(|b| b <= b' ' || b == 0x7f)
+    if trimmed.is_empty()
+        || trimmed.len() > MAX_NAME_LEN
+        || trimmed.bytes().any(is_hostile_name_byte)
     {
         return None;
     }
