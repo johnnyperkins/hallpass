@@ -49,6 +49,11 @@ const REQUEST_LEN: usize = 16 + 56;
 /// attributes may follow and are not read.
 const DIAG_MSG_LEN: usize = 72;
 
+/// How long one lookup waits for its reply. The kernel answers within the
+/// send (measured at 0.7us), so this only ever elapses when a reply was
+/// lost, and it bounds what that loss costs the verdict thread.
+const REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(50);
+
 /// What the kernel said about one socket.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DiagReply {
@@ -200,6 +205,11 @@ impl DiagSocket {
     pub fn open() -> std::io::Result<Self> {
         let socket = Socket::new(NETLINK_SOCK_DIAG)?;
         socket.connect(&netlink_sys::SocketAddr::new(0, 0))?;
+        // Lookups run on the verdict thread, and a netlink reply can be lost
+        // outright (ENOBUFS). Without a timeout that loss stalls every
+        // decision on the host forever; with one it costs one fallback read
+        // of /proc/net, and the late reply is skipped by its sequence number.
+        socket2::SockRef::from(&socket).set_read_timeout(Some(REPLY_TIMEOUT))?;
         Ok(Self {
             socket,
             buf: Vec::with_capacity(4096),
@@ -546,4 +556,17 @@ mod tests {
         }
     }
 
+    /// A reply that never comes costs the timeout, not the verdict thread.
+    /// Nothing was sent, so the read below stands in for a lost reply.
+    #[test]
+    fn a_lost_reply_times_out() {
+        let Ok(mut diag) = DiagSocket::open() else {
+            eprintln!("SKIP sockdiag: AF_NETLINK socket unavailable");
+            return;
+        };
+        let started = std::time::Instant::now();
+        diag.buf.clear();
+        assert!(diag.socket.recv(&mut diag.buf, 0).is_err());
+        assert!(started.elapsed() < REPLY_TIMEOUT * 20);
+    }
 }

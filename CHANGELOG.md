@@ -185,6 +185,8 @@ restarted together; a version mismatch is refused at connect.
 - **Concurrent rule changes could leave a stale ruleset enforced.** Two
   overlapping rebuilds could store the older one last, so a just-added deny
   was missing, or a just-deleted rule still applied, until the next change.
+- **A lost sock_diag reply could stall every verdict.** Lookups now time out
+  after 50ms and fall back to reading `/proc/net`.
 - **Connections could pass unjudged when the queue socket buffer filled.** The
   snoop queue now has its own socket, and only replies to this host's DNS
   queries are snooped.
