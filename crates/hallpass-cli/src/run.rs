@@ -20,10 +20,12 @@
 use std::path::Path;
 use std::process::Command;
 
-use hallpass_types::{ClientMsg, DaemonMsg};
+use hallpass_types::{sanitize_for_display, ClientMsg, DaemonMsg};
 use rustix::process::{Pid, Signal, WaitOptions};
 
 use crate::client::{CliError, Client};
+use crate::fmt::{self, Output};
+use crate::json;
 
 /// Exit code for a command that could not be spawned at all. 126 is the
 /// shell's convention for "found but not executable"; the two cases a shell
@@ -42,39 +44,17 @@ const REAP_POLL: std::time::Duration = std::time::Duration::from_millis(200);
 /// Run `argv` under a session grant. Returns the process exit code.
 pub async fn run(socket: &Path, argv: &[String]) -> i32 {
     let (program, args) = argv.split_first().expect("parser rejects an empty command");
-    // The basename, not the whole command line: this is display text on a
-    // journal line and in `sessions`, and a command line carries whatever a
-    // user typed, including things they would not want logged.
-    let label = Path::new(program)
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| program.clone());
 
-    // The daemon being unreachable is refused rather than degraded: running
-    // the command anyway would look identical to a session that worked
-    // until the first prompt appeared, at which point the operator is
+    // The daemon being unreachable is refused rather than degraded, and said
+    // so: running the command anyway would look identical to a session that
+    // worked until the first prompt appeared, at which point the operator is
     // answering dialogs for the command they just said not to.
-    let opened = match Client::connect(socket).await {
-        Err(e) => Err(e),
-        Ok(mut client) => match client.request(ClientMsg::RunSessionStart { label }).await {
-            Ok(DaemonMsg::RunSessionStarted { id }) => Ok((client, id)),
-            Ok(other) => Err(CliError::unexpected(&other)),
-            Err(e) => Err(e),
-        },
-    };
-    let (client, id) = match opened {
+    let (client, id) = match open_session(socket, label(program)).await {
         Ok(open) => open,
         Err(e) => {
-            let code = e.exit_code();
             eprintln!("error: {e}");
-            // The command is not run at all, and saying so is the point:
-            // a wrapper that silently ran it without a grant would look
-            // identical until the first prompt appeared.
-            eprintln!(
-                "note: {} was not run",
-                hallpass_types::sanitize_for_display(program)
-            );
-            return code;
+            eprintln!("note: {} was not run", sanitize_for_display(program));
+            return e.exit_code();
         }
     };
 
@@ -92,10 +72,7 @@ pub async fn run(socket: &Path, argv: &[String]) -> i32 {
     let child = match Command::new(program).args(args).spawn() {
         Ok(c) => c,
         Err(e) => {
-            eprintln!(
-                "error: cannot run {}: {e}",
-                hallpass_types::sanitize_for_display(program)
-            );
+            eprintln!("error: cannot run {}: {e}", sanitize_for_display(program));
             return EXIT_CANNOT_RUN;
         }
     };
@@ -111,6 +88,25 @@ pub async fn run(socket: &Path, argv: &[String]) -> i32 {
     // session; doing it here rather than at scope end keeps that visible.
     drop(writer);
     code
+}
+
+/// The session label for `program`: its basename, not the whole command
+/// line. This is display text on a journal line and in `sessions`, and a
+/// command line carries whatever a user typed, including things they would
+/// not want logged.
+fn label(program: &str) -> String {
+    Path::new(program)
+        .file_name()
+        .map_or_else(|| program.to_string(), |n| n.to_string_lossy().into_owned())
+}
+
+/// Connect and open a session grant labelled `label`.
+async fn open_session(socket: &Path, label: String) -> Result<(Client, u64), CliError> {
+    let mut client = Client::connect(socket).await?;
+    match client.request(ClientMsg::RunSessionStart { label }).await? {
+        DaemonMsg::RunSessionStarted { id } => Ok((client, id)),
+        other => Err(CliError::unexpected(&other)),
+    }
 }
 
 /// Wait for `child`, forwarding termination signals to it and reaping any
@@ -247,18 +243,17 @@ fn signal_stream(kind: tokio::signal::unix::SignalKind) -> Option<tokio::signal:
 }
 
 /// List the live session grants.
-pub async fn sessions(client: &mut Client, out: crate::fmt::Output) -> Result<(), CliError> {
-    match client.request(ClientMsg::RunSessionList).await? {
-        DaemonMsg::RunSessions(sessions) => {
-            if out.json {
-                println!("{}", crate::json::sessions(&sessions)?);
-            } else {
-                print!("{}", crate::fmt::format_sessions(&sessions, out.palette));
-            }
-            Ok(())
-        }
-        other => Err(CliError::unexpected(&other)),
+pub async fn sessions(client: &mut Client, out: Output) -> Result<(), CliError> {
+    let sessions = match client.request(ClientMsg::RunSessionList).await? {
+        DaemonMsg::RunSessions(sessions) => sessions,
+        other => return Err(CliError::unexpected(&other)),
+    };
+    if out.json {
+        println!("{}", json::sessions(&sessions)?);
+    } else {
+        print!("{}", fmt::format_sessions(&sessions, out.palette));
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -279,11 +274,7 @@ mod tests {
             ("curl", "curl"),
             ("./build.sh", "build.sh"),
         ] {
-            let label = Path::new(program)
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| program.to_string());
-            assert_eq!(label, want);
+            assert_eq!(label(program), want);
         }
     }
 }

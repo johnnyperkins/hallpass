@@ -9,6 +9,8 @@
 //! sanitizes for; a rule name that erases the line above it hides its
 //! neighbour just as well in a diff as in a table.
 
+use std::fmt::Write as _;
+
 use hallpass_types::Rule;
 use serde::{Deserialize, Serialize};
 
@@ -63,7 +65,7 @@ pub fn export(rules: &[Rule]) -> Result<String, CliError> {
     );
     for name in &altered {
         eprintln!("warning: rule {name} was altered for display and will not import as it was");
-        out.push_str(&format!("#   {name}\n"));
+        let _ = writeln!(out, "#   {name}");
     }
     out.push_str(&body);
     Ok(out)
