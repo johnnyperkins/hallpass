@@ -1034,3 +1034,36 @@ async fn watcher_does_not_feed_itself() {
     assert!(late.is_empty(), "watcher fed itself: {late:?}");
 }
 
+/// Concurrent mutations must not leave a stale compiled set behind: once
+/// every add has returned, the active set holds every rule. The race it
+/// guards is narrow (between one rebuild reading the rules and storing its
+/// compiled set), so it runs many short rounds rather than one long one.
+#[test]
+fn concurrent_adds_all_reach_the_active_set() {
+    const ROUNDS: usize = 200;
+    const THREADS: usize = 8;
+    const PER_THREAD: usize = 4;
+    for round in 0..ROUNDS {
+        let (_td, dir) = tmpdir(&format!("concurrent-adds-{round}"));
+        let store = RuleStore::new(dir);
+        let start = std::sync::Barrier::new(THREADS);
+        std::thread::scope(|s| {
+            for t in 0..THREADS {
+                let (store, start) = (&store, &start);
+                s.spawn(move || {
+                    start.wait();
+                    for i in 0..PER_THREAD {
+                        store
+                            .add(rule(&format!("r{t}-{i}"), RuleDuration::Session))
+                            .unwrap();
+                    }
+                });
+            }
+        });
+        assert_eq!(
+            store.ruleset().rule_count(),
+            THREADS * PER_THREAD,
+            "round {round}: a stale rebuild was stored last"
+        );
+    }
+}

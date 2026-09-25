@@ -74,6 +74,13 @@ pub struct RuleStore {
     /// and calls [`RuleStore::rebuild_for_posture`]; nothing else writes
     /// this.
     lockdown_tags: Mutex<Option<Vec<String>>>,
+    /// Serializes [`RuleStore::rebuild`] from reading the rules to swapping
+    /// in the compiled set. Every mutation drops the entries lock before it
+    /// rebuilds, so without this two rebuilds can interleave and the one that
+    /// read the older rules can store last: a just-added deny rule missing,
+    /// or a just-deleted rule still enforced, until the next change. With it,
+    /// whichever rebuild runs last reads every mutation made before it.
+    rebuild_lock: Mutex<()>,
 }
 
 /// Hit accounting for one rule name.
@@ -622,6 +629,7 @@ impl RuleStore {
             changed: tokio::sync::watch::channel(()).0,
             mutations: AtomicU64::new(0),
             lockdown_tags: Mutex::new(None),
+            rebuild_lock: Mutex::new(()),
         };
         store.rebuild();
         store
@@ -1001,6 +1009,11 @@ impl RuleStore {
     }
 
     fn rebuild(&self) {
+        // Taken first and by nothing else, so it adds no lock-order edge.
+        let _serial = self
+            .rebuild_lock
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         let rules: Vec<Rule> = self.list();
         self.prune_hits(&rules);
         let posture = self.lockdown_tags.lock().unwrap().clone();
@@ -1029,9 +1042,9 @@ impl RuleStore {
     /// added rule reports zero hits forever, which reads as dead policy an
     /// operator would then delete.
     ///
-    /// Called from `rebuild`, which already holds no lock: taking `hits`
-    /// here and `entries` then `hits` in [`RuleStore::hits`] keeps one
-    /// order everywhere.
+    /// Called from `rebuild`, which holds only its own serializing lock:
+    /// taking `hits` here and `entries` then `hits` in [`RuleStore::hits`]
+    /// keeps one order everywhere.
     fn prune_hits(&self, rules: &[Rule]) {
         let live: HashSet<&str> = rules.iter().map(|r| r.name.as_str()).collect();
         let mut map = self.hits.write().unwrap_or_else(PoisonError::into_inner);
