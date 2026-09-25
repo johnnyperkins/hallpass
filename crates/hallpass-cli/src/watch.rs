@@ -7,11 +7,12 @@
 //! carrying no hash. Prompts arriving while one is being answered are queued.
 
 use std::collections::VecDeque;
+use std::fmt::Write as _;
 
 use hallpass_types::wire;
 use hallpass_types::{
-    unix_ms_now, ClientMsg, Connection, DaemonMsg, PromptContext, PromptScope, RuleDuration,
-    Verdict,
+    sanitize_for_display, unix_ms_now, ClientMsg, Connection, DaemonMsg, FirstSeen, PromptContext,
+    PromptScope, RuleDuration, Verdict,
 };
 use tokio::io::{AsyncBufReadExt, BufReader};
 
@@ -27,6 +28,7 @@ struct Pending {
 }
 
 /// Where we are in the dialog for the current prompt.
+#[derive(Clone, Copy)]
 enum Stage {
     Verdict,
     Duration {
@@ -46,6 +48,21 @@ enum Stage {
         scope: PromptScope,
     },
 }
+
+impl Stage {
+    /// The question this stage puts to the operator.
+    fn hint(self) -> &'static str {
+        match self {
+            Stage::Verdict => VERDICT_HINT,
+            Stage::Duration { .. } => DURATION_HINT,
+            Stage::Scope { .. } => SCOPE_HINT,
+            Stage::Pin { .. } => PIN_HINT,
+        }
+    }
+}
+
+/// The prompt on screen, and how far its dialog has got.
+type Current = Option<(Pending, Stage)>;
 
 const VERDICT_HINT: &str = "  [a]llow / [d]eny?";
 const DURATION_HINT: &str =
@@ -98,31 +115,31 @@ fn parse_scope(line: &str) -> Option<PromptScope> {
 /// Render the connection details block for a prompt.
 fn format_prompt(p: &Pending, now_ms: u64) -> String {
     let c = &p.conn;
-    let exe = fmt::exe_display(c);
-    let pid = c.pid.map(|v| v.to_string()).unwrap_or_else(|| "?".into());
-    let uid = c.uid.map(|v| v.to_string()).unwrap_or_else(|| "?".into());
+    let or_unknown = |v: Option<u32>| v.map_or_else(|| "?".to_string(), |v| v.to_string());
     let remaining = p.deadline_ms.saturating_sub(now_ms) / 1000;
-    let mut out = format!("prompt #{}: {exe} (pid {pid}, uid {uid})\n", p.id);
+    let mut out = format!(
+        "prompt #{}: {} (pid {}, uid {})\n",
+        p.id,
+        fmt::exe_display(c),
+        or_unknown(c.pid),
+        or_unknown(c.uid)
+    );
     if let Some(app) = &c.app_id {
         // The line the exe path cannot carry: a packaged application's
         // executable resolves inside its sandbox, so two applications can
         // print the same path here. Answering an allow generates a rule
         // scoped to this identity, and consent has to be given to something
         // the operator was shown.
-        out.push_str(&format!(
-            "  app:     {}\n",
-            hallpass_types::sanitize_for_display(app)
-        ));
+        let _ = writeln!(out, "  app:     {}", sanitize_for_display(app));
     }
     if let Some(cmdline) = &c.cmdline {
         // A process writes its own argv, and this line sits right above the
         // allow/deny question. Raw, it could erase and rewrite the exe line;
         // unbounded, it could scroll it away. See `fmt::cmdline_display`.
-        out.push_str(&format!("  cmdline: {}\n", fmt::cmdline_display(cmdline)));
+        let _ = writeln!(out, "  cmdline: {}", fmt::cmdline_display(cmdline));
     }
-    // What launched it, nearest parent first. Sanitized for the same reason
-    // the command line is: every path here was chosen by whoever exec'd it,
-    // and an unprivileged user can create one containing control characters.
+    // What launched it, nearest parent first. Every path here was chosen by
+    // whoever exec'd it, so each one is sanitized and bounded.
     if !p.context.ancestors.is_empty() {
         let chain: Vec<String> = p
             .context
@@ -130,49 +147,42 @@ fn format_prompt(p: &Pending, now_ms: u64) -> String {
             .iter()
             .map(|a| fmt::path_display(a))
             .collect();
-        out.push_str(&format!("  started: {}\n", chain.join(" <- ")));
+        let _ = writeln!(out, "  started: {}", chain.join(" <- "));
     }
     // The value an `exe_sha256` rule pins, in full, because copying it into
     // one is the point of showing it.
     if let Some(hash) = &p.context.exe_sha256 {
-        out.push_str(&format!(
-            "  sha256:  {}\n",
-            hallpass_types::sanitize_for_display(hash)
-        ));
+        let _ = writeln!(out, "  sha256:  {}", sanitize_for_display(hash));
     }
     // Above the destination, unlike the annotations below it: this one is
     // not about where the connection is going, it says an existing rule was
     // written for this program and the binary running now is not the one it
     // pins.
     if let Some(what) = p.context.hash_mismatch_describe() {
-        out.push_str(&format!(
-            "  WARNING: {}\n",
-            hallpass_types::sanitize_for_display(&what)
-        ));
+        let _ = writeln!(out, "  WARNING: {}", sanitize_for_display(&what));
     }
-    out.push_str(&format!(
-        "  dest:    {} ({}) {}\n",
+    let _ = writeln!(
+        out,
+        "  dest:    {} ({}) {}",
         fmt::dst_display(c),
         c.tuple.dst,
         c.tuple.proto
-    ));
-    // Below the destination, because that is what the sentence about a new
-    // destination refers to, and above the countdown so it is inside the
-    // block being read rather than after it. Absent when nothing is new, or
-    // when the daemon is not tracking: a line claiming a connection is
-    // familiar on the strength of a feature being off would be worse than
-    // no line.
-    if let Some(what) = c.first_seen.and_then(|f| f.describe()) {
-        out.push_str(&format!("  new:     {what}\n"));
+    );
+    // Below the destination, which the sentence about a new destination
+    // refers to, and above the countdown so it is inside the block being
+    // read. Absent when nothing is new, or when the daemon is not tracking:
+    // a line claiming a connection is familiar on the strength of a feature
+    // being off would be worse than no line.
+    if let Some(what) = c.first_seen.and_then(FirstSeen::describe) {
+        let _ = writeln!(out, "  new:     {what}");
     }
-    // Next to the first-seen line, because they are the two halves of the
-    // same question and they can disagree loudly: an application that is not
-    // new and has been refused ten times is a different prompt from a first
-    // sighting.
+    // Next to the first-seen line, because they are two halves of the same
+    // question and can disagree loudly: an application that is not new and
+    // has been refused ten times is a different prompt from a first sighting.
     if let Some(what) = p.context.denials_describe() {
-        out.push_str(&format!("  denied:  {what}\n"));
+        let _ = writeln!(out, "  denied:  {what}");
     }
-    out.push_str(&format!("  respond within {remaining}s\n"));
+    let _ = writeln!(out, "  respond within {remaining}s");
     out
 }
 
@@ -192,7 +202,7 @@ pub async fn watch(mut client: Client) -> Result<(), CliError> {
 
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     let mut queue: VecDeque<Pending> = VecDeque::new();
-    let mut current: Option<(Pending, Stage)> = None;
+    let mut current: Current = None;
     // Whether the Subscribe request has been acked.
     let mut subscribed = false;
 
@@ -217,7 +227,7 @@ pub async fn watch(mut client: Client) -> Result<(), CliError> {
                     // session already holds. Without this guard the operator
                     // is walked through the same prompt twice and the second
                     // answer draws an error for an id already spent.
-                    if !already_held(&current, &queue, id) {
+                    if !already_held(current.as_ref(), &queue, id) {
                         queue.push_back(Pending { id, conn, deadline_ms, context });
                         if current.is_none() {
                             current = promote(&mut queue);
@@ -250,10 +260,7 @@ pub async fn watch(mut client: Client) -> Result<(), CliError> {
                     }
                     // Daemon errors quote paths and rule names, so they can
                     // carry whatever a rule file or a process put there.
-                    eprintln!(
-                        "daemon error: {}",
-                        hallpass_types::sanitize_for_display(&message)
-                    );
+                    eprintln!("daemon error: {}", sanitize_for_display(&message));
                 }
                 Some(Ok(DaemonMsg::PromptHandlerRevoked)) => {
                     // The daemon took the slot back because prompts sent here
@@ -319,8 +326,8 @@ pub async fn watch(mut client: Client) -> Result<(), CliError> {
 const INPUT_GRACE: std::time::Duration = std::time::Duration::from_millis(700);
 
 /// Whether prompt `id` is already on screen or waiting in the queue.
-fn already_held(current: &Option<(Pending, Stage)>, queue: &VecDeque<Pending>, id: u64) -> bool {
-    current.as_ref().is_some_and(|(p, _)| p.id == id) || queue.iter().any(|p| p.id == id)
+fn already_held(current: Option<&(Pending, Stage)>, queue: &VecDeque<Pending>, id: u64) -> bool {
+    current.is_some_and(|(p, _)| p.id == id) || queue.iter().any(|p| p.id == id)
 }
 
 /// Pop the next queued prompt that is still live and print its details plus
@@ -332,7 +339,7 @@ fn already_held(current: &Option<(Pending, Stage)>, queue: &VecDeque<Pending>, i
 /// back holds nothing: prompts that expire before it is claimed again are
 /// announced to nobody. Asking about one would be asking a question the
 /// daemon has already answered with its default verdict.
-fn promote(queue: &mut VecDeque<Pending>) -> Option<(Pending, Stage)> {
+fn promote(queue: &mut VecDeque<Pending>) -> Current {
     let now = unix_ms_now();
     let p = loop {
         let p = queue.pop_front()?;
@@ -347,54 +354,38 @@ fn promote(queue: &mut VecDeque<Pending>) -> Option<(Pending, Stage)> {
 }
 
 /// Advance the dialog one input line; returns the next current prompt.
+///
+/// An answer moves to the next stage and an unparsable one stays put;
+/// either way the resulting stage's question is asked. The last answer sends
+/// the reply instead.
 async fn step<W: tokio::io::AsyncWrite + Unpin>(
     w: &mut W,
     queue: &mut VecDeque<Pending>,
     pending: Pending,
     stage: Stage,
     line: &str,
-) -> Result<Option<(Pending, Stage)>, CliError> {
+) -> Result<Current, CliError> {
     let next = match stage {
         Stage::Verdict => match parse_verdict(line) {
-            Some(verdict) => {
-                println!("{DURATION_HINT}");
-                Stage::Duration { verdict }
-            }
-            None => {
-                println!("{VERDICT_HINT}");
-                Stage::Verdict
-            }
+            Some(verdict) => Stage::Duration { verdict },
+            None => stage,
         },
         Stage::Duration { verdict } => match parse_duration(line) {
-            Some(duration) => {
-                println!("{SCOPE_HINT}");
-                Stage::Scope { verdict, duration }
-            }
-            None => {
-                println!("{DURATION_HINT}");
-                Stage::Duration { verdict }
-            }
+            Some(duration) => Stage::Scope { verdict, duration },
+            None => stage,
         },
         Stage::Scope { verdict, duration } => match parse_scope(line) {
+            // The pin question is only worth asking when the answer can
+            // change the rule; otherwise reply straight away.
+            Some(scope) if can_pin(&pending, verdict, duration) => Stage::Pin {
+                verdict,
+                duration,
+                scope,
+            },
             Some(scope) => {
-                // The pin question is only worth asking when the answer can
-                // change the rule; otherwise reply straight away, exactly as
-                // before this stage existed.
-                if can_pin(&pending, verdict, duration) {
-                    println!("{PIN_HINT}");
-                    Stage::Pin {
-                        verdict,
-                        duration,
-                        scope,
-                    }
-                } else {
-                    return send_reply(w, queue, &pending, verdict, duration, scope, false).await;
-                }
+                return send_reply(w, queue, &pending, verdict, duration, scope, false).await;
             }
-            None => {
-                println!("{SCOPE_HINT}");
-                Stage::Scope { verdict, duration }
-            }
+            None => stage,
         },
         Stage::Pin {
             verdict,
@@ -404,16 +395,10 @@ async fn step<W: tokio::io::AsyncWrite + Unpin>(
             Some(pin_exe) => {
                 return send_reply(w, queue, &pending, verdict, duration, scope, pin_exe).await;
             }
-            None => {
-                println!("{PIN_HINT}");
-                Stage::Pin {
-                    verdict,
-                    duration,
-                    scope,
-                }
-            }
+            None => stage,
         },
     };
+    println!("{}", next.hint());
     Ok(Some((pending, next)))
 }
 
@@ -440,7 +425,7 @@ async fn send_reply<W: tokio::io::AsyncWrite + Unpin>(
     duration: RuleDuration,
     scope: PromptScope,
     pin_exe: bool,
-) -> Result<Option<(Pending, Stage)>, CliError> {
+) -> Result<Current, CliError> {
     wire::write_msg(
         w,
         &ClientMsg::PromptReply {
@@ -525,10 +510,11 @@ mod tests {
         let live = unix_ms_now() + 60_000;
         let queue: VecDeque<Pending> = [pending(2, live)].into();
         let current = Some((pending(1, live), Stage::Verdict));
-        assert!(already_held(&current, &queue, 1), "the one on screen");
-        assert!(already_held(&current, &queue, 2), "the one queued");
-        assert!(!already_held(&current, &queue, 3), "a genuinely new prompt");
-        assert!(!already_held(&None, &VecDeque::new(), 1));
+        let current = current.as_ref();
+        assert!(already_held(current, &queue, 1), "the one on screen");
+        assert!(already_held(current, &queue, 2), "the one queued");
+        assert!(!already_held(current, &queue, 3), "a genuinely new prompt");
+        assert!(!already_held(None, &VecDeque::new(), 1));
     }
 
     #[test]
@@ -553,27 +539,10 @@ mod tests {
     /// present a different binary as the one asking.
     #[test]
     fn hostile_metadata_cannot_forge_the_prompt_block() {
-        let mut p = Pending {
-            id: 9,
-            conn: Connection {
-                tuple: FlowTuple {
-                    proto: Proto::Tcp,
-                    src: "127.0.0.1:50000".parse::<SocketAddr>().unwrap(),
-                    dst: "93.184.216.34:443".parse::<SocketAddr>().unwrap(),
-                },
-                uid: Some(1000),
-                pid: Some(1),
-                exe_path: Some(PathBuf::from("/tmp/evil\r\x1b[A/usr/bin/firefox")),
-                cmdline: Some("evil\r\x1b[2Kcmdline: curl https://example.org".into()),
-                parent_exe: None,
-                domain: Some("bank.example\u{202e}moc.reknatta".into()),
-                iface: None,
-                app_id: None,
-                first_seen: None,
-            },
-            deadline_ms: 30_000,
-            context: PromptContext::default(),
-        };
+        let mut p = pending(9, 30_000);
+        p.conn.exe_path = Some(PathBuf::from("/tmp/evil\r\x1b[A/usr/bin/firefox"));
+        p.conn.cmdline = Some("evil\r\x1b[2Kcmdline: curl https://example.org".into());
+        p.conn.domain = Some("bank.example\u{202e}moc.reknatta".into());
         let out = format_prompt(&p, 5_000);
         assert!(!out.contains('\r'), "CR reached the terminal: {out:?}");
         assert!(!out.contains('\x1b'), "ESC reached the terminal: {out:?}");
@@ -590,27 +559,10 @@ mod tests {
 
     #[test]
     fn prompt_rendering() {
-        let p = Pending {
-            id: 7,
-            conn: Connection {
-                tuple: FlowTuple {
-                    proto: Proto::Tcp,
-                    src: "127.0.0.1:50000".parse::<SocketAddr>().unwrap(),
-                    dst: "93.184.216.34:443".parse::<SocketAddr>().unwrap(),
-                },
-                uid: Some(1000),
-                pid: Some(4242),
-                exe_path: Some(PathBuf::from("/usr/bin/curl")),
-                cmdline: Some("curl https://example.org".into()),
-                parent_exe: None,
-                domain: Some("example.org".into()),
-                iface: None,
-                app_id: None,
-                first_seen: None,
-            },
-            deadline_ms: 30_000,
-            context: PromptContext::default(),
-        };
+        let mut p = pending(7, 30_000);
+        p.conn.pid = Some(4242);
+        p.conn.cmdline = Some("curl https://example.org".into());
+        p.conn.domain = Some("example.org".into());
         let out = format_prompt(&p, 5_000);
         assert_eq!(
             out,
@@ -628,44 +580,26 @@ mod tests {
     /// before" line the daemon has no basis for is worse than no line.
     #[test]
     fn prompt_block_says_what_is_new() {
-        let mut p = Pending {
-            id: 7,
-            conn: Connection {
-                tuple: FlowTuple {
-                    proto: Proto::Tcp,
-                    src: "127.0.0.1:50000".parse::<SocketAddr>().unwrap(),
-                    dst: "93.184.216.34:443".parse::<SocketAddr>().unwrap(),
-                },
-                uid: Some(1000),
-                pid: Some(4242),
-                exe_path: Some(PathBuf::from("/usr/bin/curl")),
-                cmdline: None,
-                parent_exe: None,
-                domain: Some("example.org".into()),
-                iface: None,
-                app_id: None,
-                first_seen: Some(hallpass_types::FirstSeen {
-                    app: true,
-                    dest: true,
-                }),
-            },
-            deadline_ms: 30_000,
-            context: PromptContext::default(),
-        };
+        let mut p = pending(7, 30_000);
+        p.conn.domain = Some("example.org".into());
+        p.conn.first_seen = Some(FirstSeen {
+            app: true,
+            dest: true,
+        });
         assert!(
             format_prompt(&p, 5_000).contains("new:     this application has not connected before"),
             "{}",
             format_prompt(&p, 5_000)
         );
 
-        p.conn.first_seen = Some(hallpass_types::FirstSeen {
+        p.conn.first_seen = Some(FirstSeen {
             app: false,
             dest: true,
         });
         assert!(format_prompt(&p, 5_000).contains("has not reached this destination before"));
 
         for quiet in [
-            Some(hallpass_types::FirstSeen {
+            Some(FirstSeen {
                 app: false,
                 dest: false,
             }),
