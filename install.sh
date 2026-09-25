@@ -308,9 +308,15 @@ if [ "$in_group" = yes ] && [ -n "${WAYLAND_DISPLAY:-}${DISPLAY:-}" ]; then
 	) || true
 	# setsid returns once it has forked. An agent that cannot run (another
 	# still holds the lock, or no display it can open) exits at once, so it
-	# is looked for rather than assumed.
+	# is looked for rather than assumed: by the binary it runs, too, since an
+	# old one this script started that outlived the wait above has the same
+	# command line, and runs the replaced "(deleted)" image.
 	sleep 1
-	pgrep -u "$(id -u)" -x -f '/usr/bin/hallpass-ui agent' >/dev/null 2>&1 && agent_started=yes
+	for pid in $(pgrep -u "$(id -u)" -x -f '/usr/bin/hallpass-ui agent' 2>/dev/null || true); do
+		if [ "$(readlink "/proc/$pid/exe" 2>/dev/null || true)" = /usr/bin/hallpass-ui ]; then
+			agent_started=yes
+		fi
+	done
 fi
 if [ "$agent_started" = yes ]; then
 	echo "   - The prompt agent is running (tray icon, notifications, a window per"

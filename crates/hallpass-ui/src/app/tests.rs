@@ -1079,6 +1079,42 @@ fn a_quit_agent_is_not_started_again() {
     assert!(!t.app.wants_agent());
 }
 
+/// An agent stopped with a signal meant to stop it (an upgrade replacing
+/// it, `kill`) is not a crash: restarting it would run this window's own,
+/// possibly older, image against the one that replaced it.
+#[test]
+fn a_stopped_agent_is_not_started_again() {
+    let mut t = TestApp::new();
+    t.feed(UiEvent::Connected);
+    t.daemon(DaemonMsg::Stats(stats(true)));
+    let mut child = std::process::Command::new("sh")
+        .args(["-c", "kill -TERM $$"])
+        .spawn()
+        .expect("spawn sh");
+    child.wait().expect("wait for sh");
+    t.app.agent = Some((child, std::time::Instant::now()));
+    t.app.reap_agent();
+    assert!(!t.app.wants_agent());
+    let note = t.app.agent_error.as_deref().expect("the exit is reported");
+    assert!(note.contains("stopped"), "{note}");
+}
+
+/// How long the slot has been free is a fact about one daemon: a reconnect
+/// starts the count again, so an agent reconnecting too gets its grace.
+#[test]
+fn a_reconnect_restarts_the_free_slot_count() {
+    let mut t = TestApp::new();
+    t.feed(UiEvent::Connected);
+    t.daemon(DaemonMsg::Stats(stats(true)));
+    assert!(t.app.slot_free_since.is_some());
+    t.feed(UiEvent::Disconnected {
+        retry_in: Duration::from_secs(1),
+        denied: false,
+    });
+    t.feed(UiEvent::Connected);
+    assert!(t.app.slot_free_since.is_none());
+}
+
 /// A window on the read-only socket starts no agent: one there could never
 /// take the slot, and would outlive the window retrying for good. The
 /// banner says why instead.

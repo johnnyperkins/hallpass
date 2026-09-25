@@ -337,8 +337,9 @@ pub struct HallpassApp {
     /// left free (an agent that died, one quit) is reported, and one only
     /// briefly free (an agent reconnecting after a daemon restart) is not.
     slot_free_since: Option<std::time::Instant>,
-    /// The daemon socket refused this user: the session predates the
-    /// account's `hallpass` group, and retrying will not change that.
+    /// The daemon socket refused this user: usually a session that predates
+    /// the account's group, sometimes an account in neither; retrying will
+    /// not change either.
     denied: bool,
 }
 
@@ -456,6 +457,10 @@ impl HallpassApp {
                     // mode until this daemon has said what it is: the one it
                     // restarted into may not be the one it died in.
                     self.mode_reported = false;
+                    // And so does how long the slot has been free: an agent
+                    // reconnecting to this daemon gets the same grace as one
+                    // reconnecting while the window watched.
+                    self.slot_free_since = None;
                     // The event feed, never the prompt slot: prompts are the
                     // agent's. Then prime the rule/stat views (net.rs only
                     // does the handshake).
@@ -559,11 +564,12 @@ impl HallpassApp {
                 if self.agent_wanted.is_none() && self.mode_is_known() {
                     self.agent_wanted = Some(!stats.prompt_handler_connected);
                 }
-                self.slot_free_since = match (stats.prompt_handler_connected, self.slot_free_since)
-                {
-                    (true, _) => None,
-                    (false, since) => since.or_else(|| Some(std::time::Instant::now())),
-                };
+                if stats.prompt_handler_connected {
+                    self.slot_free_since = None;
+                } else {
+                    self.slot_free_since
+                        .get_or_insert_with(std::time::Instant::now);
+                }
                 self.stats = Some(stats);
             }
             // The settings form always settles on what the daemon actually
@@ -1026,48 +1032,54 @@ impl HallpassApp {
         // read-only one) is refused the same way, and relogging fixes
         // nothing there; doctor reads /etc/group and tells them apart.
         if self.denied && !matches!(self.status, ConnStatus::Connected) {
+            // The read-only socket is reached through its own group.
+            let group = if self.read_only_socket() {
+                "hallpass-observer"
+            } else {
+                "hallpass"
+            };
             theme::banner(
                 ui,
                 Tone::Bad,
                 "\u{26a0}",
                 "NO ACCESS",
-                "the firewall's socket refused this session. If your account was \
-                 added to the 'hallpass' group after you logged in, log out and back \
-                 in; otherwise `hallpass-cli doctor` says what is missing",
+                &format!(
+                    "the firewall's socket refused this session. If your account was \
+                     added to the '{group}' group after you logged in, log out and \
+                     back in; otherwise `hallpass-cli doctor` says what is missing"
+                ),
             );
             ui.add_space(8.0);
         }
         // This window takes no prompts, so on a host where the agent is not
         // running it would otherwise look healthy while every connection no
-        // rule matches is decided with nothing on screen. Only once the agent
-        // could not be started or cannot take prompts: an agent that is
-        // simply not running yet is started by this window (see
-        // `keep_agent`), not reported.
+        // rule matches is decided with nothing on screen. Not while an agent
+        // may only be reconnecting (a daemon restart frees the slot until it
+        // claims again), and not while this window is starting one: an
+        // agent the window keeps is started (see `keep_agent`), not
+        // reported, until it fails or cannot take prompts.
         if let Some(text) = self.no_handler_banner() {
-            let stalled = self
-                .agent
-                .as_ref()
-                .is_some_and(|(_, at)| at.elapsed() >= AGENT_GRACE);
+            let settled = self
+                .slot_free_since
+                .is_some_and(|since| since.elapsed() >= AGENT_GRACE);
+            let stalled = settled
+                && self
+                    .agent
+                    .as_ref()
+                    .is_some_and(|(_, at)| at.elapsed() >= AGENT_GRACE);
             let why = if self.read_only_socket() {
-                Some(
+                settled.then_some(
                     "this window is on the read-only socket, where no prompt agent \
                      can take them",
                 )
             } else if stalled {
-                Some(
-                    "the prompt agent is running but cannot take prompts on this \
-                     socket; it never can on the read-only one",
-                )
+                Some("the prompt agent is running but cannot take prompts on this socket")
             } else if let Some(why) = self.agent_error.as_deref() {
                 Some(why)
-            } else if self.agent.is_none()
-                && !self.wants_agent()
-                && self
-                    .slot_free_since
-                    .is_some_and(|since| since.elapsed() >= AGENT_GRACE)
-            {
-                // Nobody is going to fill it: not an agent of this window's,
-                // and not the window, which only keeps one it started.
+            } else if self.agent.is_none() && settled {
+                // Nobody is going to fill it: no agent of this window's is
+                // running, and `keep_agent` has already had its turn this
+                // frame.
                 Some("the prompt agent is not running")
             } else {
                 None
@@ -1111,7 +1123,8 @@ impl HallpassApp {
     /// not after Quit in its tray; opening this window brings it back. At
     /// most once per [`AGENT_RETRY`], so one that cannot start is reported
     /// (see `banners`) rather than started in a loop. An agent already
-    /// running for this user exits at once, which is reported too.
+    /// running for this user exits at once, which is reported too, once
+    /// the other one has had [`AGENT_GRACE`] to take the slot.
     fn keep_agent(&mut self) {
         if self.wants_agent() {
             self.agent_started = Some(std::time::Instant::now());
@@ -1205,6 +1218,7 @@ impl HallpassApp {
     /// display, and a button that silently re-enables explains neither. One
     /// that keeps running outlives this window, as the agent should.
     fn reap_agent(&mut self) {
+        use std::os::unix::process::ExitStatusExt as _;
         let Some((child, at)) = &mut self.agent else {
             return;
         };
@@ -1231,6 +1245,14 @@ impl HallpassApp {
                 // Quit from its tray: a choice, not a failure to recover from.
                 self.agent_wanted = Some(false);
                 "the prompt agent was quit".to_string()
+            }
+            // Stopped on purpose (`install.sh` replacing it on an upgrade, or
+            // `kill`), which is no crash either. Restarting it would run this
+            // window's own image, after an upgrade the old build, racing the
+            // new agent for the account's lock.
+            Ok(Some(status)) if status.signal().is_some_and(is_stop_signal) => {
+                self.agent_wanted = Some(false);
+                format!("the prompt agent was stopped ({status})")
             }
             Ok(Some(status)) => format!(
                 "the prompt agent stopped ({status}); run `hallpass-ui agent` in a \
@@ -2276,6 +2298,16 @@ impl eframe::App for HallpassApp {
         self.main_window(ui);
         self.editor_window(&ctx);
     }
+}
+
+/// Whether an agent killed by `signal` was stopped on purpose rather than
+/// crashed: the signals `kill`, a terminal and an upgrade send. Not KILL,
+/// which is also how the kernel ends a process it is out of memory for.
+fn is_stop_signal(signal: i32) -> bool {
+    use rustix::process::Signal;
+    [Signal::TERM, Signal::INT, Signal::HUP]
+        .iter()
+        .any(|s| s.as_raw() == signal)
 }
 
 // ---- small display helpers ----------------------------------------------
