@@ -113,7 +113,7 @@ fn main() -> eframe::Result {
         Ok(instance::Instance::First(holder)) => Some(holder),
         Ok(instance::Instance::Unanswered) => {
             tracing::info!(
-                "the open management window did not answer (minimized?); opening another"
+                "the open management window neither answered nor handed over; opening another"
             );
             None
         }

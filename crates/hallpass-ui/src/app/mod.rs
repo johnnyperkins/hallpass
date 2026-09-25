@@ -310,7 +310,7 @@ pub struct HallpassApp {
     socket: PathBuf,
     /// Raise requests from later launches (see `instance`), when this
     /// window holds the single-instance lock.
-    raise: Option<Receiver<crate::instance::RaiseRequest>>,
+    raise: Option<crate::instance::Raises>,
     /// An agent this window started and when, reaped once it exits.
     agent: Option<(std::process::Child, std::time::Instant)>,
     /// Why the last agent this window started is gone, shown beside the
@@ -2085,13 +2085,12 @@ impl eframe::App for HallpassApp {
     /// window it can still bring back must not send the launch off to open
     /// a second one.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // A launch that gave up has opened a window of its own; raising this
-        // one for it would pull the operator away from that one.
-        let raises: Vec<_> = self.raise.as_ref().map_or_else(Vec::new, |r| {
-            r.try_iter()
-                .filter(crate::instance::RaiseRequest::waiting)
-                .collect()
-        });
+        // Also what marks this window as drawing, so later launches wait
+        // for it rather than being told it is still starting.
+        let raises = self
+            .raise
+            .as_ref()
+            .map_or_else(Vec::new, crate::instance::Raises::take);
         if !raises.is_empty() {
             // X11 ignores a focus request on a minimized window; Wayland
             // cannot say it is minimized, and cannot un-minimize.
@@ -2106,7 +2105,7 @@ impl eframe::App for HallpassApp {
             ));
             // Answered from the frame, not the socket's thread: a window
             // that gets no frame (hidden, on Wayland) never gets here, and
-            // the launch that asked opens a window of its own instead.
+            // hands the lock to the launch that asked instead.
             for raise in raises {
                 raise.done();
             }
