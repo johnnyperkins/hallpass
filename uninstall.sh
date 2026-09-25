@@ -1,8 +1,8 @@
 #!/bin/sh
 # Remove a Hallpass install done by install.sh.
 #
-#   ./uninstall.sh              # remove binaries + service, keep /etc/hallpass
-#   HALLPASS_PURGE=1 ./uninstall.sh   # also delete /etc/hallpass config + rules
+#   ./uninstall.sh                   # remove binaries + service, keep /etc/hallpass
+#   HALLPASS_PURGE=1 ./uninstall.sh  # also delete /etc/hallpass config + rules
 set -eu
 
 purge=${HALLPASS_PURGE:-0}
@@ -24,7 +24,7 @@ fi
 # uninstall left it too, the machine would keep a bypass-less NFQUEUE rule with
 # no process bound to the queue: every new outbound connection dropped,
 # permanently, with the only program that knew how to remove the table just
-# deleted. Deleting a table that is not there fails, which is fine.
+# deleted.
 if command -v nft >/dev/null 2>&1; then
 	if nft list table inet hallpass >/dev/null 2>&1; then
 		nft delete table inet hallpass && echo "   removed nftables table inet hallpass"

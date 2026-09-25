@@ -50,12 +50,10 @@ esac
 # transport the rule engine does not model, and keeps enforcing while the
 # daemon is dead (queue_bypass = false).
 #
-# The desktop profile now differs on the last two only. It denies unmatched
-# and unanswered connections just the same, and allows the transports rules
-# cannot describe and everything at all while the daemon is dead, so a
-# machine that installs it keeps its network through a crash rather than
-# losing it. That is the difference, and it is one word here rather than a
-# file an operator has to know exists.
+# The desktop profile differs on the last two only: it denies unmatched and
+# unanswered connections just the same, but allows the transports rules
+# cannot describe, and everything while the daemon is dead, so a machine
+# running it keeps its network through a crash.
 #
 # Only ever applies when there is no config yet; an edited one is never
 # replaced, whatever this says.
@@ -92,7 +90,7 @@ install -Dm755 target/release/hallpass-ui  /usr/bin/hallpass-ui
 install -d -m755 /etc/hallpass /etc/hallpass/rules.d
 [ -f /etc/hallpass/config.toml ] || install -m644 "$posture_file" /etc/hallpass/config.toml
 [ -e /etc/hallpass/rules.d/example-allow-dns.toml ] \
-  || install -m644 etc/rules.d/example-allow-dns.toml /etc/hallpass/rules.d/example-allow-dns.toml
+	|| install -m644 etc/rules.d/example-allow-dns.toml /etc/hallpass/rules.d/example-allow-dns.toml
 
 # The LLMNR deny is installed unconditionally rather than through the loop
 # below. It names no executable, on purpose: a block should cover whatever
@@ -101,7 +99,7 @@ install -d -m755 /etc/hallpass /etc/hallpass/rules.d
 # host has no systemd-resolved, since anything else reaching that port is
 # what the rule is for.
 [ -e /etc/hallpass/rules.d/20-deny-llmnr.toml ] \
-  || install -m644 etc/rules.d/20-deny-llmnr.toml /etc/hallpass/rules.d/20-deny-llmnr.toml
+	|| install -m644 etc/rules.d/20-deny-llmnr.toml /etc/hallpass/rules.d/20-deny-llmnr.toml
 
 # Baseline rules for the daemons that run before anyone can answer a prompt.
 # Installed only when the binary the rule names is actually on this host: a
@@ -121,47 +119,47 @@ install -d -m755 /etc/hallpass /etc/hallpass/rules.d
 # Only the installed copy is rewritten; the shipped file keeps the path a
 # reader recognizes.
 for baseline in etc/rules.d/20-system-*.toml; do
-  [ -e "$baseline" ] || continue
-  name=$(basename "$baseline")
-  target="/etc/hallpass/rules.d/$name"
-  [ -e "$target" ] && continue
-  exe=$(sed -n 's/^exe = "\(.*\)"$/\1/p' "$baseline" | head -1)
-  if [ -z "$exe" ]; then
-    # Every baseline rule is scoped to a binary. One that is not - or that
-    # spells the key so this does not see it - would otherwise be installed
-    # unchecked, which is the direction the guard exists to prevent.
-    echo "  skipping $name: no 'exe = \"...\"' line to check" >&2
-    continue
-  fi
-  real=$(readlink -f "$exe" 2>/dev/null) || real=$exe
-  [ -n "$real" ] || real=$exe
-  if [ ! -x "$real" ]; then
-    echo "  skipping $name: $exe is not on this host."
-    echo "    Nothing takes its place: under default_verdict = \"deny\", whatever"
-    echo "    does this job here (chrony, ntpd, systemd-networkd, dhcpcd) needs a"
-    echo "    rule of its own or it is blocked. Copy the file and edit the path."
-    continue
-  fi
-  if [ "$real" != "$exe" ]; then
-    # The resolved path lands inside a TOML basic string via a sed
-    # replacement, and each layer has characters it cannot carry: " and
-    # backslash break the TOML string, | and & break the sed expression.
-    # Backslash and & could be escaped for sed, but not for TOML, so a
-    # path containing any of them is skipped whole rather than installed
-    # pointing at a path the daemon will never report.
-    case $real in
-      *'"'* | *'\'* | *'|'* | *'&'*)
-        echo "  skipping $name: resolved path $real cannot be written into" >&2
-        echo "    the rule file verbatim. Copy the file and edit the path." >&2
-        continue
-        ;;
-    esac
-  fi
-  install -m644 "$baseline" "$target"
-  if [ "$real" != "$exe" ]; then
-    sed -i "s|^exe = \".*\"\$|exe = \"$real\"|" "$target"
-    echo "  $name: exe rewritten to $real, the path /proc/<pid>/exe reports"
-  fi
+	[ -e "$baseline" ] || continue
+	name=$(basename "$baseline")
+	target="/etc/hallpass/rules.d/$name"
+	[ -e "$target" ] && continue
+	exe=$(sed -n 's/^exe = "\(.*\)"$/\1/p' "$baseline" | head -1)
+	if [ -z "$exe" ]; then
+		# Every baseline rule is scoped to a binary. One that is not - or that
+		# spells the key so this does not see it - would otherwise be installed
+		# unchecked, which is the direction the guard exists to prevent.
+		echo "  skipping $name: no 'exe = \"...\"' line to check" >&2
+		continue
+	fi
+	real=$(readlink -f "$exe" 2>/dev/null) || real=$exe
+	[ -n "$real" ] || real=$exe
+	if [ ! -x "$real" ]; then
+		echo "  skipping $name: $exe is not on this host."
+		echo "    Nothing takes its place: under default_verdict = \"deny\", whatever"
+		echo "    does this job here (chrony, ntpd, systemd-networkd, dhcpcd) needs a"
+		echo "    rule of its own or it is blocked. Copy the file and edit the path."
+		continue
+	fi
+	if [ "$real" != "$exe" ]; then
+		# The resolved path lands inside a TOML basic string via a sed
+		# replacement, and each layer has characters it cannot carry: " and
+		# backslash break the TOML string, | and & break the sed expression.
+		# Backslash and & could be escaped for sed, but not for TOML, so a
+		# path containing any of them is skipped whole rather than installed
+		# pointing at a path the daemon will never report.
+		case $real in
+			*'"'* | *'\'* | *'|'* | *'&'*)
+				echo "  skipping $name: resolved path $real cannot be written into" >&2
+				echo "    the rule file verbatim. Copy the file and edit the path." >&2
+				continue
+				;;
+		esac
+	fi
+	install -m644 "$baseline" "$target"
+	if [ "$real" != "$exe" ]; then
+		sed -i "s|^exe = \".*\"\$|exe = \"$real\"|" "$target"
+		echo "  $name: exe rewritten to $real, the path /proc/<pid>/exe reports"
+	fi
 done
 
 # Shell completions and the man page. These are package files, not policy, so
@@ -173,11 +171,11 @@ done
 # /usr/share/man is where a man page belongs whether or not a reader is
 # installed yet.
 [ -d /usr/share/bash-completion ] && install -Dm644 \
-  etc/completions/hallpass-cli.bash /usr/share/bash-completion/completions/hallpass-cli
+	etc/completions/hallpass-cli.bash /usr/share/bash-completion/completions/hallpass-cli
 [ -d /usr/share/zsh ] && install -Dm644 \
-  etc/completions/_hallpass-cli /usr/share/zsh/site-functions/_hallpass-cli
+	etc/completions/_hallpass-cli /usr/share/zsh/site-functions/_hallpass-cli
 [ -d /usr/share/fish ] && install -Dm644 \
-  etc/completions/hallpass-cli.fish /usr/share/fish/vendor_completions.d/hallpass-cli.fish
+	etc/completions/hallpass-cli.fish /usr/share/fish/vendor_completions.d/hallpass-cli.fish
 install -Dm644 etc/hallpass-cli.1 /usr/share/man/man1/hallpass-cli.1
 
 # systemd unit and desktop entries.
@@ -194,7 +192,7 @@ install -Dm644 etc/hallpass-ui-autostart.desktop /etc/xdg/autostart/hallpass-ui.
 # a member can set enforce = false, lift a lockdown posture, delete every deny
 # rule, or claim the prompt-handler slot and answer allow. That is the
 # designed boundary, not an oversight - but it is worth more than a line in
-# the README, because this is where it is handed out.
+# the docs, because this is where it is handed out.
 groupadd -f hallpass
 usermod -aG hallpass "$target_user"
 
