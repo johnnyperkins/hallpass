@@ -11,6 +11,10 @@ use hallpass_types::{ClientMsg, PromptScope, RuleDuration, Verdict};
 use crate::prompt::{self, PromptState};
 use crate::theme::{self, Tone, ALLOW_COLOR, DENY_COLOR, MUTED, REJECT_COLOR, TEXT};
 
+/// How many of the other pending prompts the list under the front one
+/// names; the rest are counted. A prompt past this is not on screen.
+pub(crate) const REST_SHOWN: usize = 5;
+
 /// Body of a prompt window: the app's oldest pending prompt, plus
 /// its other pending destinations (`rest`), which a host- or app-wide
 /// answer will cover in the same stroke.
@@ -229,7 +233,7 @@ fn prompt_info_ui(ui: &mut egui::Ui, p: &PromptState, rest: &[String]) {
                 .color(TEXT),
             );
             // A handful is informative; a browser's full endpoint list is not.
-            for dest in rest.iter().take(5) {
+            for dest in rest.iter().take(REST_SHOWN) {
                 ui.label(RichText::new(dest).small().monospace().color(MUTED));
             }
             if rest.len() > 5 {

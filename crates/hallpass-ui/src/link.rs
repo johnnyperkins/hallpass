@@ -59,6 +59,9 @@ pub enum FromWindow {
     /// The operator closed the window with these prompts on it. Sent once,
     /// as the window's last message; the agent denies each of them once.
     Dismissed { ids: Vec<u64> },
+    /// These prompts are now on screen: the front one, or a line in the list
+    /// of others pending. Each is reported once.
+    Shown { ids: Vec<u64> },
 }
 
 impl FromWindow {

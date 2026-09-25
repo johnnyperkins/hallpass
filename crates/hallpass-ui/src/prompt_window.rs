@@ -35,6 +35,8 @@ pub struct PromptWindow {
     done: bool,
     /// Whether the window has asked for the operator yet.
     announced: bool,
+    /// Prompts already reported to the agent as on screen.
+    reported: std::collections::BTreeSet<u64>,
 }
 
 impl PromptWindow {
@@ -45,6 +47,7 @@ impl PromptWindow {
             prompts: Vec::new(),
             done: false,
             announced: false,
+            reported: std::collections::BTreeSet::new(),
         }
     }
 
@@ -120,6 +123,19 @@ impl PromptWindow {
                 .collect();
             // An answer is always the front prompt's: it is the only one drawn.
             let answer = prompt_ui(ui, &mut self.prompts[0], now_ms, &rest);
+            // What this pass put on screen: the front prompt, and the others
+            // the list names. Told to the agent once each, so quitting denies
+            // what was seen and leaves the rest to the default verdict.
+            let drawn: Vec<u64> = self
+                .prompts
+                .iter()
+                .take(1 + crate::prompt_view::REST_SHOWN)
+                .map(|p| p.id)
+                .filter(|id| self.reported.insert(*id))
+                .collect();
+            if !drawn.is_empty() {
+                self.send(&FromWindow::Shown { ids: drawn });
+            }
             if let Some(answer) = answer.and_then(FromWindow::answer) {
                 self.prompts.remove(0);
                 self.send(&answer);
@@ -269,8 +285,11 @@ mod tests {
         }
         let said = Rc::new(RefCell::new(Vec::new()));
         let sink = Rc::clone(&said);
+        // Answers and dismissals only: what was shown has its own test.
         let to_agent: ToAgent = Box::new(move |msg| {
-            sink.borrow_mut().push(msg.clone());
+            if !matches!(msg, FromWindow::Shown { .. }) {
+                sink.borrow_mut().push(msg.clone());
+            }
             true
         });
         let harness = Harness::builder()
@@ -335,6 +354,44 @@ mod tests {
     }
 
     /// The keyboard route means what the close button means.
+    /// The agent hears once what reached the screen: the front prompt and
+    /// the ones the list under it names.
+    #[test]
+    fn what_is_drawn_is_reported_once() {
+        let (to_ui, from_agent) = std::sync::mpsc::channel();
+        for id in 1..=8 {
+            to_ui.send(show(id)).unwrap();
+        }
+        let said = Rc::new(RefCell::new(Vec::new()));
+        let sink = Rc::clone(&said);
+        let to_agent: ToAgent = Box::new(move |msg| {
+            sink.borrow_mut().push(msg.clone());
+            true
+        });
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(440.0, 330.0))
+            .build_ui_state(
+                |ui, w: &mut PromptWindow| w.frame(ui),
+                PromptWindow::new(from_agent, to_agent),
+            );
+        harness.step();
+        harness.step();
+        let shown: Vec<u64> = said
+            .borrow()
+            .iter()
+            .flat_map(|m| match m {
+                FromWindow::Shown { ids } => ids.clone(),
+                _ => Vec::new(),
+            })
+            .collect();
+        let named = 1 + crate::prompt_view::REST_SHOWN as u64;
+        assert_eq!(
+            shown,
+            (1..=named).collect::<Vec<_>>(),
+            "past the list, not on screen"
+        );
+    }
+
     #[test]
     fn escape_dismisses_like_closing() {
         let (mut harness, said) = window(vec![show(1)]);

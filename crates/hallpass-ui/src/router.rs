@@ -106,6 +106,9 @@ struct Window {
     retired: bool,
     /// The operator closed it; anything it says after that is ignored.
     dismissed: bool,
+    /// Of `ids`, the ones the window says it has drawn. Quitting denies
+    /// these and leaves the rest, which nobody saw, to the default verdict.
+    shown: BTreeSet<u64>,
 }
 
 #[derive(Default)]
@@ -229,6 +232,11 @@ impl Router {
                 win.ids.clear();
                 out.extend(self.place_waiting());
             }
+            FromWindow::Shown { ids } => {
+                // Only its own: a window cannot mark another's prompt seen.
+                let held: Vec<u64> = ids.into_iter().filter(|id| win.ids.contains(id)).collect();
+                win.shown.extend(held);
+            }
         }
         out
     }
@@ -270,18 +278,19 @@ impl Router {
         out
     }
 
-    /// The agent is quitting: deny, once, every prompt a window is showing,
+    /// The agent is quitting: deny, once, every prompt a window has drawn,
     /// as closing that window would, and close every window.
     ///
-    /// A prompt still waiting past [`MAX_WINDOWS`] is left unanswered: nobody
-    /// saw it, so it takes the daemon's default verdict at its deadline, like
-    /// any prompt nobody answered, unless an agent that starts before then
-    /// is handed it again and shows it.
+    /// Any other prompt is left unanswered: one still waiting past
+    /// [`MAX_WINDOWS`], or one sent to a window that has not drawn it yet.
+    /// Nobody saw it, so it takes the daemon's default verdict at its
+    /// deadline, like any prompt nobody answered, unless an agent that
+    /// starts before then is handed it again and shows it.
     pub fn quit(&mut self) -> Vec<Effect> {
         let mut out: Vec<Effect> = self
             .windows
             .values()
-            .flat_map(|win| &win.ids)
+            .flat_map(|win| win.ids.intersection(&win.shown))
             .map(|&id| Effect::Daemon(Box::new(close_reply(id))))
             .collect();
         // Forgets every prompt, waiting ones included, and closes every
@@ -348,6 +357,7 @@ impl Router {
                             ids: BTreeSet::new(),
                             retired: false,
                             dismissed: false,
+                            shown: BTreeSet::new(),
                         },
                     );
                     out.push(Effect::Spawn(w));
@@ -557,29 +567,48 @@ mod tests {
         );
     }
 
-    /// Quitting denies what is on screen and leaves what nobody saw to the
+    /// Quitting denies what a window drew and leaves what nobody saw (one
+    /// still waiting past the cap, one a window has not drawn yet) to the
     /// daemon's default.
     #[test]
-    fn quitting_denies_what_is_shown_and_leaves_what_waits() {
+    fn quitting_denies_what_was_drawn_and_leaves_the_rest() {
         let mut r = Router::new();
         for id in 0..=MAX_WINDOWS as u64 {
             r.request(prompt(id, None));
         }
+        let undrawn = 0;
+        for id in 1..MAX_WINDOWS as u64 {
+            r.window_said(id, FromWindow::Shown { ids: vec![id] });
+        }
         let out = r.quit();
-        for id in 0..MAX_WINDOWS as u64 {
-            assert!(out.contains(&deny(id)), "shown prompt {id} not denied");
+        for id in 1..MAX_WINDOWS as u64 {
+            assert!(out.contains(&deny(id)), "drawn prompt {id} not denied");
         }
         let waiting = MAX_WINDOWS as u64;
-        assert!(
-            !out.contains(&deny(waiting)),
-            "a prompt nobody saw was denied"
-        );
+        for id in [undrawn, waiting] {
+            assert!(
+                !out.contains(&deny(id)),
+                "prompt {id}, never on screen, was denied"
+            );
+        }
         assert_eq!(
             out.iter()
                 .filter(|e| matches!(e, Effect::Window(_, ToWindow::Close)))
                 .count(),
             MAX_WINDOWS
         );
+    }
+
+    /// A window reports only its own prompts as seen.
+    #[test]
+    fn a_window_cannot_mark_another_windows_prompt_seen() {
+        let mut r = Router::new();
+        r.request(prompt(1, CURL));
+        r.request(prompt(2, WGET));
+        r.window_said(0, FromWindow::Shown { ids: vec![1, 2] });
+        let out = r.quit();
+        assert!(out.contains(&deny(1)));
+        assert!(!out.contains(&deny(2)), "wget's window never drew it");
     }
 
     #[test]
