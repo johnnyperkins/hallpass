@@ -1,9 +1,9 @@
 //! Pending interactive prompts.
 //!
 //! The queue thread holds undecided packets and forwards (sequence, conn)
-//! pairs here. This table coalesces them per (exe, dst ip, dst port) key,
-//! asks the registered prompt-handler client, and pushes the resulting
-//! verdict back to the queue thread over the verdict channel.
+//! pairs here. This table coalesces them per application and destination
+//! (see [`Key`]), asks the registered prompt-handler client, and pushes the
+//! resulting verdict back to the queue thread over the verdict channel.
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -13,15 +13,15 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use hallpass_types::{
-    Connection, DaemonMsg, PromptContext, PromptScope, Proto, Rule, RuleDuration, RuleMatch,
-    Verdict, MAX_HASH_MISMATCH_RULES, MAX_PROMPT_ANCESTORS,
+    unix_ms_now, Connection, DaemonMsg, PromptContext, PromptScope, Proto, Rule, RuleDuration,
+    RuleMatch, Verdict, MAX_HASH_MISMATCH_RULES, MAX_PROMPT_ANCESTORS,
 };
 use tokio::sync::mpsc::{Sender, UnboundedSender};
 
-use hallpass_types::unix_ms_now;
-
+use crate::config::RuntimeSettings;
 use crate::events::EventBus;
-use crate::rules::store::RuleStore;
+use crate::rules::model::CompiledRule;
+use crate::rules::store::{filename_char, RuleStore};
 use crate::stats::Counters;
 
 /// Priority given to rules created from prompt replies.
@@ -45,6 +45,18 @@ type Key = (
     IpAddr,
     u16,
 );
+
+/// The key `conn` coalesces under.
+fn coalescing_key(conn: &Connection) -> Key {
+    (
+        conn.uid,
+        conn.exe_path.clone(),
+        conn.app_id.clone(),
+        conn.tuple.proto,
+        conn.tuple.dst.ip(),
+        conn.tuple.dst.port(),
+    )
+}
 
 struct Pending {
     key: Key,
@@ -79,7 +91,7 @@ impl Pending {
 /// Most packets one prompt will hold while it waits for an answer.
 ///
 /// Coalescing is what makes this necessary: every connection attempt with
-/// the same (exe, proto, dst ip, dst port) joins one prompt, so a process
+/// the same [`Key`] joins one prompt, so a process
 /// looping connect() adds a held packet per attempt to a single popup the
 /// operator sees once. Each of those pins a kernel queue slot until the
 /// prompt resolves. The queue thread caps the total
@@ -104,9 +116,9 @@ const MAX_PACKETS_PER_PROMPT: usize = 32;
 /// to unanswered prompts at once.
 ///
 /// Computed by walking the pending prompts rather than kept as a running
-/// count, deliberately. The table is capped at `max_pending_prompts` (64 by
-/// default) so the walk is short, and a counter maintained across the five
-/// paths that add or remove packets is a class of bug this does not need.
+/// count, deliberately. The table is capped at `max_pending_prompts`, so the
+/// walk is short, and a counter maintained across the five paths that add or
+/// remove packets is a class of bug this does not need.
 const MAX_PACKETS_PER_EXE: usize = 64;
 
 /// Consecutive timed-out prompts before the handler slot is taken back.
@@ -136,6 +148,55 @@ struct Inner {
     handler: Option<Handler>,
 }
 
+impl Inner {
+    /// The handler, unless its client has gone away.
+    fn live_handler(&self) -> Option<&Handler> {
+        self.handler.as_ref().filter(|h| !h.tx.is_closed())
+    }
+
+    /// The handler's channel, for telling it about prompts after the lock
+    /// is released.
+    fn handler_tx(&self) -> Option<Sender<DaemonMsg>> {
+        self.handler.as_ref().map(|h| h.tx.clone())
+    }
+
+    /// Whether `tx` is the channel holding the handler slot.
+    fn is_handler(&self, tx: &Sender<DaemonMsg>) -> bool {
+        self.handler.as_ref().is_some_and(|h| h.tx.same_channel(tx))
+    }
+
+    /// Take prompt `id` out of both indexes.
+    fn remove(&mut self, id: u64) -> Option<Pending> {
+        let pending = self.by_id.remove(&id)?;
+        self.by_key.remove(&pending.key);
+        Some(pending)
+    }
+
+    /// Whether one more packet for `conn` (coalescing under `key`) would
+    /// exceed either held-packet budget: [`MAX_PACKETS_PER_PROMPT`] for its
+    /// prompt, [`MAX_PACKETS_PER_EXE`] for its application.
+    ///
+    /// The application is the same (exe, app id) pair the coalescing key
+    /// carries, not the executable alone. Two packaged applications can run
+    /// from one sandbox path, and summing their held packets would let two
+    /// of them fill this budget and send the third's first packet down the
+    /// over-budget path, which never raises a prompt at all.
+    fn over_budget(&self, key: &Key, conn: &Connection) -> bool {
+        let app_held: usize = self
+            .by_id
+            .values()
+            .filter(|p| p.conn.exe_path == conn.exe_path && p.conn.app_id == conn.app_id)
+            .map(|p| p.packets.len())
+            .sum();
+        app_held >= MAX_PACKETS_PER_EXE
+            || self
+                .by_key
+                .get(key)
+                .and_then(|id| self.by_id.get(id))
+                .is_some_and(|p| p.packets.len() >= MAX_PACKETS_PER_PROMPT)
+    }
+}
+
 /// Table of prompts awaiting a client decision.
 pub struct PromptTable {
     inner: Mutex<Inner>,
@@ -150,7 +211,7 @@ pub struct PromptTable {
     /// timeout is read when a prompt is created (deadline and timer arm
     /// together, so they cannot disagree); the verdict is read when a
     /// decision is actually applied.
-    settings: Arc<crate::config::RuntimeSettings>,
+    settings: Arc<RuntimeSettings>,
     max_pending: usize,
     /// Mirror of `inner.handler` being occupied, readable without the lock.
     ///
@@ -183,10 +244,10 @@ impl PromptTable {
         events: Arc<EventBus>,
         stats: Arc<Counters>,
         store: Arc<RuleStore>,
-        settings: Arc<crate::config::RuntimeSettings>,
+        settings: Arc<RuntimeSettings>,
         max_pending: usize,
-    ) -> PromptTable {
-        PromptTable {
+    ) -> Self {
+        Self {
             inner: Mutex::new(Inner::default()),
             next_id: AtomicU64::new(1),
             verdict_tx,
@@ -217,8 +278,7 @@ impl PromptTable {
     /// handler, every connection no rule matches is resolved with the default
     /// verdict and no operator is ever asked.
     pub fn has_handler(&self) -> bool {
-        let inner = self.inner.lock().unwrap();
-        inner.handler.as_ref().is_some_and(|h| !h.tx.is_closed())
+        self.inner.lock().unwrap().live_handler().is_some()
     }
 
     /// The lock-free view of the handler slot, for the nfqueue verdict
@@ -230,33 +290,25 @@ impl PromptTable {
     /// Claim the prompt-handler slot. Returns false if already claimed.
     pub fn set_handler(&self, tx: Sender<DaemonMsg>) -> bool {
         let mut inner = self.inner.lock().unwrap();
-        match &inner.handler {
-            Some(h) if !h.tx.is_closed() => false,
-            _ => {
-                // Re-deliver everything still pending: requests are
-                // otherwise sent only at creation, so prompts opened
-                // before this handler connected (or while the previous
-                // one was dying) would sit invisible until their
-                // timeout applies the default verdict.
-                //
-                for (&id, p) in inner.by_id.iter() {
-                    let _ = tx.try_send(p.request(id));
-                }
-                inner.handler = Some(Handler { tx, unanswered: 0 });
-                self.handler_present.store(true, Ordering::Relaxed);
-                true
-            }
+        if inner.live_handler().is_some() {
+            return false;
         }
+        // Re-deliver everything still pending: requests are otherwise sent
+        // only at creation, so prompts opened before this handler connected
+        // (or while the previous one was dying) would sit invisible until
+        // their timeout applies the default verdict.
+        for (&id, p) in &inner.by_id {
+            let _ = tx.try_send(p.request(id));
+        }
+        inner.handler = Some(Handler { tx, unanswered: 0 });
+        self.handler_present.store(true, Ordering::Relaxed);
+        true
     }
 
     /// Release the handler slot if `tx` currently holds it.
     pub fn clear_handler(&self, tx: &Sender<DaemonMsg>) {
         let mut inner = self.inner.lock().unwrap();
-        if inner
-            .handler
-            .as_ref()
-            .is_some_and(|h| h.tx.same_channel(tx))
-        {
+        if inner.is_handler(tx) {
             inner.handler = None;
             self.handler_present.store(false, Ordering::Relaxed);
         }
@@ -279,14 +331,7 @@ impl PromptTable {
             self.finish_default(conn, vec![seq]);
             return;
         }
-        let key: Key = (
-            conn.uid,
-            conn.exe_path.clone(),
-            conn.app_id.clone(),
-            conn.tuple.proto,
-            conn.tuple.dst.ip(),
-            conn.tuple.dst.port(),
-        );
+        let key = coalescing_key(&conn);
         // Before the lock, and therefore also for packets that turn out to
         // coalesce into a prompt that already exists. That waste is bounded
         // by MAX_PACKETS_PER_PROMPT and every piece of it is cheap (see
@@ -296,31 +341,8 @@ impl PromptTable {
         let context = self.build_context(&conn, exe_sha256);
         let mut inner = self.inner.lock().unwrap();
 
-        // Both budgets, before either path can take a slot: one caps what a
-        // single destination holds, the other what one application holds
-        // across all of its destinations.
-        //
-        // Keyed on the same (exe, app id) pair the coalescing key carries,
-        // not on the executable alone. Two packaged applications can run
-        // from one sandbox path, and the coalescing key already tells them
-        // apart; summing their held packets together would let two of them
-        // fill this budget and send the third's first packet down the
-        // over-budget path, which resolves with the default verdict and
-        // never raises a prompt at all - the one thing the per-prompt cap
-        // above promises it will not do.
-        let exe_held: usize = inner
-            .by_id
-            .values()
-            .filter(|p| p.conn.exe_path == conn.exe_path && p.conn.app_id == conn.app_id)
-            .map(|p| p.packets.len())
-            .sum();
-        let over_budget = exe_held >= MAX_PACKETS_PER_EXE
-            || inner
-                .by_key
-                .get(&key)
-                .and_then(|id| inner.by_id.get(id))
-                .is_some_and(|p| p.packets.len() >= MAX_PACKETS_PER_PROMPT);
-        if over_budget {
+        // Both budgets, before either path below can take a slot.
+        if inner.over_budget(&key, &conn) {
             drop(inner);
             // No event: this flow either has a prompt already or is about to
             // be represented by one, and that prompt's decision is what the
@@ -340,19 +362,16 @@ impl PromptTable {
             }
         }
 
-        let handler = match &inner.handler {
-            Some(h) if !h.tx.is_closed() => h.tx.clone(),
-            _ => {
-                drop(inner);
-                tracing::debug!("no prompt handler connected, applying default verdict");
-                // Nobody was asked, so this is one more decision made by
-                // nobody. The counter is the only trace: with no handler
-                // there is no prompt, and an event that records the default
-                // verdict looks exactly like a rule having chosen it.
-                self.stats.record_prompt_unanswered();
-                self.finish_default(conn, vec![seq]);
-                return;
-            }
+        let Some(handler) = inner.live_handler().map(|h| h.tx.clone()) else {
+            drop(inner);
+            tracing::debug!("no prompt handler connected, applying default verdict");
+            // Nobody was asked, so this is one more decision made by nobody.
+            // The counter is the only trace: with no handler there is no
+            // prompt, and an event that records the default verdict looks
+            // exactly like a rule having chosen it.
+            self.stats.record_prompt_unanswered();
+            self.finish_default(conn, vec![seq]);
+            return;
         };
         if inner.by_id.len() >= self.max_pending {
             drop(inner);
@@ -399,16 +418,13 @@ impl PromptTable {
     /// Everything a prompt shows beyond the connection itself.
     ///
     /// Runs inline on the prompt dispatcher, before the table lock, and does
-    /// no disk IO at all. That is the whole design constraint. An earlier cut
-    /// built this on a blocking worker and sent the request afterwards, which
-    /// bought a freshly read executable hash and cost four defects: a prompt
-    /// whose build outran its deadline expired without ever being sent (and
-    /// `strike_handler` charged that to the handler, evicting a healthy GUI
-    /// after three), `expire` freed the table slot while the build ran on so
-    /// `max_pending` stopped bounding the work in flight, delivery order
-    /// stopped matching prompt-id order, and a request could arrive after the
-    /// `PromptExpired` for its own id. A prompt request must leave with the
-    /// packet, not after an unbounded read.
+    /// no disk IO at all: a prompt request must leave with the packet, not
+    /// after an unbounded read. Built on a blocking worker and sent
+    /// afterwards, a prompt could expire before it was ever sent (and be
+    /// charged to a healthy handler by `strike_handler`), `max_pending`
+    /// stopped bounding the work in flight, delivery order stopped matching
+    /// prompt-id order, and a request could arrive after the `PromptExpired`
+    /// for its own id.
     ///
     /// So `exe_sha256` is the value the verdict thread already computed while
     /// deciding this packet, passed in rather than re-read. It is present
@@ -449,12 +465,10 @@ impl PromptTable {
     /// Apply a client's decision to a pending prompt.
     ///
     /// `tx` is the replying client's outbound channel, and it must be the one
-    /// registered as the prompt handler. Only one client holds that slot, and
-    /// `set_handler` refuses to hand it over while the current holder is live,
-    /// but nothing checked it here: prompt ids are a monotonic counter from 1,
-    /// so any connected client could guess an id and answer a prompt that was
-    /// never sent to it, including racing the GUI to allow what the operator
-    /// was about to deny.
+    /// registered as the prompt handler: prompt ids are a monotonic counter
+    /// from 1, so without that check any connected client could guess an id
+    /// and answer a prompt never sent to it, including racing the GUI to
+    /// allow what the operator was about to deny.
     pub fn reply(
         &self,
         tx: &Sender<DaemonMsg>,
@@ -494,22 +508,19 @@ impl PromptTable {
         // changes) and the packet path already computes this for every
         // connection that reaches a prompt, so `None` here means the binary
         // could not be read or was past the size cap.
-        let pin = match pin_exe && verdict == Verdict::Allow {
-            true => pending.context.exe_sha256.as_deref(),
-            false => None,
+        let wants_pin = pin_exe && verdict == Verdict::Allow;
+        let pin = if wants_pin {
+            pending.context.exe_sha256.as_deref()
+        } else {
+            None
         };
-        // `duration` is part of the condition because this branch is about a
-        // rule that will not be written: with `Once` there was never going to
-        // be one, so the warning would tell an operator their answer was not
-        // remembered when nothing about it asked to be, and a security line
-        // that fires when nothing is wrong is the one people learn to skip.
-        //
-        // Live code, not a backstop. The GUI's `PromptState::pin_exe` is
-        // sticky and its `reply` gates only on the verdict, while the duration
-        // check lives in the render path - which *hides* the checkbox without
-        // clearing the field. So ticking Pin under Forever and then switching
-        // the combo to Once sends exactly this combination.
-        if pin_exe && verdict == Verdict::Allow && duration != RuleDuration::Once && pin.is_none() {
+        // Not for `Once`: this branch is about a rule that will not be
+        // written, and with `Once` there was never going to be one, so the
+        // warning would fire when nothing is wrong. Reachable, not a
+        // backstop: the GUI hides the pin checkbox for `Once` without
+        // clearing it, so ticking Pin under Forever and then switching to
+        // Once sends exactly this combination.
+        if wants_pin && duration != RuleDuration::Once && pin.is_none() {
             // No rule at all, rather than the unpinned one that would
             // otherwise be written. The operator asked to remember a set of
             // bytes; remembering a path instead is broader than what they
@@ -527,45 +538,49 @@ impl PromptTable {
             return Ok(());
         }
 
-        let mut rule_name = None;
-        let mut added_rule = None;
-        if duration != RuleDuration::Once {
-            match rule_from_reply(
-                &self.run_tag,
-                id,
-                &pending.conn,
-                verdict,
-                duration,
-                scope,
-                pin,
-            ) {
-                Some(rule) => {
-                    rule_name = Some(rule.name.clone());
-                    if let Err(e) = self.store.add(rule.clone()) {
-                        tracing::warn!("failed to add rule from prompt reply: {e}");
-                        rule_name = None;
-                    } else {
-                        added_rule = Some(rule);
-                    }
-                }
-                None => {
-                    tracing::warn!(
-                        "prompt reply for connection without executable path; \
-                         applying verdict without creating a rule"
-                    );
-                }
-            }
-        }
+        let added = if duration == RuleDuration::Once {
+            None
+        } else {
+            self.remember(id, &pending.conn, verdict, duration, scope, pin)
+        };
+        let rule_name = added.as_ref().map(|r| r.name.clone());
         self.finish(pending.conn, pending.packets, verdict, rule_name);
-        // The new rule may cover other prompts already on screen: the
-        // same app talking to its other endpoints. Resolve those now
-        // rather than leaving a stack of popups whose answer is already
-        // decided (and whose eventual timeout would apply the default
-        // verdict, possibly the opposite one).
-        if let Some(rule) = added_rule {
+        // The new rule may cover other prompts already on screen: the same
+        // app talking to its other endpoints. Resolve those now rather than
+        // leaving a stack of popups whose answer is already decided (and
+        // whose eventual timeout would apply the default verdict, possibly
+        // the opposite one).
+        if let Some(rule) = added {
             self.resolve_covered_by(&rule);
         }
         Ok(())
+    }
+
+    /// Write the rule a reply asks to be remembered, returning it when it
+    /// was added. A refusal is logged and costs only the memory of the
+    /// decision; the verdict still applies to the held packets.
+    fn remember(
+        &self,
+        id: u64,
+        conn: &Connection,
+        verdict: Verdict,
+        duration: RuleDuration,
+        scope: PromptScope,
+        pin: Option<&str>,
+    ) -> Option<Rule> {
+        let Some(rule) = rule_from_reply(&self.run_tag, id, conn, verdict, duration, scope, pin)
+        else {
+            tracing::warn!(
+                "prompt reply for connection without executable path; \
+                 applying verdict without creating a rule"
+            );
+            return None;
+        };
+        if let Err(e) = self.store.add(rule.clone()) {
+            tracing::warn!("failed to add rule from prompt reply: {e}");
+            return None;
+        }
+        Some(rule)
     }
 
     /// Resolve every pending prompt whose connection `rule` now matches,
@@ -595,7 +610,7 @@ impl PromptTable {
             );
             return;
         }
-        let compiled = match crate::rules::model::CompiledRule::compile(rule) {
+        let compiled = match CompiledRule::compile(rule) {
             Ok(c) => c,
             Err(e) => {
                 // The store accepted the rule, so this cannot happen; if
@@ -606,29 +621,23 @@ impl PromptTable {
         };
         let verdict = Verdict::from(rule.action);
         let mut inner = self.inner.lock().unwrap();
-        // Each prompt's own hash, not `None`. A pinned rule carries
-        // `exe_sha256`, and `first_failing_field` reports that criterion as
-        // failing whenever the caller supplies no hash - so passing `None`
-        // here meant a pinned rule swept nothing at all, and the sibling
-        // prompts an operator had just answered "allow, forever, this app
-        // anywhere, pinned" sat open until the timeout resolved them with
-        // `default_verdict`, possibly the opposite one. Nothing is computed
-        // for this: the value was hashed on the prompt path and `Pending`
-        // has carried it in its `PromptContext` ever since.
+        // Each prompt's own hash, not `None`: `first_failing_field` fails a
+        // pinned rule whenever no hash is supplied, so sweeping with `None`
+        // let a pinned rule cover nothing, and the siblings of a prompt just
+        // answered "allow, pinned" sat open until the timeout applied
+        // `default_verdict`. The hash was computed on the prompt path and
+        // rides in each prompt's `PromptContext`.
         let covered: Vec<u64> = inner
             .by_id
             .iter()
             .filter(|(_, p)| compiled.matches(&p.conn, p.context.exe_sha256.as_deref()))
             .map(|(&id, _)| id)
             .collect();
-        let mut resolved = Vec::new();
-        for id in covered {
-            if let Some(pending) = inner.by_id.remove(&id) {
-                inner.by_key.remove(&pending.key);
-                resolved.push((id, pending));
-            }
-        }
-        let handler = inner.handler.as_ref().map(|h| h.tx.clone());
+        let resolved: Vec<(u64, Pending)> = covered
+            .into_iter()
+            .filter_map(|id| inner.remove(id).map(|p| (id, p)))
+            .collect();
+        let handler = inner.handler_tx();
         drop(inner);
 
         for (id, pending) in resolved {
@@ -662,7 +671,7 @@ impl PromptTable {
         let mut inner = self.inner.lock().unwrap();
         let pending: Vec<(u64, Pending)> = inner.by_id.drain().collect();
         inner.by_key.clear();
-        let handler = inner.handler.as_ref().map(|h| h.tx.clone());
+        let handler = inner.handler_tx();
         drop(inner);
 
         if pending.is_empty() {
@@ -747,10 +756,7 @@ impl PromptTable {
     }
 
     fn take(&self, id: u64) -> Option<Pending> {
-        let mut inner = self.inner.lock().unwrap();
-        let pending = inner.by_id.remove(&id)?;
-        inner.by_key.remove(&pending.key);
-        Some(pending)
+        self.inner.lock().unwrap().remove(id)
     }
 
     /// Take a prompt only for the client currently holding the handler slot.
@@ -759,18 +765,12 @@ impl PromptTable {
     /// client cannot pass the check and then have the slot change under it.
     fn take_as_handler(&self, tx: &Sender<DaemonMsg>, id: u64) -> Result<Pending, String> {
         let mut inner = self.inner.lock().unwrap();
-        if !inner
-            .handler
-            .as_ref()
-            .is_some_and(|h| h.tx.same_channel(tx))
-        {
+        if !inner.is_handler(tx) {
             return Err("not the registered prompt handler".to_string());
         }
         let pending = inner
-            .by_id
-            .remove(&id)
+            .remove(id)
             .ok_or_else(|| format!("unknown or expired prompt id {id}"))?;
-        inner.by_key.remove(&pending.key);
         // Deciding one prompt clears the liveness strikes: they count
         // consecutive timeouts, so a handler that is answering is never
         // evicted for prompts its operator missed earlier in the day.
@@ -826,13 +826,7 @@ const MAX_RULE_STEM_CHARS: usize = 40;
 fn sanitize_rule_stem(raw: &str) -> String {
     raw.chars()
         .take(MAX_RULE_STEM_CHARS)
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
-                c
-            } else {
-                '_'
-            }
-        })
+        .map(filename_char)
         .collect()
 }
 
@@ -892,23 +886,17 @@ fn rule_from_reply(
     // answered about one user's process; an allow that also covered every
     // other account running that binary is a grant nobody was shown, and a
     // deny that stopped at one account would leave the rest to the default.
+    //
+    // And the hash: the operator approved these bytes rather than this name.
+    // An exe path is not an identity: an allow granted to something under a
+    // home directory or a build tree keeps matching after anything else is
+    // written there. A pinned deny, like an app-scoped one, would stop
+    // matching when the binary was updated - a block with an expiry date the
+    // operator did not ask for. `reply` already drops the flag on a deny;
+    // this is the layer that keeps a future caller from reintroducing it.
     if verdict == Verdict::Allow {
         matcher.app_id = conn.app_id.clone();
         matcher.user = conn.uid;
-    }
-    // The operator approved these bytes rather than this name. An exe path is
-    // not an identity: an allow granted to something under a home directory or
-    // a build tree keeps matching after anything else is written there, and a
-    // remembered allow must not widen on its own.
-    //
-    // Guarded on the verdict for the same reason `app_id` is, one layer up.
-    // Pinning narrows, and a deny that stops matching because the binary was
-    // updated falls through to `default_verdict`, which an operator is free to
-    // set to allow and which was never a judgement about this binary - so a
-    // pinned deny is a block with an expiry date the operator did not ask for.
-    // `reply` already drops the flag on a deny; this is the layer that makes a
-    // future caller unable to reintroduce it.
-    if verdict == Verdict::Allow {
         matcher.exe_sha256 = pin_sha256.map(str::to_string);
     }
     match scope {
@@ -942,1447 +930,4 @@ fn rule_from_reply(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use hallpass_types::{FlowTuple, Proto};
-    use tokio::sync::mpsc;
-
-    struct Harness {
-        table: Arc<PromptTable>,
-        verdict_rx: mpsc::UnboundedReceiver<(u64, Verdict)>,
-        store: Arc<RuleStore>,
-        stats: Arc<Counters>,
-        settings: Arc<crate::config::RuntimeSettings>,
-        events: Arc<EventBus>,
-        _dir: crate::testutil::TestDir,
-    }
-
-    impl Harness {
-        /// The stats snapshot a client would read, with the table's own
-        /// handler state in it.
-        fn snapshot(&self) -> hallpass_types::Stats {
-            self.stats.snapshot(
-                0,
-                0,
-                self.table.has_handler(),
-                true,
-                None,
-                Default::default(),
-            )
-        }
-    }
-
-    fn harness(tag: &str, max_pending: usize, default: Verdict) -> Harness {
-        let dir = crate::testutil::TestDir::new(&format!("prompt-{tag}"));
-        let store = Arc::new(RuleStore::new(dir.path().to_path_buf()));
-        let (verdict_tx, verdict_rx) = mpsc::unbounded_channel();
-        let stats = Arc::new(Counters::default());
-        let settings = Arc::new(crate::config::RuntimeSettings::new(
-            crate::testutil::runtime_config(5, default),
-        ));
-        let events = Arc::new(EventBus::default());
-        let table = Arc::new(PromptTable::new(
-            verdict_tx,
-            Arc::clone(&events),
-            Arc::clone(&stats),
-            Arc::clone(&store),
-            Arc::clone(&settings),
-            max_pending,
-        ));
-        Harness {
-            table,
-            verdict_rx,
-            store,
-            stats,
-            settings,
-            events,
-            _dir: dir,
-        }
-    }
-
-    fn conn(exe: &str, dst: &str) -> Connection {
-        Connection {
-            tuple: FlowTuple {
-                proto: Proto::Tcp,
-                src: "10.0.0.1:40000".parse().unwrap(),
-                dst: dst.parse().unwrap(),
-            },
-            uid: Some(1000),
-            pid: Some(1),
-            exe_path: Some(PathBuf::from(exe)),
-            cmdline: None,
-            parent_exe: None,
-            domain: None,
-            iface: None,
-            app_id: None,
-            first_seen: None,
-        }
-    }
-
-    #[tokio::test]
-    async fn no_handler_applies_default_immediately() {
-        let mut h = harness("nohandler", 4, Verdict::Deny);
-        h.table.handle_new(conn("/bin/a", "1.1.1.1:443"), 7, None);
-        assert_eq!(h.verdict_rx.recv().await, Some((7, Verdict::Deny)));
-        // Nobody was asked, and the event this emits is indistinguishable
-        // from a rule having chosen the same verdict. The counters are the
-        // only place that difference exists.
-        let s = h.snapshot();
-        assert!(!s.prompt_handler_connected);
-        assert_eq!(s.prompts_unanswered, 1);
-    }
-
-    /// A client can claim the prompt slot and never answer, which sends every
-    /// unmatched connection to the timeout default while the real interface
-    /// is told the slot is taken. Enough consecutive timeouts and the slot is
-    /// released for somebody who will use it.
-    #[tokio::test(start_paused = true)]
-    async fn a_handler_that_never_answers_loses_the_slot() {
-        let mut h = harness("evict", 8, Verdict::Allow);
-        let (tx, mut prompt_rx) = mpsc::channel(64);
-        assert!(h.table.set_handler(tx.clone()));
-
-        for seq in 1..=u64::from(MAX_UNANSWERED_EXPIRIES) {
-            h.table
-                .handle_new(conn("/bin/a", &format!("1.1.1.{seq}:443")), seq, None);
-            tokio::time::advance(Duration::from_secs(6)).await;
-            assert_eq!(h.verdict_rx.recv().await, Some((seq, Verdict::Allow)));
-        }
-
-        let s = h.snapshot();
-        assert!(!s.prompt_handler_connected, "slot released");
-        assert_eq!(s.prompt_handlers_evicted, 1);
-        assert_eq!(s.prompts_unanswered, u64::from(MAX_UNANSWERED_EXPIRIES));
-
-        // The evicted client is told, so one that is merely idle reclaims
-        // the slot instead of going quiet for the rest of the session.
-        let mut revoked = 0;
-        while let Ok(msg) = prompt_rx.try_recv() {
-            if matches!(msg, DaemonMsg::PromptHandlerRevoked) {
-                revoked += 1;
-            }
-        }
-        assert_eq!(revoked, 1, "told exactly once");
-
-        // And the slot is really free, for the evicted client or any other.
-        let (other, _other_rx) = mpsc::channel(16);
-        assert!(h.table.set_handler(other));
-    }
-
-    /// **A prompt already on screen cannot be answered through a posture.**
-    /// `decide` stops raising new ones the moment a lockdown engages, but
-    /// the ones already open outlive it by up to the prompt timeout, and an
-    /// Allow answered on one of those would put a connection through the
-    /// posture from the keyboard.
-    #[tokio::test]
-    async fn an_allow_answered_under_lockdown_is_denied() {
-        let mut h = harness("lockdown-reply", 8, Verdict::Allow);
-        let (tx, mut prompt_rx) = mpsc::channel(64);
-        assert!(h.table.set_handler(tx.clone()));
-        h.table
-            .handle_new(conn("/bin/curl", "1.1.1.1:443"), 1, None);
-        let DaemonMsg::PromptRequest { id, .. } = prompt_rx.recv().await.unwrap() else {
-            panic!("expected PromptRequest");
-        };
-
-        h.settings.set_locked_down(true);
-        h.table
-            .reply(
-                &tx,
-                id,
-                Verdict::Allow,
-                RuleDuration::Forever,
-                PromptScope::ThisPort,
-                false,
-            )
-            .expect("the reply is accepted, the answer is not");
-        assert_eq!(h.verdict_rx.recv().await, Some((1, Verdict::Deny)));
-        // And no rule is written: it would carry no pinned tag, so it would
-        // be suppressed the instant it existed, leaving an allow rule in the
-        // listing that permits nothing.
-        assert!(
-            h.store.list().is_empty(),
-            "an answer wrote policy through the posture"
-        );
-    }
-
-    /// A rule the posture suppresses must not sweep live prompts either.
-    /// Rule adds are not refused under a posture, so an untagged allow can
-    /// arrive at any moment; sweeping with it would resolve prompts with
-    /// Allow and release their held packets while the packet path denies the
-    /// identical connection.
-    #[tokio::test]
-    async fn a_suppressed_rule_does_not_sweep_prompts() {
-        let mut h = harness("lockdown-sweep", 8, Verdict::Deny);
-        let (tx, mut prompt_rx) = mpsc::channel(64);
-        assert!(h.table.set_handler(tx.clone()));
-        h.table
-            .handle_new(conn("/bin/curl", "1.1.1.1:443"), 1, None);
-        let DaemonMsg::PromptRequest { .. } = prompt_rx.recv().await.unwrap() else {
-            panic!("expected PromptRequest");
-        };
-
-        h.settings.set_locked_down(true);
-        h.store.rebuild_for_posture(Some(&["core".to_string()]));
-        let untagged = Rule {
-            name: "allow-curl".into(),
-            action: hallpass_types::Action::Allow,
-            duration: RuleDuration::Session,
-            priority: 1,
-            enabled: true,
-            tags: Vec::new(),
-            matcher: hallpass_types::RuleMatch {
-                port: Some(443),
-                ..Default::default()
-            },
-        };
-        h.store
-            .add(untagged.clone())
-            .expect("adds are not refused under a posture");
-        h.table.resolve_covered_by(&untagged);
-        assert!(
-            h.verdict_rx.try_recv().is_err(),
-            "a suppressed rule resolved a live prompt with its own verdict"
-        );
-
-        // And once the posture lifts, the same rule sweeps as it always has.
-        h.settings.set_locked_down(false);
-        h.store.rebuild_for_posture(None);
-        h.table.resolve_covered_by(&untagged);
-        assert_eq!(h.verdict_rx.recv().await, Some((1, Verdict::Allow)));
-    }
-
-    /// The lock-free flag and the slot it mirrors are two representations of
-    /// one fact, kept in step by hand at three sites, so this walks every
-    /// transition and asserts they never disagree.
-    ///
-    /// A drifted-true flag costs the verdict thread a whole-binary hash on a
-    /// host where nobody will ever see it, which is the waste the flag exists
-    /// to remove. A drifted-false flag is worse: the prompt carries no hash,
-    /// so both clients hide the pin control and the operator silently loses
-    /// the feature on a host that has a handler.
-    #[tokio::test(start_paused = true)]
-    async fn the_handler_flag_tracks_the_slot() {
-        let h = harness("handler-flag", 8, Verdict::Allow);
-        let flag = h.table.handler_flag();
-        let check = |what: &str| {
-            assert_eq!(
-                flag.load(Ordering::Relaxed),
-                h.table.has_handler(),
-                "the flag and the slot disagreed {what}"
-            );
-        };
-        check("before any handler");
-
-        let (tx, _rx) = mpsc::channel(64);
-        assert!(h.table.set_handler(tx.clone()));
-        check("after a handler claimed the slot");
-
-        // A second claim is refused, so nothing moves.
-        let (other, _other_rx) = mpsc::channel(64);
-        assert!(!h.table.set_handler(other));
-        check("after a refused second claim");
-
-        h.table.clear_handler(&tx);
-        check("after the handler released the slot");
-
-        // Releasing a channel that does not hold the slot must not clear it.
-        let (tx2, _rx2) = mpsc::channel(64);
-        assert!(h.table.set_handler(tx2.clone()));
-        h.table.clear_handler(&tx);
-        check("after a stranger tried to release the slot");
-        h.table.clear_handler(&tx2);
-        check("after the real holder released it");
-    }
-
-    /// The eviction path is the third site, and the one that empties the slot
-    /// without anybody asking it to.
-    #[tokio::test(start_paused = true)]
-    async fn eviction_clears_the_handler_flag() {
-        let mut h = harness("handler-flag-evict", 8, Verdict::Allow);
-        let flag = h.table.handler_flag();
-        let (tx, _rx) = mpsc::channel(64);
-        assert!(h.table.set_handler(tx));
-        assert!(flag.load(Ordering::Relaxed));
-
-        // Let every prompt time out until the handler is struck out.
-        for seq in 1..=MAX_UNANSWERED_EXPIRIES as u64 {
-            h.table
-                .handle_new(conn("/bin/a", &format!("1.1.1.{seq}:443")), seq, None);
-            tokio::time::advance(Duration::from_secs(6)).await;
-            assert_eq!(h.verdict_rx.recv().await, Some((seq, Verdict::Allow)));
-        }
-
-        assert!(!h.table.has_handler(), "the handler should be evicted");
-        assert!(
-            !flag.load(Ordering::Relaxed),
-            "eviction emptied the slot but left the flag claiming an operator"
-        );
-    }
-
-    /// The strikes count consecutive timeouts, so a handler that is deciding
-    /// prompts is never evicted for the ones its operator was away for.
-    #[tokio::test(start_paused = true)]
-    async fn answering_one_prompt_clears_the_strikes() {
-        let mut h = harness("evict-reset", 8, Verdict::Allow);
-        let (tx, mut prompt_rx) = mpsc::channel(64);
-        assert!(h.table.set_handler(tx.clone()));
-
-        let mut seq = 0;
-        // One short of eviction, twice over, with an answer in between.
-        for _ in 0..2 {
-            for _ in 0..MAX_UNANSWERED_EXPIRIES - 1 {
-                seq += 1;
-                h.table
-                    .handle_new(conn("/bin/a", &format!("1.1.1.{seq}:443")), seq, None);
-                tokio::time::advance(Duration::from_secs(6)).await;
-                assert_eq!(h.verdict_rx.recv().await, Some((seq, Verdict::Allow)));
-            }
-            // Drain the requests and expiries of the timed-out prompts, so
-            // the next message is the one for the prompt answered below.
-            while prompt_rx.try_recv().is_ok() {}
-            seq += 1;
-            h.table
-                .handle_new(conn("/bin/a", &format!("1.1.1.{seq}:443")), seq, None);
-            let DaemonMsg::PromptRequest { id, .. } = prompt_rx.recv().await.unwrap() else {
-                panic!("expected PromptRequest");
-            };
-            h.table
-                .reply(
-                    &tx,
-                    id,
-                    Verdict::Deny,
-                    RuleDuration::Once,
-                    PromptScope::ThisPort,
-                    false,
-                )
-                .expect("the handler answers");
-            assert_eq!(h.verdict_rx.recv().await, Some((seq, Verdict::Deny)));
-        }
-
-        let s = h.snapshot();
-        assert!(s.prompt_handler_connected, "still the handler");
-        assert_eq!(s.prompt_handlers_evicted, 0);
-    }
-
-    /// A filename may hold any byte but '/' and NUL, and the stem lands in a
-    /// persisted rule name that both clients list back when auditing policy.
-    /// An escape sequence there would rewrite that listing.
-    #[test]
-    fn rule_names_from_hostile_exe_stems_are_inert() {
-        let hostile = "/tmp/x\x1b[2K\rprompt-firefox-1";
-        let mut c = conn(hostile, "1.1.1.1:443");
-        c.exe_path = Some(PathBuf::from(hostile));
-        let rule = rule_from_reply(
-            "abc",
-            7,
-            &c,
-            Verdict::Deny,
-            RuleDuration::Forever,
-            PromptScope::ThisPort,
-            None,
-        )
-        .expect("a rule is generated");
-        assert!(!rule.name.contains('\x1b'), "{:?}", rule.name);
-        assert!(!rule.name.contains('\r'), "{:?}", rule.name);
-        assert!(
-            rule.name
-                .chars()
-                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-')),
-            "{:?}",
-            rule.name
-        );
-        // The exe criterion keeps the real path: only the name is reduced.
-        assert_eq!(rule.matcher.exe, Some(PathBuf::from(hostile)));
-    }
-
-    /// A port answer names its protocol, and an allow names the user it was
-    /// given for; a deny keeps covering every account.
-    #[test]
-    fn answered_rules_carry_the_protocol_and_an_allow_the_user() {
-        let c = conn("/usr/bin/curl", "1.1.1.1:443");
-        let rule = |verdict, scope| {
-            rule_from_reply("abc", 1, &c, verdict, RuleDuration::Forever, scope, None).unwrap()
-        };
-        let allow = rule(Verdict::Allow, PromptScope::ThisPort);
-        assert_eq!(allow.matcher.proto, Some(Proto::Tcp));
-        assert_eq!(allow.matcher.user, Some(1000));
-        let deny = rule(Verdict::Deny, PromptScope::ThisPort);
-        assert_eq!(deny.matcher.proto, Some(Proto::Tcp));
-        assert_eq!(deny.matcher.user, None);
-        // No port, no protocol: the host answer covers both.
-        assert_eq!(
-            rule(Verdict::Allow, PromptScope::ThisHost).matcher.proto,
-            None
-        );
-    }
-
-    /// **A path is not an identity.** An allow the operator granted to
-    /// something they can write themselves - a home directory, a build tree -
-    /// keeps matching after anything else is written to that path, which is
-    /// the one direction a remembered allow must never drift in. Pinning is
-    /// the operator saying they approved these bytes, not this name.
-    #[test]
-    fn a_pinned_allow_carries_the_hash_the_operator_was_shown() {
-        let c = conn("/home/u/.local/bin/tool", "1.1.1.1:443");
-        let hash = "ab".repeat(32);
-        let rule = rule_from_reply(
-            "abc",
-            7,
-            &c,
-            Verdict::Allow,
-            RuleDuration::Forever,
-            PromptScope::ThisPort,
-            Some(&hash),
-        )
-        .expect("a rule is generated");
-        assert_eq!(rule.matcher.exe_sha256.as_deref(), Some(hash.as_str()));
-        // The path is still there: the pin narrows the rule, it does not
-        // replace what it was already keyed on.
-        assert_eq!(
-            rule.matcher.exe,
-            Some(PathBuf::from("/home/u/.local/bin/tool"))
-        );
-
-        // Unpinned is the old shape exactly, so an operator who did not ask
-        // for this gets the rule they always got.
-        let plain = rule_from_reply(
-            "abc",
-            7,
-            &c,
-            Verdict::Allow,
-            RuleDuration::Forever,
-            PromptScope::ThisPort,
-            None,
-        )
-        .expect("a rule is generated");
-        assert_eq!(plain.matcher.exe_sha256, None);
-    }
-
-    /// Pinning is refused rather than downgraded. The rule an unpinned write
-    /// would produce is broader than what the operator answered and looks
-    /// identical in every listing, so the reply applies its verdict to the
-    /// held packets and remembers nothing - the connection is asked about
-    /// again, which is the visible failure.
-    #[tokio::test]
-    async fn a_pin_request_with_no_hash_creates_no_rule_at_all() {
-        let mut h = harness("pin-no-hash", 8, Verdict::Deny);
-        let (tx, mut rx) = mpsc::channel(8);
-        assert!(h.table.set_handler(tx.clone()));
-
-        // No hash on the prompt: the binary was unreadable or past the cap.
-        h.table
-            .handle_new(conn("/usr/bin/curl", "1.1.1.1:443"), 1, None);
-        let id = match rx.recv().await.expect("a prompt request") {
-            DaemonMsg::PromptRequest { id, context, .. } => {
-                assert_eq!(context.exe_sha256, None, "the fixture has no hash");
-                id
-            }
-            other => panic!("expected a prompt request, got {other:?}"),
-        };
-
-        h.table
-            .reply(
-                &tx,
-                id,
-                Verdict::Allow,
-                RuleDuration::Forever,
-                PromptScope::ThisPort,
-                true,
-            )
-            .expect("the reply is accepted");
-
-        // The verdict still reached the held packet: refusing to remember a
-        // decision must not refuse to apply it.
-        assert_eq!(h.verdict_rx.recv().await, Some((1, Verdict::Allow)));
-        assert!(
-            h.store.list().is_empty(),
-            "an unpinnable pin request must not fall back to an unpinned rule"
-        );
-    }
-
-    /// Pinning narrows, and narrowing runs the wrong way for a deny: a deny
-    /// that stops matching because the binary was updated resolves the
-    /// connection with `default_verdict`, which an operator is free to set to
-    /// allow. So the flag is dropped rather than honoured, the same way
-    /// `app_id` already is.
-    #[test]
-    fn a_deny_is_never_pinned() {
-        let c = conn("/usr/bin/curl", "1.1.1.1:443");
-        for verdict in [Verdict::Deny, Verdict::Reject] {
-            let rule = rule_from_reply(
-                "abc",
-                7,
-                &c,
-                verdict,
-                RuleDuration::Forever,
-                PromptScope::ThisPort,
-                Some(&"ab".repeat(32)),
-            )
-            .expect("a rule is generated");
-            // `reply` filters the flag before it reaches here; this asserts
-            // the same thing one layer down, so a future caller that forgets
-            // cannot quietly produce a self-expiring block.
-            //
-            // The hash is the assertion that matters. Asserting only on `exe`
-            // passed vacuously - `rule_from_reply` sets it for every
-            // `ThisPort` rule whether or not the pin was honoured - so this
-            // test would have stayed green with the guard missing, which is
-            // the one state it exists to catch.
-            assert_eq!(
-                rule.matcher.exe_sha256, None,
-                "{verdict:?} must not be pinned to bytes that can be replaced"
-            );
-            assert_eq!(
-                rule.matcher.exe,
-                Some(PathBuf::from("/usr/bin/curl")),
-                "{verdict:?} stays keyed on the path"
-            );
-        }
-    }
-
-    /// An allow answered for a sandboxed application names the application,
-    /// not only the path inside its sandbox: that path is shared by every
-    /// application of the same packaging system, so an exe-only allow would
-    /// answer for all of them at once.
-    ///
-    /// A deny must not be pinned the same way. The operand only narrows, and
-    /// a deny that stops matching because the application turned up without
-    /// a recognized cgroup scope is resolved by `default_verdict`, which an
-    /// operator is free to set to allow: the operator's block would silently
-    /// stop applying.
-    #[test]
-    fn only_an_allow_pins_the_application() {
-        let mut c = conn("/app/bin/firefox", "1.1.1.1:443");
-        c.app_id = Some("flatpak:org.mozilla.firefox".into());
-        let generated = |verdict| {
-            rule_from_reply(
-                "abc",
-                7,
-                &c,
-                verdict,
-                RuleDuration::Forever,
-                PromptScope::AppAnywhere,
-                None,
-            )
-            .expect("a rule is generated")
-        };
-
-        let allow = generated(Verdict::Allow);
-        assert_eq!(allow.matcher.exe, Some(PathBuf::from("/app/bin/firefox")));
-        assert_eq!(
-            allow.matcher.app_id.as_deref(),
-            Some("flatpak:org.mozilla.firefox")
-        );
-
-        for verdict in [Verdict::Deny, Verdict::Reject] {
-            let rule = generated(verdict);
-            assert_eq!(
-                rule.matcher.app_id, None,
-                "{verdict:?} must not be narrowed"
-            );
-            assert_eq!(rule.matcher.exe, Some(PathBuf::from("/app/bin/firefox")));
-        }
-
-        // Nothing changes for a connection with no application identity.
-        let plain = conn("/usr/bin/curl", "1.1.1.1:443");
-        let rule = rule_from_reply(
-            "abc",
-            8,
-            &plain,
-            Verdict::Allow,
-            RuleDuration::Forever,
-            PromptScope::AppAnywhere,
-            None,
-        )
-        .expect("a rule is generated");
-        assert_eq!(rule.matcher.app_id, None);
-    }
-
-    /// Two executables differing only in stripped characters must not collapse
-    /// onto one rule name, or answering for one would silently cover the other.
-    #[test]
-    fn distinct_hostile_stems_do_not_collide() {
-        let a = sanitize_rule_stem("ev\x1bil");
-        let b = sanitize_rule_stem("ev\ril");
-        assert_eq!(a, b, "same shape maps the same way");
-        assert_ne!(sanitize_rule_stem("evil"), a, "dropped chars would collide");
-    }
-
-    /// The request carries what the operator reads to decide, not just the
-    /// connection. Built off the dispatcher, so this is also the proof that
-    /// the deferred send arrives at all.
-    #[tokio::test]
-    async fn the_request_carries_the_prompt_context() {
-        let h = harness("context", 4, Verdict::Deny);
-        let (tx, mut prompt_rx) = mpsc::channel(16);
-        assert!(h.table.set_handler(tx));
-
-        // Two earlier refusals for this application, and one for another, so
-        // the count has to be per identity rather than a total.
-        let mut denied = conn("/bin/a", "9.9.9.9:443");
-        denied.app_id = Some("snap:thing".into());
-        h.events.emit(denied.clone(), Verdict::Deny, None, true);
-        h.events.emit(denied.clone(), Verdict::Reject, None, true);
-        h.events
-            .emit(conn("/bin/other", "9.9.9.9:443"), Verdict::Deny, None, true);
-
-        let mut asked = conn("/bin/a", "1.1.1.1:443");
-        asked.app_id = Some("snap:thing".into());
-        h.table.handle_new(asked, 1, None);
-
-        let DaemonMsg::PromptRequest { context, .. } = prompt_rx.recv().await.unwrap() else {
-            panic!("expected PromptRequest");
-        };
-        assert_eq!(context.recent_denials, 2);
-        // No rule in this store pins a hash, so there is nothing to warn
-        // about, and the exe of a fixture connection does not exist to hash.
-        assert!(context.hash_mismatch_rules.is_empty());
-        assert_eq!(context.exe_sha256, None);
-    }
-
-    /// A prompt is on its way to the handler before `handle_new` returns,
-    /// and in prompt-id order.
-    ///
-    /// Both were true by construction until the request was briefly built
-    /// and sent from a task of its own. That cost four defects at once, and
-    /// this is the property that rules them all out: nothing may sit between
-    /// entering a prompt in the table and offering it to the handler. If it
-    /// does, the expiry timer armed alongside it can fire first - applying
-    /// the default verdict to a connection nobody was shown, and charging
-    /// the silence to a handler that was never asked, until three of them
-    /// evict it - and the order the operator is walked through prompts stops
-    /// matching the order the packets arrived in.
-    #[tokio::test]
-    async fn requests_are_sent_before_handle_new_returns_and_in_order() {
-        let h = harness("sync-delivery", 8, Verdict::Deny);
-        let (tx, mut prompt_rx) = mpsc::channel(16);
-        assert!(h.table.set_handler(tx));
-
-        for seq in 1..=4u64 {
-            h.table
-                .handle_new(conn("/bin/a", &format!("1.1.1.{seq}:443")), seq, None);
-            // try_recv, not recv().await: nothing may be awaited for the
-            // request to exist.
-            let msg = prompt_rx
-                .try_recv()
-                .expect("the request is sent synchronously");
-            let DaemonMsg::PromptRequest { id, .. } = msg else {
-                panic!("expected PromptRequest");
-            };
-            assert_eq!(id, seq, "prompt ids reach the handler in creation order");
-        }
-    }
-
-    /// Prompt ids are a monotonic counter from 1, so they are trivially
-    /// guessable. Only the client holding the handler slot may answer, or any
-    /// other connected client could race the GUI and allow what the operator
-    /// was about to deny.
-    #[tokio::test]
-    async fn only_the_registered_handler_may_reply() {
-        let mut h = harness("reply-authz", 4, Verdict::Deny);
-        let (tx, mut prompt_rx) = mpsc::channel(16);
-        assert!(h.table.set_handler(tx.clone()));
-        // A second client connects but does not hold the slot.
-        let (other, _other_rx) = mpsc::channel(16);
-        assert!(!h.table.set_handler(other.clone()), "slot is exclusive");
-
-        h.table.handle_new(conn("/bin/a", "1.1.1.1:443"), 1, None);
-        let DaemonMsg::PromptRequest { id, .. } = prompt_rx.recv().await.unwrap() else {
-            panic!("expected PromptRequest");
-        };
-
-        let err = h
-            .table
-            .reply(
-                &other,
-                id,
-                Verdict::Allow,
-                RuleDuration::Once,
-                PromptScope::ThisPort,
-                false,
-            )
-            .expect_err("a non-handler must not answer");
-        assert!(err.contains("prompt handler"), "{err}");
-        // The prompt is untouched: no verdict released, still answerable.
-        assert!(h.verdict_rx.try_recv().is_err());
-
-        h.table
-            .reply(
-                &tx,
-                id,
-                Verdict::Deny,
-                RuleDuration::Once,
-                PromptScope::ThisPort,
-                false,
-            )
-            .expect("the handler may answer");
-        assert_eq!(h.verdict_rx.recv().await, Some((1, Verdict::Deny)));
-    }
-
-    #[tokio::test]
-    async fn reply_resolves_all_coalesced_packets() {
-        let mut h = harness("coalesce", 4, Verdict::Allow);
-        let (tx, mut prompt_rx) = mpsc::channel(16);
-        assert!(h.table.set_handler(tx.clone()));
-        assert!(!h.table.set_handler(tx.clone()), "slot is exclusive");
-
-        // Same key twice: one prompt, two held packets.
-        h.table.handle_new(conn("/bin/a", "1.1.1.1:443"), 1, None);
-        h.table.handle_new(conn("/bin/a", "1.1.1.1:443"), 2, None);
-        let DaemonMsg::PromptRequest { id, .. } = prompt_rx.recv().await.unwrap() else {
-            panic!("expected PromptRequest");
-        };
-        assert!(prompt_rx.try_recv().is_err(), "second packet coalesced");
-
-        h.table
-            .reply(
-                &tx,
-                id,
-                Verdict::Deny,
-                RuleDuration::Once,
-                PromptScope::ThisPort,
-                false,
-            )
-            .unwrap();
-        assert_eq!(h.verdict_rx.recv().await, Some((1, Verdict::Deny)));
-        assert_eq!(h.verdict_rx.recv().await, Some((2, Verdict::Deny)));
-        // Once: no rule created.
-        assert!(h.store.list().is_empty());
-        assert!(h
-            .table
-            .reply(
-                &tx,
-                id,
-                Verdict::Allow,
-                RuleDuration::Once,
-                PromptScope::ThisPort,
-                false
-            )
-            .is_err());
-    }
-
-    #[tokio::test]
-    async fn udp_once_covers_the_flow_without_a_rule() {
-        // conntrack marks only the first datagram of a UDP flow `ct state
-        // new`, so a single verdict reaches the queue and covers the whole
-        // flow. `Once` reuses that: the held datagram is released with the
-        // verdict and no persistent rule is created, so a genuinely new
-        // flow prompts again.
-        let mut h = harness("udp-once", 4, Verdict::Deny);
-        let (tx, mut prompt_rx) = mpsc::channel(16);
-        assert!(h.table.set_handler(tx.clone()));
-        let mut c = conn("/usr/bin/dig", "9.9.9.9:53");
-        c.tuple.proto = Proto::Udp;
-        h.table.handle_new(c, 1, None);
-        let DaemonMsg::PromptRequest { id, .. } = prompt_rx.recv().await.unwrap() else {
-            panic!("expected PromptRequest");
-        };
-        h.table
-            .reply(
-                &tx,
-                id,
-                Verdict::Allow,
-                RuleDuration::Once,
-                PromptScope::ThisHost,
-                false,
-            )
-            .unwrap();
-        assert_eq!(h.verdict_rx.recv().await, Some((1, Verdict::Allow)));
-        assert!(
-            h.store.list().is_empty(),
-            "Once creates no rule for UDP either"
-        );
-    }
-
-    /// An app-wide (or host-wide) answer resolves the other prompts the
-    /// same app already has open, with the same verdict; unrelated apps'
-    /// prompts stay.
-    #[tokio::test]
-    async fn broad_reply_resolves_other_prompts_it_covers() {
-        let mut h = harness("sweep", 8, Verdict::Deny);
-        let (tx, mut prompt_rx) = mpsc::channel(16);
-        assert!(h.table.set_handler(tx.clone()));
-
-        // One app, three endpoints; another app, one endpoint.
-        h.table
-            .handle_new(conn("/usr/bin/chrome", "1.1.1.1:443"), 1, None);
-        h.table
-            .handle_new(conn("/usr/bin/chrome", "2.2.2.2:443"), 2, None);
-        h.table
-            .handle_new(conn("/usr/bin/chrome", "3.3.3.3:80"), 3, None);
-        h.table
-            .handle_new(conn("/bin/other", "4.4.4.4:443"), 4, None);
-        let DaemonMsg::PromptRequest { id: first, .. } = prompt_rx.recv().await.unwrap() else {
-            panic!("expected PromptRequest");
-        };
-        for _ in 0..3 {
-            let _ = prompt_rx.recv().await.unwrap();
-        }
-
-        // Allow the app anywhere: every chrome prompt resolves allow.
-        h.table
-            .reply(
-                &tx,
-                first,
-                Verdict::Allow,
-                RuleDuration::Session,
-                PromptScope::AppAnywhere,
-                false,
-            )
-            .unwrap();
-        let mut released = std::collections::HashMap::new();
-        for _ in 0..3 {
-            let (seq, v) = h.verdict_rx.recv().await.unwrap();
-            released.insert(seq, v);
-        }
-        assert_eq!(
-            released,
-            [
-                (1, Verdict::Allow),
-                (2, Verdict::Allow),
-                (3, Verdict::Allow)
-            ]
-            .into(),
-            "all three chrome endpoints released with the replied verdict"
-        );
-
-        // The two covered prompts are announced gone so popups close.
-        let mut expired = 0;
-        while let Ok(msg) = prompt_rx.try_recv() {
-            if matches!(msg, DaemonMsg::PromptExpired { .. }) {
-                expired += 1;
-            }
-        }
-        assert_eq!(expired, 2, "both covered prompts expired to the handler");
-
-        // The unrelated app's prompt is untouched and still answerable.
-        assert!(h.verdict_rx.try_recv().is_err());
-        let other_id = first + 3;
-        h.table
-            .reply(
-                &tx,
-                other_id,
-                Verdict::Deny,
-                RuleDuration::Once,
-                PromptScope::ThisPort,
-                false,
-            )
-            .unwrap();
-        assert_eq!(h.verdict_rx.recv().await, Some((4, Verdict::Deny)));
-    }
-
-    /// A port-scoped answer must not touch the app's prompts for other
-    /// destinations.
-    #[tokio::test]
-    async fn narrow_reply_leaves_other_prompts_open() {
-        let mut h = harness("narrow", 8, Verdict::Deny);
-        let (tx, mut prompt_rx) = mpsc::channel(16);
-        assert!(h.table.set_handler(tx.clone()));
-        h.table
-            .handle_new(conn("/usr/bin/chrome", "1.1.1.1:443"), 1, None);
-        h.table
-            .handle_new(conn("/usr/bin/chrome", "2.2.2.2:443"), 2, None);
-        let DaemonMsg::PromptRequest { id: first, .. } = prompt_rx.recv().await.unwrap() else {
-            panic!("expected PromptRequest");
-        };
-        let _ = prompt_rx.recv().await.unwrap();
-
-        h.table
-            .reply(
-                &tx,
-                first,
-                Verdict::Allow,
-                RuleDuration::Session,
-                PromptScope::ThisPort,
-                false,
-            )
-            .unwrap();
-        assert_eq!(h.verdict_rx.recv().await, Some((1, Verdict::Allow)));
-        // The second endpoint's prompt is still pending: no verdict, no
-        // expiry announcement.
-        assert!(h.verdict_rx.try_recv().is_err());
-        assert!(prompt_rx.try_recv().is_err());
-    }
-
-    /// TCP and UDP flows to the same ip:port are different requests
-    /// (HTTPS vs QUIC); one prompt must not answer both.
-    #[tokio::test]
-    async fn different_protocols_prompt_separately() {
-        let mut h = harness("proto", 4, Verdict::Allow);
-        let (tx, mut prompt_rx) = mpsc::channel(16);
-        assert!(h.table.set_handler(tx.clone()));
-        h.table.handle_new(conn("/bin/a", "1.1.1.1:443"), 1, None);
-        let mut udp = conn("/bin/a", "1.1.1.1:443");
-        udp.tuple.proto = Proto::Udp;
-        h.table.handle_new(udp, 2, None);
-
-        let DaemonMsg::PromptRequest { id: tcp_id, .. } = prompt_rx.recv().await.unwrap() else {
-            panic!("expected PromptRequest");
-        };
-        let DaemonMsg::PromptRequest { id: udp_id, .. } = prompt_rx.recv().await.unwrap() else {
-            panic!("expected a second PromptRequest for the UDP flow");
-        };
-        assert_ne!(tcp_id, udp_id);
-
-        h.table
-            .reply(
-                &tx,
-                tcp_id,
-                Verdict::Deny,
-                RuleDuration::Once,
-                PromptScope::ThisPort,
-                false,
-            )
-            .unwrap();
-        assert_eq!(h.verdict_rx.recv().await, Some((1, Verdict::Deny)));
-        // The UDP prompt is untouched and still answerable.
-        assert!(h.verdict_rx.try_recv().is_err());
-        h.table
-            .reply(
-                &tx,
-                udp_id,
-                Verdict::Allow,
-                RuleDuration::Once,
-                PromptScope::ThisPort,
-                false,
-            )
-            .unwrap();
-        assert_eq!(h.verdict_rx.recv().await, Some((2, Verdict::Allow)));
-    }
-
-    /// A handler claiming the slot receives the prompts that were opened
-    /// while the previous handler was connected (or dying), instead of
-    /// them silently timing out to the default verdict.
-    #[tokio::test]
-    async fn new_handler_receives_pending_prompts() {
-        let mut h = harness("redeliver", 4, Verdict::Allow);
-        let (tx1, mut rx1) = mpsc::channel(16);
-        assert!(h.table.set_handler(tx1));
-        h.table.handle_new(conn("/bin/a", "1.1.1.1:443"), 1, None);
-        let DaemonMsg::PromptRequest { id, .. } = rx1.recv().await.unwrap() else {
-            panic!("expected PromptRequest");
-        };
-
-        // The handler dies without answering; a new one takes the slot.
-        drop(rx1);
-        let (tx2, mut rx2) = mpsc::channel(16);
-        assert!(h.table.set_handler(tx2.clone()));
-        let DaemonMsg::PromptRequest {
-            id: redelivered, ..
-        } = rx2.recv().await.unwrap()
-        else {
-            panic!("expected the pending prompt to be re-delivered");
-        };
-        assert_eq!(redelivered, id);
-
-        // The new handler owns the slot now, so it is the one that may answer.
-        h.table
-            .reply(
-                &tx2,
-                id,
-                Verdict::Deny,
-                RuleDuration::Once,
-                PromptScope::ThisPort,
-                false,
-            )
-            .unwrap();
-        assert_eq!(h.verdict_rx.recv().await, Some((1, Verdict::Deny)));
-    }
-
-    #[tokio::test]
-    async fn overflow_applies_default() {
-        let mut h = harness("overflow", 1, Verdict::Deny);
-        let (tx, mut prompt_rx) = mpsc::channel(16);
-        assert!(h.table.set_handler(tx.clone()));
-        h.table.handle_new(conn("/bin/a", "1.1.1.1:443"), 1, None);
-        let _ = prompt_rx.recv().await.unwrap();
-        // Different key while table is full.
-        h.table.handle_new(conn("/bin/b", "2.2.2.2:80"), 2, None);
-        assert_eq!(h.verdict_rx.recv().await, Some((2, Verdict::Deny)));
-    }
-
-    /// One flow cannot hold packets without limit. Coalescing means a
-    /// process looping connect() to one endpoint adds a packet per attempt
-    /// to a single prompt, and each held packet pins a kernel queue slot, so
-    /// past the budget the extras take the default verdict immediately while
-    /// the prompt itself stays open and answerable.
-    #[tokio::test]
-    async fn one_prompt_holds_a_bounded_number_of_packets() {
-        let mut h = harness("packetcap", 4, Verdict::Deny);
-        let (tx, mut prompt_rx) = mpsc::channel(16);
-        assert!(h.table.set_handler(tx.clone()));
-
-        for seq in 0..MAX_PACKETS_PER_PROMPT as u64 {
-            h.table.handle_new(conn("/bin/a", "1.1.1.1:443"), seq, None);
-        }
-        let DaemonMsg::PromptRequest { id, .. } = prompt_rx.recv().await.unwrap() else {
-            panic!("expected PromptRequest");
-        };
-        assert!(
-            h.verdict_rx.try_recv().is_err(),
-            "packets inside the budget stay held for the operator"
-        );
-
-        // One past the budget: released now, and counted as a connection
-        // nobody was asked about.
-        h.table.handle_new(conn("/bin/a", "1.1.1.1:443"), 999, None);
-        assert_eq!(h.verdict_rx.recv().await, Some((999, Verdict::Deny)));
-        assert_eq!(h.snapshot().prompts_overflowed, 1);
-
-        // The prompt is untouched: still one popup, still answerable, and
-        // its answer still governs every packet it did hold.
-        h.table
-            .reply(
-                &tx,
-                id,
-                Verdict::Allow,
-                RuleDuration::Once,
-                PromptScope::ThisPort,
-                false,
-            )
-            .expect("the prompt survives the packet budget");
-        assert_eq!(h.verdict_rx.recv().await, Some((0, Verdict::Allow)));
-    }
-
-    /// The per-prompt budget is per destination, so without a second budget
-    /// one process spreading connections over a handful of ip:port pairs
-    /// still holds every packet the queue thread will hold, and then nothing
-    /// on the host gets a prompt until they drain.
-    #[tokio::test]
-    async fn one_executable_holds_a_bounded_number_of_packets_across_destinations() {
-        // Room for more prompts than this test opens, so the pending-table
-        // cap cannot be what resolves them.
-        let mut h = harness("exebudget", MAX_PACKETS_PER_EXE * 2, Verdict::Deny);
-        let (tx, _prompt_rx) = mpsc::channel(256);
-        assert!(h.table.set_handler(tx.clone()));
-
-        // Spread over destinations so the per-prompt budget never applies:
-        // MAX_PACKETS_PER_EXE packets, none of them a repeat.
-        let mut seq = 0u64;
-        for port in 0..(MAX_PACKETS_PER_EXE as u16) {
-            h.table.handle_new(
-                conn("/bin/loud", &format!("1.1.1.1:{}", 1000 + port)),
-                seq,
-                None,
-            );
-            seq += 1;
-        }
-        assert!(
-            h.verdict_rx.try_recv().is_err(),
-            "packets inside the budget stay held"
-        );
-
-        // One more from the same executable, to a fresh destination: over
-        // budget, released immediately rather than holding another slot.
-        h.table
-            .handle_new(conn("/bin/loud", "1.1.1.1:9999"), seq, None);
-        assert_eq!(h.verdict_rx.recv().await, Some((seq, Verdict::Deny)));
-        assert_eq!(h.snapshot().prompts_overflowed, 1);
-
-        // A different executable is unaffected: this is a per-exe share, not
-        // a global stop.
-        seq += 1;
-        h.table
-            .handle_new(conn("/bin/quiet", "2.2.2.2:443"), seq, None);
-        assert!(
-            h.verdict_rx.try_recv().is_err(),
-            "one loud executable must not deny everyone else a prompt"
-        );
-    }
-
-    /// The share is per application, and two packaged applications can run
-    /// from one path inside their sandboxes. Summing their held packets
-    /// together would let one of them spend the other's budget, and the
-    /// over-budget path does not merely drop packets - it resolves them with
-    /// the default verdict without ever raising a prompt, so the second
-    /// application would be decided without anyone being asked.
-    #[tokio::test]
-    async fn applications_sharing_a_sandbox_path_do_not_share_a_budget() {
-        let mut h = harness("appbudget", MAX_PACKETS_PER_EXE * 4, Verdict::Deny);
-        let (tx, _prompt_rx) = mpsc::channel(256);
-        assert!(h.table.set_handler(tx.clone()));
-
-        let from = |app: &str, port: u16| {
-            let mut c = conn("/app/bin/electron", &format!("1.1.1.1:{port}"));
-            c.app_id = Some(app.to_string());
-            c
-        };
-
-        // The first application spends its whole share.
-        let mut seq = 0u64;
-        for port in 0..(MAX_PACKETS_PER_EXE as u16) {
-            h.table
-                .handle_new(from("flatpak:com.example.First", 1000 + port), seq, None);
-            seq += 1;
-        }
-        h.table
-            .handle_new(from("flatpak:com.example.First", 9999), seq, None);
-        assert_eq!(h.verdict_rx.recv().await, Some((seq, Verdict::Deny)));
-
-        // The second is still asked about, though it runs from the same path.
-        seq += 1;
-        h.table
-            .handle_new(from("flatpak:com.example.Second", 443), seq, None);
-        assert!(
-            h.verdict_rx.try_recv().is_err(),
-            "a second application must not inherit the first's spent budget"
-        );
-    }
-
-    /// Turning enforcement off must not leave packets held behind a prompt
-    /// nobody is going to answer: the operator was told nothing is being
-    /// blocked, and a packet held to its deadline is delayed by up to an
-    /// hour.
-    #[tokio::test]
-    async fn switching_to_observe_releases_prompts_opened_while_enforcing() {
-        let mut h = harness("observe-release", 8, Verdict::Allow);
-        let (tx, mut prompt_rx) = mpsc::channel(16);
-        assert!(h.table.set_handler(tx.clone()));
-        h.table.handle_new(conn("/bin/a", "1.1.1.1:443"), 11, None);
-        let DaemonMsg::PromptRequest { id, .. } = prompt_rx.recv().await.unwrap() else {
-            panic!("expected PromptRequest");
-        };
-
-        h.table.resolve_pending_for_observe();
-
-        assert_eq!(h.verdict_rx.recv().await, Some((11, Verdict::Allow)));
-        assert_eq!(
-            prompt_rx.recv().await,
-            Some(DaemonMsg::PromptExpired { id })
-        );
-        // The prompt is gone from the table, so a late answer is refused
-        // rather than resolving a flow that was already released.
-        assert!(h
-            .table
-            .reply(
-                &tx,
-                id,
-                Verdict::Deny,
-                RuleDuration::Once,
-                PromptScope::ThisPort,
-                false
-            )
-            .is_err());
-    }
-
-    /// The sweep must apply the same enabled filter the packet path does. A
-    /// client can add a disabled rule, and sweeping with it resolved live
-    /// prompts with a verdict no packet would ever have been given.
-    #[tokio::test]
-    async fn a_disabled_rule_does_not_resolve_prompts() {
-        let mut h = harness("disabled-sweep", 8, Verdict::Deny);
-        let (tx, mut prompt_rx) = mpsc::channel(16);
-        assert!(h.table.set_handler(tx.clone()));
-        h.table.handle_new(conn("/bin/a", "1.1.1.1:443"), 21, None);
-        let _ = prompt_rx.recv().await.unwrap();
-
-        let mut rule = Rule {
-            name: "off-allow".into(),
-            action: hallpass_types::Action::Allow,
-            duration: RuleDuration::Session,
-            priority: 1,
-            enabled: false,
-            tags: Vec::new(),
-            matcher: RuleMatch {
-                exe: Some(PathBuf::from("/bin/a")),
-                ..Default::default()
-            },
-        };
-        h.table.resolve_covered_by(&rule);
-        assert!(
-            h.verdict_rx.try_recv().is_err(),
-            "a disabled rule must not decide a prompt"
-        );
-
-        // Enabled, the same rule sweeps it.
-        rule.enabled = true;
-        h.table.resolve_covered_by(&rule);
-        assert_eq!(h.verdict_rx.recv().await, Some((21, Verdict::Allow)));
-    }
-
-    /// Answering one of several pending prompts from one program with a
-    /// remembered rule settles the others that rule covers, through the
-    /// reply path itself: each is decided with the answer and its handler
-    /// told it is gone. Checked for both verdicts, since an allow rule
-    /// carries the user and the application identity and a deny does not,
-    /// and for every scope, which decides how many of the siblings the
-    /// answer reaches.
-    #[tokio::test]
-    async fn a_remembered_answer_settles_the_sibling_prompts_it_covers() {
-        for (verdict, scope, covered) in [
-            (Verdict::Deny, PromptScope::AppAnywhere, vec![2, 3, 4]),
-            (Verdict::Allow, PromptScope::AppAnywhere, vec![2, 3, 4]),
-            (Verdict::Deny, PromptScope::ThisHost, vec![2]),
-            (Verdict::Allow, PromptScope::ThisPort, vec![]),
-        ] {
-            let mut h = harness("siblings", 8, Verdict::Allow);
-            let (tx, mut prompt_rx) = mpsc::channel(16);
-            assert!(h.table.set_handler(tx.clone()));
-            let mut ids = Vec::new();
-            // Same program: the first two share an address on different
-            // ports, the rest go elsewhere. A different program's prompt
-            // is never covered.
-            for (seq, dst) in [
-                (1, "1.1.1.1:443"),
-                (2, "1.1.1.1:80"),
-                (3, "2.2.2.2:443"),
-                (4, "3.3.3.3:53"),
-            ] {
-                h.table.handle_new(conn("/usr/bin/curl", dst), seq, None);
-                let DaemonMsg::PromptRequest { id, .. } = prompt_rx.recv().await.unwrap() else {
-                    panic!("expected PromptRequest");
-                };
-                ids.push(id);
-            }
-            h.table
-                .handle_new(conn("/usr/bin/wget", "1.1.1.1:443"), 9, None);
-            let _ = prompt_rx.recv().await.unwrap();
-
-            h.table
-                .reply(&tx, ids[0], verdict, RuleDuration::Session, scope, false)
-                .unwrap();
-
-            let mut decided = vec![h.verdict_rx.recv().await.unwrap()];
-            while let Ok(v) = h.verdict_rx.try_recv() {
-                decided.push(v);
-            }
-            let mut want: Vec<(u64, Verdict)> = vec![(1, verdict)];
-            want.extend(covered.iter().map(|seq| (*seq, verdict)));
-            decided.sort_unstable_by_key(|(seq, _)| *seq);
-            assert_eq!(decided, want, "{verdict:?} {scope:?}");
-
-            let mut gone = Vec::new();
-            while let Ok(msg) = prompt_rx.try_recv() {
-                if let DaemonMsg::PromptExpired { id } = msg {
-                    gone.push(id);
-                }
-            }
-            let want_gone: Vec<u64> = covered.iter().map(|seq| ids[*seq as usize - 1]).collect();
-            gone.sort_unstable();
-            assert_eq!(
-                gone, want_gone,
-                "{verdict:?} {scope:?}: the handler is told"
-            );
-        }
-    }
-
-    /// A pinned rule must sweep the prompts it covers.
-    ///
-    /// `first_failing_field` reports `exe_sha256` as the failing criterion
-    /// whenever the rule pins a hash and the caller supplies none, so sweeping
-    /// with `None` made every pinned rule cover nothing at all. The visible
-    /// failure: an operator answers one of a stack of prompts for the same
-    /// application with "allow, forever, this app anywhere, pinned", the rule
-    /// is written, and the siblings sit open until the timeout resolves them
-    /// with `default_verdict` - here the opposite verdict to the one just
-    /// given.
-    #[tokio::test]
-    async fn a_pinned_rule_sweeps_the_prompts_it_covers() {
-        let hash = "ab".repeat(32);
-        let mut h = harness("pinned-sweep", 8, Verdict::Deny);
-        let (tx, mut prompt_rx) = mpsc::channel(16);
-        assert!(h.table.set_handler(tx.clone()));
-        h.table
-            .handle_new(conn("/bin/a", "1.1.1.1:443"), 31, Some(hash.clone()));
-        let _ = prompt_rx.recv().await.unwrap();
-
-        let rule = Rule {
-            name: "pinned-allow".into(),
-            action: hallpass_types::Action::Allow,
-            duration: RuleDuration::Forever,
-            priority: 1,
-            enabled: true,
-            tags: Vec::new(),
-            matcher: RuleMatch {
-                exe: Some(PathBuf::from("/bin/a")),
-                exe_sha256: Some(hash),
-                ..Default::default()
-            },
-        };
-        h.table.resolve_covered_by(&rule);
-        assert_eq!(h.verdict_rx.recv().await, Some((31, Verdict::Allow)));
-    }
-
-    /// The other direction, so the fix above cannot be read as "ignore the
-    /// hash when sweeping": pinning still narrows. A prompt for a different
-    /// set of bytes at the same path is not covered by the pinned rule and
-    /// must stay open to be answered on its own.
-    #[tokio::test]
-    async fn a_pinned_rule_does_not_sweep_a_different_binary() {
-        let mut h = harness("pinned-sweep-narrow", 8, Verdict::Deny);
-        let (tx, mut prompt_rx) = mpsc::channel(16);
-        assert!(h.table.set_handler(tx.clone()));
-        h.table
-            .handle_new(conn("/bin/a", "1.1.1.1:443"), 32, Some("cd".repeat(32)));
-        let _ = prompt_rx.recv().await.unwrap();
-
-        let rule = Rule {
-            name: "pinned-allow".into(),
-            action: hallpass_types::Action::Allow,
-            duration: RuleDuration::Forever,
-            priority: 1,
-            enabled: true,
-            tags: Vec::new(),
-            matcher: RuleMatch {
-                exe: Some(PathBuf::from("/bin/a")),
-                exe_sha256: Some("ab".repeat(32)),
-                ..Default::default()
-            },
-        };
-        h.table.resolve_covered_by(&rule);
-        assert!(
-            h.verdict_rx.try_recv().is_err(),
-            "a pin is a narrowing, so bytes it does not name stay unanswered"
-        );
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn timeout_applies_default_and_notifies() {
-        let mut h = harness("timeout", 4, Verdict::Deny);
-        let (tx, mut prompt_rx) = mpsc::channel(16);
-        assert!(h.table.set_handler(tx.clone()));
-        h.table.handle_new(conn("/bin/a", "1.1.1.1:443"), 9, None);
-        let DaemonMsg::PromptRequest { id, .. } = prompt_rx.recv().await.unwrap() else {
-            panic!("expected PromptRequest");
-        };
-        tokio::time::advance(Duration::from_secs(6)).await;
-        assert_eq!(h.verdict_rx.recv().await, Some((9, Verdict::Deny)));
-        assert_eq!(
-            prompt_rx.recv().await,
-            Some(DaemonMsg::PromptExpired { id })
-        );
-    }
-
-    /// A runtime settings change: the new timeout arms prompts created
-    /// after it (armed prompts keep their deadline), and the default
-    /// verdict is read when a decision is applied, so a prompt that
-    /// outlives the change resolves with the operator's latest choice.
-    #[tokio::test(start_paused = true)]
-    async fn settings_changes_apply_to_new_prompts_and_pending_defaults() {
-        let mut h = harness("settings", 8, Verdict::Allow);
-        let (tx, mut prompt_rx) = mpsc::channel(16);
-        assert!(h.table.set_handler(tx.clone()));
-
-        // Armed under timeout=5s.
-        h.table.handle_new(conn("/bin/a", "1.1.1.1:443"), 1, None);
-        let DaemonMsg::PromptRequest {
-            deadline_ms: first_deadline,
-            ..
-        } = prompt_rx.recv().await.unwrap()
-        else {
-            panic!("expected PromptRequest");
-        };
-
-        h.settings
-            .apply(&crate::testutil::runtime_config(60, Verdict::Deny))
-            .expect("valid settings");
-
-        // A prompt created after the change carries the longer deadline.
-        h.table.handle_new(conn("/bin/b", "2.2.2.2:443"), 2, None);
-        let DaemonMsg::PromptRequest {
-            deadline_ms: second_deadline,
-            ..
-        } = prompt_rx.recv().await.unwrap()
-        else {
-            panic!("expected PromptRequest");
-        };
-        assert!(
-            second_deadline >= first_deadline + 50_000,
-            "new timeout did not reach new prompts: {first_deadline} vs {second_deadline}"
-        );
-
-        // The first prompt still expires on its original 5s timer, and the
-        // default it resolves with is the one in force now: deny.
-        tokio::time::advance(Duration::from_secs(6)).await;
-        assert_eq!(h.verdict_rx.recv().await, Some((1, Verdict::Deny)));
-
-        // Out-of-range sets are refused and change nothing.
-        let err = h
-            .settings
-            .apply(&crate::testutil::runtime_config(0, Verdict::Allow))
-            .expect_err("zero timeout must be refused");
-        assert!(err.contains("at least 1"), "{err}");
-        assert_eq!(h.settings.snapshot().prompt_timeout_secs, 60);
-        assert_eq!(h.settings.snapshot().default_verdict, Verdict::Deny);
-    }
-
-    #[tokio::test]
-    async fn reply_with_duration_creates_scoped_rule() {
-        let mut h = harness("rule", 4, Verdict::Allow);
-        let (tx, mut prompt_rx) = mpsc::channel(16);
-        assert!(h.table.set_handler(tx.clone()));
-        h.table
-            .handle_new(conn("/usr/bin/curl", "9.9.9.9:853"), 1, None);
-        let DaemonMsg::PromptRequest { id, .. } = prompt_rx.recv().await.unwrap() else {
-            panic!("expected PromptRequest");
-        };
-        h.table
-            .reply(
-                &tx,
-                id,
-                Verdict::Allow,
-                RuleDuration::Session,
-                PromptScope::ThisHost,
-                false,
-            )
-            .unwrap();
-        assert_eq!(h.verdict_rx.recv().await, Some((1, Verdict::Allow)));
-
-        let rules = h.store.list();
-        assert_eq!(rules.len(), 1);
-        let r = &rules[0];
-        assert_eq!(
-            r.matcher.exe.as_deref(),
-            Some(std::path::Path::new("/usr/bin/curl"))
-        );
-        assert_eq!(r.matcher.dest.as_deref(), Some("9.9.9.9"));
-        assert_eq!(r.matcher.port, None, "ThisHost scope has no port");
-        assert_eq!(r.duration, RuleDuration::Session);
-    }
-
-    #[test]
-    fn scope_matchers() {
-        let c = conn("/usr/bin/curl", "9.9.9.9:853");
-        let r = rule_from_reply(
-            "abc",
-            1,
-            &c,
-            Verdict::Deny,
-            RuleDuration::Session,
-            PromptScope::ThisPort,
-            None,
-        )
-        .unwrap();
-        assert_eq!(r.matcher.dest.as_deref(), Some("9.9.9.9"));
-        assert_eq!(r.matcher.port, Some(853));
-        assert_eq!(r.action, hallpass_types::Action::Deny);
-
-        let r = rule_from_reply(
-            "abc",
-            2,
-            &c,
-            Verdict::Allow,
-            RuleDuration::Forever,
-            PromptScope::AppAnywhere,
-            None,
-        )
-        .unwrap();
-        assert_eq!(r.matcher.dest, None);
-        assert_eq!(r.matcher.port, None);
-        assert!(r.matcher.exe.is_some());
-
-        let mut anon = c.clone();
-        anon.exe_path = None;
-        assert!(rule_from_reply(
-            "abc",
-            3,
-            &anon,
-            Verdict::Allow,
-            RuleDuration::Session,
-            PromptScope::AppAnywhere,
-            None
-        )
-        .is_none());
-    }
-}
+mod tests;
