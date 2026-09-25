@@ -92,6 +92,7 @@ pub async fn write_msg<T: Serialize, W: AsyncWrite + Unpin>(w: &mut W, msg: &T) 
 mod tests {
     use super::*;
     use crate::*;
+    use std::fmt::Write as _;
     use std::net::SocketAddr;
     use std::path::PathBuf;
 
@@ -197,6 +198,42 @@ mod tests {
         }
     }
 
+    fn sample_config() -> RuntimeConfig {
+        RuntimeConfig {
+            prompt_timeout_secs: 30,
+            default_verdict: Verdict::Allow,
+            enforce: true,
+        }
+    }
+
+    fn sample_context() -> PromptContext {
+        PromptContext {
+            ancestors: vec![PathBuf::from("/bin/bash"), PathBuf::from("/sbin/init")],
+            exe_sha256: Some("ab".repeat(32)),
+            hash_mismatch_rules: vec!["curl-pinned".into()],
+            recent_denials: 3,
+        }
+    }
+
+    fn sample_session() -> RunSessionInfo {
+        RunSessionInfo {
+            id: 7,
+            uid: 1000,
+            root_pid: 4242,
+            label: "curl".into(),
+            allowed: 3,
+            age_secs: 12,
+        }
+    }
+
+    fn sample_lockdown() -> Lockdown {
+        Lockdown {
+            tags: vec!["core".into()],
+            since_ms: 1_720_000_000_123,
+            rules_suppressed: 4,
+        }
+    }
+
     async fn roundtrip<T>(msg: &T) -> T
     where
         T: Serialize + DeserializeOwned + PartialEq + std::fmt::Debug,
@@ -265,12 +302,7 @@ mod tests {
                 id: 1,
                 conn: sample_conn(),
                 deadline_ms: 1_720_000_000_000,
-                context: PromptContext {
-                    ancestors: vec![PathBuf::from("/bin/bash"), PathBuf::from("/sbin/init")],
-                    exe_sha256: Some("ab".repeat(32)),
-                    hash_mismatch_rules: vec!["curl-pinned".into()],
-                    recent_denials: 3,
-                },
+                context: sample_context(),
             },
             DaemonMsg::PromptExpired { id: 1 },
             DaemonMsg::Event(sample_event(Verdict::Reject, true)),
@@ -381,14 +413,7 @@ mod tests {
 
         let started = DaemonMsg::RunSessionStarted { id: 7 };
         assert_eq!(roundtrip(&started).await, started);
-        let listed = DaemonMsg::RunSessions(vec![crate::RunSessionInfo {
-            id: 7,
-            uid: 1000,
-            root_pid: 4242,
-            label: "curl".into(),
-            allowed: 3,
-            age_secs: 12,
-        }]);
+        let listed = DaemonMsg::RunSessions(vec![sample_session()]);
         assert_eq!(roundtrip(&listed).await, listed);
     }
 
@@ -432,11 +457,7 @@ mod tests {
         };
         assert_eq!(roundtrip(&set).await, set);
 
-        let on = DaemonMsg::LockdownState(Some(Lockdown {
-            tags: vec!["core".into()],
-            since_ms: 1_720_000_000_123,
-            rules_suppressed: 4,
-        }));
+        let on = DaemonMsg::LockdownState(Some(sample_lockdown()));
         assert_eq!(roundtrip(&on).await, on);
         let off = DaemonMsg::LockdownState(None);
         assert_eq!(roundtrip(&off).await, off);
@@ -512,12 +533,7 @@ mod tests {
                 id: 1,
                 conn: sample_conn(),
                 deadline_ms: 1_720_000_000_000,
-                context: PromptContext {
-                    ancestors: vec![PathBuf::from("/bin/bash"), PathBuf::from("/sbin/init")],
-                    exe_sha256: Some("ab".repeat(32)),
-                    hash_mismatch_rules: vec!["curl-pinned".into()],
-                    recent_denials: 3,
-                },
+                context: sample_context(),
             },
             DaemonMsg::PromptExpired { id: 1 },
             DaemonMsg::Event(sample_event(Verdict::Reject, true)),
@@ -573,32 +589,13 @@ mod tests {
             DaemonMsg::PromptHandlerRevoked,
             DaemonMsg::Config(sample_config()),
             DaemonMsg::RunSessionStarted { id: 7 },
-            DaemonMsg::RunSessions(vec![RunSessionInfo {
-                id: 7,
-                uid: 1000,
-                root_pid: 4242,
-                label: "curl".into(),
-                allowed: 3,
-                age_secs: 12,
-            }]),
+            DaemonMsg::RunSessions(vec![sample_session()]),
             DaemonMsg::RulesToggled {
                 changed: 3,
                 failed: vec!["locked-rule".into()],
             },
-            DaemonMsg::LockdownState(Some(Lockdown {
-                tags: vec!["core".into()],
-                since_ms: 1_720_000_000_123,
-                rules_suppressed: 4,
-            })),
+            DaemonMsg::LockdownState(Some(sample_lockdown())),
         ]
-    }
-
-    fn sample_config() -> RuntimeConfig {
-        RuntimeConfig {
-            prompt_timeout_secs: 30,
-            default_verdict: Verdict::Allow,
-            enforce: true,
-        }
     }
 
     /// Name of a fixture's variant, for failure messages.
@@ -653,7 +650,56 @@ mod tests {
     }
 
     fn hex(bytes: &[u8]) -> String {
-        bytes.iter().map(|b| format!("{b:02x}")).collect()
+        bytes.iter().fold(String::new(), |mut out, b| {
+            let _ = write!(out, "{b:02x}");
+            out
+        })
+    }
+
+    /// Assert that `fixtures` encode to `golden`, row for row. See
+    /// [`client_wire_layout_is_frozen`] for what each check catches.
+    fn assert_layout_frozen<T: Serialize>(
+        enum_name: &str,
+        fixtures: &[T],
+        golden: &[(&str, &str)],
+        variant: fn(&T) -> &'static str,
+    ) {
+        assert_eq!(
+            fixtures.len(),
+            golden.len(),
+            "every {enum_name} variant needs a golden row"
+        );
+        for (i, (msg, &(name, want))) in fixtures.iter().zip(golden).enumerate() {
+            assert_eq!(variant(msg), name, "fixture {i} is out of order");
+            let frame = encode(msg).unwrap();
+            let payload = &frame[FRAME_PREFIX_BYTES..];
+            assert_eq!(
+                payload[0], i as u8,
+                "{enum_name}::{name} now encodes as variant {}, not {i}: a variant was inserted \
+                 or reordered, which silently reinterprets an older peer's messages",
+                payload[0]
+            );
+            assert_eq!(
+                hex(payload),
+                want,
+                "{enum_name}::{name} changed shape; bump PROTOCOL_VERSION (now {PROTOCOL_VERSION}) \
+                 and regenerate this table in the same commit"
+            );
+        }
+    }
+
+    /// Print `fixtures` as a golden table named `table`.
+    fn print_golden<T: Serialize>(table: &str, fixtures: &[T], variant: fn(&T) -> &'static str) {
+        println!("const {table}: &[(&str, &str)] = &[");
+        for msg in fixtures {
+            let frame = encode(msg).unwrap();
+            println!(
+                "    ({:?}, {:?}),",
+                variant(msg),
+                hex(&frame[FRAME_PREFIX_BYTES..])
+            );
+        }
+        println!("];");
     }
 
     /// What [`client_fixtures`] encodes to at wire protocol v17.
@@ -722,60 +768,24 @@ mod tests {
     /// and names the first one that moved instead of failing on all of them.
     #[test]
     fn client_wire_layout_is_frozen() {
-        let fixtures = client_fixtures();
-        assert_eq!(
-            fixtures.len(),
-            CLIENT_GOLDEN.len(),
-            "every ClientMsg variant needs a golden row"
+        assert_layout_frozen(
+            "ClientMsg",
+            &client_fixtures(),
+            CLIENT_GOLDEN,
+            client_variant,
         );
-        for (i, msg) in fixtures.iter().enumerate() {
-            let (name, want) = CLIENT_GOLDEN[i];
-            assert_eq!(client_variant(msg), name, "fixture {i} is out of order");
-            let frame = encode(msg).unwrap();
-            let payload = &frame[FRAME_PREFIX_BYTES..];
-            assert_eq!(
-                payload[0], i as u8,
-                "ClientMsg::{name} now encodes as variant {}, not {i}: a variant was inserted or \
-                 reordered, which silently reinterprets an older peer's messages",
-                payload[0]
-            );
-            assert_eq!(
-                hex(payload),
-                want,
-                "ClientMsg::{name} changed shape; bump PROTOCOL_VERSION (now {PROTOCOL_VERSION}) \
-                 and regenerate this table in the same commit"
-            );
-        }
     }
 
     /// See [`client_wire_layout_is_frozen`]; the daemon's half of the same
     /// guarantee.
     #[test]
     fn daemon_wire_layout_is_frozen() {
-        let fixtures = daemon_fixtures();
-        assert_eq!(
-            fixtures.len(),
-            DAEMON_GOLDEN.len(),
-            "every DaemonMsg variant needs a golden row"
+        assert_layout_frozen(
+            "DaemonMsg",
+            &daemon_fixtures(),
+            DAEMON_GOLDEN,
+            daemon_variant,
         );
-        for (i, msg) in fixtures.iter().enumerate() {
-            let (name, want) = DAEMON_GOLDEN[i];
-            assert_eq!(daemon_variant(msg), name, "fixture {i} is out of order");
-            let frame = encode(msg).unwrap();
-            let payload = &frame[FRAME_PREFIX_BYTES..];
-            assert_eq!(
-                payload[0], i as u8,
-                "DaemonMsg::{name} now encodes as variant {}, not {i}: a variant was inserted or \
-                 reordered, which silently reinterprets an older peer's messages",
-                payload[0]
-            );
-            assert_eq!(
-                hex(payload),
-                want,
-                "DaemonMsg::{name} changed shape; bump PROTOCOL_VERSION (now {PROTOCOL_VERSION}) \
-                 and regenerate this table in the same commit"
-            );
-        }
     }
 
     /// The variant indices of the enums carried *inside* those messages.
@@ -900,26 +910,8 @@ mod tests {
     #[test]
     #[ignore = "prints the golden tables for regeneration"]
     fn print_wire_golden() {
-        println!("const CLIENT_GOLDEN: &[(&str, &str)] = &[");
-        for msg in &client_fixtures() {
-            let frame = encode(msg).unwrap();
-            println!(
-                "    ({:?}, {:?}),",
-                client_variant(msg),
-                hex(&frame[FRAME_PREFIX_BYTES..])
-            );
-        }
-        println!("];");
-        println!("const DAEMON_GOLDEN: &[(&str, &str)] = &[");
-        for msg in &daemon_fixtures() {
-            let frame = encode(msg).unwrap();
-            println!(
-                "    ({:?}, {:?}),",
-                daemon_variant(msg),
-                hex(&frame[FRAME_PREFIX_BYTES..])
-            );
-        }
-        println!("];");
+        print_golden("CLIENT_GOLDEN", &client_fixtures(), client_variant);
+        print_golden("DAEMON_GOLDEN", &daemon_fixtures(), daemon_variant);
     }
 
     #[test]
