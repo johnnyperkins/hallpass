@@ -2101,6 +2101,72 @@ mod tests {
         assert_eq!(h.verdict_rx.recv().await, Some((21, Verdict::Allow)));
     }
 
+    /// Answering one of several pending prompts from one program with a
+    /// remembered rule settles the others that rule covers, through the
+    /// reply path itself: each is decided with the answer and its handler
+    /// told it is gone. Checked for both verdicts, since an allow rule
+    /// carries the user and the application identity and a deny does not,
+    /// and for every scope, which decides how many of the siblings the
+    /// answer reaches.
+    #[tokio::test]
+    async fn a_remembered_answer_settles_the_sibling_prompts_it_covers() {
+        for (verdict, scope, covered) in [
+            (Verdict::Deny, PromptScope::AppAnywhere, vec![2, 3, 4]),
+            (Verdict::Allow, PromptScope::AppAnywhere, vec![2, 3, 4]),
+            (Verdict::Deny, PromptScope::ThisHost, vec![2]),
+            (Verdict::Allow, PromptScope::ThisPort, vec![]),
+        ] {
+            let mut h = harness("siblings", 8, Verdict::Allow);
+            let (tx, mut prompt_rx) = mpsc::channel(16);
+            assert!(h.table.set_handler(tx.clone()));
+            let mut ids = Vec::new();
+            // Same program: the first two share an address on different
+            // ports, the rest go elsewhere. A different program's prompt
+            // is never covered.
+            for (seq, dst) in [
+                (1, "1.1.1.1:443"),
+                (2, "1.1.1.1:80"),
+                (3, "2.2.2.2:443"),
+                (4, "3.3.3.3:53"),
+            ] {
+                h.table.handle_new(conn("/usr/bin/curl", dst), seq, None);
+                let DaemonMsg::PromptRequest { id, .. } = prompt_rx.recv().await.unwrap() else {
+                    panic!("expected PromptRequest");
+                };
+                ids.push(id);
+            }
+            h.table
+                .handle_new(conn("/usr/bin/wget", "1.1.1.1:443"), 9, None);
+            let _ = prompt_rx.recv().await.unwrap();
+
+            h.table
+                .reply(&tx, ids[0], verdict, RuleDuration::Session, scope, false)
+                .unwrap();
+
+            let mut decided = vec![h.verdict_rx.recv().await.unwrap()];
+            while let Ok(v) = h.verdict_rx.try_recv() {
+                decided.push(v);
+            }
+            let mut want: Vec<(u64, Verdict)> = vec![(1, verdict)];
+            want.extend(covered.iter().map(|seq| (*seq, verdict)));
+            decided.sort_unstable_by_key(|(seq, _)| *seq);
+            assert_eq!(decided, want, "{verdict:?} {scope:?}");
+
+            let mut gone = Vec::new();
+            while let Ok(msg) = prompt_rx.try_recv() {
+                if let DaemonMsg::PromptExpired { id } = msg {
+                    gone.push(id);
+                }
+            }
+            let want_gone: Vec<u64> = covered.iter().map(|seq| ids[*seq as usize - 1]).collect();
+            gone.sort_unstable();
+            assert_eq!(
+                gone, want_gone,
+                "{verdict:?} {scope:?}: the handler is told"
+            );
+        }
+    }
+
     /// A pinned rule must sweep the prompts it covers.
     ///
     /// `first_failing_field` reports `exe_sha256` as the failing criterion
