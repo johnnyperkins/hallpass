@@ -40,38 +40,61 @@ fn main() -> ExitCode {
     }
 }
 
+const USAGE: &str = "\
+usage: cargo xtask <task>
+
+verification (cheapest first):
+  fmt           cargo fmt --check over the workspace and hallpass-ebpf
+  check         cargo check over the workspace and the ebpf feature
+  test          run the workspace unit/integration tests (no privileges)
+  lint          clippy in both feature configurations, plus clippy-ebpf;
+                the same lints CI fails on
+  doc           cargo doc --no-deps with -D warnings (broken links fail)
+  ci            everything CI runs that does not need root, failing at
+                the first stage that breaks; cargo-deny if it is installed
+  e2e [--ebpf]  run the hallpassd e2e tests (compiles as you, runs the
+                test binary under sudo -E; will prompt for your password).
+                --ebpf builds the object first and enables the feature, so
+                the tests that skip without it actually run
+
+builds:
+  build-ebpf    build the hallpass-ebpf kernel programs
+  clippy-ebpf   lint the hallpass-ebpf kernel programs (-D warnings)
+  build         build-ebpf, then a release build of the whole workspace
+                (with the ebpf feature); what install.sh runs
+
+running:
+  dev           run hallpassd unprivileged against a scratch config, for
+                CLI/UI work; interception is off, IPC and rules work
+";
+
 fn print_usage() {
-    eprintln!("usage: cargo xtask <task>");
-    eprintln!();
-    eprintln!("verification (cheapest first):");
-    eprintln!("  fmt           cargo fmt --check over the workspace and hallpass-ebpf");
-    eprintln!("  check         cargo check over the workspace and the ebpf feature");
-    eprintln!("  test          run the workspace unit/integration tests (no privileges)");
-    eprintln!("  lint          clippy in both feature configurations, plus clippy-ebpf;");
-    eprintln!("                the same lints CI fails on");
-    eprintln!("  doc           cargo doc --no-deps with -D warnings (broken links fail)");
-    eprintln!("  ci            everything CI runs that does not need root, failing at");
-    eprintln!("                the first stage that breaks; cargo-deny if it is installed");
-    eprintln!("  e2e [--ebpf]  run the hallpassd e2e tests (compiles as you, runs the");
-    eprintln!("                test binary under sudo -E; will prompt for your password).");
-    eprintln!("                --ebpf builds the object first and enables the feature, so");
-    eprintln!("                the tests that skip without it actually run");
-    eprintln!();
-    eprintln!("builds:");
-    eprintln!("  build-ebpf    build the hallpass-ebpf kernel programs");
-    eprintln!("  clippy-ebpf   lint the hallpass-ebpf kernel programs (-D warnings)");
-    eprintln!("  build         build-ebpf, then a release build of the whole workspace");
-    eprintln!("                (with the ebpf feature); what install.sh runs");
-    eprintln!();
-    eprintln!("running:");
-    eprintln!("  dev           run hallpassd unprivileged against a scratch config, for");
-    eprintln!("                CLI/UI work; interception is off, IPC and rules work");
+    eprint!("{USAGE}");
 }
 
-/// The cargo binary that invoked xtask. Cargo sets $CARGO to its own
-/// absolute path; fall back to plain "cargo" if it is somehow unset.
-fn cargo() -> String {
-    std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string())
+/// `cargo <args>` in the workspace root, run by the cargo that invoked
+/// xtask. Cargo sets $CARGO to its own absolute path; fall back to plain
+/// "cargo" if it is somehow unset.
+fn cargo(args: &[&str]) -> Command {
+    let bin = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+    let mut cmd = Command::new(bin);
+    cmd.args(args).current_dir(workspace_root());
+    cmd
+}
+
+/// `cargo <args>` in crates/hallpass-ebpf, which is not a workspace member.
+///
+/// Target, build-std and the shared target dir come from the crate's own
+/// .cargo/config.toml, nightly and rust-src from its rust-toolchain.toml.
+/// cargo xtask runs under the workspace toolchain, so that is dropped from
+/// the environment for the crate's own pin to take effect.
+fn ebpf_cargo(args: &[&str]) -> Command {
+    let mut cmd = Command::new("cargo");
+    cmd.args(args)
+        .current_dir(workspace_root().join("crates/hallpass-ebpf"))
+        .env_remove("RUSTUP_TOOLCHAIN")
+        .env_remove("CARGO");
+    cmd
 }
 
 fn workspace_root() -> PathBuf {
@@ -83,27 +106,14 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
-/// Build crates/hallpass-ebpf for bpfel-unknown-none. Target, build-std,
-/// and the shared target dir come from the crate's own .cargo/config.toml;
-/// nightly + rust-src come from its rust-toolchain.toml.
+/// Build crates/hallpass-ebpf for bpfel-unknown-none.
 fn build_ebpf() -> Result<(), String> {
-    if Command::new("bpf-linker")
-        .arg("--version")
-        .output()
-        .is_err()
-    {
+    if !have_binary("bpf-linker") {
         return Err(
             "bpf-linker not found in PATH; install it with: cargo install bpf-linker".to_string(),
         );
     }
-    let dir = workspace_root().join("crates/hallpass-ebpf");
-    run(Command::new("cargo")
-        .args(["build", "--release"])
-        .current_dir(dir)
-        // cargo xtask runs under the workspace toolchain; drop that so
-        // hallpass-ebpf's rust-toolchain.toml (nightly) takes effect.
-        .env_remove("RUSTUP_TOOLCHAIN")
-        .env_remove("CARGO"))
+    run(ebpf_cargo(&["build", "--release"]))
 }
 
 /// Lint crates/hallpass-ebpf, which no workspace command reaches.
@@ -111,58 +121,43 @@ fn build_ebpf() -> Result<(), String> {
 /// It is deliberately not a workspace member, so `cargo clippy --workspace`
 /// cannot see it, and `build-ebpf` only compiles it. That left the one crate
 /// in the project containing `unsafe` (and running in the kernel) as the only
-/// crate never linted. Same toolchain juggling as [`build_ebpf`].
+/// crate never linted.
 fn clippy_ebpf() -> Result<(), String> {
-    let dir = workspace_root().join("crates/hallpass-ebpf");
-    run(Command::new("cargo")
-        .args(["clippy", "--release", "--", "-D", "warnings"])
-        .current_dir(dir)
-        .env_remove("RUSTUP_TOOLCHAIN")
-        .env_remove("CARGO"))
+    run(ebpf_cargo(&["clippy", "--release", "--", "-D", "warnings"]))
 }
 
 fn build_workspace() -> Result<(), String> {
-    run(Command::new(cargo())
-        .args([
-            "build",
-            "--release",
-            "--workspace",
-            "--features",
-            "hallpassd/ebpf",
-        ])
-        .current_dir(workspace_root()))
+    run(cargo(&[
+        "build",
+        "--release",
+        "--workspace",
+        "--features",
+        "hallpassd/ebpf",
+    ]))
 }
 
 /// Type-check everything without codegen: the fastest way to learn that a
 /// change does not compile, including in the `ebpf` configuration, which the
 /// plain workspace commands never enable.
 fn check() -> Result<(), String> {
-    run(Command::new(cargo())
-        .args(["check", "--workspace", "--all-targets"])
-        .current_dir(workspace_root()))?;
-    run(Command::new(cargo())
-        .args([
-            "check",
-            "-p",
-            "hallpassd",
-            "--features",
-            "ebpf,dev-fixtures",
-        ])
-        .current_dir(workspace_root()))
+    run(cargo(&["check", "--workspace", "--all-targets"]))?;
+    run(cargo(&[
+        "check",
+        "-p",
+        "hallpassd",
+        "--features",
+        "ebpf,dev-fixtures",
+    ]))
 }
 
 fn test_workspace() -> Result<(), String> {
-    run(Command::new(cargo())
-        .args(["test", "--workspace"])
-        .current_dir(workspace_root()))
+    run(cargo(&["test", "--workspace"]))
 }
 
 /// The eBPF attribution unit tests are gated on the feature, so the plain
 /// workspace test run never reaches them.
 fn test_ebpf_feature() -> Result<(), String> {
-    run(Command::new(cargo())
-        .args(["test", "-p", "hallpassd", "--features", "ebpf"])
-        .current_dir(workspace_root()))
+    run(cargo(&["test", "-p", "hallpassd", "--features", "ebpf"]))
 }
 
 /// Every lint gate CI has, in one command.
@@ -173,52 +168,39 @@ fn test_ebpf_feature() -> Result<(), String> {
 /// `ebpf` for the same reason `clippy-ebpf` exists: code nothing lints is
 /// code that rots, and this is the feature that fabricates events.
 fn lint() -> Result<(), String> {
-    run(Command::new(cargo())
-        .args([
-            "clippy",
-            "--workspace",
-            "--all-targets",
-            "--",
-            "-D",
-            "warnings",
-        ])
-        .current_dir(workspace_root()))?;
-    run(Command::new(cargo())
-        .args([
-            "clippy",
-            "-p",
-            "hallpassd",
-            "--all-targets",
-            "--features",
-            "ebpf,dev-fixtures",
-            "--",
-            "-D",
-            "warnings",
-        ])
-        .current_dir(workspace_root()))?;
+    run(cargo(&[
+        "clippy",
+        "--workspace",
+        "--all-targets",
+        "--",
+        "-D",
+        "warnings",
+    ]))?;
+    run(cargo(&[
+        "clippy",
+        "-p",
+        "hallpassd",
+        "--all-targets",
+        "--features",
+        "ebpf,dev-fixtures",
+        "--",
+        "-D",
+        "warnings",
+    ]))?;
     clippy_ebpf()
 }
 
 /// Check formatting, workspace and eBPF crate alike.
 ///
-/// Gated in CI rather than left to habit, because the alternative is what this
-/// project had: no `rustfmt.toml`, no `fmt` stage, and a tree that had drifted
-/// far enough from rustfmt's output that running the standard formatter once
-/// rewrote 56 files. A formatter nothing enforces is not a convention, it is a
-/// trap for the next person who runs it.
+/// Gated in CI rather than left to habit: a tree nothing checks drifts from
+/// rustfmt's output until running the formatter once rewrites dozens of
+/// files, which makes it a trap for the next person who runs it.
 ///
 /// `hallpass-ebpf` is not a workspace member, so `--all` does not reach it -
-/// the same gap [`clippy_ebpf`] exists to close, with the same toolchain
-/// juggling.
+/// the same gap [`clippy_ebpf`] exists to close.
 fn fmt_check() -> Result<(), String> {
-    run(Command::new(cargo())
-        .args(["fmt", "--all", "--check"])
-        .current_dir(workspace_root()))?;
-    run(Command::new("cargo")
-        .args(["fmt", "--check"])
-        .current_dir(workspace_root().join("crates/hallpass-ebpf"))
-        .env_remove("RUSTUP_TOOLCHAIN")
-        .env_remove("CARGO"))
+    run(cargo(&["fmt", "--all", "--check"]))?;
+    run(ebpf_cargo(&["fmt", "--check"]))
 }
 
 /// Build the rustdoc, treating warnings as errors.
@@ -228,19 +210,13 @@ fn fmt_check() -> Result<(), String> {
 /// stops resolving is a silent downgrade to plain text, so the convention rots
 /// without anything failing.
 fn doc() -> Result<(), String> {
-    run(Command::new(cargo())
-        .args(["doc", "--workspace", "--no-deps"])
-        .env("RUSTDOCFLAGS", "-D warnings")
-        .current_dir(workspace_root()))
+    let mut cmd = cargo(&["doc", "--workspace", "--no-deps"]);
+    cmd.env("RUSTDOCFLAGS", "-D warnings");
+    run(cmd)
 }
 
-/// One stage of [`ci`]: a name for the failure message, and the task to run.
-type Stage = (&'static str, fn() -> Result<(), String>);
-
 fn deny() -> Result<(), String> {
-    run(Command::new(cargo())
-        .args(["deny", "check"])
-        .current_dir(workspace_root()))
+    run(cargo(&["deny", "check"]))
 }
 
 /// True if `name` can be spawned, i.e. it is on PATH and executable.
@@ -248,18 +224,19 @@ fn have_binary(name: &str) -> bool {
     Command::new(name).arg("--version").output().is_ok()
 }
 
+/// One stage of [`ci`]: a name for the failure message, and the task to run.
+type Stage = (&'static str, fn() -> Result<(), String>);
+
 /// Everything CI runs that does not need root, cheapest failure first.
 ///
 /// The point is that a contributor can learn CI's answer before pushing.
 /// Stages that need privileges (the e2e suite) are deliberately excluded, so
 /// this task never asks for a password; run `cargo xtask e2e` separately.
 fn ci() -> Result<(), String> {
-    // build-ebpf first, because every later stage that enables the `ebpf`
-    // feature needs an object to embed, and without one the failure surfaces
-    // from a build script deep inside a long compile rather than up front.
-    // fmt first of all: it is the cheapest stage by a wide margin and it needs
-    // nothing built, so a badly formatted branch fails in a second rather than
-    // after the eBPF object and two test runs.
+    // fmt needs nothing built, so a badly formatted branch fails in a second.
+    // build-ebpf comes next because every later stage that enables the
+    // `ebpf` feature needs an object to embed, and without one the failure
+    // surfaces from a build script deep inside a long compile.
     let stages: [Stage; 7] = [
         ("fmt", fmt_check),
         ("build-ebpf", build_ebpf),
@@ -304,8 +281,7 @@ fn test_e2e(ebpf: bool) -> Result<(), String> {
     if ebpf {
         build_ebpf()?;
     }
-    let mut cmd = Command::new(cargo());
-    cmd.args(["test", "-p", "hallpassd", "--test", "e2e"]);
+    let mut cmd = cargo(&["test", "-p", "hallpassd", "--test", "e2e"]);
     if ebpf {
         cmd.args(["--features", "ebpf"]);
     }
@@ -316,7 +292,7 @@ fn test_e2e(ebpf: bool) -> Result<(), String> {
         "--ignored",
         "--test-threads=1",
     ]);
-    run(cmd.current_dir(workspace_root()))
+    run(cmd)
 }
 
 /// Escape a string for a TOML basic string (`"..."`).
@@ -325,15 +301,8 @@ fn test_e2e(ebpf: bool) -> Result<(), String> {
 /// which the operator chose with TOML in mind, so a backslash or quote in
 /// either would otherwise render a config the daemon rejects as malformed.
 fn toml_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '\\' => out.push_str("\\\\"),
-            '"' => out.push_str("\\\""),
-            _ => out.push(c),
-        }
-    }
-    out
+    // Backslashes first, so the ones escaping quotes are not doubled.
+    s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 /// Render the dev config that [`dev`] writes into `dir`.
@@ -488,9 +457,13 @@ fn dev() -> Result<(), String> {
     // view renders an empty machine and the whole observability surface is
     // undevelopable. It is a non-default feature precisely so a shipped
     // binary cannot be talked into fabricating events.
-    run(Command::new(cargo())
-        .args(["build", "-p", "hallpassd", "--features", "dev-fixtures"])
-        .current_dir(workspace_root()))?;
+    run(cargo(&[
+        "build",
+        "-p",
+        "hallpassd",
+        "--features",
+        "dev-fixtures",
+    ]))?;
 
     let socket = socket.display();
     eprintln!();
@@ -542,7 +515,7 @@ fn set_mode(path: &Path, mode: u32) -> Result<(), String> {
         .map_err(|e| format!("failed to chmod {} to {mode:o}: {e}", path.display()))
 }
 
-fn run(cmd: &mut Command) -> Result<(), String> {
+fn run(mut cmd: Command) -> Result<(), String> {
     let status = cmd
         .status()
         .map_err(|e| format!("failed to spawn {:?}: {e}", cmd.get_program()))?;
