@@ -20,7 +20,7 @@ pub(crate) const REST_SHOWN: usize = 5;
 /// answer will cover in the same stroke.
 ///
 /// Split into a bottom action panel, a top summary and a scrolling info
-/// body, in that order, because the window is a fixed 440x330 and every
+/// body, in that order, because the window is a small fixed size and every
 /// info line (path, command line, resolved names) is text the judged
 /// process chose: stacked in one column, enough of it pushed Allow and Deny
 /// out of the window, an unanswerable prompt an adversary can construct.
@@ -582,7 +582,8 @@ mod tests {
     /// warning and a denial count all present at once.
     ///
     /// The default for every fixture here on purpose. This module exists to hold
-    /// the layout property that the viewport is a fixed 440x330 and the verdict
+    /// the layout property that at 440x330 (smaller than the window ships
+    /// at, see `prompt_window::viewport`) the verdict
     /// buttons must stay reachable no matter how much the scrolling body wants,
     /// so the fixtures carry the largest body the daemon can produce rather than
     /// the smallest.
@@ -676,7 +677,7 @@ mod tests {
     /// The buttons must survive the worst content the window can carry: a
     /// path at its display cap, a file name at the filesystem's, a command line
     /// at its cap, an application id at its cap, the full pending list, and the
-    /// App-anywhere warning, all inside the fixed 440x330 viewport. Every one of
+    /// App-anywhere warning, all inside a 440x330 viewport. Every one of
     /// those strings is chosen by the process being judged, so "the info pushed
     /// Allow and Deny off the window" is an unanswerable prompt an adversary can
     /// construct; the actions are pinned to a bottom panel and the info scrolls,
