@@ -14,7 +14,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::fs::File;
 use std::io::ErrorKind;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Child, Command};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::Arc;
@@ -247,15 +247,7 @@ pub fn run(socket: PathBuf) -> i32 {
 /// every session of that user shares; the prompt slot is one per host, so
 /// a second session's agent could not hold it either.
 fn single_instance() -> std::io::Result<Option<File>> {
-    let dir = std::env::var_os("XDG_RUNTIME_DIR").ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::NotFound, "XDG_RUNTIME_DIR is not set")
-    })?;
-    let file = File::create(Path::new(&dir).join("hallpass-ui-agent.lock"))?;
-    match file.try_lock() {
-        Ok(()) => Ok(Some(file)),
-        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
-        Err(std::fs::TryLockError::Error(e)) => Err(e),
-    }
+    crate::instance::try_lock(&crate::instance::runtime_dir()?.join("hallpass-ui-agent.lock"))
 }
 
 impl Agent {

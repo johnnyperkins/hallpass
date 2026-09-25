@@ -310,7 +310,7 @@ pub struct HallpassApp {
     socket: PathBuf,
     /// Raise requests from later launches (see `instance`), when this
     /// window holds the single-instance lock.
-    raise: Option<Receiver<()>>,
+    raise: Option<Receiver<crate::instance::RaiseRequest>>,
     /// An agent this window started and when, reaped once it exits.
     agent: Option<(std::process::Child, std::time::Instant)>,
     /// Why the last agent this window started is gone, shown beside the
@@ -2084,17 +2084,23 @@ impl eframe::App for HallpassApp {
         let ctx = ui.ctx().clone();
         self.drain_net();
         self.reap_agent();
-        if self
+        let raises: Vec<_> = self
             .raise
             .as_ref()
-            .is_some_and(|r| r.try_iter().count() > 0)
-        {
+            .map_or_else(Vec::new, |r| r.try_iter().collect());
+        if !raises.is_empty() {
             // Focus works on X11; on Wayland the attention request is what
             // gets the shell to flag the window.
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
             ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
                 egui::UserAttentionType::Informational,
             ));
+            // Answered from the frame, not the socket's thread: a window
+            // that draws nothing never gets here, and the launch that asked
+            // opens a window of its own instead.
+            for raise in raises {
+                raise.done();
+            }
         }
         // The posture banner and the mode both come from `Stats`, which
         // until now only the Stats tab refetched: a lockdown entered by

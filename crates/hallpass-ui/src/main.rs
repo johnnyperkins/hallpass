@@ -103,8 +103,20 @@ fn main() -> eframe::Result {
     // or the tray, raises the open one and leaves. Without a runtime
     // directory there is no lock to take, and every launch is a window.
     let raise = match instance::claim(&socket) {
-        Ok(instance::Instance::Raised) => return Ok(()),
+        Ok(instance::Instance::Raised) => {
+            // Said, or a launch from a terminal ends with nothing to show.
+            tracing::info!(
+                "a management window is already open for this socket; asked it for attention"
+            );
+            return Ok(());
+        }
         Ok(instance::Instance::First(holder)) => Some(holder),
+        Ok(instance::Instance::Unanswered) => {
+            tracing::info!(
+                "the open management window did not answer (minimized?); opening another"
+            );
+            None
+        }
         Err(e) => {
             tracing::warn!("not single-instance: {e}");
             None

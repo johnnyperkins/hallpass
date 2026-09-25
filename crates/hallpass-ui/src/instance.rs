@@ -1,10 +1,13 @@
 //! One management window per user and daemon socket.
 //!
-//! The first window takes a lock in the session's runtime directory and
-//! listens on a socket beside it. A later launch, from the app menu or the
-//! tray, finds the lock taken, connects to the socket and exits; the open
-//! window takes the connection as a request to be raised. Nothing is read
-//! from it: connecting is the whole message.
+//! The first window takes a lock in the user's runtime directory, which
+//! every session of that user shares, and listens on a socket beside it. A later launch, from the app menu or the
+//! tray, finds the lock taken and connects to the socket: connecting is the
+//! request. The open window answers with one byte once its frame has asked
+//! the shell for attention, and the launch exits. A window that draws
+//! nothing (minimized, or on another workspace, on Wayland) cannot ask, so
+//! a launch that hears nothing within [`ACK_TIMEOUT`] opens a window of its
+//! own rather than exiting with nothing on screen.
 //!
 //! The runtime directory is the user's own (mode 0700), so only the user's
 //! processes can reach the socket, and all they can do there is ask a
@@ -23,12 +26,30 @@ use std::time::Duration;
 const CONNECT_TRIES: u32 = 20;
 const CONNECT_PAUSE: Duration = Duration::from_millis(50);
 
+/// How long a later launch waits for the open window to say it asked for
+/// attention. Long enough for a throttled frame on a visible window.
+const ACK_TIMEOUT: Duration = Duration::from_secs(2);
+
 pub enum Instance {
     /// This process is the window; hold this for its lifetime.
     First(Holder),
-    /// A window is already open for this socket and was asked to raise
-    /// itself.
+    /// A window is already open for this socket and asked the shell for
+    /// attention.
     Raised,
+    /// A window is open but did not answer in time; this launch runs
+    /// without the lock, as a second window.
+    Unanswered,
+}
+
+/// One raise request, answered once the window has acted on it.
+pub struct RaiseRequest(UnixStream);
+
+impl RaiseRequest {
+    /// Tell the launch that asked that the window asked for attention.
+    pub fn done(mut self) {
+        use std::io::Write as _;
+        let _ = self.0.write_all(b"r");
+    }
 }
 
 /// The lock and listening socket of the one open window.
@@ -37,23 +58,43 @@ pub struct Holder {
     listener: UnixListener,
 }
 
-/// Claim the window for `daemon_socket`, in the session's runtime directory.
-pub fn claim(daemon_socket: &Path) -> io::Result<Instance> {
-    let dir = std::env::var_os("XDG_RUNTIME_DIR")
+/// The user's runtime directory, where the UI's single-instance locks live.
+/// An empty `XDG_RUNTIME_DIR` counts as unset: joined onto, it would put
+/// the lock in whatever directory the process was started from.
+pub fn runtime_dir() -> io::Result<PathBuf> {
+    std::env::var_os("XDG_RUNTIME_DIR")
         .filter(|d| !d.is_empty())
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "XDG_RUNTIME_DIR is not set"))?;
-    claim_in(Path::new(&dir), daemon_socket)
+        .map(PathBuf::from)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "XDG_RUNTIME_DIR is not set"))
+}
+
+/// Take the lock at `path`, or `None` while another process holds it.
+pub fn try_lock(path: &Path) -> io::Result<Option<File>> {
+    let file = File::create(path)?;
+    match file.try_lock() {
+        Ok(()) => Ok(Some(file)),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+        Err(std::fs::TryLockError::Error(e)) => Err(e),
+    }
+}
+
+/// Claim the window for `daemon_socket`, in the user's runtime directory.
+pub fn claim(daemon_socket: &Path) -> io::Result<Instance> {
+    claim_in(&runtime_dir()?, daemon_socket, ACK_TIMEOUT)
 }
 
 /// [`claim`] in `dir`.
 ///
 /// Keyed by the daemon socket, so a window on a development daemon and one
-/// on the installed daemon are two windows, as they should be.
-fn claim_in(dir: &Path, daemon_socket: &Path) -> io::Result<Instance> {
-    let (lock_path, sock_path) = paths(dir, daemon_socket);
-    let lock = File::create(lock_path)?;
-    match lock.try_lock() {
-        Ok(()) => {
+/// on the installed daemon are two windows, as they should be. Made
+/// absolute first: a relative `--socket` names a different daemon from
+/// each directory it is given in.
+fn claim_in(dir: &Path, daemon_socket: &Path, ack_timeout: Duration) -> io::Result<Instance> {
+    let daemon_socket =
+        std::path::absolute(daemon_socket).unwrap_or_else(|_| daemon_socket.to_path_buf());
+    let (lock_path, sock_path) = paths(dir, &daemon_socket);
+    match try_lock(&lock_path)? {
+        Some(lock) => {
             // Whatever is at the path was left by a window that has exited:
             // the lock says no other is running.
             let _ = std::fs::remove_file(&sock_path);
@@ -63,10 +104,16 @@ fn claim_in(dir: &Path, daemon_socket: &Path) -> io::Result<Instance> {
                 listener,
             }))
         }
-        Err(std::fs::TryLockError::WouldBlock) => {
+        None => {
             for _ in 0..CONNECT_TRIES {
-                if UnixStream::connect(&sock_path).is_ok() {
-                    return Ok(Instance::Raised);
+                if let Ok(mut conn) = UnixStream::connect(&sock_path) {
+                    use std::io::Read as _;
+                    conn.set_read_timeout(Some(ack_timeout))?;
+                    let mut ack = [0u8; 1];
+                    return Ok(match conn.read(&mut ack) {
+                        Ok(1) => Instance::Raised,
+                        _ => Instance::Unanswered,
+                    });
                 }
                 std::thread::sleep(CONNECT_PAUSE);
             }
@@ -74,7 +121,6 @@ fn claim_in(dir: &Path, daemon_socket: &Path) -> io::Result<Instance> {
                 "another management window holds the lock but does not answer",
             ))
         }
-        Err(std::fs::TryLockError::Error(e)) => Err(e),
     }
 }
 
@@ -100,19 +146,26 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 impl Holder {
     /// Take raise requests on a thread of their own, each paired with a
     /// `wake` so the window's frame drains the channel.
-    pub fn serve(self, wake: crate::Wake) -> Receiver<()> {
+    pub fn serve(self, wake: crate::Wake) -> Receiver<RaiseRequest> {
         let (tx, rx) = std::sync::mpsc::channel();
         let spawned = std::thread::Builder::new()
             .name("window-raise".into())
             .spawn(move || {
                 let _lock = self._lock;
                 for conn in self.listener.incoming() {
-                    // Dropped at once: connecting was the message.
-                    if conn.is_ok() {
-                        if tx.send(()).is_err() {
-                            break;
+                    match conn {
+                        Ok(conn) => {
+                            if tx.send(RaiseRequest(conn)).is_err() {
+                                break;
+                            }
+                            wake();
                         }
-                        wake();
+                        // Out of descriptors, most likely. The connection
+                        // stays queued, so retrying at once would spin.
+                        Err(e) => {
+                            tracing::debug!("accepting a raise request: {e}");
+                            std::thread::sleep(CONNECT_PAUSE);
+                        }
                     }
                 }
             });
@@ -138,19 +191,43 @@ mod tests {
     }
 
     /// The first launch holds the window; a second raises it and gets no
-    /// window of its own.
+    /// window of its own, once the open window says it asked.
     #[test]
     fn a_second_launch_raises_the_first() {
         let dir = scratch();
         let daemon = Path::new("/run/hallpass/hallpass.sock");
-        let Instance::First(holder) = claim_in(&dir, daemon).unwrap() else {
+        let Instance::First(holder) = claim_in(&dir, daemon, Duration::from_secs(5)).unwrap()
+        else {
             panic!("the first launch must hold the window");
         };
         let raises = holder.serve(std::sync::Arc::new(|| {}));
-        assert!(matches!(claim_in(&dir, daemon).unwrap(), Instance::Raised));
-        raises
-            .recv_timeout(Duration::from_secs(5))
-            .expect("the open window was not asked to raise");
+        // The window's frame, answering whatever arrives.
+        std::thread::spawn(move || {
+            for req in raises {
+                req.done();
+            }
+        });
+        assert!(matches!(
+            claim_in(&dir, daemon, Duration::from_secs(5)).unwrap(),
+            Instance::Raised
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A window that cannot act on the request (drawing nothing while
+    /// minimized) does not leave the launch with nothing on screen.
+    #[test]
+    fn an_unanswered_raise_opens_a_second_window() {
+        let dir = scratch();
+        let daemon = Path::new("/run/hallpass/hallpass.sock");
+        let Instance::First(holder) = claim_in(&dir, daemon, Duration::ZERO).unwrap() else {
+            panic!("the first launch must hold the window");
+        };
+        let _raises = holder.serve(std::sync::Arc::new(|| {}));
+        assert!(matches!(
+            claim_in(&dir, daemon, Duration::from_millis(200)).unwrap(),
+            Instance::Unanswered
+        ));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -158,11 +235,40 @@ mod tests {
     #[test]
     fn windows_on_different_daemons_do_not_collide() {
         let dir = scratch();
-        let first = claim_in(&dir, Path::new("/run/hallpass/hallpass.sock")).unwrap();
-        let second =
-            claim_in(&dir, Path::new("/run/user/1000/hallpass-dev/hallpass.sock")).unwrap();
+        let first = claim_in(
+            &dir,
+            Path::new("/run/hallpass/hallpass.sock"),
+            Duration::ZERO,
+        )
+        .unwrap();
+        let second = claim_in(
+            &dir,
+            Path::new("/run/user/1000/hallpass-dev/hallpass.sock"),
+            Duration::ZERO,
+        )
+        .unwrap();
         assert!(matches!(first, Instance::First(_)));
         assert!(matches!(second, Instance::First(_)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A relative `--socket` is the daemon it names from here, so the same
+    /// socket spelt absolute is the same window.
+    #[test]
+    fn a_relative_socket_is_keyed_by_where_it_points() {
+        let dir = scratch();
+        let relative = Path::new("hallpass-dev.sock");
+        let Instance::First(holder) = claim_in(&dir, relative, Duration::ZERO).unwrap() else {
+            panic!("the first launch must hold the window");
+        };
+        let _raises = holder.serve(std::sync::Arc::new(|| {}));
+        let absolute = std::env::current_dir().unwrap().join(relative);
+        // Unanswered rather than Raised only because nothing plays the
+        // window's frame here; either way it found the same lock.
+        assert!(!matches!(
+            claim_in(&dir, &absolute, Duration::from_millis(100)).unwrap(),
+            Instance::First(_)
+        ));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -174,7 +280,7 @@ mod tests {
         let (_, sock) = paths(&dir, daemon);
         drop(UnixListener::bind(&sock).unwrap());
         assert!(matches!(
-            claim_in(&dir, daemon).unwrap(),
+            claim_in(&dir, daemon, Duration::from_secs(5)).unwrap(),
             Instance::First(_)
         ));
         let _ = std::fs::remove_dir_all(&dir);
