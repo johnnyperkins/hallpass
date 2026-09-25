@@ -33,10 +33,13 @@ pub fn to_json<T: Serialize>(value: &T) -> Result<String, CliError> {
         .map_err(|e| CliError::Protocol(format!("cannot encode output as json: {e}")))
 }
 
-/// Daemon stats as one JSON object. [`Stats`] is all counters, so there is
-/// nothing here to sanitize.
+/// Daemon stats as one JSON object. Counters apart from the lockdown
+/// posture, whose tags are sanitized.
 pub fn stats(s: &Stats) -> Result<String, CliError> {
-    to_json(s)
+    to_json(&Stats {
+        lockdown: s.lockdown.as_ref().map(sanitized_lockdown),
+        ..s.clone()
+    })
 }
 
 /// The runtime settings as one JSON object, carrying the lockdown posture
@@ -54,14 +57,28 @@ struct ConfigWithLockdown<'a> {
     config: &'a RuntimeConfig,
     /// Null when no posture is in force. While one is, the mode is enforce
     /// and the default verdict is deny whatever the fields above say.
-    lockdown: Option<&'a Lockdown>,
+    lockdown: Option<Lockdown>,
 }
 
 pub fn config(c: &RuntimeConfig, lockdown: Option<&Lockdown>) -> Result<String, CliError> {
     to_json(&ConfigWithLockdown {
         config: c,
-        lockdown,
+        lockdown: lockdown.map(sanitized_lockdown),
     })
+}
+
+/// The lockdown posture as one JSON value, `null` when none is in force.
+pub fn lockdown(l: Option<&Lockdown>) -> Result<String, CliError> {
+    to_json(&l.map(sanitized_lockdown))
+}
+
+/// Copy of `l` with its tags sanitized. The daemon validates tags, but
+/// output does not lean on that, exactly as for a rule's tags.
+pub fn sanitized_lockdown(l: &Lockdown) -> Lockdown {
+    Lockdown {
+        tags: l.tags.iter().map(|t| clean(t)).collect(),
+        ..l.clone()
+    }
 }
 
 /// The live session grants as a JSON array. The label came from a client,
@@ -291,6 +308,40 @@ mod tests {
         assert!(line.contains("firefox"), "{line:?}");
         assert!(line.contains("\"enforced\":false"), "{line:?}");
         assert!(line.contains("\"verdict\":\"deny\""), "{line:?}");
+    }
+
+    /// Lockdown tags reach three outputs (`status`, `config`, `lockdown`);
+    /// none of them may carry a control byte through, even though the daemon
+    /// validates tags.
+    #[test]
+    fn lockdown_tags_are_sanitized_everywhere() {
+        let hostile = Lockdown {
+            tags: vec!["core\x1b[2J\rok".to_string()],
+            since_ms: 1,
+            rules_suppressed: 0,
+        };
+        let stats_line = stats(&Stats {
+            lockdown: Some(hostile.clone()),
+            ..Stats::default()
+        })
+        .unwrap();
+        let config_line = config(
+            &RuntimeConfig {
+                prompt_timeout_secs: 30,
+                default_verdict: Verdict::Deny,
+                enforce: true,
+            },
+            Some(&hostile),
+        )
+        .unwrap();
+        let lockdown_line = lockdown(Some(&hostile)).unwrap();
+        let text = crate::fmt::lockdown_summary(&hostile);
+        for line in [&stats_line, &config_line, &lockdown_line, &text] {
+            assert!(line.contains("core"), "{line:?}");
+            for bad in ["\x1b", "\r", "\\u001b", "\\r"] {
+                assert!(!line.contains(bad), "{bad:?} survived: {line:?}");
+            }
+        }
     }
 
     /// JSON is the one output that can tell "nothing was new" from "the

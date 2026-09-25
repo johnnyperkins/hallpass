@@ -282,7 +282,7 @@ async fn print_lockdown(
     out: Output,
 ) -> Result<(), CliError> {
     if out.json {
-        println!("{}", json::to_json(&state)?);
+        println!("{}", json::lockdown(state)?);
         return Ok(());
     }
     let Some(state) = state else {

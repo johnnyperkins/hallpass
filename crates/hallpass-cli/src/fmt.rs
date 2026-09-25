@@ -282,7 +282,7 @@ pub fn pinned_tags(tags: &[String]) -> String {
     if tags.is_empty() {
         "nothing".to_string()
     } else {
-        tags.join(",")
+        sanitize_for_display(&tags.join(",")).into_owned()
     }
 }
 
