@@ -31,7 +31,9 @@ use hallpass_types::{FlowTuple, Proto};
 use netlink_sys::protocols::NETLINK_SOCK_DIAG;
 use netlink_sys::Socket;
 
-use crate::netlink::{AF_INET, AF_INET6, IPPROTO_TCP, IPPROTO_UDP, NLMSG_ERROR, NLMSG_HDRLEN};
+use crate::netlink::{
+    AF_INET, AF_INET6, IPPROTO_TCP, IPPROTO_UDP, MAX_STALE_REPLIES, NLMSG_ERROR, NLMSG_HDRLEN,
+};
 
 use super::procfs::SocketEntry;
 
@@ -40,9 +42,6 @@ const SOCK_DIAG_BY_FAMILY: u16 = 20;
 /// "Answer this request." Deliberately without `NLM_F_DUMP`, which is what
 /// turns the request into the whole-table walk this module exists to avoid.
 const NLM_F_REQUEST: u16 = 1;
-
-// The address-family, protocol, error-type and header-length constants are
-// shared across the daemon's netlink clients; see crate::netlink.
 
 /// Total size of the request message: netlink header plus `inet_diag_req_v2`.
 const REQUEST_LEN: usize = 16 + 56;
@@ -173,7 +172,7 @@ fn parse_diag_msg(payload: &[u8]) -> Option<SocketEntry> {
     // idiag_inode is 32 bits in the ABI; socket inodes come from the
     // kernel's 32-bit inode allocator, so nothing is truncated. Widened
     // here to match SocketEntry.
-    let inode = u32::from_ne_bytes(payload[68..72].try_into().ok()?) as u64;
+    let inode = u64::from(u32::from_ne_bytes(payload[68..72].try_into().ok()?));
     Some(SocketEntry {
         local: SocketAddr::new(ip, sport),
         uid,
@@ -189,12 +188,6 @@ pub struct DiagSocket {
     seq: u32,
 }
 
-/// Replies read while hunting for the one matching the request's sequence
-/// number. One request gets one reply, so anything extra is a leftover from
-/// an earlier errored call; a small fixed bound keeps a confused socket
-/// from ever becoming an unbounded read.
-const MAX_STALE_REPLIES: usize = 8;
-
 impl DiagSocket {
     /// Open and connect the netlink socket. Needs no privilege.
     ///
@@ -204,10 +197,10 @@ impl DiagSocket {
     /// probed once at startup rather than retried per packet: a failing
     /// query in front of the file read is strictly worse than the file
     /// read alone.
-    pub fn open() -> std::io::Result<DiagSocket> {
+    pub fn open() -> std::io::Result<Self> {
         let socket = Socket::new(NETLINK_SOCK_DIAG)?;
         socket.connect(&netlink_sys::SocketAddr::new(0, 0))?;
-        Ok(DiagSocket {
+        Ok(Self {
             socket,
             buf: Vec::with_capacity(4096),
             seq: 0,
@@ -552,4 +545,5 @@ mod tests {
             DiagReply::Found(e) => panic!("found {e:?} for a reserved tuple"),
         }
     }
+
 }

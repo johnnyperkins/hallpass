@@ -38,8 +38,7 @@
 //! the inbound side (loose conntrack pickup) and the outbound side rides
 //! it as established. A flow whose peer transmits continuously can win
 //! that race; the deterministic fix is event-driven re-deletion off the
-//! conntrack event stream, planned with flow accounting (TODO roadmap
-//! item 5). Second, re-judgment runs fresh attribution: if enrichment
+//! conntrack event stream. Second, re-judgment runs fresh attribution: if enrichment
 //! drifted since the original decision (domain cache aged out, executable
 //! replaced), the re-entered flow can prompt or take the default rather
 //! than match the deny - once per flow, never a storm.
@@ -52,20 +51,16 @@
 //! whose entry is already gone answers ENOENT, which is success: the goal
 //! is "no undecided established flow", not "a delete happened".
 
-use std::net::IpAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
-use hallpass_types::{ConnEvent, FlowTuple, Proto, Verdict};
+use hallpass_types::{ConnEvent, FlowTuple, Verdict};
 use netlink_sys::protocols::NETLINK_NETFILTER;
 use netlink_sys::Socket;
 
 use crate::config::RuntimeSettings;
 use crate::events::EventBus;
-use crate::netlink::{
-    nla, AF_INET, AF_INET6, CTA_IP_V4_DST, CTA_IP_V4_SRC, CTA_IP_V6_DST, CTA_IP_V6_SRC,
-    CTA_PROTO_DST_PORT, CTA_PROTO_NUM, CTA_PROTO_SRC_PORT, CTA_TUPLE_IP, CTA_TUPLE_ORIG,
-    CTA_TUPLE_PROTO, IPPROTO_TCP, IPPROTO_UDP, NLA_F_NESTED, NLMSG_ERROR, NLMSG_HDRLEN,
-};
+use crate::netlink::{orig_tuple_attr, MAX_STALE_REPLIES, NLMSG_ERROR, NLMSG_HDRLEN};
 use crate::rules::engine::RuleSet;
 use crate::rules::store::RuleStore;
 
@@ -80,49 +75,7 @@ const NLM_F_REQUEST_ACK: u16 = 1 | 4;
 /// The original direction is the flow as its initiator sent it, which is
 /// exactly what the outbound event's tuple records.
 fn build_delete(tuple: &FlowTuple, seq: u32) -> Vec<u8> {
-    let (family, ip_attrs) = match (tuple.src.ip(), tuple.dst.ip()) {
-        (IpAddr::V4(src), IpAddr::V4(dst)) => (
-            AF_INET,
-            [
-                nla(CTA_IP_V4_SRC, &src.octets()),
-                nla(CTA_IP_V4_DST, &dst.octets()),
-            ]
-            .concat(),
-        ),
-        (IpAddr::V6(src), IpAddr::V6(dst)) => (
-            AF_INET6,
-            [
-                nla(CTA_IP_V6_SRC, &src.octets()),
-                nla(CTA_IP_V6_DST, &dst.octets()),
-            ]
-            .concat(),
-        ),
-        // Both halves of a tuple are read from the same IP header, so a
-        // mixed-family pair is not a packet this daemon can be handed. The
-        // v4-mapped form does not arise either: it is a sockaddr encoding,
-        // and nothing on the wire carries one.
-        _ => unreachable!("mixed-family flow tuple"),
-    };
-    let proto_num = match tuple.proto {
-        Proto::Tcp => IPPROTO_TCP,
-        Proto::Udp => IPPROTO_UDP,
-    };
-    let proto = [
-        nla(CTA_PROTO_NUM, &[proto_num]),
-        nla(CTA_PROTO_SRC_PORT, &tuple.src.port().to_be_bytes()),
-        nla(CTA_PROTO_DST_PORT, &tuple.dst.port().to_be_bytes()),
-    ]
-    .concat();
-
-    let orig = nla(
-        CTA_TUPLE_ORIG | NLA_F_NESTED,
-        &[
-            nla(CTA_TUPLE_IP | NLA_F_NESTED, &ip_attrs),
-            nla(CTA_TUPLE_PROTO | NLA_F_NESTED, &proto),
-        ]
-        .concat(),
-    );
-
+    let (family, orig) = orig_tuple_attr(tuple);
     // nfgenmsg: family, version 0, res_id 0.
     let payload = [&[family, 0, 0, 0][..], &orig].concat();
 
@@ -157,17 +110,13 @@ fn parse_ack(buf: &[u8]) -> Option<(u32, i32)> {
     Some((seq, errno))
 }
 
-/// Replies read while hunting for the one matching the request's sequence
-/// number; same rationale and bound as sockdiag's.
-const MAX_STALE_REPLIES: usize = 8;
-
 /// How long one delete waits for its ack before giving up, as retry steps.
 /// A netlink ack can be lost outright (ENOBUFS drops it on a full socket
 /// buffer), and this socket is read by the singleton sweeper task: a recv
 /// that blocks forever would wedge the whole kill mechanism until the
 /// daemon restarts, silently. Bounded waiting turns that into one warned
 /// failure. 200 steps of 5ms cap a lost ack at about a second.
-const ACK_WAIT_STEP: std::time::Duration = std::time::Duration::from_millis(5);
+const ACK_WAIT_STEP: Duration = Duration::from_millis(5);
 const ACK_WAIT_STEPS: usize = 200;
 
 /// One connected `NETLINK_NETFILTER` socket, reused across one sweep.
@@ -178,13 +127,13 @@ struct CtSocket {
 }
 
 impl CtSocket {
-    fn open() -> std::io::Result<CtSocket> {
+    fn open() -> std::io::Result<Self> {
         let socket = Socket::new(NETLINK_NETFILTER)?;
         socket.connect(&netlink_sys::SocketAddr::new(0, 0))?;
         // Non-blocking so a lost ack costs the wait budget, never forever;
         // see ACK_WAIT_STEP.
         socket.set_non_blocking(true)?;
-        Ok(CtSocket {
+        Ok(Self {
             socket,
             buf: Vec::with_capacity(4096),
             seq: 0,
@@ -218,7 +167,7 @@ impl CtSocket {
                     };
                 }
                 // A stale or unparsable datagram is "keep reading", within
-                // the same small bound as sockdiag's.
+                // the shared bound.
                 _ => {
                     stale += 1;
                     if stale > MAX_STALE_REPLIES {
@@ -356,7 +305,8 @@ pub fn spawn_kill_sweeper(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hallpass_types::{Action, Connection, Rule, RuleDuration, RuleMatch};
+    use crate::netlink::{AF_INET6, CTA_IP_V6_SRC, CTA_TUPLE_ORIG, IPPROTO_TCP, NLA_F_NESTED};
+    use hallpass_types::{Action, Connection, Proto, Rule, RuleDuration, RuleMatch};
 
     fn tuple(src: &str, dst: &str, proto: Proto) -> FlowTuple {
         FlowTuple {

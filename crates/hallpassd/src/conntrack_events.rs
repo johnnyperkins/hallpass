@@ -26,7 +26,7 @@
 //! decision-history ring under its lock to decide whether it is a hallpass
 //! flow. That is cheap at moderate teardown rates and the feature is
 //! off by default; a per-tuple index is the fix if a very high-rate host
-//! ever needs it (noted in the roadmap).
+//! ever needs it.
 //!
 //! What this does not yet do: fold the volume back into the per-connection
 //! event stream (`events`, `top`, syslog export), which record a connection
@@ -39,19 +39,22 @@
 //! is built from.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use hallpass_types::{FlowTuple, Proto};
 use netlink_sys::protocols::NETLINK_NETFILTER;
 use netlink_sys::{Socket, SocketAddr as NlAddr};
 
+use crate::events::EventBus;
 use crate::netlink::{
     align4, Attrs, CTA_COUNTERS_BYTES, CTA_COUNTERS_ORIG, CTA_COUNTERS_PACKETS, CTA_COUNTERS_REPLY,
     CTA_IP_V4_DST, CTA_IP_V4_SRC, CTA_IP_V6_DST, CTA_IP_V6_SRC, CTA_PROTO_DST_PORT, CTA_PROTO_NUM,
     CTA_PROTO_SRC_PORT, CTA_TUPLE_IP, CTA_TUPLE_ORIG, CTA_TUPLE_PROTO, IPPROTO_TCP, IPPROTO_UDP,
     NLMSG_HDRLEN,
 };
+use crate::stats::Counters;
 
 /// The conntrack multicast group that carries destroy notifications.
 /// `NFNLGRP_CONNTRACK_DESTROY` is 3; membership groups are 1-based, so this
@@ -130,14 +133,8 @@ pub fn parse_destroy(msg: &[u8]) -> Option<FlowSummary> {
     // last-write of an accumulating loop are equivalent here.
     let attrs = Attrs::new(msg.get(NLMSG_HDRLEN + NFGENMSG_LEN..)?);
     let tuple = parse_tuple(attrs.get(CTA_TUPLE_ORIG)?)?;
-    let orig = attrs
-        .get(CTA_COUNTERS_ORIG)
-        .map(parse_counters)
-        .unwrap_or((0, 0));
-    let reply = attrs
-        .get(CTA_COUNTERS_REPLY)
-        .map(parse_counters)
-        .unwrap_or((0, 0));
+    let orig = attrs.get(CTA_COUNTERS_ORIG).map_or((0, 0), parse_counters);
+    let reply = attrs.get(CTA_COUNTERS_REPLY).map_or((0, 0), parse_counters);
     // A flow the kernel never accounted carries no counters; there is
     // nothing to record for it, and a zero-volume summary would only dilute
     // the totals with flows we cannot measure.
@@ -217,11 +214,7 @@ fn be_u64(b: &[u8]) -> Option<u64> {
 /// loop with no async in it, and the join is a synchronous history lookup.
 /// The socket is non-blocking with a short poll so the loop can retire when
 /// `shutdown` is set instead of parking on recv forever.
-pub fn spawn(
-    events: Arc<crate::events::EventBus>,
-    counters: Arc<crate::stats::Counters>,
-    shutdown: Arc<std::sync::atomic::AtomicBool>,
-) {
+pub fn spawn(events: Arc<EventBus>, counters: Arc<Counters>, shutdown: Arc<AtomicBool>) {
     std::thread::Builder::new()
         .name("hallpass-ctacct".into())
         .spawn(move || {
@@ -237,55 +230,59 @@ pub fn spawn(
             };
             tracing::info!("flow accounting on: recording per-flow byte and packet totals");
             warn_if_prereqs_off();
-            // recv appends into the Vec (netlink-sys writes via BufMut), so
-            // clear before each read and parse what it wrote.
-            let mut buf: Vec<u8> = Vec::with_capacity(8192);
-            let mut errors = 0usize;
-            while !shutdown.load(Ordering::Relaxed) {
-                buf.clear();
-                match socket.recv(&mut buf, 0) {
-                    Ok(_) => {
-                        errors = 0;
-                        for summary in parse_datagram(&buf) {
-                            record(&events, &counters, &summary);
-                        }
-                    }
-                    // No data yet: idle, not an error.
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        errors = 0;
-                        std::thread::sleep(std::time::Duration::from_millis(200));
-                    }
-                    // A signal interrupted the call; retry immediately.
-                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                    // Anything else - a socket-buffer overflow under a burst
-                    // (ENOBUFS, whose value is architecture-specific), a
-                    // transient ENOMEM - means some teardowns were missed,
-                    // not that the socket is dead. Keep listening: the next
-                    // recv normally succeeds and resets the count. Only a
-                    // stuck socket climbs to the cap, and the short sleep
-                    // keeps that from becoming a hot spin. Rate-limited to
-                    // powers of two so a burst does not flood the journal.
-                    Err(e) => {
-                        errors += 1;
-                        if errors.is_power_of_two() {
-                            tracing::warn!(
-                                "flow accounting recv error (missed some flows), still \
-                                 listening: {e}"
-                            );
-                        }
-                        if errors >= MAX_CONSECUTIVE_ERRORS {
-                            tracing::warn!(
-                                "flow accounting listener giving up after {errors} \
-                                 consecutive errors: {e}"
-                            );
-                            return;
-                        }
-                        std::thread::sleep(std::time::Duration::from_millis(50));
-                    }
-                }
-            }
+            listen(&socket, &events, &counters, &shutdown);
         })
         .expect("spawn flow-accounting thread");
+}
+
+/// Record every counted teardown until `shutdown` is set or the socket
+/// stays broken for [`MAX_CONSECUTIVE_ERRORS`] reads in a row.
+fn listen(socket: &Socket, events: &EventBus, counters: &Counters, shutdown: &AtomicBool) {
+    // recv appends into the Vec (netlink-sys writes via BufMut), so clear
+    // before each read and parse what it wrote.
+    let mut buf: Vec<u8> = Vec::with_capacity(8192);
+    let mut errors = 0usize;
+    while !shutdown.load(Ordering::Relaxed) {
+        buf.clear();
+        match socket.recv(&mut buf, 0) {
+            Ok(_) => {
+                errors = 0;
+                for summary in parse_datagram(&buf) {
+                    record(events, counters, &summary);
+                }
+            }
+            // No data yet: idle, not an error.
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                errors = 0;
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            // A signal interrupted the call; retry immediately.
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            // Anything else - a socket-buffer overflow under a burst
+            // (ENOBUFS, whose value is architecture-specific), a transient
+            // ENOMEM - means some teardowns were missed, not that the socket
+            // is dead. Keep listening: the next recv normally succeeds and
+            // resets the count. The short sleep keeps a stuck socket from
+            // becoming a hot spin on its way to the cap, and the warning is
+            // rate-limited to powers of two so a burst does not flood the
+            // journal.
+            Err(e) => {
+                errors += 1;
+                if errors.is_power_of_two() {
+                    tracing::warn!(
+                        "flow accounting recv error (missed some flows), still listening: {e}"
+                    );
+                }
+                if errors >= MAX_CONSECUTIVE_ERRORS {
+                    tracing::warn!(
+                        "flow accounting listener giving up after {errors} consecutive errors: {e}"
+                    );
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
 }
 
 /// Warn at startup for whichever prerequisite sysctl is off. The group join
@@ -295,11 +292,7 @@ pub fn spawn(
 /// eternal zeros with no hint which prerequisite they missed. Both can be
 /// flipped live, so this warns rather than refusing to start.
 fn warn_if_prereqs_off() {
-    let off = |path: &str| {
-        std::fs::read_to_string(path)
-            .map(|v| v.trim() == "0")
-            .unwrap_or(false)
-    };
+    let off = |path: &str| std::fs::read_to_string(path).is_ok_and(|v| v.trim() == "0");
     if off(ACCT_SYSCTL) {
         tracing::warn!(
             "flow accounting is on but {ACCT_SYSCTL} is 0, so the kernel attaches no \
@@ -328,23 +321,13 @@ fn open() -> std::io::Result<Socket> {
 /// Fold one ended flow into the totals and log it, but only if the daemon
 /// actually decided this connection.
 ///
-/// The destroy group carries every conntrack teardown on the host -
-/// inbound, forwarded, other applications, flows that predate the daemon -
-/// and counting all of them would make `flow bytes` read as whole-host
-/// volume mislabeled as hallpass traffic. So a teardown is recorded only
-/// when its tuple matches a connection still in the daemon's decision
-/// history; a hallpass flow whose decision has aged out of that ring is
-/// missed, the same bound as everything keyed on history. This also keeps
-/// the per-flow log proportional to hallpass-governed connections rather
-/// than to all host traffic.
-fn record(
-    events: &crate::events::EventBus,
-    counters: &crate::stats::Counters,
-    summary: &FlowSummary,
-) {
+/// The destroy group carries every teardown on the host, so the join to the
+/// decision history is what keeps `flow bytes` hallpass traffic rather than
+/// whole-host volume (see the module docs), and it also keeps the per-flow
+/// log proportional to the connections hallpass governs.
+fn record(events: &EventBus, counters: &Counters, summary: &FlowSummary) {
     // The lookup returns the event by pointer; fields are read after the
-    // history lock has been dropped. None means "not a connection this
-    // daemon decided" - skip it entirely.
+    // history lock has been dropped.
     let Some(decided) = events.latest_for_tuple(&summary.tuple) else {
         return;
     };
@@ -353,8 +336,7 @@ fn record(
         .conn
         .exe_path
         .as_ref()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|| "unknown".into());
+        .map_or_else(|| "unknown".into(), |p| p.display().to_string());
     tracing::info!(
         exe = %exe,
         proto = ?summary.tuple.proto,
@@ -370,7 +352,7 @@ fn record(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::netlink::{nla, CTA_TUPLE_PROTO, NLA_F_NESTED};
+    use crate::netlink::{nla, orig_tuple_attr, NLA_F_NESTED};
 
     /// Build a destroy message the way the kernel lays one out: netlink
     /// header, nfgenmsg, then the tuple and counter attributes.
@@ -380,31 +362,11 @@ mod tests {
         orig: Option<(u64, u64)>,
         reply: Option<(u64, u64)>,
     ) -> Vec<u8> {
-        let src: SocketAddr = src.parse().unwrap();
-        let dst: SocketAddr = dst.parse().unwrap();
-        let (s4, d4) = match (src.ip(), dst.ip()) {
-            (IpAddr::V4(s), IpAddr::V4(d)) => (s, d),
-            _ => unreachable!(),
-        };
-        let ip = [
-            nla(CTA_IP_V4_SRC, &s4.octets()),
-            nla(CTA_IP_V4_DST, &d4.octets()),
-        ]
-        .concat();
-        let proto = [
-            nla(CTA_PROTO_NUM, &[IPPROTO_TCP]),
-            nla(CTA_PROTO_SRC_PORT, &src.port().to_be_bytes()),
-            nla(CTA_PROTO_DST_PORT, &dst.port().to_be_bytes()),
-        ]
-        .concat();
-        let tuple = nla(
-            CTA_TUPLE_ORIG | NLA_F_NESTED,
-            &[
-                nla(CTA_TUPLE_IP | NLA_F_NESTED, &ip),
-                nla(CTA_TUPLE_PROTO | NLA_F_NESTED, &proto),
-            ]
-            .concat(),
-        );
+        let (_, tuple) = orig_tuple_attr(&FlowTuple {
+            proto: Proto::Tcp,
+            src: src.parse().unwrap(),
+            dst: dst.parse().unwrap(),
+        });
         let counters = |bytes: u64, packets: u64| {
             [
                 nla(CTA_COUNTERS_BYTES, &bytes.to_be_bytes()),
