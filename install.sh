@@ -249,37 +249,79 @@ echo "     reaches /run/hallpass/observe.sock: stats, events, rules and config,"
 echo "     read-only. Note the event stream names every process on this host and"
 echo "     its command line, root's included. Created empty; add with"
 echo "     'sudo usermod -aG hallpass-observer <user>'."
-echo "   - Log out and back in once so '$target_user' picks up the 'hallpass' group."
+# Whether this session already holds the group, which only a login after the
+# first install does: the control socket is 0660 root:hallpass.
+in_group=no
+if [ "$(id -un)" = "$target_user" ]; then
+	case " $(id -nG) " in
+	*" hallpass "*) in_group=yes ;;
+	esac
+fi
+if [ "$in_group" = no ]; then
+	echo "   - Log out and back in once so '$target_user' picks up the 'hallpass' group."
+fi
 # Start the prompt agent now, as the installing user, rather than leave the
 # host deciding every unmatched connection unseen until the next login. Only
-# where it can work: this user, already in the 'hallpass' group in this
-# session (the control socket is 0660 root:hallpass), with a display. One
-# left running from before is replaced, so the new build is the one taking
+# where it can work: this user, in the group in this session, with a display.
+# One left running from before is replaced, so the new build is the one taking
 # prompts: its open prompts are not answered, the daemon keeps them and hands
 # them to the new agent. setsid, so it does not die with this terminal.
 agent_started=no
-if [ "$(id -un)" = "$target_user" ] && [ -n "${WAYLAND_DISPLAY:-}${DISPLAY:-}" ]; then
-	case " $(id -nG) " in
-	*" hallpass "*)
-		pkill -u "$(id -u)" -x -f 'hallpass-ui agent( .*)?|/usr/bin/hallpass-ui agent( .*)?|hallpass-ui --hidden|/usr/bin/hallpass-ui --hidden' 2>/dev/null || true
-		sleep 1
-		# Its log to the journal, as an autostarted one's goes, where there
-		# is one to write to.
+if [ "$in_group" = yes ] && [ -n "${WAYLAND_DISPLAY:-}${DISPLAY:-}" ]; then
+	# Every agent of this user's running an installed build, whatever
+	# started it: the login's autostart ("hallpass-ui agent"), this script
+	# ("/usr/bin/hallpass-ui agent"), a management window (named
+	# "/proc/self/exe agent" by builds before it set its argv[0]), and the
+	# old single-process UI ("--hidden"). Confirmed by the binary each one
+	# runs, which after the install above reads "(deleted)", rather than by
+	# the name alone.
+	old=
+	for pid in $(pgrep -u "$(id -u)" -f '(^|[ /])(hallpass-ui|exe) (agent|--hidden)( |$)' 2>/dev/null || true); do
+		case $(readlink "/proc/$pid/exe" 2>/dev/null || true) in
+		/usr/bin/hallpass-ui | '/usr/bin/hallpass-ui (deleted)')
+			kill "$pid" 2>/dev/null && old="$old $pid"
+			;;
+		esac
+	done
+	# Until they are gone, so the new one finds the agent lock free, and no
+	# longer than that: a management window left open sees the slot free in
+	# the gap and starts an agent of its own, from its own older image.
+	# Bounded, and a zombie counts as gone (its lock is released and its exe
+	# link no longer resolves).
+	tries=0
+	for pid in $old; do
+		while [ -e "/proc/$pid/exe" ] && [ "$tries" -lt 50 ]; do
+			sleep 0.1
+			tries=$((tries + 1))
+		done
+	done
+	# From /, so it does not hold this checkout busy for as long as it runs.
+	# Its log to the journal, as an autostarted one's goes, where there is
+	# one to write to.
+	(
+		cd /
 		if command -v systemd-cat >/dev/null 2>&1; then
-			setsid -f systemd-cat -t hallpass-ui /usr/bin/hallpass-ui agent </dev/null && agent_started=yes
+			setsid -f systemd-cat -t hallpass-ui /usr/bin/hallpass-ui agent </dev/null
 		else
-			setsid -f /usr/bin/hallpass-ui agent </dev/null >/dev/null 2>&1 && agent_started=yes
+			setsid -f /usr/bin/hallpass-ui agent </dev/null >/dev/null 2>&1
 		fi
-		;;
-	esac
+	) || true
+	# setsid returns once it has forked. An agent that cannot run (another
+	# still holds the lock, or no display it can open) exits at once, so it
+	# is looked for rather than assumed.
+	sleep 1
+	pgrep -u "$(id -u)" -x -f '/usr/bin/hallpass-ui agent' >/dev/null 2>&1 && agent_started=yes
 fi
 if [ "$agent_started" = yes ]; then
 	echo "   - The prompt agent is running (tray icon, notifications, a window per"
 	echo "     prompting app) and starts with every login from now on."
-else
+elif [ "$in_group" = yes ]; then
 	echo "   - The prompt agent (tray icon, notifications, a window per prompting"
 	echo "     app) starts with your next login; the management window in the app"
 	echo "     menu also starts it."
+else
+	echo "   - The prompt agent (tray icon, notifications, a window per prompting"
+	echo "     app) starts with your next login."
 fi
 echo "   - Terminal client: hallpass-cli status | rules | events | watch"
 echo "   - Full reference: man hallpass-cli (tab completion is installed for"

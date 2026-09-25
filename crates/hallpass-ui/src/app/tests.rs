@@ -1049,9 +1049,79 @@ fn the_window_starts_the_agent_when_nobody_takes_prompts() {
     assert!(!t.app.wants_agent(), "the slot is held");
 
     t.daemon(DaemonMsg::Stats(stats(true)));
-    assert!(t.app.wants_agent());
+    assert!(
+        !t.app.wants_agent(),
+        "the slot was held when the window opened: a free one now is a Quit, or \
+         an agent reconnecting, not the window's to fill"
+    );
+
+    let mut t = TestApp::new();
+    t.feed(UiEvent::Connected);
+    t.daemon(DaemonMsg::Stats(stats(true)));
+    assert!(t.app.wants_agent(), "nobody took prompts when it opened");
     t.app.agent_started = Some(std::time::Instant::now());
     assert!(!t.app.wants_agent(), "not again within the retry period");
+}
+
+/// An agent quit from its tray stays quit while the window is open.
+#[test]
+fn a_quit_agent_is_not_started_again() {
+    let mut t = TestApp::new();
+    t.feed(UiEvent::Connected);
+    t.daemon(DaemonMsg::Stats(stats(true)));
+    let mut child = std::process::Command::new("true")
+        .spawn()
+        .expect("spawn true");
+    child.wait().expect("wait for true");
+    t.app.agent = Some((child, std::time::Instant::now()));
+    t.app.reap_agent();
+    t.app.agent_started = None;
+    assert!(!t.app.wants_agent());
+}
+
+/// A window on the read-only socket starts no agent: one there could never
+/// take the slot, and would outlive the window retrying for good. The
+/// banner says why instead.
+#[test]
+fn a_window_on_the_read_only_socket_starts_no_agent() {
+    let mut t = TestApp::new();
+    t.app.socket = std::path::PathBuf::from("/run/hallpass/observe.sock");
+    t.feed(UiEvent::Connected);
+    t.daemon(DaemonMsg::Stats(stats(true)));
+    assert!(t.app.no_handler_banner().is_some());
+    assert!(!t.app.wants_agent());
+}
+
+/// An agent that found another running is not reported while the other may
+/// still be taking the slot, and no second one is started meanwhile.
+#[test]
+fn an_agent_already_running_is_judged_after_the_grace() {
+    let mut t = TestApp::new();
+    t.feed(UiEvent::Connected);
+    t.daemon(DaemonMsg::Stats(stats(true)));
+
+    let mut child = std::process::Command::new("sh")
+        .args(["-c", &format!("exit {}", crate::agent::ALREADY_RUNNING)])
+        .spawn()
+        .expect("spawn sh");
+    child.wait().expect("wait for sh");
+    t.app.agent = Some((child, std::time::Instant::now()));
+    t.app.reap_agent();
+    assert!(t.app.agent.is_some(), "held through the grace");
+    assert!(t.app.agent_error.is_none(), "nothing said yet");
+    assert!(!t.app.wants_agent(), "and no second one started");
+
+    // Backdated, where the clock allows it (see `with_channels`).
+    let Some(started) = std::time::Instant::now().checked_sub(AGENT_GRACE) else {
+        return;
+    };
+    if let Some((_, at)) = t.app.agent.as_mut() {
+        *at = started;
+    }
+    t.app.reap_agent();
+    assert!(t.app.agent.is_none());
+    let note = t.app.agent_error.as_deref().expect("the exit is reported");
+    assert!(note.contains("already running"), "{note}");
 }
 
 /// A session that predates the account's group membership is told what to

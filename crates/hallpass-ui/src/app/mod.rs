@@ -38,6 +38,11 @@ const AGENT_GRACE: Duration = Duration::from_secs(10);
 /// window is open; not so often that a failing agent is started in a loop.
 const AGENT_RETRY: Duration = Duration::from_secs(60);
 
+/// File name of the daemon's read-only socket, a sibling of the control one
+/// (the daemon's `OBSERVE_SOCKET_NAME`). No client on it can take the prompt
+/// slot, so a window there starts no agent.
+const OBSERVE_SOCKET_NAME: &str = "observe.sock";
+
 const MAX_EVENTS: usize = 1000;
 
 /// Events requested from the daemon's history when a connection comes up.
@@ -318,11 +323,20 @@ pub struct HallpassApp {
     raise: Option<crate::instance::Raises>,
     /// An agent this window started and when, reaped once it exits.
     agent: Option<(std::process::Child, std::time::Instant)>,
-    /// Why the last agent this window started is gone, shown beside the
-    /// button that starts another rather than as a daemon error.
+    /// Why the last agent this window started is gone, shown in the
+    /// no-prompts banner rather than as a daemon error.
     agent_error: Option<String>,
     /// When this window last started an agent by itself, for [`AGENT_RETRY`].
     agent_started: Option<std::time::Instant>,
+    /// Whether this window keeps an agent running: decided by the first
+    /// stats reply it gets (nobody taking prompts when it opened), and
+    /// dropped once one is quit or another agent turns out to own the job.
+    /// A Quit in the tray is a choice this window must not undo.
+    agent_wanted: Option<bool>,
+    /// Since when stats replies have shown nobody taking prompts, so a slot
+    /// left free (an agent that died, one quit) is reported, and one only
+    /// briefly free (an agent reconnecting after a daemon restart) is not.
+    slot_free_since: Option<std::time::Instant>,
     /// The daemon socket refused this user: the session predates the
     /// account's `hallpass` group, and retrying will not change that.
     denied: bool,
@@ -406,6 +420,8 @@ impl HallpassApp {
             agent: None,
             agent_error: None,
             agent_started: None,
+            agent_wanted: None,
+            slot_free_since: None,
             denied: false,
         }
     }
@@ -540,6 +556,14 @@ impl HallpassApp {
             DaemonMsg::Stats(stats) => {
                 self.enforcing = Some(stats.enforcing);
                 self.mode_reported = true;
+                if self.agent_wanted.is_none() && self.mode_is_known() {
+                    self.agent_wanted = Some(!stats.prompt_handler_connected);
+                }
+                self.slot_free_since = match (stats.prompt_handler_connected, self.slot_free_since)
+                {
+                    (true, _) => None,
+                    (false, since) => since.or_else(|| Some(std::time::Instant::now())),
+                };
                 self.stats = Some(stats);
             }
             // The settings form always settles on what the daemon actually
@@ -995,37 +1019,58 @@ impl HallpassApp {
             theme::banner(ui, Tone::Bad, "\u{26a0}", "LOCKDOWN", &l);
             ui.add_space(8.0);
         }
-        // This window takes no prompts, so on a host where the agent is not
-        // running it would otherwise look healthy while every connection no
-        // rule matches is decided with nothing on screen.
         // The one thing about the connection itself worth a banner: the
-        // socket refused this user, which no retry fixes.
+        // socket refused this user, which no retry fixes. Not a claim about
+        // why: a session from before the account joined the group is the
+        // usual cause, but an account in neither group (or only the
+        // read-only one) is refused the same way, and relogging fixes
+        // nothing there; doctor reads /etc/group and tells them apart.
         if self.denied && !matches!(self.status, ConnStatus::Connected) {
             theme::banner(
                 ui,
                 Tone::Bad,
                 "\u{26a0}",
-                "LOG OUT AND BACK IN",
-                "your account is in the 'hallpass' group, but this login session \
-                 started before it was added, so it cannot reach the firewall yet",
+                "NO ACCESS",
+                "the firewall's socket refused this session. If your account was \
+                 added to the 'hallpass' group after you logged in, log out and back \
+                 in; otherwise `hallpass-cli doctor` says what is missing",
             );
             ui.add_space(8.0);
         }
-        // Only once the agent could not be started or cannot take prompts:
-        // an agent that is simply not running yet is started by this
-        // window (see `keep_agent`), not reported.
+        // This window takes no prompts, so on a host where the agent is not
+        // running it would otherwise look healthy while every connection no
+        // rule matches is decided with nothing on screen. Only once the agent
+        // could not be started or cannot take prompts: an agent that is
+        // simply not running yet is started by this window (see
+        // `keep_agent`), not reported.
         if let Some(text) = self.no_handler_banner() {
             let stalled = self
                 .agent
                 .as_ref()
                 .is_some_and(|(_, at)| at.elapsed() >= AGENT_GRACE);
-            let why = if stalled {
+            let why = if self.read_only_socket() {
+                Some(
+                    "this window is on the read-only socket, where no prompt agent \
+                     can take them",
+                )
+            } else if stalled {
                 Some(
                     "the prompt agent is running but cannot take prompts on this \
                      socket; it never can on the read-only one",
                 )
+            } else if let Some(why) = self.agent_error.as_deref() {
+                Some(why)
+            } else if self.agent.is_none()
+                && !self.wants_agent()
+                && self
+                    .slot_free_since
+                    .is_some_and(|since| since.elapsed() >= AGENT_GRACE)
+            {
+                // Nobody is going to fill it: not an agent of this window's,
+                // and not the window, which only keeps one it started.
+                Some("the prompt agent is not running")
             } else {
-                self.agent_error.as_deref()
+                None
             };
             if let Some(why) = why {
                 theme::banner(
@@ -1035,7 +1080,17 @@ impl HallpassApp {
                     "PROMPTS OFF",
                     &format!("{text}: {why}"),
                 );
-                if self.agent.is_none() && ui.button("Try again").clicked() {
+                if self.agent.is_none()
+                    && !self.read_only_socket()
+                    && ui.button("Start the prompt agent").clicked()
+                {
+                    // Cleared here and not in `start_agent`: an automatic
+                    // retry keeps the last reason on screen until it has an
+                    // outcome, rather than blanking the banner every period.
+                    self.agent_error = None;
+                    // Asked for, so kept running again from here on.
+                    self.agent_wanted = Some(true);
+                    self.agent_started = Some(std::time::Instant::now());
                     self.start_agent();
                 }
                 ui.add_space(8.0);
@@ -1072,10 +1127,22 @@ impl HallpassApp {
                 .as_ref()
                 .is_some_and(|s| !s.prompt_handler_connected);
         unhandled
+            && self.agent_wanted == Some(true)
             && self.agent.is_none()
+            && !self.read_only_socket()
             && self
                 .agent_started
                 .is_none_or(|at| at.elapsed() >= AGENT_RETRY)
+    }
+
+    /// Whether this window speaks to the daemon's read-only socket, told by
+    /// its name as `hallpass-cli doctor` tells it. An agent started there
+    /// could never take the slot, and would still outlive this window,
+    /// holding the account's agent lock and retrying its claim for good.
+    fn read_only_socket(&self) -> bool {
+        self.socket
+            .file_name()
+            .is_some_and(|n| n == OBSERVE_SOCKET_NAME)
     }
 
     /// The no-handler banner's text, when nobody holds the prompt slot on a
@@ -1111,10 +1178,15 @@ impl HallpassApp {
     /// In a process group of its own, with nothing on stdin: it outlives
     /// this window, so it must not also die with the terminal this window
     /// was started from (Ctrl+C, or the shell hanging up its jobs).
+    ///
+    /// Named `hallpass-ui` in its command line, as an autostarted one is:
+    /// `argv[0]` would otherwise be `/proc/self/exe`, and `install.sh` (or
+    /// anyone with `pkill -f 'hallpass-ui agent'`) could not find it to
+    /// replace it on an upgrade.
     fn start_agent(&mut self) {
         use std::os::unix::process::CommandExt as _;
-        self.agent_error = None;
         match std::process::Command::new("/proc/self/exe")
+            .arg0("hallpass-ui")
             .arg("agent")
             .arg("--socket")
             .arg(&self.socket)
@@ -1133,18 +1205,33 @@ impl HallpassApp {
     /// display, and a button that silently re-enables explains neither. One
     /// that keeps running outlives this window, as the agent should.
     fn reap_agent(&mut self) {
-        let Some((child, _)) = &mut self.agent else {
+        let Some((child, at)) = &mut self.agent else {
             return;
         };
         let exited = match child.try_wait() {
             Ok(None) => return,
             Ok(Some(status)) if status.code() == Some(crate::agent::ALREADY_RUNNING) => {
-                "another prompt agent is running for your account but not taking \
-                 prompts from this daemon; if you were added to the 'hallpass' group \
-                 since logging in, log out and back in"
+                // Judged after the same grace as one that keeps running: the
+                // other agent may be about to take the slot (starting at
+                // login, reconnecting after a daemon restart, waiting out a
+                // refused claim), and a slot taken meanwhile says nothing.
+                // Held until then, so no second one is started either;
+                // `try_wait` keeps answering with the status it reaped.
+                if at.elapsed() < AGENT_GRACE {
+                    return;
+                }
+                self.agent_wanted = Some(false);
+                "another prompt agent is already running for your account and has \
+                 not taken the prompt slot; if it started before your account joined \
+                 the 'hallpass' group, log out and back in, otherwise quit it from its \
+                 tray"
                     .to_string()
             }
-            Ok(Some(status)) if status.success() => "the prompt agent was quit".to_string(),
+            Ok(Some(status)) if status.success() => {
+                // Quit from its tray: a choice, not a failure to recover from.
+                self.agent_wanted = Some(false);
+                "the prompt agent was quit".to_string()
+            }
             Ok(Some(status)) => format!(
                 "the prompt agent stopped ({status}); run `hallpass-ui agent` in a \
                  terminal to see why"
