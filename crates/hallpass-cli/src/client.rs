@@ -4,7 +4,7 @@ use std::fmt;
 use std::path::Path;
 
 use hallpass_types::wire::{self, WireError};
-use hallpass_types::{ClientMsg, DaemonMsg, PROTOCOL_VERSION};
+use hallpass_types::{ClientMsg, DaemonMsg, Lockdown, Rule, RuntimeConfig, PROTOCOL_VERSION};
 use tokio::net::UnixStream;
 
 /// Errors surfaced to the user, mapped to exit codes.
@@ -25,31 +25,29 @@ impl CliError {
     /// Exit code for this error.
     pub fn exit_code(&self) -> i32 {
         match self {
-            CliError::Connect(_) => crate::EXIT_CONN,
-            CliError::Daemon(_) | CliError::Protocol(_) | CliError::Input(_) => crate::EXIT_ERR,
+            Self::Connect(_) => crate::EXIT_CONN,
+            Self::Daemon(_) | Self::Protocol(_) | Self::Input(_) => crate::EXIT_ERR,
         }
     }
 
     /// Build a protocol error for an unexpected daemon reply.
     pub fn unexpected(msg: &DaemonMsg) -> Self {
-        CliError::Protocol(format!("unexpected reply from daemon: {msg:?}"))
+        Self::Protocol(format!("unexpected reply from daemon: {msg:?}"))
     }
 }
 
 impl fmt::Display for CliError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // Daemon messages quote rule names and paths, so they can carry
-        // whatever a rule file or a process put there. Sanitizing in Display
-        // covers every printer of these errors at once, rather than relying on
-        // each call site to remember (watch.rs did; the plain command paths in
-        // lib.rs did not).
+        // Daemon messages quote rule names and paths, and an import error
+        // quotes a file not necessarily written here, so any of these can
+        // carry whatever a rule file or a process put there. Sanitizing in
+        // Display covers every printer at once instead of trusting each call
+        // site to remember.
         use hallpass_types::sanitize_for_display as clean;
         match self {
-            CliError::Connect(e) => write!(f, "{} - is hallpassd running?", clean(e)),
-            CliError::Daemon(m) => write!(f, "daemon: {}", clean(m)),
-            // Sanitized like the rest: an import error quotes the file it came
-            // from, and that file was not necessarily written here.
-            CliError::Protocol(m) | CliError::Input(m) => write!(f, "{}", clean(m)),
+            Self::Connect(e) => write!(f, "{} - is hallpassd running?", clean(e)),
+            Self::Daemon(m) => write!(f, "daemon: {}", clean(m)),
+            Self::Protocol(m) | Self::Input(m) => write!(f, "{}", clean(m)),
         }
     }
 }
@@ -57,7 +55,7 @@ impl fmt::Display for CliError {
 impl From<WireError> for CliError {
     fn from(e: WireError) -> Self {
         // A wire failure mid-conversation means the daemon connection broke.
-        CliError::Connect(format!("connection to daemon lost: {e}"))
+        Self::Connect(format!("connection to daemon lost: {e}"))
     }
 }
 
@@ -69,25 +67,23 @@ pub struct Client {
 impl Client {
     /// Connect to the daemon socket and perform the Hello handshake.
     pub async fn connect(socket: &Path) -> Result<Self, CliError> {
+        let handshake_failed = |e: WireError| CliError::Connect(format!("handshake failed: {e}"));
         let mut stream = UnixStream::connect(socket).await.map_err(|e| {
             CliError::Connect(format!("cannot connect to {}: {e}", socket.display()))
         })?;
-        wire::write_msg(
-            &mut stream,
-            &ClientMsg::Hello {
-                version: PROTOCOL_VERSION,
-            },
-        )
-        .await
-        .map_err(|e| CliError::Connect(format!("handshake failed: {e}")))?;
+        let hello = ClientMsg::Hello {
+            version: PROTOCOL_VERSION,
+        };
+        wire::write_msg(&mut stream, &hello)
+            .await
+            .map_err(handshake_failed)?;
         match wire::read_msg::<DaemonMsg, _>(&mut stream)
             .await
-            .map_err(|e| CliError::Connect(format!("handshake failed: {e}")))?
+            .map_err(handshake_failed)?
         {
             // A mismatch is fatal, not a warning. The daemon refuses the
-            // connection outright on its side, so carrying on only produced
-            // a second, less clear failure (an unexpected EOF) after the
-            // warning had scrolled past; and where a version does answer,
+            // connection on its side anyway, so carrying on only produced a
+            // second, less clear failure; and where a version does answer,
             // guessing at frames the other end decodes differently is how a
             // client silently misreads policy.
             DaemonMsg::HelloAck { version } if version != PROTOCOL_VERSION => {
@@ -96,7 +92,7 @@ impl Client {
                      the daemon, CLI and UI ship together and must be upgraded together"
                 )))
             }
-            DaemonMsg::HelloAck { .. } => Ok(Client { stream }),
+            DaemonMsg::HelloAck { .. } => Ok(Self { stream }),
             DaemonMsg::Err { message } => Err(CliError::Connect(format!(
                 "daemon rejected handshake: {message}"
             ))),
@@ -129,6 +125,38 @@ impl Client {
         match self.recv().await? {
             DaemonMsg::Err { message } => Err(CliError::Daemon(message)),
             reply => Ok(reply),
+        }
+    }
+
+    /// Send a request whose only success reply is [`DaemonMsg::Ok`].
+    pub async fn request_ok(&mut self, msg: ClientMsg) -> Result<(), CliError> {
+        match self.request(msg).await? {
+            DaemonMsg::Ok => Ok(()),
+            other => Err(CliError::unexpected(&other)),
+        }
+    }
+
+    /// The runtime settings as the operator set them (`ConfigGet`).
+    pub async fn config(&mut self) -> Result<RuntimeConfig, CliError> {
+        match self.request(ClientMsg::ConfigGet).await? {
+            DaemonMsg::Config(cfg) => Ok(cfg),
+            other => Err(CliError::unexpected(&other)),
+        }
+    }
+
+    /// The lockdown posture in force, if any (`LockdownGet`).
+    pub async fn lockdown(&mut self) -> Result<Option<Lockdown>, CliError> {
+        match self.request(ClientMsg::LockdownGet).await? {
+            DaemonMsg::LockdownState(state) => Ok(state),
+            other => Err(CliError::unexpected(&other)),
+        }
+    }
+
+    /// The whole ruleset (`RuleList`).
+    pub async fn rules(&mut self) -> Result<Vec<Rule>, CliError> {
+        match self.request(ClientMsg::RuleList).await? {
+            DaemonMsg::Rules(rules) => Ok(rules),
+            other => Err(CliError::unexpected(&other)),
         }
     }
 }

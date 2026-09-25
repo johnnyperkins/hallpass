@@ -6,15 +6,17 @@
 //! interesting groupings differ per question, and doing it here keeps the
 //! verdict path out of it entirely.
 
-use std::collections::HashMap;
-use std::io::{IsTerminal, Write};
+use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
+use std::io::Write as _;
+use std::path::Path;
 
 use hallpass_types::{sanitize_for_display, ClientMsg, ConnEvent, DaemonMsg, Verdict};
 use serde::Serialize;
 
 use crate::args::{GroupBy, TopOpts};
 use crate::client::{spawn_reader, CliError, Client};
-use crate::fmt::{self, Palette, Style};
+use crate::fmt::{self, Cell, Output, Palette, Style};
 
 /// Events requested from the daemon's history to seed the view.
 const SEED_EVENTS: u32 = 1000;
@@ -50,7 +52,7 @@ pub struct Row {
     /// Most recent event for this row, as Unix milliseconds.
     pub last_ms: u64,
     #[serde(skip)]
-    peer_set: std::collections::HashSet<String>,
+    peer_set: HashSet<String>,
 }
 
 /// The whole view: rows plus the totals a header line needs.
@@ -72,11 +74,10 @@ impl Aggregate {
     /// Fold one event in.
     pub fn add(&mut self, ev: &ConnEvent, group_by: GroupBy) {
         let key = sanitize_for_display(&raw_key(ev, group_by)).into_owned();
+        let class = classify(ev);
         self.total += 1;
-        if !ev.enforced {
-            self.observing = true;
-        }
-        match classify(ev) {
+        self.observing |= !ev.enforced;
+        match class {
             Class::Allowed => self.allowed += 1,
             Class::Blocked => self.blocked += 1,
             Class::WouldBlock => self.would_block += 1,
@@ -93,7 +94,7 @@ impl Aggregate {
             ..Row::default()
         });
         row.total += 1;
-        match classify(ev) {
+        match class {
             Class::Allowed => row.allowed += 1,
             Class::Blocked => row.blocked += 1,
             Class::WouldBlock => row.would_block += 1,
@@ -117,6 +118,7 @@ impl Aggregate {
 }
 
 /// How one event counts against the blocked columns.
+#[derive(Clone, Copy)]
 enum Class {
     Allowed,
     Blocked,
@@ -161,108 +163,70 @@ fn raw_key(ev: &ConnEvent, group_by: GroupBy) -> String {
 
 /// Render the view as a plain text block (no cursor movement).
 pub fn render(agg: &Aggregate, opts: TopOpts, pal: Palette) -> String {
-    let rows = agg.top(opts.top_n);
     let mut out = String::new();
     if agg.observing {
-        out.push_str(&pal.paint(
-            Style::Warn,
-            "OBSERVE MODE: policy is evaluated but nothing is blocked",
-        ));
-        out.push('\n');
+        let banner = "OBSERVE MODE: policy is evaluated but nothing is blocked";
+        let _ = writeln!(out, "{}", pal.paint(Style::Warn, banner));
     }
-    out.push_str(&format!(
-        "{} connections  {} allowed  {} blocked  {} would-block  (by {}, top {})\n",
+    let _ = writeln!(
+        out,
+        "{} connections  {} allowed  {} blocked  {} would-block  (by {}, top {})",
         agg.total,
         agg.allowed,
         agg.blocked,
         agg.would_block,
         opts.group_by.as_str(),
         opts.top_n
-    ));
+    );
 
+    let group = opts.group_by.as_str().to_uppercase();
     let header = [
-        opts.group_by.as_str().to_uppercase(),
-        "COUNT".into(),
-        "ALLOW".into(),
-        "BLOCK".into(),
-        "WOULD".into(),
-        "PEERS".into(),
-        "LAST".into(),
+        group.as_str(),
+        "COUNT",
+        "ALLOW",
+        "BLOCK",
+        "WOULD",
+        "PEERS",
+        "LAST",
     ];
-    let cells: Vec<[String; 7]> = rows
-        .iter()
+    let rows: Vec<Vec<Cell>> = agg
+        .top(opts.top_n)
+        .into_iter()
         .map(|r| {
-            [
+            let style = if r.would_block > 0 {
+                Style::Would
+            } else if r.blocked > 0 {
+                Style::Deny
+            } else {
+                Style::Allow
+            };
+            vec![
                 // Bounded like every path the CLI prints: the column is as
                 // wide as its longest cell, so one process run from a deep
                 // directory otherwise wrapped every row of the table.
-                fmt::path_display(std::path::Path::new(&r.key)),
-                r.total.to_string(),
-                r.allowed.to_string(),
-                r.blocked.to_string(),
-                r.would_block.to_string(),
-                r.peers.to_string(),
-                hallpass_types::format_ts(r.last_ms),
+                Cell::painted(fmt::path_display(Path::new(&r.key)), Some(style)),
+                Cell::plain(r.total.to_string()),
+                Cell::plain(r.allowed.to_string()),
+                Cell::plain(r.blocked.to_string()),
+                Cell::plain(r.would_block.to_string()),
+                Cell::plain(r.peers.to_string()),
+                Cell::plain(hallpass_types::format_ts(r.last_ms)),
             ]
         })
         .collect();
-    // Character counts, not bytes: a multibyte path would otherwise over-pad
-    // and misalign every column after it.
-    let mut widths: [usize; 7] = std::array::from_fn(|i| header[i].chars().count());
-    for row in &cells {
-        for (w, cell) in widths.iter_mut().zip(row.iter()) {
-            *w = (*w).max(cell.chars().count());
-        }
-    }
-    for (i, h) in header.iter().enumerate() {
-        push_cell(&mut out, h, widths[i], i == header.len() - 1);
-    }
-    out.push('\n');
-    for (row, r) in cells.iter().zip(rows.iter()) {
-        for (i, c) in row.iter().enumerate() {
-            let last = i == row.len() - 1;
-            if i == 0 {
-                let style = if r.would_block > 0 {
-                    Style::Would
-                } else if r.blocked > 0 {
-                    Style::Deny
-                } else {
-                    Style::Allow
-                };
-                out.push_str(&fmt::cell(pal, style, c, widths[i]));
-                out.push_str("  ");
-            } else {
-                push_cell(&mut out, c, widths[i], last);
-            }
-        }
-        out.push('\n');
-    }
+    out.push_str(&fmt::render_table(pal, &header, &rows));
     if agg.overflow > 0 {
-        out.push_str(&format!(
-            "({} events not counted: more than {MAX_ROWS} distinct keys)\n",
+        let _ = writeln!(
+            out,
+            "({} events not counted: more than {MAX_ROWS} distinct keys)",
             agg.overflow
-        ));
+        );
     }
     out
 }
 
-fn push_cell(out: &mut String, text: &str, width: usize, last: bool) {
-    out.push_str(text);
-    if !last {
-        for _ in 0..width.saturating_sub(text.chars().count()) {
-            out.push(' ');
-        }
-        out.push_str("  ");
-    }
-}
-
 /// Run the live view until Ctrl-C.
-pub async fn top(
-    mut client: Client,
-    opts: TopOpts,
-    json: bool,
-    pal: Palette,
-) -> Result<(), CliError> {
+pub async fn top(mut client: Client, opts: TopOpts, out: Output) -> Result<(), CliError> {
     let mut agg = Aggregate::default();
 
     // Seed from history. An older daemon answers Err; that costs the
@@ -295,7 +259,6 @@ pub async fn top(
     // tick lost its first half and the stream came apart from there.
     let mut rx = spawn_reader(client.into_stream());
 
-    let interactive = std::io::stdout().is_terminal();
     let mut ticker =
         tokio::time::interval(std::time::Duration::from_secs(opts.interval_secs.max(1)));
     // The first tick fires immediately, which is what shows the seeded view
@@ -309,9 +272,9 @@ pub async fn top(
                 DaemonMsg::Err { message } => return Err(CliError::Daemon(message)),
                 _ => {}
             },
-            _ = ticker.tick() => draw(&agg, opts, json, pal, interactive)?,
+            _ = ticker.tick() => draw(&agg, opts, out)?,
             _ = tokio::signal::ctrl_c() => {
-                if interactive {
+                if out.tty {
                     // Leave the terminal with the final view intact rather
                     // than half-erased.
                     println!();
@@ -322,30 +285,19 @@ pub async fn top(
     }
 }
 
-fn draw(
-    agg: &Aggregate,
-    opts: TopOpts,
-    json: bool,
-    pal: Palette,
-    interactive: bool,
-) -> Result<(), CliError> {
-    let mut out = std::io::stdout().lock();
-    if json {
+fn draw(agg: &Aggregate, opts: TopOpts, out: Output) -> Result<(), CliError> {
+    let mut stdout = std::io::stdout().lock();
+    if out.json {
         let rows = agg.top(opts.top_n);
-        let _ = writeln!(out, "{}", crate::json::to_json(&rows)?);
-        let _ = out.flush();
-        return Ok(());
-    }
-    if interactive {
+        let _ = writeln!(stdout, "{}", crate::json::to_json(&rows)?);
+    } else if out.tty {
         // Cursor home plus erase-down: redrawing in place rather than
-        // scrolling. Only ever written to a terminal, never to a pipe.
-        let _ = write!(out, "\x1b[H\x1b[J");
+        // scrolling.
+        let _ = write!(stdout, "\x1b[H\x1b[J{}", render(agg, opts, out.palette));
+    } else {
+        let _ = writeln!(stdout, "{}", render(agg, opts, out.palette));
     }
-    let _ = write!(out, "{}", render(agg, opts, pal));
-    if !interactive {
-        let _ = writeln!(out);
-    }
-    let _ = out.flush();
+    let _ = stdout.flush();
     Ok(())
 }
 

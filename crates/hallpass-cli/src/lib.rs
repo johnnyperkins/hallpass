@@ -21,7 +21,8 @@ use std::io::IsTerminal;
 use std::path::Path;
 
 use hallpass_types::{
-    sanitize_for_display, ClientMsg, ConnEvent, DaemonMsg, ExplainRequest, RuntimeConfig,
+    sanitize_for_display, Action, ClientMsg, ConnEvent, DaemonMsg, ExplainRequest, Lockdown, Rule,
+    RuntimeConfig,
 };
 
 use crate::args::{Cmd, ConfigSetOpts, EventsOpts};
@@ -78,12 +79,11 @@ pub async fn run(argv: &[String]) -> i32 {
 
     let mut client = match Client::connect(&cli.socket).await {
         Ok(c) => c,
-        Err(e) => return report(e),
+        Err(e) => return report(&e),
     };
 
     let result = match cli.cmd {
-        Cmd::Doctor => unreachable!("dispatched before connecting"),
-        Cmd::Run { .. } => unreachable!("dispatched before connecting"),
+        Cmd::Doctor | Cmd::Run { .. } => unreachable!("dispatched before connecting"),
         Cmd::Status => status(&mut client, out).await,
         Cmd::Sessions => run::sessions(&mut client, out).await,
         Cmd::LockdownShow => lockdown_show(&mut client, out).await,
@@ -93,28 +93,28 @@ pub async fn run(argv: &[String]) -> i32 {
         Cmd::ConfigShow => config_show(&mut client, out).await,
         Cmd::ConfigSet(opts) => config_set(&mut client, opts, out).await,
         Cmd::RulesList { stats, tag } => rules_list(&mut client, stats, tag, out).await,
-        Cmd::RulesAdd(rule) => expect_ok(&mut client, ClientMsg::RuleAdd(rule)).await,
-        Cmd::RulesRm { name } => expect_ok(&mut client, ClientMsg::RuleDelete { name }).await,
+        Cmd::RulesAdd(rule) => print_ok(&mut client, ClientMsg::RuleAdd(rule)).await,
+        Cmd::RulesRm { name } => print_ok(&mut client, ClientMsg::RuleDelete { name }).await,
         Cmd::RulesToggle { name, enabled } => {
-            expect_ok(&mut client, ClientMsg::RuleToggle { name, enabled }).await
+            print_ok(&mut client, ClientMsg::RuleToggle { name, enabled }).await
         }
         Cmd::RulesToggleTag { tag, enabled } => rules_toggle_tag(&mut client, tag, enabled).await,
         Cmd::RulesExport => rules_export(&mut client).await,
         Cmd::RulesImport { path } => rules_import(&mut client, &path).await,
         Cmd::Suggest(opts) => suggest::run(&mut client, opts, out).await,
         Cmd::Events(opts) => events(client, opts, out).await,
-        Cmd::Top(opts) => top::top(client, opts, out.json, out.palette).await,
+        Cmd::Top(opts) => top::top(client, opts, out).await,
         Cmd::Watch => watch::watch(client).await,
         Cmd::Explain(req) => explain(&mut client, req, out).await,
     };
 
     match result {
         Ok(()) => EXIT_OK,
-        Err(e) => report(e),
+        Err(e) => report(&e),
     }
 }
 
-fn report(e: CliError) -> i32 {
+fn report(e: &CliError) -> i32 {
     eprintln!("error: {e}");
     e.exit_code()
 }
@@ -134,31 +134,21 @@ async fn status(client: &mut Client, out: Output) -> Result<(), CliError> {
 }
 
 async fn config_show(client: &mut Client, out: Output) -> Result<(), CliError> {
-    let cfg = match client.request(ClientMsg::ConfigGet).await? {
-        DaemonMsg::Config(cfg) => cfg,
-        other => return Err(CliError::unexpected(&other)),
-    };
+    let cfg = client.config().await?;
     // Always asked for, in both output modes. `ConfigGet` reports what the
     // operator set, not what a lockdown posture is forcing, so that a
     // client's read-modify-write cannot persist the posture's values as the
-    // operator's own - which makes this the only thing that says the two
-    // fields it owns are not the ones in force. A script reading
+    // operator's own. That makes this the only thing saying the two fields
+    // the posture owns are not the ones in force: a script reading
     // `enforce: false` on a locked-down host would otherwise record it as
     // not filtering.
-    let lockdown = match client.request(ClientMsg::LockdownGet).await? {
-        DaemonMsg::LockdownState(state) => state,
-        other => return Err(CliError::unexpected(&other)),
-    };
-    print_config(&cfg, &lockdown, out)?;
+    let lockdown = client.lockdown().await?;
+    print_config(&cfg, lockdown.as_ref(), out)?;
     if let (false, Some(l)) = (out.json, &lockdown) {
         println!(
             "note: lockdown is on (pinned {}), so the mode is enforce and \
              the default verdict is deny until it is lifted",
-            if l.tags.is_empty() {
-                "nothing".to_string()
-            } else {
-                l.tags.join(",")
-            }
+            fmt::pinned_tags(&l.tags)
         );
     }
     Ok(())
@@ -172,33 +162,21 @@ async fn config_show(client: &mut Client, out: Output) -> Result<(), CliError> {
 /// usage text says so), and what is printed afterwards is refetched rather
 /// than echoed, so it is what the daemon actually holds.
 async fn config_set(client: &mut Client, opts: ConfigSetOpts, out: Output) -> Result<(), CliError> {
-    let current = match client.request(ClientMsg::ConfigGet).await? {
-        DaemonMsg::Config(cfg) => cfg,
-        other => return Err(CliError::unexpected(&other)),
-    };
+    let current = client.config().await?;
     let new = RuntimeConfig {
         prompt_timeout_secs: opts.timeout_secs.unwrap_or(current.prompt_timeout_secs),
         default_verdict: opts.default_verdict.unwrap_or(current.default_verdict),
         enforce: opts.enforce.unwrap_or(current.enforce),
     };
-    match client.request(ClientMsg::ConfigSet(new)).await? {
-        DaemonMsg::Ok => {}
-        other => return Err(CliError::unexpected(&other)),
-    }
-    let refetched = match client.request(ClientMsg::ConfigGet).await? {
-        DaemonMsg::Config(cfg) => cfg,
-        other => return Err(CliError::unexpected(&other)),
-    };
-    let lockdown = match client.request(ClientMsg::LockdownGet).await? {
-        DaemonMsg::LockdownState(state) => state,
-        other => return Err(CliError::unexpected(&other)),
-    };
-    print_config(&refetched, &lockdown, out)
+    client.request_ok(ClientMsg::ConfigSet(new)).await?;
+    let refetched = client.config().await?;
+    let lockdown = client.lockdown().await?;
+    print_config(&refetched, lockdown.as_ref(), out)
 }
 
 fn print_config(
     cfg: &RuntimeConfig,
-    lockdown: &Option<hallpass_types::Lockdown>,
+    lockdown: Option<&Lockdown>,
     out: Output,
 ) -> Result<(), CliError> {
     if out.json {
@@ -215,25 +193,19 @@ async fn rules_list(
     tag: Option<String>,
     out: Output,
 ) -> Result<(), CliError> {
-    let mut rules = match client.request(ClientMsg::RuleList).await? {
-        DaemonMsg::Rules(rules) => rules,
-        other => return Err(CliError::unexpected(&other)),
-    };
+    let mut rules = client.rules().await?;
     // Filtered here rather than by the daemon: `RuleList` answers with the
-    // whole set, and a listing filter is a display concern that no other
-    // client has to agree with. The predicate is the daemon's, so a listing
-    // and a bulk toggle cannot disagree about what a set contains.
+    // whole set, and a listing filter is a display concern no other client
+    // has to agree with. The predicate is the daemon's, so a listing and a
+    // bulk toggle cannot disagree about what a set contains.
     if let Some(tag) = &tag {
         rules.retain(|r| r.has_tag(tag));
-        // Before the counters are fetched: an empty listing has nothing to
-        // count, and asking anyway costs a whole round trip thrown away.
-        //
-        // An error rather than an empty listing, in both output modes, and
-        // worded exactly as `rules toggle --tag` words it. A tag no rule
-        // carries is nearly always a typo, and the two entrances must not
-        // disagree about that: `--json rules --tag wrok` printing `[]` and
-        // exiting 0 tells a script "this set is empty, nothing to review"
-        // about a set it never actually queried, while the same typo
+        // Checked before the counters are fetched, which would be a round
+        // trip thrown away. An error rather than an empty listing, in both
+        // output modes, and worded exactly as `rules toggle --tag` words it:
+        // a tag no rule carries is nearly always a typo, and `--json rules
+        // --tag wrok` printing `[]` and exiting 0 would tell a script "this
+        // set is empty" about a set it never queried, while the same typo
         // through the toggle fails loudly.
         if rules.is_empty() {
             return Err(CliError::Input(format!("no rule carries tag `{tag}`")));
@@ -250,48 +222,41 @@ async fn rules_list(
     } else {
         None
     };
+    if out.json {
+        match &hits {
+            Some(hits) => println!("{}", json::rules_with_hits(&rules, hits)?),
+            None => println!("{}", json::rules(&rules)?),
+        }
+        return Ok(());
+    }
     // A posture changes what this table means: an enabled allow it
     // suppresses decides nothing, and the column an operator reads to answer
     // "what is in force" would otherwise say `yes` for every one of them.
     // Asked for only on the human path; the JSON carries the tags on each
     // rule, so a consumer can apply the same predicate itself.
-    let lockdown = match out.json {
-        true => None,
-        false => match client.request(ClientMsg::LockdownGet).await? {
-            DaemonMsg::LockdownState(state) => state,
-            other => return Err(CliError::unexpected(&other)),
-        },
-    };
-    match (&hits, out.json, &lockdown) {
-        (Some(hits), true, _) => println!("{}", json::rules_with_hits(&rules, hits)?),
-        (Some(hits), false, Some(l)) => print!(
-            "{}",
-            fmt::format_rules_with_hits_under_lockdown(&rules, hits, &l.tags)
-        ),
-        (Some(hits), false, None) => print!("{}", fmt::format_rules_with_hits(&rules, hits)),
-        (None, true, _) => println!("{}", json::rules(&rules)?),
-        (None, false, Some(l)) => {
-            print!("{}", fmt::format_rules_under_lockdown(&rules, &l.tags))
-        }
-        (None, false, None) => print!("{}", fmt::format_rules(&rules)),
-    }
+    let lockdown = client.lockdown().await?;
+    print!(
+        "{}",
+        fmt::format_rules(
+            &rules,
+            hits.as_deref(),
+            lockdown.as_ref().map(|l| l.tags.as_slice())
+        )
+    );
     Ok(())
 }
 
 /// Report the lockdown posture.
 async fn lockdown_show(client: &mut Client, out: Output) -> Result<(), CliError> {
-    let state = match client.request(ClientMsg::LockdownGet).await? {
-        DaemonMsg::LockdownState(state) => state,
-        other => return Err(CliError::unexpected(&other)),
-    };
-    print_lockdown(client, &state, out).await
+    let state = client.lockdown().await?;
+    print_lockdown(client, state.as_ref(), out).await
 }
 
 /// Enter or leave the lockdown posture.
 ///
 /// Entering prints what the posture keeps, because "which rules still decide
 /// connections" is the question an operator has immediately after running
-/// this and the only way to answer it otherwise is to reason about tags by
+/// this, and otherwise the only way to answer it is to reason about tags by
 /// hand across the whole ruleset.
 async fn lockdown_set(
     client: &mut Client,
@@ -307,57 +272,45 @@ async fn lockdown_set(
         DaemonMsg::LockdownState(state) => state,
         other => return Err(CliError::unexpected(&other)),
     };
-    print_lockdown(client, &state, out).await
+    print_lockdown(client, state.as_ref(), out).await
 }
 
 /// Render a posture, and under it the rules that still decide connections.
 async fn print_lockdown(
     client: &mut Client,
-    state: &Option<hallpass_types::Lockdown>,
+    state: Option<&Lockdown>,
     out: Output,
 ) -> Result<(), CliError> {
     if out.json {
-        println!("{}", json::to_json(state)?);
+        println!("{}", json::to_json(&state)?);
         return Ok(());
     }
     let Some(state) = state else {
         println!("lockdown is off");
         return Ok(());
     };
-    println!(
-        "lockdown is ON since {} (pinned {}, {} rule(s) suppressed)",
-        hallpass_types::format_ts(state.since_ms),
-        if state.tags.is_empty() {
-            "nothing".to_string()
-        } else {
-            state.tags.join(",")
-        },
-        state.rules_suppressed
-    );
+    println!("lockdown is {}", fmt::lockdown_summary(state));
     // The kept set is computed from the rule list with the daemon's own
     // predicate, so this cannot describe a set other than the one enforcing.
-    let rules = match client.request(ClientMsg::RuleList).await? {
-        DaemonMsg::Rules(rules) => rules,
-        other => return Err(CliError::unexpected(&other)),
-    };
-    let kept: Vec<&hallpass_types::Rule> = rules
+    let rules = client.rules().await?;
+    let kept: Vec<&Rule> = rules
         .iter()
         .filter(|r| r.enabled && r.active_under_lockdown(&state.tags))
         .collect();
     // Split by action rather than listed together: every deny survives every
     // posture, so a combined list reads as though the host can still reach
     // things when the only survivors are blocks.
-    let permitting: Vec<&&hallpass_types::Rule> = kept
+    let permitting: Vec<&Rule> = kept
         .iter()
-        .filter(|r| r.action == hallpass_types::Action::Allow)
+        .copied()
+        .filter(|r| r.action == Action::Allow)
         .collect();
-    match permitting.is_empty() {
-        true => println!("nothing still permits connections: only loopback is reachable"),
-        false => {
-            println!("still permitting:");
-            for rule in &permitting {
-                println!("  {}", sanitize_for_display(&rule.name));
-            }
+    if permitting.is_empty() {
+        println!("nothing still permits connections: only loopback is reachable");
+    } else {
+        println!("still permitting:");
+        for rule in &permitting {
+            println!("  {}", sanitize_for_display(&rule.name));
         }
     }
     let blocking = kept.len() - permitting.len();
@@ -368,22 +321,11 @@ async fn print_lockdown(
     // written against a domain silently stops matching when it cannot: the
     // daemon annotates a connection with a domain only when it saw the
     // lookup, and under lockdown the lookup itself is what gets denied.
-    // Allows only. A deny rule on port 53 survives the posture like every
-    // other deny, and counting it as "something covers DNS" would silence
-    // this warning on exactly the hosts that block plaintext DNS.
-    let resolves = kept
-        .iter()
-        .filter(|r| r.action == hallpass_types::Action::Allow)
-        .any(|r| {
-            r.matcher.port == Some(53)
-                || r.matcher
-                    .port_range
-                    .is_some_and(|(lo, hi)| lo <= 53 && 53 <= hi)
-        });
-    if !resolves {
-        let pinned_domains = rules.iter().any(|r| {
-            r.enabled && r.active_under_lockdown(&state.tags) && r.matcher.domain.is_some()
-        });
+    // Allows only: a deny on port 53 survives the posture like every other
+    // deny, and counting it as "something covers DNS" would silence this
+    // warning on exactly the hosts that block plaintext DNS.
+    if !permitting.iter().any(|r| covers_dns(r)) {
+        let pinned_domains = kept.iter().any(|r| r.matcher.domain.is_some());
         println!(
             "warning: nothing pinned covers DNS, so this host cannot resolve names{}",
             if pinned_domains {
@@ -395,6 +337,12 @@ async fn print_lockdown(
         );
     }
     Ok(())
+}
+
+/// Whether `rule` matches destination port 53, alone or within a range.
+fn covers_dns(rule: &Rule) -> bool {
+    let m = &rule.matcher;
+    m.port == Some(53) || m.port_range.is_some_and(|(lo, hi)| lo <= 53 && 53 <= hi)
 }
 
 /// Enable or disable every rule carrying a tag.
@@ -437,13 +385,9 @@ async fn rules_toggle_tag(client: &mut Client, tag: String, enabled: bool) -> Re
 /// back to `rules import`, and `--json` already covers the "pipe it into a
 /// program" case through `rules --json`.
 async fn rules_export(client: &mut Client) -> Result<(), CliError> {
-    match client.request(ClientMsg::RuleList).await? {
-        DaemonMsg::Rules(rules) => {
-            print!("{}", rules_file::export(&rules)?);
-            Ok(())
-        }
-        other => Err(CliError::unexpected(&other)),
-    }
+    let rules = client.rules().await?;
+    print!("{}", rules_file::export(&rules)?);
+    Ok(())
 }
 
 /// Add every rule in `path`, one request each.
@@ -497,14 +441,11 @@ async fn explain(client: &mut Client, req: ExplainRequest, out: Output) -> Resul
     }
 }
 
-async fn expect_ok(client: &mut Client, msg: ClientMsg) -> Result<(), CliError> {
-    match client.request(msg).await? {
-        DaemonMsg::Ok => {
-            println!("ok");
-            Ok(())
-        }
-        other => Err(CliError::unexpected(&other)),
-    }
+/// Send a request answered by a bare `Ok`, and say so.
+async fn print_ok(client: &mut Client, msg: ClientMsg) -> Result<(), CliError> {
+    client.request_ok(msg).await?;
+    println!("ok");
+    Ok(())
 }
 
 /// Replay past connections, then stream new ones until Ctrl-C.

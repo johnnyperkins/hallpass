@@ -12,15 +12,16 @@
 //! turn a process picking an odd exe path into a broken pipeline; sanitizing
 //! through `Path::display` guarantees UTF-8 on the way in.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use hallpass_types::{
-    sanitize_for_display, ConnEvent, Connection, Explanation, Rule, RuleHit, RuleMatch, RuleTrace,
-    RunSessionInfo, RuntimeConfig, Stats, TraceOutcome,
+    sanitize_for_display, ConnEvent, Connection, Explanation, Lockdown, Rule, RuleHit, RuleMatch,
+    RuleTrace, RunSessionInfo, RuntimeConfig, Stats, TraceOutcome,
 };
 use serde::Serialize;
 
 use crate::client::CliError;
+use crate::fmt::hits_by_name;
 
 /// Serialize a value to one line of JSON.
 ///
@@ -53,13 +54,10 @@ struct ConfigWithLockdown<'a> {
     config: &'a RuntimeConfig,
     /// Null when no posture is in force. While one is, the mode is enforce
     /// and the default verdict is deny whatever the fields above say.
-    lockdown: &'a Option<hallpass_types::Lockdown>,
+    lockdown: Option<&'a Lockdown>,
 }
 
-pub fn config(
-    c: &RuntimeConfig,
-    lockdown: &Option<hallpass_types::Lockdown>,
-) -> Result<String, CliError> {
+pub fn config(c: &RuntimeConfig, lockdown: Option<&Lockdown>) -> Result<String, CliError> {
     to_json(&ConfigWithLockdown {
         config: c,
         lockdown,
@@ -105,9 +103,7 @@ struct RuleWithHits {
 /// A rule the daemon reported no counter for gets `0` and `null`, so every
 /// element has the same shape whether or not the rule has ever matched.
 pub fn rules_with_hits(rules: &[Rule], hits: &[RuleHit]) -> Result<String, CliError> {
-    // Keyed on the raw name, which is what the daemon accounts against.
-    let by_name: std::collections::HashMap<&str, &RuleHit> =
-        hits.iter().map(|h| (h.name.as_str(), h)).collect();
+    let by_name = hits_by_name(hits);
     let clean: Vec<RuleWithHits> = rules
         .iter()
         .map(|r| {
@@ -133,7 +129,7 @@ pub fn explanation(e: &Explanation) -> Result<String, CliError> {
 pub fn sanitized_explanation(e: &Explanation) -> Explanation {
     Explanation {
         verdict: e.verdict,
-        rule_name: clean_opt(&e.rule_name),
+        rule_name: clean_opt(e.rule_name.as_deref()),
         would_prompt: e.would_prompt,
         enforced: e.enforced,
         trace: e
@@ -170,14 +166,13 @@ fn clean(s: &str) -> String {
 }
 
 /// Sanitize an optional string field.
-fn clean_opt(s: &Option<String>) -> Option<String> {
-    s.as_deref().map(clean)
+fn clean_opt(s: Option<&str>) -> Option<String> {
+    s.map(clean)
 }
 
 /// Sanitize an optional path field, lossily decoding it on the way.
-fn clean_path(p: &Option<PathBuf>) -> Option<PathBuf> {
-    p.as_ref()
-        .map(|p| PathBuf::from(clean(&p.display().to_string())))
+fn clean_path(p: Option<&Path>) -> Option<PathBuf> {
+    p.map(|p| PathBuf::from(clean(&p.display().to_string())))
 }
 
 /// Copy of `ev` with every daemon-supplied string sanitized.
@@ -191,17 +186,17 @@ pub fn sanitized_event(ev: &ConnEvent) -> ConnEvent {
             tuple: ev.conn.tuple,
             uid: ev.conn.uid,
             pid: ev.conn.pid,
-            exe_path: clean_path(&ev.conn.exe_path),
-            cmdline: clean_opt(&ev.conn.cmdline),
-            parent_exe: clean_path(&ev.conn.parent_exe),
-            domain: clean_opt(&ev.conn.domain),
-            iface: clean_opt(&ev.conn.iface),
-            app_id: clean_opt(&ev.conn.app_id),
+            exe_path: clean_path(ev.conn.exe_path.as_deref()),
+            cmdline: clean_opt(ev.conn.cmdline.as_deref()),
+            parent_exe: clean_path(ev.conn.parent_exe.as_deref()),
+            domain: clean_opt(ev.conn.domain.as_deref()),
+            iface: clean_opt(ev.conn.iface.as_deref()),
+            app_id: clean_opt(ev.conn.app_id.as_deref()),
             // Two bools; nothing here can carry an escape or a newline.
             first_seen: ev.conn.first_seen,
         },
         verdict: ev.verdict,
-        rule_name: clean_opt(&ev.rule_name),
+        rule_name: clean_opt(ev.rule_name.as_deref()),
         unix_ms: ev.unix_ms,
         enforced: ev.enforced,
     }
@@ -224,24 +219,24 @@ pub fn sanitized_rule(r: &Rule) -> Rule {
         // being correct is the argument it exists so nobody has to make.
         tags: r.tags.iter().map(|t| clean(t)).collect(),
         matcher: RuleMatch {
-            exe: clean_path(&m.exe),
-            exe_glob: clean_opt(&m.exe_glob),
-            exe_sha256: clean_opt(&m.exe_sha256),
-            dest: clean_opt(&m.dest),
+            exe: clean_path(m.exe.as_deref()),
+            exe_glob: clean_opt(m.exe_glob.as_deref()),
+            exe_sha256: clean_opt(m.exe_sha256.as_deref()),
+            dest: clean_opt(m.dest.as_deref()),
             port: m.port,
             port_range: m.port_range,
-            domain: clean_opt(&m.domain),
+            domain: clean_opt(m.domain.as_deref()),
             user: m.user,
             proto: m.proto,
-            domains_file: clean_path(&m.domains_file),
-            ips_file: clean_path(&m.ips_file),
-            hashes_file: clean_path(&m.hashes_file),
-            cmdline_contains: clean_opt(&m.cmdline_contains),
-            parent_exe: clean_path(&m.parent_exe),
-            src: clean_opt(&m.src),
+            domains_file: clean_path(m.domains_file.as_deref()),
+            ips_file: clean_path(m.ips_file.as_deref()),
+            hashes_file: clean_path(m.hashes_file.as_deref()),
+            cmdline_contains: clean_opt(m.cmdline_contains.as_deref()),
+            parent_exe: clean_path(m.parent_exe.as_deref()),
+            src: clean_opt(m.src.as_deref()),
             src_port: m.src_port,
-            iface: clean_opt(&m.iface),
-            app_id: clean_opt(&m.app_id),
+            iface: clean_opt(m.iface.as_deref()),
+            app_id: clean_opt(m.app_id.as_deref()),
         },
     }
 }
