@@ -19,13 +19,15 @@ pub(crate) const REST_SHOWN: usize = 5;
 /// its other pending destinations (`rest`), which a host- or app-wide
 /// answer will cover in the same stroke.
 ///
-/// Split into a bottom action panel and a scrolling info body, in that
-/// order, because the window is a fixed 440x330 and every info line
-/// (path, command line, resolved names) is text the judged process
-/// chose: stacked in one column, enough of it pushed Allow and Deny out
-/// of the window, an unanswerable prompt an adversary can construct.
-/// The panel is laid out first so the actions own their space no matter
-/// how much the body wants, and the body scrolls inside what is left.
+/// Split into a bottom action panel, a top summary and a scrolling info
+/// body, in that order, because the window is a fixed 440x330 and every
+/// info line (path, command line, resolved names) is text the judged
+/// process chose: stacked in one column, enough of it pushed Allow and Deny
+/// out of the window, an unanswerable prompt an adversary can construct.
+/// The action panel is laid out first so it owns its space no matter how
+/// much the rest wants. The summary is next and is one line per fact, cut
+/// to the width, so the question itself - which program, to where - stays
+/// on screen however far the body scrolls or the actions grow.
 ///
 /// Returns this pass's answer, if a button gave one.
 #[must_use = "a dropped answer is a click that never reaches the daemon"]
@@ -58,6 +60,19 @@ pub(crate) fn prompt_ui(
         .show_separator_line(false)
         .show(ui, |ui| prompt_actions_ui(ui, p, now_ms))
         .inner;
+    egui::Panel::top(egui::Id::new(("prompt-summary", p.id)))
+        .frame(
+            egui::Frame::new()
+                .fill(theme::BG)
+                .inner_margin(egui::Margin {
+                    left: 10,
+                    right: 10,
+                    top: 8,
+                    bottom: 2,
+                }),
+        )
+        .show_separator_line(false)
+        .show(ui, |ui| prompt_summary_ui(ui, p));
     egui::CentralPanel::default()
         .frame(
             egui::Frame::new()
@@ -74,74 +89,106 @@ pub(crate) fn prompt_ui(
     answer
 }
 
-/// The scrolling half: everything the operator reads to decide.
+/// The pinned summary: which program, and where it wants to go.
+///
+/// A band in the colour of the prompt's own risk, read off the same facts
+/// the body states in words: a first sighting, a history of refusals, or a
+/// binary that no longer matches the rule pinned to it. A routine prompt
+/// gets the neutral accent, so the loud ones are loud by contrast rather
+/// than by everything shouting.
+///
+/// Each line is cut to the window's width rather than wrapped, which is
+/// what keeps this panel one size whatever the process named itself; the
+/// full text is on hover, and in the body below.
+fn prompt_summary_ui(ui: &mut egui::Ui, p: &PromptState) {
+    let conn = &p.conn;
+    theme::band(ui, prompt_tone(p).color(), |ui| {
+        ui.spacing_mut().item_spacing.y = 2.0;
+        ui.horizontal(|ui| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                // In the title line rather than the details grid, because
+                // it changes what the question is: a first-ever connection
+                // from a program is the one an operator reads the rest of
+                // this window for. Absent when nothing is new *and* when
+                // the daemon is not tracking, which is why there is no
+                // "seen before" badge to pair with it: it would be a claim
+                // the daemon may have no basis for.
+                if let Some(what) = conn.first_seen.and_then(|f| f.describe()) {
+                    theme::pill(ui, "NEW", REJECT_COLOR).on_hover_text(what);
+                }
+                theme::ghost_pill(ui, &conn.tuple.proto.to_string());
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(prompt::exe_name(conn))
+                                .strong()
+                                .variation("wght", theme::SEMIBOLD)
+                                .size(18.0)
+                                .color(TEXT),
+                        )
+                        .truncate(),
+                    );
+                });
+            });
+        });
+        // Where to: the name the program asked for when there is one, since
+        // that is what the operator recognises, with the port it wants.
+        let dst = conn.tuple.dst;
+        let target = match &conn.domain {
+            Some(domain) => format!("{}:{}", prompt::ui_text(domain), dst.port()),
+            None => dst.to_string(),
+        };
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            ui.label(RichText::new("\u{2192}").color(MUTED));
+            ui.add(
+                egui::Label::new(RichText::new(target).monospace().size(14.0).color(TEXT))
+                    .truncate(),
+            );
+        });
+    });
+}
+
+/// The scrolling half: everything else the operator reads to decide.
 fn prompt_info_ui(ui: &mut egui::Ui, p: &PromptState, rest: &[String]) {
     let conn = &p.conn;
-    // Read once and used by both the badge and the details row below, so
-    // "the badge and the row always say the same thing" is structural rather
-    // than two call sites a later edit could split.
+    // Read once and used by both the summary's badge and the details row
+    // below, from the same connection, so the two cannot disagree.
     let whats_new = conn.first_seen.and_then(|f| f.describe());
 
-    // The header band. Its colour is the prompt's own risk, read off the
-    // same facts the body states in words: a first sighting, a history of
-    // refusals, or a binary that no longer matches the rule pinned to it.
-    // A routine prompt gets the neutral accent, so the loud ones are loud
-    // by contrast rather than by everything shouting.
-    let risk = prompt_tone(p);
-    theme::band(ui, risk.color(), |ui| {
-        ui.horizontal_wrapped(|ui| {
-            ui.spacing_mut().item_spacing.x = 6.0;
+    // First, and its own band rather than a line of text: it says a rule was
+    // written for this program and the binary running now is not the one
+    // that rule pins, which changes what the whole window is about. The
+    // sentence itself is the shared one, so this window and `hallpass-cli
+    // watch` cannot end up saying different things about the same fact.
+    if let Some(what) = p.context.hash_mismatch_describe() {
+        theme::band(ui, DENY_COLOR, |ui| {
             ui.label(
-                RichText::new(prompt::exe_name(conn))
+                RichText::new(format!("Warning: {}", prompt::sentence_text(&what)))
                     .strong()
                     .variation("wght", theme::SEMIBOLD)
-                    .size(18.0)
-                    .color(TEXT),
+                    .color(DENY_COLOR),
             );
-            ui.label(RichText::new("wants to connect").color(MUTED));
-            theme::ghost_pill(ui, &conn.tuple.proto.to_string());
-            // In the title line rather than the details grid below,
-            // because it changes what the question is: a first-ever
-            // connection from a program is the one an operator reads
-            // the rest of this window for. Absent when nothing is new
-            // *and* when the daemon is not tracking, which is why
-            // there is no "seen before" badge to pair with it: it
-            // would be a claim the daemon may have no basis for.
-            if let Some(what) = whats_new {
-                theme::pill(ui, "NEW", REJECT_COLOR).on_hover_text(what);
-            }
         });
-        if let Some(exe) = &conn.exe_path {
-            // Full path, sanitized: this is the line the operator
-            // checks to see which binary is actually asking.
-            ui.label(
-                RichText::new(prompt::path_text(exe))
-                    .small()
-                    .monospace()
-                    .color(MUTED),
-            );
-        }
-    });
+        ui.add_space(6.0);
+    }
+    if let Some(exe) = &conn.exe_path {
+        // Full path, sanitized: this is the line the operator checks to
+        // see which binary is actually asking.
+        ui.label(
+            RichText::new(prompt::path_text(exe))
+                .small()
+                .monospace()
+                .color(MUTED),
+        );
+    }
     if let Some(cmdline) = &conn.cmdline {
         ui.add_space(4.0);
         ui.label(
             RichText::new(prompt::truncate(cmdline, 100))
                 .small()
                 .color(MUTED),
-        );
-    }
-    // Its own banner rather than a line of text: it says a rule was
-    // written for this program and the binary running now is not the one
-    // that rule pins, which changes what the whole window is about. The
-    // sentence itself is the shared one, so this window and `hallpass-cli
-    // watch` cannot end up saying different things about the same fact.
-    if let Some(what) = p.context.hash_mismatch_describe() {
-        ui.add_space(4.0);
-        ui.label(
-            RichText::new(format!("Warning: {}", prompt::sentence_text(&what)))
-                .strong()
-                .variation("wght", theme::SEMIBOLD)
-                .color(DENY_COLOR),
         );
     }
     ui.add_space(6.0);
@@ -151,9 +198,13 @@ fn prompt_info_ui(ui: &mut egui::Ui, p: &PromptState, rest: &[String]) {
         .striped(false)
         .spacing([10.0, 4.0])
         .show(ui, |ui| {
-            ui.label(RichText::new("Destination").color(MUTED));
-            ui.label(theme::num(prompt::format_dest(conn)));
-            ui.end_row();
+            // The summary names the destination; this adds the address
+            // behind a name, and the name in full where the summary cut it.
+            if conn.domain.is_some() {
+                ui.label(RichText::new("Destination").color(MUTED));
+                ui.label(theme::num(prompt::format_dest(conn)));
+                ui.end_row();
+            }
             ui.label(RichText::new("User / process").color(MUTED));
             ui.label(theme::num(format!(
                 "uid {} / pid {}",
@@ -437,7 +488,7 @@ fn prompt_actions_ui(ui: &mut egui::Ui, p: &mut PromptState, now_ms: u64) -> Opt
     theme::countdown(
         ui,
         frac,
-        &format!("{}s until default verdict", p.remaining_secs(now_ms)),
+        &format!("default verdict in {}s", p.remaining_secs(now_ms)),
     );
     answer
 }
@@ -565,21 +616,7 @@ mod tests {
             )
     }
 
-    /// The buttons must survive the worst content the window can carry: a
-    /// path at its display cap, a file name at the filesystem's, a command line
-    /// at its cap, an application id at its cap, the full pending list, and the
-    /// App-anywhere warning, all inside the fixed 440x330 viewport. Every one of
-    /// those strings is chosen by the process being judged, so "the info pushed
-    /// Allow and Deny off the window" is an unanswerable prompt an adversary can
-    /// construct; the actions are pinned to a bottom panel and the info scrolls,
-    /// and this clicks Deny through exactly that worst case to prove it stays
-    /// reachable.
-    ///
-    /// The file name and application id are the two that also reach the pinned
-    /// panel, through the App-anywhere warning, so they are sized to wrap as
-    /// many lines as they can: wide glyphs, with break points.
-    #[test]
-    fn buttons_survive_worst_case_content() {
+    fn worst_case_harness() -> Harness<'static, PromptFixture> {
         // NAME_MAX: the longest file name the kernel will hand the daemon.
         let file_name = "WWWW ".repeat(51);
         let mut state = PromptFixture {
@@ -612,9 +649,28 @@ mod tests {
                 },
                 state,
             );
-        // Settled first: the panel sizes itself from the frame before, so the
-        // first pass alone would not show where the buttons end up.
+        // Settled first: the panels size themselves from the frame before,
+        // so the first pass alone would not show where things end up.
         harness.run();
+        harness
+    }
+
+    /// The buttons must survive the worst content the window can carry: a
+    /// path at its display cap, a file name at the filesystem's, a command line
+    /// at its cap, an application id at its cap, the full pending list, and the
+    /// App-anywhere warning, all inside the fixed 440x330 viewport. Every one of
+    /// those strings is chosen by the process being judged, so "the info pushed
+    /// Allow and Deny off the window" is an unanswerable prompt an adversary can
+    /// construct; the actions are pinned to a bottom panel and the info scrolls,
+    /// and this clicks Deny through exactly that worst case to prove it stays
+    /// reachable.
+    ///
+    /// The file name and application id are the two that also reach the pinned
+    /// panel, through the App-anywhere warning, so they are sized to wrap as
+    /// many lines as they can: wide glyphs, with break points.
+    #[test]
+    fn buttons_survive_worst_case_content() {
+        let mut harness = worst_case_harness();
         harness.get_by_label("Deny").click();
         harness.run();
         let expected = harness.state().prompt.reply(Verdict::Deny);
@@ -622,6 +678,21 @@ mod tests {
             harness.state().answered,
             vec![expected],
             "Deny was not clickable under worst-case content"
+        );
+    }
+
+    /// Where the connection is going is the question the buttons answer,
+    /// so it has to be on screen whenever they are: under the same worst
+    /// case, with the body at its longest and the action panel at its
+    /// tallest, the destination is still in the window and above them.
+    #[test]
+    fn the_destination_stays_on_screen_under_worst_case_content() {
+        let harness = worst_case_harness();
+        let dest = harness.get_by_label("93.184.216.34:443").rect();
+        let deny = harness.get_by_label("Deny").rect();
+        assert!(
+            dest.top() >= 0.0 && dest.bottom() <= deny.top(),
+            "destination at {dest:?}, Deny at {deny:?}"
         );
     }
 

@@ -1139,13 +1139,15 @@ pub fn verdict_button(text: &str, color: Color32) -> egui::Button<'static> {
     .min_size(Vec2::new(118.0, 34.0))
 }
 
-/// The countdown under a prompt: a bar that drains and warms as the
-/// default verdict approaches.
+/// The countdown under a prompt: a thin bar that drains and warms as the
+/// default verdict approaches, with the time left beside it.
 ///
 /// The colour is the point. A prompt at twenty seconds and one at two are
 /// the same widget with the same words, and the second one is about to
-/// decide itself.
+/// decide itself. The words sit beside the bar rather than on it, where
+/// they stay readable over every colour it passes through.
 pub fn countdown(ui: &mut Ui, fraction: f32, text: &str) {
+    let fraction = fraction.clamp(0.0, 1.0);
     let color = if fraction > 0.5 {
         ALLOW_COLOR
     } else if fraction > 0.2 {
@@ -1153,36 +1155,39 @@ pub fn countdown(ui: &mut Ui, fraction: f32, text: &str) {
     } else {
         DENY_COLOR
     };
-    let height = 17.0;
-    let (rect, _) = ui.allocate_exact_size(
+    let font = egui::TextStyle::Small.resolve(ui.style());
+    let text_color = if fraction > 0.2 { MUTED } else { color };
+    let galley = ui
+        .painter()
+        .layout_no_wrap(text.to_owned(), font, text_color);
+    let height = galley.size().y.max(14.0);
+    let (rect, response) = ui.allocate_exact_size(
         Vec2::new(ui.available_width(), height),
         egui::Sense::hover(),
     );
+    let label = text.to_owned();
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::ProgressIndicator, true, label.clone())
+    });
     if !ui.is_rect_visible(rect) {
         return;
     }
-    let radius = CornerRadius::same((height / 2.0) as u8);
-    ui.painter().rect_filled(rect, radius, SURFACE);
+    let text_pos = egui::pos2(
+        rect.right() - galley.size().x,
+        rect.center().y - galley.size().y / 2.0,
+    );
+    let track = egui::Rect::from_min_max(
+        egui::pos2(rect.left(), rect.center().y - 2.5),
+        egui::pos2(text_pos.x - 10.0, rect.center().y + 2.5),
+    );
+    let radius = CornerRadius::same(3);
+    ui.painter().rect_filled(track, radius, WELL);
     let filled = egui::Rect::from_min_size(
-        rect.min,
-        Vec2::new((rect.width() * fraction.clamp(0.0, 1.0)).max(2.0), height),
+        track.min,
+        Vec2::new((track.width() * fraction).max(5.0), track.height()),
     );
-    ui.painter()
-        .rect_filled(filled, radius, color.gamma_multiply(0.55));
-    ui.painter().rect(
-        rect,
-        radius,
-        Color32::TRANSPARENT,
-        Stroke::new(1.0, color.gamma_multiply(0.5)),
-        egui::StrokeKind::Inside,
-    );
-    ui.painter().text(
-        rect.center(),
-        egui::Align2::CENTER_CENTER,
-        text,
-        egui::TextStyle::Small.resolve(ui.style()),
-        TEXT,
-    );
+    ui.painter().rect_filled(filled, radius, color);
+    ui.painter().galley(text_pos, galley, text_color);
 }
 
 /// The brand mark: a shield in the colour of whatever the host is doing.
