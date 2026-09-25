@@ -19,7 +19,7 @@
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixDatagram;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
@@ -73,6 +73,16 @@ fn skip_reason() -> Option<String> {
     None
 }
 
+/// Whether `tool` runs; when it does not, say this test is skipping. For a
+/// test's own `if !require_tool(...) { return; }` guard.
+fn require_tool(tag: &str, tool: &str, probe: &str) -> bool {
+    let found = tool_available(tool, probe);
+    if !found {
+        eprintln!("SKIP e2e {tag}: `{tool}` not found in PATH");
+    }
+    found
+}
+
 /// Run a command to completion, capturing output.
 fn run(program: &str, args: &[&str]) -> Output {
     Command::new(program)
@@ -86,6 +96,31 @@ fn ns_run(ns: &str, args: &[&str]) -> Output {
     let mut full = vec!["netns", "exec", ns];
     full.extend_from_slice(args);
     run("ip", &full)
+}
+
+/// Start a command inside a namespace with no stdio, for helpers that run
+/// until the test tears them down.
+fn ns_spawn(ns: &str, args: &[&str], what: &str) -> Child {
+    Command::new("ip")
+        .args(["netns", "exec", ns])
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap_or_else(|e| panic!("spawn {what}: {e}"))
+}
+
+/// Whether something in `ns` listens on `port`, per `ss` with `flags`
+/// (`-ltnH` for TCP, `-lunH` for UDP).
+fn port_bound(ns: &str, flags: &str, port: u16) -> bool {
+    String::from_utf8_lossy(&ns_run(ns, &["ss", flags]).stdout).contains(&format!(":{port} "))
+}
+
+/// Kill a helper process and reap it.
+fn reap(mut child: Child) {
+    let _ = child.kill(); // Child::kill sends SIGKILL
+    let _ = child.wait();
 }
 
 /// Per-namespace `/etc` overlay that `ip netns exec` bind-mounts.
@@ -369,25 +404,20 @@ impl TestEnv {
             // with it and every connection is then allowed, so the only
             // symptom otherwise is that assertions expecting a block fail
             // one by one with nothing pointing at the cause.
-            if let Some(status) = self
-                .daemon
-                .as_mut()
-                .and_then(|d| d.try_wait().ok().flatten())
-            {
+            if let Some(status) = self.daemon_exit() {
                 panic!(
                     "daemon exited during startup ({status}); log:\n{}",
                     self.daemon_log()
                 );
             }
-            let table_up = ns_run(&self.ns_cli, &["nft", "list", "table", "inet", "hallpass"])
-                .status
-                .success();
-            if table_up && self.socket_path.exists() {
+            if self.table_present() && self.socket_path.exists() {
                 return;
             }
-            if Instant::now() > deadline {
-                panic!("daemon not ready in 10s; log:\n{}", self.daemon_log());
-            }
+            assert!(
+                Instant::now() <= deadline,
+                "daemon not ready in 10s; log:\n{}",
+                self.daemon_log()
+            );
             std::thread::sleep(Duration::from_millis(100));
         }
     }
@@ -396,16 +426,24 @@ impl TestEnv {
     /// a connection to be blocked otherwise report the block failing
     /// rather than the daemon being gone.
     fn assert_daemon_alive(&mut self) {
-        if let Some(status) = self
-            .daemon
-            .as_mut()
-            .and_then(|d| d.try_wait().ok().flatten())
-        {
+        if let Some(status) = self.daemon_exit() {
             panic!(
                 "daemon is no longer running ({status}); log:\n{}",
                 self.daemon_log()
             );
         }
+    }
+
+    /// How the daemon exited, if it has.
+    fn daemon_exit(&mut self) -> Option<ExitStatus> {
+        self.daemon.as_mut()?.try_wait().ok().flatten()
+    }
+
+    /// Whether the daemon's nft table is installed in the cli namespace.
+    fn table_present(&self) -> bool {
+        ns_run(&self.ns_cli, &["nft", "list", "table", "inet", "hallpass"])
+            .status
+            .success()
     }
 
     fn daemon_log(&self) -> String {
@@ -425,18 +463,16 @@ impl TestEnv {
 
     /// SIGKILL the daemon, simulating a crash. The nft table stays behind.
     fn kill_daemon_hard(&mut self) {
-        if let Some(mut d) = self.daemon.take() {
-            let _ = d.kill(); // Child::kill sends SIGKILL
-            let _ = d.wait();
+        if let Some(d) = self.daemon.take() {
+            reap(d);
         }
     }
 
     /// Crash the daemon and assert its nft table survived the crash.
     fn kill_daemon_and_assert_table_stays(&mut self) {
         self.kill_daemon_hard();
-        let table = ns_run(&self.ns_cli, &["nft", "list", "table", "inet", "hallpass"]);
         assert!(
-            table.status.success(),
+            self.table_present(),
             "nft table should still exist after kill -9"
         );
     }
@@ -480,23 +516,14 @@ impl TestEnv {
             None => all.into_iter().enumerate().collect(),
         };
         for (i, form) in forms {
-            let mut args = vec!["netns", "exec", self.ns_srv.as_str()];
-            args.extend_from_slice(form);
-            let mut child = Command::new("ip")
-                .args(&args)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .expect("spawn nc listener");
+            let mut child = ns_spawn(&self.ns_srv, form, "nc listener");
             let deadline = Instant::now() + Duration::from_secs(3);
             let mut bound = false;
             while Instant::now() < deadline {
                 if child.try_wait().expect("try_wait").is_some() {
                     break; // this nc form exited immediately; try next
                 }
-                let ss = ns_run(&self.ns_srv, &["ss", "-ltnH"]);
-                if String::from_utf8_lossy(&ss.stdout).contains(&format!(":{port} ")) {
+                if port_bound(&self.ns_srv, "-ltnH", port) {
                     bound = true;
                     break;
                 }
@@ -507,17 +534,13 @@ impl TestEnv {
                 self.listeners.push(child);
                 return;
             }
-            let _ = child.kill();
-            let _ = child.wait();
+            reap(child);
         }
         panic!("nc listener never bound port {port}");
     }
 
     fn stop_listeners(&mut self) {
-        for mut l in self.listeners.drain(..) {
-            let _ = l.kill();
-            let _ = l.wait();
-        }
+        self.listeners.drain(..).for_each(reap);
     }
 
     /// Path to the DNS helper script, written on first use.
@@ -533,19 +556,15 @@ impl TestEnv {
     /// query with `SRV_IP`, and wait until it is listening on port 53.
     fn start_dns_server(&mut self) {
         let script = self.dns_helper();
-        let child = Command::new("ip")
-            .args(["netns", "exec", &self.ns_srv])
-            .args(["python3", &script.to_string_lossy(), "server", SRV_IP])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn dns server");
+        let child = ns_spawn(
+            &self.ns_srv,
+            &["python3", &script.to_string_lossy(), "server", SRV_IP],
+            "dns server",
+        );
         self.dns_server = Some(child);
         let deadline = Instant::now() + Duration::from_secs(3);
         while Instant::now() < deadline {
-            let ss = ns_run(&self.ns_srv, &["ss", "-lunH"]);
-            if String::from_utf8_lossy(&ss.stdout).contains(":53 ") {
+            if port_bound(&self.ns_srv, "-lunH", 53) {
                 return;
             }
             std::thread::sleep(Duration::from_millis(50));
@@ -692,29 +711,8 @@ impl TestEnv {
 
     /// Ask the daemon for its counters over IPC.
     fn stats(&self) -> hallpass_types::Stats {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-        rt.block_on(async {
-            let mut sock = tokio::net::UnixStream::connect(&self.socket_path)
-                .await
-                .expect("connect IPC socket");
-            wire::write_msg(
-                &mut sock,
-                &ClientMsg::Hello {
-                    version: PROTOCOL_VERSION,
-                },
-            )
-            .await
-            .expect("send hello");
-            let ack: DaemonMsg = wire::read_msg(&mut sock).await.expect("read ack");
-            assert_eq!(
-                ack,
-                DaemonMsg::HelloAck {
-                    version: PROTOCOL_VERSION
-                }
-            );
+        runtime().block_on(async {
+            let mut sock = ipc_connect(&self.socket_path).await;
             wire::write_msg(&mut sock, &ClientMsg::Stats)
                 .await
                 .expect("send stats request");
@@ -735,14 +733,7 @@ impl TestEnv {
     /// Start a helper process inside the cli namespace, tracked for
     /// teardown.
     fn start_helper(&mut self, args: &[&str]) {
-        let child = Command::new("ip")
-            .args(["netns", "exec", &self.ns_cli])
-            .args(args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn helper");
+        let child = ns_spawn(&self.ns_cli, args, "helper");
         self.helpers.push(child);
     }
 
@@ -759,8 +750,7 @@ impl TestEnv {
             &port.to_string(),
         ]);
         let bound = wait_until(Duration::from_secs(5), || {
-            let ss = ns_run(&self.ns_cli, &["ss", "-lunH"]);
-            String::from_utf8_lossy(&ss.stdout).contains(&format!(":{port} "))
+            port_bound(&self.ns_cli, "-lunH", port)
         });
         assert!(bound.is_some(), "syslog collector never bound port {port}");
         count_path
@@ -771,19 +761,51 @@ impl TestEnv {
     /// Nothing here needs it to be on PATH: the binary sits beside the
     /// daemon this test built. See [`cli_binary`] for why it can be absent.
     fn run_cli(&self, args: &[&str]) -> Output {
-        let cli = cli_binary().expect("caller checked the CLI exists");
-        let socket = self.socket_path.to_string_lossy().into_owned();
-        let mut full: Vec<String> = vec![
-            "netns".into(),
-            "exec".into(),
-            self.ns_cli.clone(),
-            cli.to_string_lossy().into_owned(),
-            "--socket".into(),
-            socket,
-        ];
-        full.extend(args.iter().map(|a| a.to_string()));
-        let refs: Vec<&str> = full.iter().map(String::as_str).collect();
-        run("ip", &refs)
+        run_cli_in(&self.ns_cli, &self.socket_path, args)
+    }
+
+    /// A Unix datagram socket for the daemon's `local` syslog target, and
+    /// the config lines that point JSON export at it. Bound before the
+    /// daemon starts so the export sink has somewhere to send.
+    fn local_syslog_collector(&self) -> (UnixDatagram, String) {
+        let path = self.tmp.join("syslog.sock");
+        let collector = UnixDatagram::bind(&path).expect("bind syslog collector");
+        collector
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("set read timeout");
+        let config = format!(
+            "[syslog]\n\
+             format = \"json\"\n\
+             [syslog.target]\n\
+             kind = \"local\"\n\
+             path = \"{}\"\n",
+            path.display()
+        );
+        (collector, config)
+    }
+
+    /// The first record on `collector` containing `dst`, a `"dst":"ip:port"`
+    /// fragment, within 10s; fails with every record seen instead.
+    fn record_for(&self, collector: &UnixDatagram, dst: &str) -> String {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut buf = [0u8; 4096];
+        let mut seen = Vec::new();
+        loop {
+            assert!(
+                Instant::now() < deadline,
+                "no syslog record for {dst} arrived; records seen:\n{}\ndaemon log:\n{}",
+                seen.join("\n"),
+                self.daemon_log()
+            );
+            let Ok(n) = collector.recv(&mut buf) else {
+                continue;
+            };
+            let record = String::from_utf8_lossy(&buf[..n]).to_string();
+            if record.contains(dst) {
+                return record;
+            }
+            seen.push(record);
+        }
     }
 
     /// Delete the root-only export exemption from the *live* output chain,
@@ -834,6 +856,74 @@ fn cli_binary() -> Option<PathBuf> {
     path.exists().then_some(path)
 }
 
+/// Run the CLI inside namespace `ns`, pointed at the daemon on `socket`.
+fn run_cli_in(ns: &str, socket: &Path, args: &[&str]) -> Output {
+    let cli = cli_binary().expect("caller checked the CLI exists");
+    let cli = cli.to_string_lossy();
+    let socket = socket.to_string_lossy();
+    let mut full = vec!["netns", "exec", ns, &cli, "--socket", &socket];
+    full.extend_from_slice(args);
+    run("ip", &full)
+}
+
+/// A current-thread runtime for the tests that talk to the daemon.
+fn runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime")
+}
+
+/// Connect to the daemon's control socket and complete the version
+/// handshake.
+async fn ipc_connect(socket: &Path) -> tokio::net::UnixStream {
+    let mut sock = tokio::net::UnixStream::connect(socket)
+        .await
+        .expect("connect IPC socket");
+    wire::write_msg(
+        &mut sock,
+        &ClientMsg::Hello {
+            version: PROTOCOL_VERSION,
+        },
+    )
+    .await
+    .expect("send hello");
+    let ack: DaemonMsg = wire::read_msg(&mut sock).await.expect("read ack");
+    assert_eq!(
+        ack,
+        DaemonMsg::HelloAck {
+            version: PROTOCOL_VERSION
+        }
+    );
+    sock
+}
+
+/// [`ipc_connect`], subscribed to the event stream.
+async fn subscribe_events(socket: &Path) -> tokio::net::UnixStream {
+    let mut sock = ipc_connect(socket).await;
+    wire::write_msg(
+        &mut sock,
+        &ClientMsg::Subscribe {
+            events: true,
+            prompts: false,
+        },
+    )
+    .await
+    .expect("send subscribe");
+    let ok: DaemonMsg = wire::read_msg(&mut sock).await.expect("read subscribe ack");
+    assert_eq!(ok, DaemonMsg::Ok);
+    sock
+}
+
+/// Connect to `port` on the server from the cli namespace with `nc`, on a
+/// blocking task so the caller can keep reading events meanwhile.
+fn probe_in_background(ns_cli: &str, port: u16) {
+    let ns = ns_cli.to_string();
+    tokio::task::spawn_blocking(move || {
+        let _ = ns_run(&ns, &["nc", "-z", "-w", "3", SRV_IP, &port.to_string()]);
+    });
+}
+
 /// Running total published by [`TestEnv::start_syslog_sink`]. Zero until
 /// the first datagram arrives.
 fn sink_count(path: &Path) -> u64 {
@@ -846,13 +936,9 @@ fn sink_count(path: &Path) -> u64 {
 impl Drop for TestEnv {
     fn drop(&mut self) {
         self.stop_listeners();
-        for mut h in self.helpers.drain(..) {
-            let _ = h.kill();
-            let _ = h.wait();
-        }
-        if let Some(mut d) = self.dns_server.take() {
-            let _ = d.kill();
-            let _ = d.wait();
+        self.helpers.drain(..).for_each(reap);
+        if let Some(d) = self.dns_server.take() {
+            reap(d);
         }
         self.kill_daemon_hard();
         // Deleting the namespaces removes the veth pair and any nft table
@@ -896,12 +982,17 @@ impl Drop for TestEnv {
 /// at parse time, which covers hand-written rule files on disk; keeping the
 /// tests typed keeps the failure at build time instead of run time.
 fn rule_with(name: &str, action: Action, port: u16, extra: impl FnOnce(&mut RuleMatch)) -> String {
+    rule_toml(&port_rule(name, action, port, extra))
+}
+
+/// The typed rule behind [`rule_with`]: priority 10, forever, untagged.
+fn port_rule(name: &str, action: Action, port: u16, extra: impl FnOnce(&mut RuleMatch)) -> Rule {
     let mut matcher = RuleMatch {
         port: Some(port),
         ..Default::default()
     };
     extra(&mut matcher);
-    rule_toml(&Rule {
+    Rule {
         name: name.to_string(),
         action,
         duration: RuleDuration::Forever,
@@ -909,7 +1000,7 @@ fn rule_with(name: &str, action: Action, port: u16, extra: impl FnOnce(&mut Rule
         enabled: true,
         tags: Vec::new(),
         matcher,
-    })
+    }
 }
 
 fn rule_toml(r: &Rule) -> String {
@@ -923,19 +1014,9 @@ fn rule(name: &str, action: Action, port: u16) -> String {
 
 /// A plain TCP rule on `port`, carrying `tags`.
 fn tagged_rule(name: &str, action: Action, port: u16, tags: &[&str]) -> String {
-    let mut matcher = RuleMatch {
-        port: Some(port),
-        ..Default::default()
-    };
-    matcher.proto = Some(Proto::Tcp);
     rule_toml(&Rule {
-        name: name.to_string(),
-        action,
-        duration: RuleDuration::Forever,
-        priority: 10,
-        enabled: true,
         tags: tags.iter().map(|t| (*t).to_string()).collect(),
-        matcher,
+        ..port_rule(name, action, port, |m| m.proto = Some(Proto::Tcp))
     })
 }
 
@@ -963,19 +1044,10 @@ fn tool_path(tool: &str) -> Option<PathBuf> {
 #[test]
 fn timed_rule_serializes_to_loadable_toml() {
     let text = rule_toml(&Rule {
-        name: "timed".to_string(),
-        action: Action::Deny,
         duration: RuleDuration::Until {
             deadline_ms: 1_720_000_000_123,
         },
-        priority: 10,
-        enabled: true,
-        tags: Vec::new(),
-        matcher: RuleMatch {
-            port: Some(19014),
-            proto: Some(Proto::Tcp),
-            ..Default::default()
-        },
+        ..port_rule("timed", Action::Deny, 19014, |m| m.proto = Some(Proto::Tcp))
     });
     let back: Rule = toml::from_str(&text).unwrap_or_else(|e| panic!("reparse {text:?}: {e}"));
     assert_eq!(
@@ -1099,11 +1171,11 @@ fn reject_rule_refuses_connection_promptly() {
 #[test]
 #[ignore = "requires root and network namespaces"]
 fn rules_apply_to_ipv6_connections() {
+    const OPEN: u16 = 19016;
+    const BLOCKED: u16 = 19017;
     let Some(mut env) = TestEnv::setup("ipv6") else {
         return;
     };
-    const OPEN: u16 = 19016;
-    const BLOCKED: u16 = 19017;
     env.start_listener6(OPEN);
     env.start_listener6(BLOCKED);
     env.start_daemon("allow", &[&rule("e2e-deny-v6", Action::Deny, BLOCKED)]);
@@ -1190,29 +1262,19 @@ fn a_flushed_ruleset_is_detected_and_reinstalled() {
     // What a firewalld restart does to every table on the host.
     ns_run(&env.ns_cli, &["nft", "flush", "ruleset"]);
     assert!(
-        !ns_run(&env.ns_cli, &["nft", "list", "table", "inet", "hallpass"])
-            .status
-            .success(),
+        !env.table_present(),
         "the flush should have removed the table"
     );
 
     // The watchdog polls on a ten-second cadence, so allow a couple of
     // rounds rather than racing it.
     let deadline = Instant::now() + Duration::from_secs(30);
-    while Instant::now() < deadline {
-        if ns_run(&env.ns_cli, &["nft", "list", "table", "inet", "hallpass"])
-            .status
-            .success()
-        {
-            break;
-        }
+    while Instant::now() < deadline && !env.table_present() {
         std::thread::sleep(Duration::from_millis(250));
     }
     env.assert_daemon_alive();
     assert!(
-        ns_run(&env.ns_cli, &["nft", "list", "table", "inet", "hallpass"])
-            .status
-            .success(),
+        env.table_present(),
         "the table should have been reinstalled; daemon log:\n{}",
         env.daemon_log()
     );
@@ -1277,62 +1339,11 @@ fn attribution_event_reports_exe_path() {
     env.start_listener(PORT);
     env.start_daemon("allow", &[]);
 
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("tokio runtime");
-    let event = rt.block_on(async {
-        let mut sock = tokio::net::UnixStream::connect(&env.socket_path)
-            .await
-            .expect("connect IPC socket");
-        wire::write_msg(
-            &mut sock,
-            &ClientMsg::Hello {
-                version: PROTOCOL_VERSION,
-            },
-        )
-        .await
-        .expect("send hello");
-        let ack: DaemonMsg = wire::read_msg(&mut sock).await.expect("read ack");
-        assert_eq!(
-            ack,
-            DaemonMsg::HelloAck {
-                version: PROTOCOL_VERSION
-            }
-        );
-        wire::write_msg(
-            &mut sock,
-            &ClientMsg::Subscribe {
-                events: true,
-                prompts: false,
-            },
-        )
-        .await
-        .expect("send subscribe");
-        let ok: DaemonMsg = wire::read_msg(&mut sock).await.expect("read subscribe ack");
-        assert_eq!(ok, DaemonMsg::Ok);
-
-        // Trigger a connection with a known binary (nc) without blocking
-        // this thread: fire it from a spawned task after subscription.
-        let ns = env.ns_cli.clone();
-        tokio::task::spawn_blocking(move || {
-            let _ = ns_run(&ns, &["nc", "-z", "-w", "3", SRV_IP, &PORT.to_string()]);
-        });
-
-        // Read events until the one for our connection shows up.
-        loop {
-            let msg = tokio::time::timeout(Duration::from_secs(10), async {
-                wire::read_msg::<DaemonMsg, _>(&mut sock).await
-            })
-            .await
-            .expect("timed out waiting for connection event")
-            .expect("read event");
-            if let DaemonMsg::Event(ev) = msg {
-                if ev.conn.tuple.dst.port() == PORT {
-                    return ev;
-                }
-            }
-        }
+    let event = runtime().block_on(async {
+        let mut sock = subscribe_events(&env.socket_path).await;
+        // Trigger a connection with a known binary (nc) after subscribing.
+        probe_in_background(&env.ns_cli, PORT);
+        next_event_on_port(&mut sock, PORT).await
     });
 
     let exe = event.conn.exe_path.unwrap_or_else(|| {
@@ -1397,51 +1408,12 @@ fn first_connection_is_flagged_new_on_the_event_stream() {
     env.start_listener(PORT_AGAIN);
     env.start_daemon("allow", &[]);
 
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("tokio runtime");
-    let (first, second) = rt.block_on(async {
-        let mut sock = tokio::net::UnixStream::connect(&env.socket_path)
-            .await
-            .expect("connect IPC socket");
-        wire::write_msg(
-            &mut sock,
-            &ClientMsg::Hello {
-                version: PROTOCOL_VERSION,
-            },
-        )
-        .await
-        .expect("send hello");
-        let ack: DaemonMsg = wire::read_msg(&mut sock).await.expect("read ack");
-        assert_eq!(
-            ack,
-            DaemonMsg::HelloAck {
-                version: PROTOCOL_VERSION
-            }
-        );
-        wire::write_msg(
-            &mut sock,
-            &ClientMsg::Subscribe {
-                events: true,
-                prompts: false,
-            },
-        )
-        .await
-        .expect("send subscribe");
-        let ok: DaemonMsg = wire::read_msg(&mut sock).await.expect("read subscribe ack");
-        assert_eq!(ok, DaemonMsg::Ok);
-
+    let (first, second) = runtime().block_on(async {
+        let mut sock = subscribe_events(&env.socket_path).await;
         // Two connections from the same binary to the same host.
-        let probe = |port: u16| {
-            let ns = env.ns_cli.clone();
-            tokio::task::spawn_blocking(move || {
-                let _ = ns_run(&ns, &["nc", "-z", "-w", "3", SRV_IP, &port.to_string()]);
-            });
-        };
-        probe(PORT);
+        probe_in_background(&env.ns_cli, PORT);
         let first = next_event_on_port(&mut sock, PORT).await;
-        probe(PORT_AGAIN);
+        probe_in_background(&env.ns_cli, PORT_AGAIN);
         let second = next_event_on_port(&mut sock, PORT_AGAIN).await;
         (first, second)
     });
@@ -1473,23 +1445,25 @@ fn domain_rule_blocks_after_dns_snoop() {
     let Some(mut env) = TestEnv::setup("dns") else {
         return;
     };
-    if !tool_available("python3", "--version") {
-        eprintln!("SKIP e2e dns: python3 not found");
+    if !require_tool("dns", "python3", "--version") {
         return;
     }
     env.start_listener(PORT);
     env.start_dns_server();
     // Deny by domain, any port. default_verdict = allow so the DNS query
     // itself (which has no cached domain yet) passes and gets snooped.
-    let deny_domain = format!(
-        "name = \"e2e-dns\"\n\
-         action = \"deny\"\n\
-         duration = \"forever\"\n\
-         priority = 10\n\
-         enabled = true\n\
-         [match]\n\
-         domain = \"{NAME}\"\n"
-    );
+    let deny_domain = rule_toml(&Rule {
+        name: "e2e-dns".to_string(),
+        action: Action::Deny,
+        duration: RuleDuration::Forever,
+        priority: 10,
+        enabled: true,
+        tags: Vec::new(),
+        matcher: RuleMatch {
+            domain: Some(NAME.to_string()),
+            ..Default::default()
+        },
+    });
     env.start_daemon("allow", &[&deny_domain]);
 
     // Control: with nothing in the IP-domain cache, the connection to
@@ -1647,8 +1621,7 @@ fn domains_file_rule_blocks_after_dns_snoop() {
     let Some(mut env) = TestEnv::setup("domlist") else {
         return;
     };
-    if !tool_available("python3", "--version") {
-        eprintln!("SKIP e2e domlist: python3 not found");
+    if !require_tool("domlist", "python3", "--version") {
         return;
     }
     env.start_listener(PORT);
@@ -1682,12 +1655,12 @@ fn domains_file_rule_blocks_after_dns_snoop() {
 #[ignore = "requires root and network namespaces"]
 fn timed_rule_stops_applying_after_its_deadline() {
     const PORT: u16 = 19014;
-    /// Lead time on the deadline. It has to outlast the whole
-    /// Lead time on the deadline, which has to outlast the reload wait
-    /// plus one blocked connect (nc's full 3s timeout). The watcher
-    /// debounces 200ms, so a reload anywhere near RELOAD_WAIT is an
-    /// anomaly worth failing on rather than racing against.
+    /// How long the watcher gets to load the rule. It debounces 200ms, so a
+    /// reload anywhere near this is an anomaly worth failing on rather than
+    /// racing against.
     const RELOAD_WAIT: Duration = Duration::from_secs(6);
+    /// Lead time on the deadline, which has to outlast the reload wait plus
+    /// one blocked connect (nc's full 3s timeout).
     const LEAD: Duration = Duration::from_secs(10);
     let Some(mut env) = TestEnv::setup("timed") else {
         return;
@@ -1704,19 +1677,12 @@ fn timed_rule_stops_applying_after_its_deadline() {
     std::fs::write(
         &rule_file,
         rule_toml(&Rule {
-            name: "e2e-timed".to_string(),
-            action: Action::Deny,
             duration: RuleDuration::Until {
                 deadline_ms: deadline,
             },
-            priority: 10,
-            enabled: true,
-            tags: Vec::new(),
-            matcher: RuleMatch {
-                port: Some(PORT),
-                proto: Some(Proto::Tcp),
-                ..Default::default()
-            },
+            ..port_rule("e2e-timed", Action::Deny, PORT, |m| {
+                m.proto = Some(Proto::Tcp);
+            })
         }),
     )
     .expect("write timed rule");
@@ -1818,8 +1784,7 @@ fn unhandled_proto_verdict_denies_icmp() {
     let Some(mut env) = TestEnv::setup("unhandled-deny") else {
         return;
     };
-    if !tool_available("ping", "-V") {
-        eprintln!("SKIP e2e unhandled-deny: ping not found");
+    if !require_tool("unhandled-deny", "ping", "-V") {
         return;
     }
     // ICMP is neither TCP nor UDP, so no rule can model it and the
@@ -1840,8 +1805,7 @@ fn unhandled_proto_verdict_allows_icmp_under_default_deny() {
     let Some(mut env) = TestEnv::setup("unhandled-allow") else {
         return;
     };
-    if !tool_available("ping", "-V") {
-        eprintln!("SKIP e2e unhandled-allow: ping not found");
+    if !require_tool("unhandled-allow", "ping", "-V") {
         return;
     }
     // The mirror of the deny case: default_verdict would block this, so
@@ -1866,26 +1830,11 @@ fn syslog_export_writes_a_record_per_decision() {
         return;
     };
     env.start_listener(PORT);
-
-    // Bind the collector before the daemon starts so the export sink has
-    // somewhere to send.
-    let sock_path = env.tmp.join("syslog.sock");
-    let collector = UnixDatagram::bind(&sock_path).expect("bind syslog collector");
-    collector
-        .set_read_timeout(Some(Duration::from_secs(1)))
-        .expect("set read timeout");
-
+    let (collector, syslog_config) = env.local_syslog_collector();
     env.start_daemon_with(
         "allow",
         &[&rule("e2e-syslog", Action::Deny, PORT)],
-        &format!(
-            "[syslog]\n\
-             format = \"json\"\n\
-             [syslog.target]\n\
-             kind = \"local\"\n\
-             path = \"{}\"\n",
-            sock_path.display()
-        ),
+        &syslog_config,
     );
 
     env.assert_daemon_alive();
@@ -1897,36 +1846,17 @@ fn syslog_export_writes_a_record_per_decision() {
     // attribution and the destination were missing entirely.
     let dst = format!("\"dst\":\"{SRV_IP}:{PORT}\"");
     let exe = format!("\"exe\":\"{}\"", nc.display());
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let mut buf = [0u8; 4096];
-    let mut seen = Vec::new();
-    loop {
-        assert!(
-            Instant::now() < deadline,
-            "no syslog record for {dst} arrived; records seen:\n{}\ndaemon log:\n{}",
-            seen.join("\n"),
-            env.daemon_log()
-        );
-        let Ok(n) = collector.recv(&mut buf) else {
-            continue;
-        };
-        let record = String::from_utf8_lossy(&buf[..n]).to_string();
-        if !record.contains(&dst) {
-            seen.push(record);
-            continue;
-        }
-        // A JSON record, not the RFC 5424 rendering the format key would
-        // otherwise select.
-        assert!(
-            record.contains("{\"") && record.contains("\"verdict\":\"deny\""),
-            "expected a JSON record carrying the deny verdict: {record}"
-        );
-        assert!(
-            record.contains(&exe),
-            "expected the attributed binary as an exe field: {record}"
-        );
-        return;
-    }
+    let record = env.record_for(&collector, &dst);
+    // A JSON record, not the RFC 5424 rendering the format key would
+    // otherwise select.
+    assert!(
+        record.contains("{\"") && record.contains("\"verdict\":\"deny\""),
+        "expected a JSON record carrying the deny verdict: {record}"
+    );
+    assert!(
+        record.contains(&exe),
+        "expected the attributed binary as an exe field: {record}"
+    );
 }
 
 #[test]
@@ -1941,11 +1871,10 @@ fn libc_resolver_uprobes_feed_the_domain_cache() {
     let Some(mut env) = TestEnv::setup("uprobe") else {
         return;
     };
-    for tool in [("python3", "--version"), ("getent", "--version")] {
-        if !tool_available(tool.0, tool.1) {
-            eprintln!("SKIP e2e uprobe: {} not found", tool.0);
-            return;
-        }
+    if !require_tool("uprobe", "python3", "--version")
+        || !require_tool("uprobe", "getent", "--version")
+    {
+        return;
     }
     env.start_listener(PORT);
     env.start_dns_server();
@@ -2107,8 +2036,7 @@ fn flow_accounting_reports_a_finished_flows_volume() {
         eprintln!("SKIP e2e flowacct: cannot resolve the nc binary");
         return;
     };
-    if !tool_available("sysctl", "--version") {
-        eprintln!("SKIP e2e flowacct: `sysctl` not found in PATH");
+    if !require_tool("flowacct", "sysctl", "--version") {
         return;
     }
     // Accounting is off by default on most kernels, and without it the
@@ -2211,8 +2139,7 @@ fn udp_syslog_export_is_exempt_from_its_own_verdict_queue() {
     let Some(mut env) = TestEnv::setup("syslogudp") else {
         return;
     };
-    if !tool_available("python3", "--version") {
-        eprintln!("SKIP e2e syslogudp: `python3` not found in PATH");
+    if !require_tool("syslogudp", "python3", "--version") {
         return;
     }
     env.start_listener(PORT);
@@ -2417,8 +2344,7 @@ fn a_reparented_descendant_stays_covered() {
         eprintln!("SKIP e2e runsessionorphan: hallpass-cli is not built");
         return;
     }
-    if !tool_available("setsid", "--version") {
-        eprintln!("SKIP e2e runsessionorphan: `setsid` not found in PATH");
+    if !require_tool("runsessionorphan", "setsid", "--version") {
         return;
     }
     // Not every setsid takes --fork (busybox's does not), and without it
@@ -2430,64 +2356,14 @@ fn a_reparented_descendant_stays_covered() {
     env.start_listener(PORT);
     env.start_daemon("allow", &[]);
 
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("tokio runtime");
-    let event = rt.block_on(async {
-        let mut sock = tokio::net::UnixStream::connect(&env.socket_path)
-            .await
-            .expect("connect IPC socket");
-        wire::write_msg(
-            &mut sock,
-            &ClientMsg::Hello {
-                version: PROTOCOL_VERSION,
-            },
-        )
-        .await
-        .expect("send hello");
-        let ack: DaemonMsg = wire::read_msg(&mut sock).await.expect("read ack");
-        assert_eq!(
-            ack,
-            DaemonMsg::HelloAck {
-                version: PROTOCOL_VERSION
-            }
-        );
-        wire::write_msg(
-            &mut sock,
-            &ClientMsg::Subscribe {
-                events: true,
-                prompts: false,
-            },
-        )
-        .await
-        .expect("send subscribe");
-        let ok: DaemonMsg = wire::read_msg(&mut sock).await.expect("read subscribe ack");
-        assert_eq!(ok, DaemonMsg::Ok);
-
+    let event = runtime().block_on(async {
+        let mut sock = subscribe_events(&env.socket_path).await;
         // The wrapper outlives the orphan's connection: `sleep` keeps the
         // session open while the detached `nc` runs.
         let script = format!("setsid --fork nc -z -w 3 {SRV_IP} {PORT}; sleep 3");
-        let socket = env.socket_path.to_string_lossy().into_owned();
-        let ns = env.ns_cli.clone();
-        let cli = cli_binary().expect("checked above");
+        let (ns, socket) = (env.ns_cli.clone(), env.socket_path.clone());
         tokio::task::spawn_blocking(move || {
-            run(
-                "ip",
-                &[
-                    "netns",
-                    "exec",
-                    &ns,
-                    &cli.to_string_lossy(),
-                    "--socket",
-                    &socket,
-                    "run",
-                    "--",
-                    "sh",
-                    "-c",
-                    &script,
-                ],
-            )
+            run_cli_in(&ns, &socket, &["run", "--", "sh", "-c", &script])
         });
 
         next_event_on_port(&mut sock, PORT).await
@@ -2590,7 +2466,7 @@ fn lockdown_suppresses_untagged_allows_against_a_real_queue() {
 /// A process that connects and then execs must not inherit the allow rule
 /// of the binary it became.
 ///
-/// This is the exec-after-connect race the README documents as a limit of
+/// This is the exec-after-connect race docs/security.md documents as a limit of
 /// `exe` matching. The eBPF path narrows it by stamping the process's exec
 /// generation into the flow record at connect and refusing to name the
 /// executable when it no longer matches; the procfs path cannot, is the
@@ -2632,8 +2508,7 @@ fn assert_exec_race_refused(tag: &str, racer_src: &str, port: u16) {
     let Some(mut env) = TestEnv::setup(tag) else {
         return;
     };
-    if !tool_available("python3", "--version") {
-        eprintln!("SKIP e2e {tag}: python3 not found");
+    if !require_tool(tag, "python3", "--version") {
         return;
     }
     let Some(sleep_bin) = tool_path("sleep") else {
@@ -2641,12 +2516,7 @@ fn assert_exec_race_refused(tag: &str, racer_src: &str, port: u16) {
         return;
     };
     env.start_listener(port);
-
-    let sock_path = env.tmp.join("syslog.sock");
-    let collector = UnixDatagram::bind(&sock_path).expect("bind syslog collector");
-    collector
-        .set_read_timeout(Some(Duration::from_secs(1)))
-        .expect("set read timeout");
+    let (collector, syslog_config) = env.local_syslog_collector();
 
     // The masquerade target: everything is denied except this one binary,
     // so inheriting its identity is worth something to an attacker and the
@@ -2657,14 +2527,7 @@ fn assert_exec_race_refused(tag: &str, racer_src: &str, port: u16) {
         &[&rule_with("e2e-execrace", Action::Allow, port, |m| {
             m.exe = Some(sleep_bin.clone())
         })],
-        &format!(
-            "[syslog]\n\
-             format = \"json\"\n\
-             [syslog.target]\n\
-             kind = \"local\"\n\
-             path = \"{}\"\n",
-            sock_path.display()
-        ),
+        &syslog_config,
     );
     env.assert_daemon_alive();
 
@@ -2692,37 +2555,18 @@ fn assert_exec_race_refused(tag: &str, racer_src: &str, port: u16) {
 
     let dst = format!("\"dst\":\"{SRV_IP}:{port}\"");
     let stolen = format!("\"exe\":\"{}\"", sleep_bin.display());
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let mut seen = Vec::new();
-    let mut buf = [0u8; 4096];
-    loop {
-        assert!(
-            Instant::now() < deadline,
-            "no syslog record for {dst} arrived; records seen:\n{}\ndaemon log:\n{}",
-            seen.join("\n"),
-            env.daemon_log()
-        );
-        let Ok(n) = collector.recv(&mut buf) else {
-            continue;
-        };
-        let record = String::from_utf8_lossy(&buf[..n]).to_string();
-        if !record.contains(&dst) {
-            seen.push(record);
-            continue;
-        }
-        assert!(
-            !record.contains(&stolen),
-            "the connection was attributed to the binary it exec'd into, which is the \
-             race this closes: {record}\ndaemon log:\n{}",
-            env.daemon_log()
-        );
-        assert!(
-            record.contains("\"verdict\":\"deny\""),
-            "only the exec'd-into binary has an allow rule, so an honest attribution \
-             must leave this denied: {record}"
-        );
-        return;
-    }
+    let record = env.record_for(&collector, &dst);
+    assert!(
+        !record.contains(&stolen),
+        "the connection was attributed to the binary it exec'd into, which is the \
+         race this closes: {record}\ndaemon log:\n{}",
+        env.daemon_log()
+    );
+    assert!(
+        record.contains("\"verdict\":\"deny\""),
+        "only the exec'd-into binary has an allow rule, so an honest attribution \
+         must leave this denied: {record}"
+    );
 }
 
 /// An `exe` rule names a file on this host, not a path in whatever mount
@@ -2748,8 +2592,7 @@ fn an_exe_rule_does_not_follow_its_path_into_another_mount_namespace() {
         eprintln!("SKIP e2e mntns: cannot resolve the nc binary");
         return;
     };
-    if !tool_available("unshare", "--version") {
-        eprintln!("SKIP e2e mntns: unshare not found");
+    if !require_tool("mntns", "unshare", "--version") {
         return;
     }
     let copy = env.tmp.join("nc-copy");

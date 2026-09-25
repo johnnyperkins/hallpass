@@ -22,6 +22,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+use hallpass_types::{
+    wire, Action, ClientMsg, DaemonMsg, Rule, RuleDuration, RuleMatch, Stats, PROTOCOL_VERSION,
+};
+
 /// Scratch directory removed on drop, unless the test failed.
 struct Scratch {
     dir: PathBuf,
@@ -30,9 +34,9 @@ struct Scratch {
 
 impl Drop for Scratch {
     fn drop(&mut self) {
-        if let Some(mut d) = self.daemon.take() {
-            let _ = d.kill();
-            let _ = d.wait();
+        if let Some(mut daemon) = self.daemon.take() {
+            let _ = daemon.kill();
+            let _ = daemon.wait();
         }
         if std::thread::panicking() {
             eprintln!("unprivileged test failed, keeping {}", self.dir.display());
@@ -43,12 +47,12 @@ impl Drop for Scratch {
 }
 
 impl Scratch {
-    fn new(tag: &str) -> Scratch {
+    fn new(tag: &str) -> Self {
         // Short path: the socket goes inside, and sun_path is 108 bytes.
         let dir = std::env::temp_dir().join(format!("hp-unpriv-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("rules.d")).expect("create scratch dir");
-        Scratch { dir, daemon: None }
+        Self { dir, daemon: None }
     }
 
     fn socket(&self) -> PathBuf {
@@ -122,24 +126,32 @@ fn set_mode_600(path: &Path) {
 /// Length-prefixed postcard round trip over the control socket, the same
 /// framing `hallpass_types::wire` does, done synchronously so the test needs
 /// no runtime.
-fn request(socket: &Path, msg: &hallpass_types::ClientMsg) -> hallpass_types::DaemonMsg {
+fn request(socket: &Path, msg: &ClientMsg) -> DaemonMsg {
     let mut stream = UnixStream::connect(socket).expect("connect to daemon socket");
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .expect("read timeout");
     for m in [
-        &hallpass_types::ClientMsg::Hello {
-            version: hallpass_types::PROTOCOL_VERSION,
+        &ClientMsg::Hello {
+            version: PROTOCOL_VERSION,
         },
         msg,
     ] {
-        let frame = hallpass_types::wire::encode(m).expect("encode");
+        let frame = wire::encode(m).expect("encode");
         stream.write_all(&frame).expect("write frame");
     }
     // First reply is the HelloAck, second answers `msg`.
     read_frame(&mut stream);
     let payload = read_frame(&mut stream);
-    hallpass_types::wire::decode(&payload).expect("decode reply")
+    wire::decode(&payload).expect("decode reply")
+}
+
+/// The daemon's counters, asked for over the control socket.
+fn stats(env: &Scratch) -> Stats {
+    match request(&env.socket(), &ClientMsg::Stats) {
+        DaemonMsg::Stats(stats) => stats,
+        other => panic!("expected Stats, got {other:?}; log:\n{}", env.log()),
+    }
 }
 
 fn read_frame(stream: &mut UnixStream) -> Vec<u8> {
@@ -181,18 +193,14 @@ fn stays_up_without_privileges_and_serves_the_control_socket() {
 
     // And the control channel actually answers, which is the whole point of
     // staying up: rule management and monitoring work without privileges.
-    match request(&env.socket(), &hallpass_types::ClientMsg::Stats) {
-        hallpass_types::DaemonMsg::Stats(stats) => {
-            assert_eq!(stats.rules_loaded, 0);
-            assert!(stats.enforcing, "default mode is enforce");
-            // No queue was bound, so there is no kernel counter to report:
-            // None, not zero, and never another process's /proc row.
-            assert_eq!(stats.verdict_queue_dropped, None);
-            assert_eq!(stats.snoop_queue_depth, None);
-            assert_eq!(stats.verdict_queue_fail_open, None);
-        }
-        other => panic!("expected Stats, got {other:?}; log:\n{}", env.log()),
-    }
+    let stats = stats(&env);
+    assert_eq!(stats.rules_loaded, 0);
+    assert!(stats.enforcing, "default mode is enforce");
+    // No queue was bound, so there is no kernel counter to report: None, not
+    // zero, and never another process's /proc row.
+    assert_eq!(stats.verdict_queue_dropped, None);
+    assert_eq!(stats.snoop_queue_depth, None);
+    assert_eq!(stats.verdict_queue_fail_open, None);
 }
 
 /// Observe mode is reported over the wire, not only in the log. A client
@@ -202,12 +210,10 @@ fn observe_mode_is_visible_over_the_control_socket() {
     let mut env = Scratch::new("observe");
     env.start("mode = \"observe\"\n");
 
-    match request(&env.socket(), &hallpass_types::ClientMsg::Stats) {
-        hallpass_types::DaemonMsg::Stats(stats) => {
-            assert!(!stats.enforcing, "observe mode must report enforcing=false");
-        }
-        other => panic!("expected Stats, got {other:?}; log:\n{}", env.log()),
-    }
+    assert!(
+        !stats(&env).enforcing,
+        "observe mode must report enforcing=false"
+    );
     let log = env.log();
     assert!(
         log.contains("NOT enforced"),
@@ -222,29 +228,26 @@ fn rules_can_be_managed_without_privileges() {
     let mut env = Scratch::new("rules");
     env.start("");
 
-    let rule = hallpass_types::Rule {
+    let rule = Rule {
         name: "unpriv-test".to_string(),
-        action: hallpass_types::Action::Deny,
-        duration: hallpass_types::RuleDuration::Session,
+        action: Action::Deny,
+        duration: RuleDuration::Session,
         priority: 7,
         enabled: true,
         tags: Vec::new(),
-        matcher: hallpass_types::RuleMatch {
+        matcher: RuleMatch {
             port: Some(25),
             ..Default::default()
         },
     };
     assert_eq!(
-        request(
-            &env.socket(),
-            &hallpass_types::ClientMsg::RuleAdd(rule.clone())
-        ),
-        hallpass_types::DaemonMsg::Ok,
+        request(&env.socket(), &ClientMsg::RuleAdd(rule)),
+        DaemonMsg::Ok,
         "log:\n{}",
         env.log()
     );
-    match request(&env.socket(), &hallpass_types::ClientMsg::RuleStats) {
-        hallpass_types::DaemonMsg::RuleHits(hits) => {
+    match request(&env.socket(), &ClientMsg::RuleStats) {
+        DaemonMsg::RuleHits(hits) => {
             assert_eq!(hits.len(), 1);
             assert_eq!(hits[0].name, "unpriv-test");
             // Never fired, and reported as zero rather than omitted: "this
