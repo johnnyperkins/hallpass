@@ -74,7 +74,7 @@ pub const OBSERVE_SOCKET_NAME: &str = "observe.sock";
 /// set up, or land somewhere `install.sh`, the unit's `RuntimeDirectory` and
 /// `doctor` know nothing about. Deriving keeps one deployment contract instead
 /// of two that can disagree.
-pub fn observe_socket_path(control: &std::path::Path) -> std::path::PathBuf {
+pub fn observe_socket_path(control: &Path) -> PathBuf {
     control.with_file_name(OBSERVE_SOCKET_NAME)
 }
 
@@ -104,7 +104,7 @@ pub enum Mode {
 impl Mode {
     /// True when verdicts are applied to packets.
     pub fn enforcing(self) -> bool {
-        matches!(self, Mode::Enforce)
+        matches!(self, Self::Enforce)
     }
 }
 
@@ -189,7 +189,7 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Self {
-        Config {
+        Self {
             default_verdict: Verdict::Deny,
             prompt_timeout_secs: 30,
             queue_num: 0,
@@ -276,8 +276,8 @@ fn verdict_from_u8(v: u8) -> Verdict {
 }
 
 impl RuntimeSettings {
-    pub fn new(initial: RuntimeConfig) -> RuntimeSettings {
-        RuntimeSettings {
+    pub fn new(initial: RuntimeConfig) -> Self {
+        Self {
             prompt_timeout_secs: AtomicU64::new(initial.prompt_timeout_secs),
             default_verdict: AtomicU8::new(verdict_to_u8(initial.default_verdict)),
             enforcing: AtomicBool::new(initial.enforce),
@@ -323,13 +323,12 @@ impl RuntimeSettings {
 
     /// Whether a lockdown posture is in force. Set only by
     /// [`crate::lockdown::apply`].
+    ///
     /// Deliberately does not wake the flow-kill sweeper, unlike an
     /// observe-to-enforce flip. That sweeper kills flows an explicit *deny
     /// rule* matches, and a posture denies by suppressing allows rather than
-    /// by adding a deny, so waking it would find nothing to kill and the
-    /// wake would read as a promise the code does not keep. Flows already
-    /// established when a posture engages keep running; the README says so,
-    /// and integrating the two is a recorded follow-up.
+    /// by adding one, so a wake would find nothing to kill. Flows already
+    /// established when a posture engages keep running; docs/rules.md says so.
     pub fn set_locked_down(&self, on: bool) {
         self.locked_down.store(on, Ordering::Relaxed);
     }
@@ -443,13 +442,13 @@ impl Config {
     /// bypass, so a hardened deployment silently loses the one guarantee it
     /// asked for while the unit starts, the socket answers and prompts
     /// appear.
-    pub fn load(arg: &ConfigArg) -> Result<Config, String> {
+    pub fn load(arg: &ConfigArg) -> Result<Self, String> {
         let path = arg.path.as_path();
-        let cfg: Config = match read_trusted(path) {
+        let cfg: Self = match read_trusted(path) {
             Ok(text) => toml::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound && !arg.explicit => {
                 tracing::warn!(path = %path.display(), "config file not found, using defaults");
-                Config::default()
+                Self::default()
             }
             Err(e) => return Err(format!("{}: {e}", path.display())),
         };
@@ -477,10 +476,8 @@ impl Config {
             // queue_num + 1 is the DNS snoop queue.
             return Err(format!("queue_num must be below {}", u16::MAX));
         }
-        // A too-long socket path only fails when the IPC server binds,
-        // which is after the nftables table is installed - the daemon
-        // would then filter traffic with no way to answer prompts. Catch
-        // it here instead. sun_path is 108 bytes including the NUL.
+        // Caught here rather than at bind, so a path that can never work
+        // fails before anything is installed.
         let socket_len = self.socket_path.as_os_str().len();
         if socket_len > MAX_SOCKET_PATH {
             return Err(format!(
@@ -490,11 +487,8 @@ impl Config {
         // And the read-only socket derived from it, which is longer whenever
         // the control socket's own basename is shorter than `observe.sock`.
         // Failing to bind that one is survivable by design, so without this
-        // the tier would simply not exist on such a host, reported by one
-        // journal line and by `doctor` saying the daemon may use another path.
-        // A config that cannot ever produce it is an operator error, catchable
-        // here, before anything is installed - the same argument the check
-        // above makes.
+        // the tier would silently not exist on such a host, reported only by
+        // one journal line.
         let observe = observe_socket_path(&self.socket_path);
         let observe_len = observe.as_os_str().len();
         if observe_len > MAX_SOCKET_PATH {
@@ -508,8 +502,8 @@ impl Config {
     }
 }
 
-/// Parse command line arguments. Only `--config <path>` / `--config=<path>`
-/// are recognized. Returns the config file path to use.
+/// Parse command line arguments: `--config <path>` or `--config=<path>`,
+/// plus `--synthetic-events` in a `dev-fixtures` build.
 pub fn parse_args<I: Iterator<Item = String>>(mut args: I) -> Result<ConfigArg, String> {
     let mut arg_out = ConfigArg {
         path: PathBuf::from(DEFAULT_CONFIG_PATH),
@@ -669,7 +663,6 @@ mod tests {
     /// deployment path drift, so both are asserted against the same shapes.
     #[test]
     fn the_observe_socket_is_a_sibling_of_the_control_socket() {
-        use std::path::{Path, PathBuf};
         for (control, want) in [
             ("/run/hallpass/hallpass.sock", "/run/hallpass/observe.sock"),
             // A test daemon in its own directory, the shape the syslog
@@ -704,12 +697,7 @@ mod tests {
             control.len() <= MAX_SOCKET_PATH,
             "the control path itself must fit, or this tests the wrong thing"
         );
-        assert!(
-            observe_socket_path(std::path::Path::new(&control))
-                .as_os_str()
-                .len()
-                > MAX_SOCKET_PATH
-        );
+        assert!(observe_socket_path(Path::new(&control)).as_os_str().len() > MAX_SOCKET_PATH);
 
         let err = parse(&format!("socket_path = \"{control}\""))
             .validate()
@@ -722,7 +710,7 @@ mod tests {
 
     #[test]
     fn args_default_and_override() {
-        let a = |v: &[&str]| parse_args(v.iter().map(|s| s.to_string()));
+        let a = |v: &[&str]| parse_args(v.iter().map(ToString::to_string));
         let d = a(&[]).unwrap();
         assert_eq!(d.path, PathBuf::from(DEFAULT_CONFIG_PATH));
         assert!(!d.explicit, "the default path is not operator-specified");

@@ -29,13 +29,14 @@
 
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 
 use arc_swap::ArcSwap;
 use hallpass_types::RunSessionInfo;
 
 use crate::attribution::procfs::{covering_root, starttime_of};
+use crate::rules::store::MAX_RULE_NAME_BYTES;
 
 /// Live sessions allowed at once, host-wide.
 ///
@@ -117,7 +118,7 @@ pub struct SessionRegistry {
 
 impl Default for SessionRegistry {
     fn default() -> Self {
-        SessionRegistry {
+        Self {
             active: ArcSwap::from_pointee(Vec::new()),
             writers: Mutex::new(()),
             next_id: AtomicU64::new(1),
@@ -136,7 +137,7 @@ impl SessionRegistry {
         let Some(pid) = peer.pid.filter(|p| *p != 0) else {
             return Err(
                 "the daemon cannot see this client's process id, so it cannot \
-                        tell which processes the session would cover"
+                 tell which processes the session would cover"
                     .into(),
             );
         };
@@ -164,15 +165,14 @@ impl SessionRegistry {
                 "process {pid} is not the process that opened this connection"
             ));
         }
-        if label.len() > crate::rules::store::MAX_RULE_NAME_BYTES {
+        if label.len() > MAX_RULE_NAME_BYTES {
             return Err(format!(
-                "session label is {} bytes, must be at most {}",
+                "session label is {} bytes, must be at most {MAX_RULE_NAME_BYTES}",
                 label.len(),
-                crate::rules::store::MAX_RULE_NAME_BYTES
             ));
         }
 
-        let _writing = self.writers.lock().unwrap_or_else(|e| e.into_inner());
+        let _writing = self.writers.lock().unwrap_or_else(PoisonError::into_inner);
         let current = self.active.load();
         if current.len() >= MAX_RUN_SESSIONS {
             return Err(format!(
@@ -194,9 +194,7 @@ impl SessionRegistry {
             allowed: AtomicU64::new(0),
             started: Instant::now(),
         });
-        let mut next = Vec::with_capacity(current.len() + 1);
-        next.extend(current.iter().cloned());
-        next.push(session.clone());
+        let next = current.iter().chain([&session]).cloned().collect();
         self.active.store(Arc::new(next));
         tracing::info!(
             id,
@@ -210,7 +208,7 @@ impl SessionRegistry {
 
     /// Close a session. Silent when it is already gone.
     pub fn unregister(&self, id: u64) {
-        let _writing = self.writers.lock().unwrap_or_else(|e| e.into_inner());
+        let _writing = self.writers.lock().unwrap_or_else(PoisonError::into_inner);
         let current = self.active.load();
         let Some(gone) = current.iter().find(|s| s.id == id).cloned() else {
             return;
@@ -258,8 +256,8 @@ pub struct PeerProcess {
 impl PeerProcess {
     /// Read the peer's start time now, pinning the identity of the process
     /// on the other end of a freshly accepted connection.
-    pub fn resolve(pid: Option<u32>) -> PeerProcess {
-        PeerProcess {
+    pub fn resolve(pid: Option<u32>) -> Self {
+        Self {
             pid,
             started: pid
                 .filter(|p| *p != 0)
@@ -298,20 +296,21 @@ pub fn covering(
     // Only sessions this connection's user opened are worth walking for, so
     // a mismatched uid is a walk that never happens rather than one thrown
     // away afterwards.
-    let mut roots = Vec::with_capacity(sessions.len());
-    for s in sessions.iter().filter(|s| s.uid == uid) {
-        roots.push(s.root);
-    }
-    if roots.is_empty() {
+    let mine: Vec<&RunSession> = sessions
+        .iter()
+        .filter(|s| s.uid == uid)
+        .map(|s| &**s)
+        .collect();
+    if mine.is_empty() {
         return None;
     }
-    let root = roots.get(covering_root(
+    let roots: Vec<(u32, u64)> = mine.iter().map(|s| s.root).collect();
+    let session = mine.get(covering_root(
         proc_root,
         pid,
         &roots,
         MAX_SESSION_WALK_DEPTH,
     )?)?;
-    let session = sessions.iter().find(|s| s.uid == uid && s.root == *root)?;
     session.allowed.fetch_add(1, Ordering::Relaxed);
     Some(session.id)
 }
@@ -369,7 +368,7 @@ mod tests {
     #[test]
     fn an_oversized_label_is_refused() {
         let reg = registry();
-        let label = "x".repeat(crate::rules::store::MAX_RULE_NAME_BYTES + 1);
+        let label = "x".repeat(MAX_RULE_NAME_BYTES + 1);
         assert!(reg.register(peer(), 1000, label).is_err());
         assert!(reg.snapshot().is_empty());
     }

@@ -12,9 +12,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use hallpass_types::ConnEvent;
+use hallpass_types::{ConnEvent, FirstSeen, Verdict};
 use serde::Deserialize;
 use tokio::net::{UdpSocket, UnixDatagram};
+use tokio::sync::broadcast::error::RecvError;
 
 use crate::events::EventBus;
 
@@ -108,18 +109,18 @@ struct FieldWriter<'a> {
 }
 
 impl<'a> FieldWriter<'a> {
-    fn new(out: &'a mut String, escape: Escape) -> FieldWriter<'a> {
-        FieldWriter {
+    /// Write `value` into `out` under `escape`, capped at
+    /// [`MAX_FIELD_BYTES`] and marked with an ellipsis when cut.
+    fn write_value(out: &'a mut String, escape: Escape, value: &dyn std::fmt::Display) {
+        let mut w = FieldWriter {
             out,
             escape,
             remaining: MAX_FIELD_BYTES,
             truncated: false,
-        }
-    }
-
-    fn finish(self) {
-        if self.truncated {
-            self.out.push_str("...");
+        };
+        let _ = write!(w, "{value}");
+        if w.truncated {
+            w.out.push_str("...");
         }
     }
 }
@@ -131,7 +132,7 @@ impl std::fmt::Write for FieldWriter<'_> {
             piece.clear();
             // Control characters (and DEL) are never emitted literally in
             // either format: in structured data they would break framing.
-            if (c as u32) < 0x20 || c as u32 == 0x7f {
+            if c.is_ascii_control() {
                 match self.escape {
                     Escape::Sd => {
                         // rsyslog's own convention for an escaped byte.
@@ -219,7 +220,7 @@ fn for_each_field(ev: &ConnEvent, mut visit: impl FnMut(&'static str, &dyn std::
     // collector or a send timeout drops that event like any other, and
     // nothing re-sends it, because by then the pair is no longer new. What
     // is lost is the annotation, never the event's verdict.
-    if let Some(tag) = c.first_seen.and_then(|f| f.tag()) {
+    if let Some(tag) = c.first_seen.and_then(FirstSeen::tag) {
         visit("first_seen", &tag);
     }
     if let Some(pid) = c.pid {
@@ -233,8 +234,8 @@ fn for_each_field(ev: &ConnEvent, mut visit: impl FnMut(&'static str, &dyn std::
 /// Render one event as a syslog line (no trailing newline).
 pub fn format_event(ev: &ConnEvent, format: SyslogFormat, hostname: &str, pid: u32) -> String {
     let severity = match ev.verdict {
-        hallpass_types::Verdict::Allow => SEVERITY_INFO,
-        hallpass_types::Verdict::Deny | hallpass_types::Verdict::Reject => SEVERITY_WARNING,
+        Verdict::Allow => SEVERITY_INFO,
+        Verdict::Deny | Verdict::Reject => SEVERITY_WARNING,
     };
     let prival = FACILITY * 8 + severity;
     // RFC 5424: <PRI>VERSION TIMESTAMP HOSTNAME APP-NAME PROCID MSGID ...
@@ -246,9 +247,7 @@ pub fn format_event(ev: &ConnEvent, format: SyslogFormat, hostname: &str, pid: u
             out.push_str(SD_ID);
             for_each_field(ev, |k, v| {
                 let _ = write!(out, " {k}=\"");
-                let mut w = FieldWriter::new(&mut out, Escape::Sd);
-                let _ = write!(w, "{v}");
-                w.finish();
+                FieldWriter::write_value(&mut out, Escape::Sd, v);
                 out.push('"');
             });
             out.push(']');
@@ -263,9 +262,7 @@ pub fn format_event(ev: &ConnEvent, format: SyslogFormat, hostname: &str, pid: u
                 }
                 first = false;
                 let _ = write!(out, "\"{k}\":\"");
-                let mut w = FieldWriter::new(&mut out, Escape::Json);
-                let _ = write!(w, "{v}");
-                w.finish();
+                FieldWriter::write_value(&mut out, Escape::Json, v);
                 out.push('"');
             });
             let _ = write!(out, ",\"unix_ms\":{}", ev.unix_ms);
@@ -312,13 +309,13 @@ fn mark_exempt(sock: &UdpSocket) {
 }
 
 impl Sink {
-    async fn open(target: &SyslogTarget) -> Result<Sink, String> {
+    async fn open(target: &SyslogTarget) -> Result<Self, String> {
         match target {
             SyslogTarget::Local { path } => {
                 let sock = UnixDatagram::unbound().map_err(|e| format!("unix socket: {e}"))?;
                 // Connect is deferred to send time: /dev/log may not exist
                 // yet at startup, and syslogd restarts recreate it.
-                Ok(Sink::Unix {
+                Ok(Self::Unix {
                     sock,
                     path: path.clone(),
                 })
@@ -336,15 +333,23 @@ impl Sink {
                     .await
                     .map_err(|e| format!("udp socket: {e}"))?;
                 mark_exempt(&sock);
-                Ok(Sink::Udp { sock, addr })
+                Ok(Self::Udp { sock, addr })
             }
         }
     }
 
     async fn send(&self, line: &str) -> std::io::Result<()> {
         match self {
-            Sink::Unix { sock, path } => sock.send_to(line.as_bytes(), path).await.map(|_| ()),
-            Sink::Udp { sock, addr } => sock.send_to(line.as_bytes(), addr).await.map(|_| ()),
+            Self::Unix { sock, path } => sock.send_to(line.as_bytes(), path).await.map(|_| ()),
+            Self::Udp { sock, addr } => sock.send_to(line.as_bytes(), addr).await.map(|_| ()),
+        }
+    }
+
+    /// [`Sink::send`], bounded by [`SEND_TIMEOUT`].
+    async fn send_timed(&self, line: &str) -> Result<(), String> {
+        match tokio::time::timeout(SEND_TIMEOUT, self.send(line)).await {
+            Ok(sent) => sent.map_err(|e| e.to_string()),
+            Err(_) => Err("send timed out".to_string()),
         }
     }
 }
@@ -376,37 +381,29 @@ pub fn spawn(events: Arc<EventBus>, cfg: SyslogConfig) {
         let mut last_report: Option<Instant> = None;
         tracing::info!(?cfg.target, ?cfg.format, "syslog export active");
         loop {
-            match rx.recv().await {
-                Ok(ev) => {
-                    let line = format_event(&ev, cfg.format, &hostname, pid);
-                    let sent = match tokio::time::timeout(SEND_TIMEOUT, sink.send(&line)).await {
-                        Ok(Ok(())) => Ok(()),
-                        Ok(Err(e)) => Err(e.to_string()),
-                        Err(_) => Err("send timed out".to_string()),
-                    };
-                    match sent {
-                        Ok(()) => {
-                            if dropped > 0 {
-                                tracing::info!(dropped, "syslog export recovered");
-                                dropped = 0;
-                                last_report = None;
-                            }
-                        }
-                        Err(e) => {
-                            dropped += 1;
-                            let due =
-                                last_report.is_none_or(|t| t.elapsed() >= FAILURE_REPORT_INTERVAL);
-                            if due {
-                                last_report = Some(Instant::now());
-                                tracing::warn!(dropped, "syslog send failing: {e}");
-                            }
-                        }
+            let ev = match rx.recv().await {
+                Ok(ev) => ev,
+                Err(RecvError::Lagged(n)) => {
+                    tracing::warn!(dropped = n, "syslog export lagged");
+                    continue;
+                }
+                Err(RecvError::Closed) => return,
+            };
+            let line = format_event(&ev, cfg.format, &hostname, pid);
+            match sink.send_timed(&line).await {
+                Ok(()) if dropped > 0 => {
+                    tracing::info!(dropped, "syslog export recovered");
+                    dropped = 0;
+                    last_report = None;
+                }
+                Ok(()) => {}
+                Err(e) => {
+                    dropped += 1;
+                    if last_report.is_none_or(|t| t.elapsed() >= FAILURE_REPORT_INTERVAL) {
+                        last_report = Some(Instant::now());
+                        tracing::warn!(dropped, "syslog send failing: {e}");
                     }
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                    tracing::warn!(dropped = n, "syslog export lagged");
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
             }
         }
     });
@@ -424,7 +421,7 @@ fn hostname() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hallpass_types::{Connection, FlowTuple, Proto, Verdict};
+    use hallpass_types::{Connection, FlowTuple, Proto};
     use std::path::PathBuf;
 
     fn event() -> ConnEvent {

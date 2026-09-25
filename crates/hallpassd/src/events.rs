@@ -3,7 +3,7 @@
 
 use std::collections::VecDeque;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use hallpass_types::{unix_ms_now, ConnEvent, Connection, FlowTuple, Verdict};
 use tokio::sync::broadcast;
@@ -50,7 +50,7 @@ pub struct EventBus {
 
 impl Default for EventBus {
     fn default() -> Self {
-        EventBus {
+        Self {
             tx: broadcast::channel(CHANNEL_CAPACITY).0,
             history: Mutex::new(VecDeque::with_capacity(HISTORY_CAPACITY)),
         }
@@ -97,14 +97,10 @@ impl EventBus {
     ///
     /// For flow accounting, which learns a flow's volume only at teardown
     /// and joins it back to the connection the daemon decided at the start.
-    /// Best-effort by the ring's bound. Returns the whole event by shared
-    /// pointer - the primitive the deferred teardown-enrichment and
-    /// resurrection-redelete follow-ups both need - so the only work under
-    /// the lock is a scan and one `Arc` clone; the caller reads fields
-    /// after the guard drops.
+    /// Best-effort by the ring's bound. Returned by shared pointer, so the
+    /// only work under the lock is a scan and one `Arc` clone.
     pub fn latest_for_tuple(&self, tuple: &FlowTuple) -> Option<Arc<ConnEvent>> {
-        let guard = self.lock_history();
-        guard
+        self.lock_history()
             .iter()
             .rev()
             .find(|ev| ev.conn.tuple == *tuple)
@@ -132,8 +128,7 @@ impl EventBus {
         if exe_path.is_none() && app_id.is_none() {
             return 0;
         }
-        let guard = self.lock_history();
-        guard
+        self.lock_history()
             .iter()
             .filter(|ev| {
                 ev.verdict != Verdict::Allow
@@ -150,11 +145,15 @@ impl EventBus {
     pub fn history(&self, limit: usize) -> Vec<ConnEvent> {
         let limit = limit.min(HISTORY_CAPACITY);
         // Under the lock: pointer copies only, newest first.
-        let guard = self.lock_history();
-        let newest: Vec<Arc<ConnEvent>> = guard.iter().rev().take(limit).cloned().collect();
-        drop(guard);
+        let newest: Vec<Arc<ConnEvent>> = self
+            .lock_history()
+            .iter()
+            .rev()
+            .take(limit)
+            .cloned()
+            .collect();
 
-        let mut out: Vec<ConnEvent> = Vec::new();
+        let mut out = Vec::new();
         let mut bytes = 0usize;
         for ev in &newest {
             let cost = event_cost(ev);
@@ -191,28 +190,30 @@ impl EventBus {
     /// control channel. (The flow-kill sweeper does read history, so losing
     /// it now also costs best-effort kill coverage - but a kill only ever
     /// re-routes a flow into the normal verdict path, never decides one.)
-    fn lock_history(&self) -> std::sync::MutexGuard<'_, VecDeque<Arc<ConnEvent>>> {
-        self.history.lock().unwrap_or_else(|e| e.into_inner())
+    fn lock_history(&self) -> MutexGuard<'_, VecDeque<Arc<ConnEvent>>> {
+        self.history.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
 /// Estimated encoded size of one event, for the history reply budget.
 fn event_cost(ev: &ConnEvent) -> usize {
+    let path = |p: Option<&Path>| p.map_or(0, |p| p.as_os_str().len());
+    let text = |s: Option<&str>| s.map_or(0, str::len);
     let c = &ev.conn;
     HISTORY_FIXED_COST
-        + c.exe_path.as_ref().map_or(0, |p| p.as_os_str().len())
-        + c.parent_exe.as_ref().map_or(0, |p| p.as_os_str().len())
-        + c.cmdline.as_ref().map_or(0, |s| s.len())
-        + c.domain.as_ref().map_or(0, |s| s.len())
-        + c.iface.as_ref().map_or(0, |s| s.len())
-        + c.app_id.as_ref().map_or(0, |s| s.len())
-        + ev.rule_name.as_ref().map_or(0, |s| s.len())
+        + path(c.exe_path.as_deref())
+        + path(c.parent_exe.as_deref())
+        + text(c.cmdline.as_deref())
+        + text(c.domain.as_deref())
+        + text(c.iface.as_deref())
+        + text(c.app_id.as_deref())
+        + text(ev.rule_name.as_deref())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hallpass_types::{FlowTuple, Proto};
+    use hallpass_types::Proto;
 
     fn conn() -> Connection {
         Connection {

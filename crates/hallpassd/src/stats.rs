@@ -48,10 +48,9 @@ pub struct QueueStats {
 /// path: one small /proc read per status request. Any failure (file absent,
 /// row absent, column unparsable) degrades to `None` rather than zero.
 pub fn read_queue_stats(verdict_queue: u16) -> QueueStats {
-    match std::fs::read_to_string("/proc/net/netfilter/nfnetlink_queue") {
-        Ok(text) => parse_queue_stats(&text, verdict_queue),
-        Err(_) => QueueStats::default(),
-    }
+    std::fs::read_to_string("/proc/net/netfilter/nfnetlink_queue")
+        .map(|text| parse_queue_stats(&text, verdict_queue))
+        .unwrap_or_default()
 }
 
 /// Parse the seq_file: one row per bound queue, no header. The column order
@@ -125,14 +124,14 @@ pub struct Counters {
 
 impl Default for Counters {
     fn default() -> Self {
-        Counters::new()
+        Self::new()
     }
 }
 
 impl Counters {
     /// Fresh counters.
     pub fn new() -> Self {
-        Counters {
+        Self {
             start: Instant::now(),
             connections_total: AtomicU64::new(0),
             allowed: AtomicU64::new(0),
@@ -207,9 +206,9 @@ impl Counters {
     /// Count a DNS snoop packet dropped because the queue was full.
     ///
     /// Costs a domain annotation, never a verdict: snoop packets are accepted
-    /// immediately and no rule decision waits on this queue. Logged on the
-    /// first drop and then at each power of ten, so a flood is visible without
-    /// the log itself becoming the flood.
+    /// immediately and no rule decision waits on this queue. Logged at each
+    /// power of two and every ten thousandth drop, so a flood is visible
+    /// without the log itself becoming the flood.
     pub fn record_dns_snoop_dropped(&self) {
         let n = self.dns_snoop_dropped.fetch_add(1, Ordering::Relaxed) + 1;
         if n.is_power_of_two() || n.is_multiple_of(10_000) {
@@ -304,16 +303,12 @@ impl Counters {
             snoop_queue_fail_open: queues.snoop_fail_open,
             verdict_queue_max_len: queues.verdict_max_len,
             nft_flushes,
-            // Gated on the count so the pair can never contradict itself
-            // in either direction: a timestamp is reported exactly when at
-            // least one flush is. (record_nft_flush stores a nonzero
-            // timestamp before publishing the count, so the 0 arm is
-            // belt-and-braces.)
-            nft_last_flush_ms: match self.nft_last_flush_ms.load(Ordering::Relaxed) {
-                _ if nft_flushes == 0 => None,
-                0 => None,
-                ms => Some(ms),
-            },
+            // Gated on the count so the pair can never contradict itself:
+            // a timestamp is reported exactly when at least one flush is.
+            // (record_nft_flush stores a nonzero timestamp before publishing
+            // the count, so the zero check is belt-and-braces.)
+            nft_last_flush_ms: Some(self.nft_last_flush_ms.load(Ordering::Relaxed))
+                .filter(|&ms| nft_flushes > 0 && ms != 0),
             flows_accounted: self.flows_accounted.load(Ordering::Relaxed),
             flow_bytes: self.flow_bytes.load(Ordering::Relaxed),
             flow_packets: self.flow_packets.load(Ordering::Relaxed),
