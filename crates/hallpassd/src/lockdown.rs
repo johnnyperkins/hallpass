@@ -21,7 +21,7 @@
 //!   security posture that silently lifts when it does is the wrong failure
 //!   direction. It is persisted, and re-read at startup.
 //!
-//! Two limits a posture does not overcome, both documented in the README
+//! Two limits a posture does not overcome, both documented in docs/rules.md
 //! rather than worked around here. Only `ct state new` is judged, so flows
 //! already established when one engages keep running. And the verdict
 //! queue's fail-open flag is fixed at bind (`nfqueue::want_fail_open`; the
@@ -59,10 +59,28 @@ struct PostureFile {
     on: bool,
 }
 
+/// A posture in force: the tags it pins, and when it began.
+#[derive(Debug, Clone)]
+struct Active {
+    tags: Vec<String>,
+    since_ms: u64,
+}
+
+impl Active {
+    /// This posture as a client sees it, given the ruleset now compiled.
+    fn report(&self, store: &RuleStore) -> Lockdown {
+        Lockdown {
+            tags: self.tags.clone(),
+            since_ms: self.since_ms,
+            rules_suppressed: store.ruleset().suppressed_count(),
+        }
+    }
+}
+
 /// The posture in force, and where it is kept.
 pub struct Posture {
-    /// None when there is none. The tags and when it started.
-    active: Mutex<Option<(Vec<String>, u64)>>,
+    /// None when no posture is in force.
+    active: Mutex<Option<Active>>,
     path: PathBuf,
 }
 
@@ -76,8 +94,8 @@ impl Posture {
     /// `queue_bypass`, the other place availability wins here, this one is
     /// visible: `status` and `doctor` both report the posture, so "not locked
     /// down" is never silent.
-    pub fn load(path: &Path) -> Posture {
-        let posture = Posture {
+    pub fn load(path: &Path) -> Self {
+        let posture = Self {
             active: Mutex::new(None),
             path: path.to_path_buf(),
         };
@@ -135,13 +153,16 @@ impl Posture {
             "lockdown is in force from the stored posture: only the allow rules \
              carrying these tags decide connections, everything else is denied"
         );
-        *posture.active.lock().unwrap() = Some((tags, file.since_ms));
+        *posture.active.lock().unwrap() = Some(Active {
+            tags,
+            since_ms: file.since_ms,
+        });
         posture
     }
 
-    /// The posture in force, without the suppressed count.
+    /// The tags of the posture in force, if there is one.
     pub fn tags(&self) -> Option<Vec<String>> {
-        self.active.lock().unwrap().as_ref().map(|(t, _)| t.clone())
+        self.active.lock().unwrap().as_ref().map(|a| a.tags.clone())
     }
 
     /// Whether a posture is in force.
@@ -151,12 +172,8 @@ impl Posture {
 
     /// The posture as a client sees it, given the ruleset now compiled.
     pub fn snapshot(&self, store: &RuleStore) -> Option<Lockdown> {
-        let (tags, since_ms) = self.active.lock().unwrap().clone()?;
-        Some(Lockdown {
-            tags,
-            since_ms,
-            rules_suppressed: store.ruleset().suppressed_count(),
-        })
+        let active = self.active.lock().unwrap().clone()?;
+        Some(active.report(store))
     }
 
     /// Write `state` to disk. Synchronous, and its failure is the caller's:
@@ -168,20 +185,12 @@ impl Posture {
     /// happen under one guard: two clients setting a posture at once must
     /// not be able to interleave into a file that says off while memory
     /// says on.
-    fn save(&self, state: &Option<(Vec<String>, u64)>) -> Result<(), String> {
-        let file = match state.clone() {
-            Some((tags, since_ms)) => PostureFile {
-                version: POSTURE_VERSION,
-                tags,
-                since_ms,
-                on: true,
-            },
-            None => PostureFile {
-                version: POSTURE_VERSION,
-                tags: Vec::new(),
-                since_ms: 0,
-                on: false,
-            },
+    fn save(&self, state: Option<&Active>) -> Result<(), String> {
+        let file = PostureFile {
+            version: POSTURE_VERSION,
+            tags: state.map(|a| a.tags.clone()).unwrap_or_default(),
+            since_ms: state.map_or(0, |a| a.since_ms),
+            on: state.is_some(),
         };
         let text = toml::to_string(&file).map_err(|e| format!("serialize the posture: {e}"))?;
         // 0600, like the first-seen state: nothing but the daemon reads it.
@@ -231,7 +240,6 @@ pub fn apply(
     // and the compiled rule set say another - which the next restart then
     // resolves in favour of a posture the host was never actually in.
     let mut active = posture.active.lock().unwrap();
-    let previous = active.clone();
     let next = if on {
         hallpass_types::validate_tags(&tags)?;
         // A posture that keeps nothing is a host that reaches nothing but
@@ -246,14 +254,13 @@ pub fn apply(
                  if that is what you want"
             ));
         }
-        let since_ms = match &previous {
-            // Re-pinning an existing posture keeps its start time: the
-            // interesting question is how long this host has been locked
-            // down, not when its tag list was last edited.
-            Some((_, since)) => *since,
-            None => hallpass_types::unix_ms_now(),
-        };
-        Some((tags, since_ms))
+        // Re-pinning an existing posture keeps its start time: the
+        // interesting question is how long this host has been locked down,
+        // not when its tag list was last edited.
+        let since_ms = active
+            .as_ref()
+            .map_or_else(hallpass_types::unix_ms_now, |a| a.since_ms);
+        Some(Active { tags, since_ms })
     } else {
         None
     };
@@ -262,35 +269,25 @@ pub fn apply(
     // at all if that fails: a posture in force but unrecorded lifts at the
     // next restart with nobody told, which is the failure persisting it
     // exists to prevent.
-    if let Err(e) = posture.save(&next) {
+    if let Err(e) = posture.save(next.as_ref()) {
         return Err(format!("the posture was not changed: {e}"));
     }
     *active = next;
 
-    let pinned = active.as_ref().map(|(t, _)| t.clone());
-    settings.set_locked_down(pinned.is_some());
-    store.rebuild_for_posture(pinned.as_deref());
-    let state = active.as_ref().map(|(tags, since_ms)| Lockdown {
-        tags: tags.clone(),
-        since_ms: *since_ms,
-        rules_suppressed: store.ruleset().suppressed_count(),
-    });
+    settings.set_locked_down(active.is_some());
+    store.rebuild_for_posture(active.as_ref().map(|a| a.tags.as_slice()));
+    let state = active.as_ref().map(|a| a.report(store));
     drop(active);
-    match state {
-        Some(state) => {
-            tracing::warn!(
-                tags = ?state.tags,
-                suppressed = state.rules_suppressed,
-                "lockdown is on: only the allow rules carrying these tags decide \
-                 connections, everything else is denied without a prompt"
-            );
-            Ok(Some(state))
-        }
-        None => {
-            tracing::warn!("lockdown is off: policy decides connections again");
-            Ok(None)
-        }
+    match &state {
+        Some(state) => tracing::warn!(
+            tags = ?state.tags,
+            suppressed = state.rules_suppressed,
+            "lockdown is on: only the allow rules carrying these tags decide \
+             connections, everything else is denied without a prompt"
+        ),
+        None => tracing::warn!("lockdown is off: policy decides connections again"),
     }
+    Ok(state)
 }
 
 /// Read the posture file, refusing a symlink at the path.
@@ -332,6 +329,14 @@ mod tests {
         path: PathBuf,
     }
 
+    impl Fixture {
+        /// [`apply`] against this fixture's posture, store and settings.
+        fn apply(&self, tags: &[&str], on: bool, force: bool) -> Result<Option<Lockdown>, String> {
+            let tags = tags.iter().map(|t| (*t).to_string()).collect();
+            apply(&self.posture, &self.store, &self.settings, tags, on, force)
+        }
+    }
+
     fn fixture(tag: &str) -> Fixture {
         let dir = TestDir::new(&format!("lockdown-{tag}"));
         let path = dir.path().join("posture.toml");
@@ -366,16 +371,10 @@ mod tests {
             .add(rule("deny-tracker", Action::Deny, &[]))
             .unwrap();
 
-        let state = apply(
-            &f.posture,
-            &f.store,
-            &f.settings,
-            vec!["work".into()],
-            true,
-            false,
-        )
-        .expect("a surviving rule means no force is needed")
-        .expect("the posture is on");
+        let state = f
+            .apply(&["work"], true, false)
+            .expect("a surviving rule means no force is needed")
+            .expect("the posture is on");
         assert_eq!(state.tags, vec!["work".to_string()]);
         assert_eq!(state.rules_suppressed, 1, "only the untagged allow");
         assert!(f.store.ruleset().locked_down());
@@ -398,15 +397,7 @@ mod tests {
         assert!(!f.settings.enforcing(), "observe to begin with");
         assert_eq!(f.settings.default_verdict(), hallpass_types::Verdict::Allow);
 
-        apply(
-            &f.posture,
-            &f.store,
-            &f.settings,
-            vec!["work".into()],
-            true,
-            false,
-        )
-        .unwrap();
+        f.apply(&["work"], true, false).unwrap();
         assert!(
             f.settings.enforcing(),
             "a posture that records nothing is theatre"
@@ -441,7 +432,7 @@ mod tests {
         want.prompt_timeout_secs = 45;
         assert!(f.settings.apply(&want).is_ok());
 
-        apply(&f.posture, &f.store, &f.settings, Vec::new(), false, false).unwrap();
+        f.apply(&[], false, false).unwrap();
         assert!(!f.settings.enforcing(), "the operator's mode came back");
         assert_eq!(f.settings.default_verdict(), hallpass_types::Verdict::Allow);
         assert!(!f.store.ruleset().locked_down());
@@ -455,15 +446,7 @@ mod tests {
         f.store
             .add(rule("allow-work", Action::Allow, &["work"]))
             .unwrap();
-        apply(
-            &f.posture,
-            &f.store,
-            &f.settings,
-            vec!["work".into()],
-            true,
-            false,
-        )
-        .unwrap();
+        f.apply(&["work"], true, false).unwrap();
         let since = f.posture.snapshot(&f.store).unwrap().since_ms;
 
         let reloaded = Posture::load(&f.path);
@@ -477,7 +460,7 @@ mod tests {
 
         // And lifting it is recorded too, rather than leaving a file that
         // would put the host back into lockdown at the next start.
-        apply(&f.posture, &f.store, &f.settings, Vec::new(), false, false).unwrap();
+        f.apply(&[], false, false).unwrap();
         assert!(!Posture::load(&f.path).is_on());
     }
 
@@ -490,15 +473,9 @@ mod tests {
             .add(rule("allow-work", Action::Allow, &["work"]))
             .unwrap();
 
-        let err = apply(
-            &f.posture,
-            &f.store,
-            &f.settings,
-            vec!["wrok".into()],
-            true,
-            false,
-        )
-        .expect_err("a posture keeping nothing must not engage quietly");
+        let err = f
+            .apply(&["wrok"], true, false)
+            .expect_err("a posture keeping nothing must not engage quietly");
         assert!(err.contains("force"), "{err}");
         assert!(
             !f.posture.is_on(),
@@ -510,15 +487,8 @@ mod tests {
         );
 
         // Deliberate is still expressible.
-        apply(
-            &f.posture,
-            &f.store,
-            &f.settings,
-            vec!["wrok".into()],
-            true,
-            true,
-        )
-        .expect("--force says the operator means it");
+        f.apply(&["wrok"], true, true)
+            .expect("--force says the operator means it");
         assert!(f.posture.is_on());
     }
 
