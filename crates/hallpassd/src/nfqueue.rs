@@ -156,42 +156,6 @@ pub fn want_fail_open(queue_bypass: bool, enforcing: bool) -> bool {
     queue_bypass || !enforcing
 }
 
-/// Commit a decision: count it, record it as an event, and hand the packet
-/// back to the kernel.
-///
-/// The verdict that is recorded and the verdict that is applied are the same
-/// thing only while enforcing. In observe mode the packet is always accepted,
-/// so the event carries what policy decided (stamped unenforced) and the
-/// operator gets the rollout number without the outage.
-///
-/// `enforcing` is the caller's one read for the whole packet: the guard that
-/// skipped the prompt, this count, the event stamp and the application all
-/// see the same mode, so a toggle landing mid-decision cannot make them
-/// disagree about what happened to it.
-fn commit(
-    queue: &mut Queue,
-    msg: nfq::Message,
-    verdict: Verdict,
-    rule_name: Option<String>,
-    conn: Connection,
-    deps: &QueueDeps,
-    enforcing: bool,
-) {
-    deps.stats.record_verdict(verdict);
-    if let Some(name) = &rule_name {
-        deps.rules.record_hit(name);
-    }
-    let applied = applied_verdict(verdict, enforcing);
-    if packet::is_dns_query(&conn.tuple) {
-        snoop_released_query(deps, conn.tuple, &msg, applied);
-    }
-    if !enforcing && verdict != Verdict::Allow {
-        deps.stats.record_observed_only();
-    }
-    deps.events.emit(conn, verdict, rule_name, enforcing);
-    apply_verdict(queue, msg, applied);
-}
-
 /// Hand the first query of a DNS flow to the snoop consumer, if it is about
 /// to leave the host.
 ///
@@ -293,17 +257,6 @@ fn decide(
     };
     match set.match_conn(&conn, exe_sha256.as_deref()) {
         Some((rule, verdict)) => Decision::Verdict(verdict, rule.name.clone(), conn),
-        // Only here, where the answer would otherwise be a prompt. A session
-        // grant suppresses the question; it never overrides a rule, so an
-        // explicit deny inside a session still denies and an explicit allow
-        // still reports its own rule name.
-        //
-        // Nothing above this line changes while no session is open: the
-        // snapshot is loaded per unmatched connection, not per packet, and an
-        // empty one costs a length check. Everything that can go wrong on the
-        // way to coverage - no pid, no session, a uid that is not the
-        // session's, an unwalkable chain - leaves the prompt exactly as it
-        // would have been.
         // A lockdown posture answers before a session grant does. The grant
         // is a prompt suppressor that allows, so consulting it first would
         // let anything started under `hallpass run` walk straight through
@@ -313,40 +266,28 @@ fn decide(
         // Read off the same snapshot that just failed to match, so a posture
         // lifted between the two cannot deny a connection against a rule set
         // that would have allowed it.
-        None if set.locked_down() => match stays_on_host(&conn) {
-            // Loopback never leaves the host, so refusing it buys nothing
-            // and costs the local resolver stub, every 127.0.0.1 service,
-            // and with them most of the desktop. Deny rules are not
-            // suppressed, so an operator who does want loopback blocked
-            // still has it blocked here.
-            true => Decision::Verdict(
-                Verdict::Allow,
-                hallpass_types::LOCKDOWN_LOOPBACK_RULE.to_string(),
-                conn,
-            ),
-            // No prompt, deliberately. A dialog would let anyone at the
-            // keyboard answer their way out of the posture, and the rule
-            // that answer writes carries no pinned tag, so it would be
-            // suppressed the moment it was created - an Allow that appears
-            // to do nothing.
-            false => Decision::Verdict(
-                Verdict::Deny,
-                hallpass_types::LOCKDOWN_DENIED_RULE.to_string(),
-                conn,
-            ),
-        },
+        None if set.locked_down() => lockdown_decision(conn),
+        // Only here, where the answer would otherwise be a prompt. A session
+        // grant suppresses the question; it never overrides a rule, so an
+        // explicit deny inside a session still denies and an explicit allow
+        // still reports its own rule name.
+        //
+        // Free while no session is open: the snapshot is loaded per
+        // unmatched connection, not per packet, and an empty one costs a
+        // length check. Everything that can go wrong on the way to coverage
+        // - no pid, no session, a uid that is not the session's, an
+        // unwalkable chain - leaves the prompt exactly as it would have been.
         None => match session_grant(&conn, ctx) {
             Some(id) => Decision::Verdict(Verdict::Allow, crate::session::rule_name(id), conn),
             // Carries whatever a rule already asked to be hashed, and nothing
             // more. A connection on its way to a prompt does need its
             // executable hashed even when no rule wanted one - the operator
             // may answer "allow, and pin this binary", and the value pinned
-            // has to be the value the prompt showed them - but the caller
-            // pays for that, not this function. Two of the three arms
-            // consuming `Decision::Prompt` never raise a prompt at all, so
-            // hashing here charged them a whole-binary read on the verdict
-            // thread for a value they discard. See the prompting arm in
-            // `run_queue`.
+            // has to be the value the prompt showed them - but only the arm
+            // that actually raises the prompt pays for that. Two of the three
+            // arms consuming `Decision::Prompt` never raise one, and hashing
+            // here charged them a whole-binary read on the verdict thread for
+            // a value they discard. See `VerdictLoop::hold_for_prompt`.
             None => Decision::Prompt(
                 conn,
                 PromptExe {
@@ -355,6 +296,31 @@ fn decide(
                 },
             ),
         },
+    }
+}
+
+/// What a lockdown posture answers for a connection no rule decided.
+fn lockdown_decision(conn: Connection) -> Decision {
+    if stays_on_host(&conn) {
+        // Loopback never leaves the host, so refusing it buys nothing and
+        // costs the local resolver stub, every 127.0.0.1 service, and with
+        // them most of the desktop. Deny rules are not suppressed, so an
+        // operator who does want loopback blocked still has it blocked.
+        Decision::Verdict(
+            Verdict::Allow,
+            hallpass_types::LOCKDOWN_LOOPBACK_RULE.to_string(),
+            conn,
+        )
+    } else {
+        // No prompt, deliberately. A dialog would let anyone at the keyboard
+        // answer their way out of the posture, and the rule that answer
+        // writes carries no pinned tag, so it would be suppressed the moment
+        // it was created - an Allow that appears to do nothing.
+        Decision::Verdict(
+            Verdict::Deny,
+            hallpass_types::LOCKDOWN_DENIED_RULE.to_string(),
+            conn,
+        )
     }
 }
 
@@ -376,8 +342,6 @@ fn session_grant(conn: &Connection, ctx: &DecideCtx) -> Option<u64> {
     crate::session::covering(&live, std::path::Path::new("/proc"), conn.pid?, conn.uid)
 }
 
-/// Run the queue loop until `shutdown` is set. Blocking; call from a
-/// dedicated std thread.
 /// Open and bind both queues.
 ///
 /// Separate from [`run`] so the daemon can bind them before installing
@@ -611,14 +575,14 @@ const MAX_RECV_ERRORS: u32 = 50;
 ///
 /// A held packet occupies a slot in the kernel's queue for the whole prompt
 /// window, and that queue is [`QUEUE_MAX_LEN`] entries deep (1024 if the
-/// kernel refused the request). Nothing else
-/// bounds this: prompts coalesce by (exe, proto, dst ip, dst port), so one
-/// process looping connect() to one endpoint produces a single prompt (a
-/// single popup) that holds a packet per attempt. Left uncapped it fills the
-/// kernel queue, and every other new connection on the host is then resolved
-/// by the queue-full behaviour rather than by policy: dropped when
-/// fail-closed, and unjudged when fail-open. Either way an unprivileged
-/// local process decides what happens to everyone else's traffic.
+/// kernel refused the request). Nothing else bounds this: prompts coalesce
+/// by (exe, proto, dst ip, dst port), so one process looping connect() to
+/// one endpoint produces a single prompt (a single popup) that holds a
+/// packet per attempt. Left uncapped it fills the kernel queue, and every
+/// other new connection on the host is then resolved by the queue-full
+/// behaviour rather than by policy: dropped when fail-closed, and unjudged
+/// when fail-open. Either way an unprivileged local process decides what
+/// happens to everyone else's traffic.
 ///
 /// Well under the kernel's depth so the rest of the queue stays available
 /// for traffic that can still be judged. Past the cap a connection is
@@ -642,332 +606,390 @@ const _: () = assert!(
     "the held-packet budget must leave most of the kernel queue for traffic that can still be judged"
 );
 
-pub fn run(mut queue: Queue, queue_num: u16, mut deps: QueueDeps) -> std::io::Result<()> {
-    let iface_map = crate::iface::IfaceMap::default();
-    let mut held: HashMap<u64, nfq::Message> = HashMap::new();
-    // Monotonic packet-hold sequence. u64 does not wrap in any real runtime
-    // (billions of held packets per second for centuries), so no reuse guard;
-    // do not "fix" this into a wrapping counter that could collide live keys.
-    let mut next_seq: u64 = 0;
-    let mut recv_errors: u32 = 0;
-    let mut refused_verdicts: u64 = 0;
-    let mut prompt_send_failures: u64 = 0;
-    let mut fatal: Option<std::io::Error> = None;
+/// Run the verdict loop over the bound verdict queue until `shutdown` is
+/// set or the queue fails persistently. Blocking; [`spawn`] runs it on a
+/// dedicated thread.
+pub fn run(queue: Queue, queue_num: u16, mut deps: QueueDeps) -> std::io::Result<()> {
     // Out of `deps` so `decide` can take it mutably while the rest of the
-    // deps are borrowed for the context it reads. Dropped when this function
-    // returns, which flushes what the run recorded and closes the channel
-    // the writer task ends on.
-    let mut seen = deps.first_seen.take();
+    // deps are borrowed for the context it reads. Dropped when the loop
+    // ends, which flushes what the run recorded and closes the channel the
+    // writer task ends on.
+    let seen = deps.first_seen.take();
+    VerdictLoop {
+        seen,
+        held: HashMap::new(),
+        next_seq: 0,
+        refused_verdicts: 0,
+        prompt_send_failures: 0,
+        iface_map: crate::iface::IfaceMap::default(),
+        deps,
+        queue,
+    }
+    .run(queue_num)
+}
 
-    while fatal.is_none() && !deps.shutdown.load(Ordering::Relaxed) {
-        let mut busy = false;
-        // A clock read and a bool on all but one iteration a minute, and
-        // only a channel send on that one: the file itself is written by
-        // another thread, because an fsync here is a packet waiting.
-        if let Some(seen) = seen.as_mut() {
-            seen.maybe_flush();
-        }
+/// The verdict thread: the queue, what it holds, and the counters its
+/// rate-limited warnings read.
+struct VerdictLoop {
+    /// First-seen tracking, taken out of [`QueueDeps`]; see [`run`].
+    seen: Option<crate::firstseen::Tracker>,
+    /// Packets held for a prompt reply, by hold sequence number.
+    held: HashMap<u64, nfq::Message>,
+    /// Monotonic packet-hold sequence. u64 does not wrap in any real runtime
+    /// (billions of held packets per second for centuries), so no reuse guard;
+    /// do not "fix" this into a wrapping counter that could collide live keys.
+    next_seq: u64,
+    refused_verdicts: u64,
+    prompt_send_failures: u64,
+    iface_map: crate::iface::IfaceMap,
+    deps: QueueDeps,
+    queue: Queue,
+}
 
-        // Apply verdicts decided by the async side.
-        while let Ok((seq, verdict)) = deps.verdict_rx.try_recv() {
-            busy = true;
-            if let Some(msg) = held.remove(&seq) {
-                // Through the helper like every other policy verdict, with
-                // the mode read now, not when the packet was held: a packet
-                // is only held while enforcing, but the mode can flip while
-                // it waits, and "observe blocks nothing" is promised from
-                // the moment of the toggle.
-                let applied = applied_verdict(verdict, deps.settings.enforcing());
-                if let packet::Parsed::Flow(tuple) =
-                    packet::parse(msg.get_payload(), msg.get_original_len())
-                {
-                    if packet::is_dns_query(&tuple) {
-                        snoop_released_query(&deps, tuple, &msg, applied);
-                    }
-                }
-                apply_verdict(&mut queue, msg, applied);
+impl VerdictLoop {
+    fn run(mut self, queue_num: u16) -> std::io::Result<()> {
+        let mut recv_errors: u32 = 0;
+        let mut fatal: Option<std::io::Error> = None;
+        while fatal.is_none() && !self.deps.shutdown.load(Ordering::Relaxed) {
+            // A clock read and a bool on all but one iteration a minute, and
+            // only a channel send on that one: the file itself is written by
+            // another thread, because an fsync here is a packet waiting.
+            if let Some(seen) = self.seen.as_mut() {
+                seen.maybe_flush();
             }
-        }
-
-        match queue.recv() {
-            Ok(msg) => {
-                busy = true;
-                recv_errors = 0;
-                // get_original_len is the on-wire length; the payload is
-                // capped by the queue's copy range, so the two differ for an
-                // oversized packet and parsing must tolerate the missing tail.
-                let parsed = packet::parse(msg.get_payload(), msg.get_original_len());
-
-                // Transports the rule engine does not model (SCTP, ICMP,
-                // ...) and unparsable packets are never silently accepted:
-                // they are counted and resolved by the configured policy.
-                // One mode read governs this whole packet: the unhandled
-                // branch's log line and application, the prompt guard, and
-                // everything inside `commit`. Reading again at each site
-                // would let a toggle land between two of them and make the
-                // record disagree with what was done.
-                let enforcing = deps.settings.enforcing();
-
-                let packet::Parsed::Flow(tuple) = parsed else {
-                    deps.stats.record_other_proto();
-                    // A lockdown posture reaches here too. Nothing on this
-                    // branch goes through the rule engine, so the posture's
-                    // suppression cannot touch it: without this, ICMP, SCTP,
-                    // GRE, ESP and anything unparsable keep leaving a host
-                    // whose operator was told everything unpinned is denied,
-                    // and an ICMP tunnel survives the posture raised to stop
-                    // it. There is no rule to pin these to, so a posture
-                    // denies them outright.
-                    //
-                    // UDP-Lite is refused whatever the policy says. Any
-                    // process can open a UDP-Lite socket and it carries
-                    // anything UDP carries, so under an allowing policy it
-                    // was UDP with no rule and no prompt. It cannot go to the
-                    // rule engine as UDP either: its ports are a space of
-                    // their own, and every attributor looks a flow up among
-                    // UDP sockets, so a UDP-Lite socket on the port of some
-                    // program's UDP socket would be judged as that program.
-                    // Nothing on a desktop speaks it.
-                    let udplite =
-                        matches!(parsed, packet::Parsed::OtherProto(packet::IPPROTO_UDPLITE));
-                    let unhandled = match deps.settings.locked_down() || udplite {
-                        true => Verdict::Deny,
-                        false => deps.unhandled_verdict,
-                    };
-                    // These carry no Connection, so there is no event to
-                    // emit and observe mode can only note it in the log.
-                    if unhandled == Verdict::Allow {
-                        tracing::debug!(?parsed, "unhandled packet allowed by policy");
-                    } else if enforcing {
-                        // Blocked traffic must be findable without debug
-                        // logging: this is the only trace of e.g. a dead
-                        // ping under the hardened policy.
-                        tracing::info!(
-                            ?parsed,
-                            verdict = unhandled.as_str(),
-                            "unhandled packet blocked by policy"
-                        );
+            let mut busy = self.release_decided();
+            match self.queue.recv() {
+                Ok(msg) => {
+                    busy = true;
+                    recv_errors = 0;
+                    self.on_packet(msg);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    recv_errors = 0;
+                }
+                Err(e) => {
+                    recv_errors += 1;
+                    if recv_errors >= MAX_RECV_ERRORS {
+                        fatal = Some(e);
                     } else {
-                        // Counted like any other unenforced block. These
-                        // carry no Connection, so this counter is the only
-                        // place they appear: an operator sizing a rollout
-                        // from `observed_only` would otherwise read zero and
-                        // then lose ping and path-MTU discovery on the day
-                        // they switch to enforcing, which is exactly the
-                        // breakage observe mode exists to predict.
-                        deps.stats.record_observed_only();
-                        tracing::info!(
-                            ?parsed,
-                            verdict = unhandled.as_str(),
-                            "observe mode: unhandled packet would be blocked by policy"
-                        );
-                    }
-                    let applied = applied_verdict(unhandled, enforcing);
-                    apply_verdict(&mut queue, msg, applied);
-                    continue;
-                };
-
-                let iface = iface_map.name(msg.get_outdev());
-                let ctx = DecideCtx {
-                    attribution: &deps.attribution,
-                    rules: &deps.rules,
-                    dns_cache: &deps.dns_cache,
-                    exe_hash: &deps.exe_hash,
-                    sessions: &deps.sessions,
-                };
-                match decide(tuple, iface, &ctx, seen.as_mut()) {
-                    Decision::Verdict(verdict, rule_name, conn) => {
-                        commit(
-                            &mut queue,
-                            msg,
-                            verdict,
-                            Some(rule_name),
-                            conn,
-                            &deps,
-                            enforcing,
-                        );
-                    }
-                    // Observe mode never holds a packet for a prompt: the
-                    // operator would be asked to decide something that is
-                    // not going to be applied, and answering would build
-                    // policy from a dialog that changed nothing. Record the
-                    // configured default instead, which is what an
-                    // unanswered prompt resolves to anyway.
-                    Decision::Prompt(conn, _) if !enforcing => {
-                        let verdict = deps.settings.default_verdict();
-                        commit(&mut queue, msg, verdict, None, conn, &deps, enforcing);
-                    }
-                    // Holding budget spent: decide with the default rather
-                    // than take a kernel queue slot this daemon cannot give
-                    // back in time. See MAX_HELD_PACKETS for why the budget
-                    // exists; the counter is the same one the pending-prompt
-                    // table's overflow uses, because it is the same outcome:
-                    // a connection nobody was asked about.
-                    Decision::Prompt(conn, _) if held.len() >= MAX_HELD_PACKETS => {
-                        deps.stats.record_prompt_overflow();
-                        tracing::warn!(
-                            held = held.len(),
-                            "held-packet budget full, applying default verdict"
-                        );
-                        let verdict = deps.settings.default_verdict();
-                        commit(&mut queue, msg, verdict, None, conn, &deps, enforcing);
-                    }
-                    // The arm that hands a connection to the prompt path, and
-                    // the only one that pays for a hash no rule asked for. The
-                    // operator may answer "allow, and pin this binary", and
-                    // the value pinned has to be the value the prompt showed
-                    // them rather than one computed behind them at reply time.
-                    //
-                    // Still a whole-binary read on the verdict thread, which
-                    // is the accepted cost: this connection is already about
-                    // to wait for a human, and `ExeHashCache` keys on (dev,
-                    // ino, mtime, ctime, size) so a program that prompts often
-                    // is read once. What is not accepted is charging it to
-                    // connections nobody will ever be asked about. The two
-                    // arms above resolve with `default_verdict` and never show
-                    // anyone a hash - observe mode, the low-risk rollout mode,
-                    // paid it on every unmatched connection - and the handler
-                    // check here covers the other permanent case, a host with
-                    // no GUI and no `hallpass-cli watch` attached, where
-                    // `handle_new` takes the default verdict for the same
-                    // reason.
-                    //
-                    // Not exhaustive, deliberately: `handle_new` also declines
-                    // to prompt when its packet budget is spent, when the
-                    // pending table is full, and when this connection
-                    // coalesces into an open prompt. Those are bounded
-                    // load-shedding paths rather than steady states, and the
-                    // cache makes the second hash of a binary free, so they
-                    // are not worth another cross-thread signal. Do not read
-                    // this as "the hash is now only paid for prompts".
-                    //
-                    // Racing a handler that connects between this load and
-                    // `handle_new` costs that one prompt its pin control, the
-                    // same outcome as an unreadable binary, and the next
-                    // connection has it.
-                    //
-                    // A `None` result means the prompt offers no pin, which is
-                    // the honest answer rather than an unpinned rule that
-                    // looks pinned. Only the size-cap refusal is remembered
-                    // (`ExeHashCache::sha256` caches `None` there and nowhere
-                    // else), so a binary that cannot be opened at all is
-                    // re-attempted per connection - two failed syscalls, not a
-                    // read, and not worth negative-caching a file that may
-                    // become readable.
-                    Decision::Prompt(conn, exe) => {
-                        let seq = next_seq;
-                        next_seq += 1;
-                        let exe_sha256 = exe.sha256.or_else(|| {
-                            deps.prompt_handler
-                                .load(std::sync::atomic::Ordering::Relaxed)
-                                .then(|| deps.exe_hash.for_connection(&conn, exe.id))
-                                .flatten()
-                        });
-                        match deps.prompt_tx.send(PromptTask {
-                            seq,
-                            conn,
-                            exe_sha256,
-                        }) {
-                            Ok(()) => {
-                                held.insert(seq, msg);
-                            }
-                            Err(unsent) => {
-                                // Prompt path gone. At shutdown that is
-                                // expected; any other way for the channel to
-                                // close is the prompt task dying, after which
-                                // every unmatched packet takes the default
-                                // verdict, as an unanswered prompt would -
-                                // which must not happen in silence. Log
-                                // rate-limited: the failure repeats per
-                                // packet until the daemon restarts.
-                                prompt_send_failures += 1;
-                                if prompt_send_failures.is_power_of_two() {
-                                    tracing::warn!(
-                                        failures = prompt_send_failures,
-                                        "prompt channel closed; unmatched connections \
-                                         take the default verdict without prompting \
-                                         (expected only at shutdown)"
-                                    );
-                                }
-                                let verdict = deps.settings.default_verdict();
-                                commit(
-                                    &mut queue,
-                                    msg,
-                                    verdict,
-                                    None,
-                                    unsent.0.conn,
-                                    &deps,
-                                    enforcing,
-                                );
-                            }
-                        }
+                        tracing::warn!(attempt = recv_errors, "nfqueue recv failed: {e}");
+                        std::thread::sleep(IDLE_POLL);
                     }
                 }
             }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                recv_errors = 0;
-            }
-            Err(e) => {
-                recv_errors += 1;
-                if recv_errors >= MAX_RECV_ERRORS {
-                    fatal = Some(e);
-                } else {
-                    tracing::warn!(attempt = recv_errors, "nfqueue recv failed: {e}");
-                    std::thread::sleep(IDLE_POLL);
-                }
+            self.note_refused_verdicts();
+            if !busy {
+                std::thread::sleep(IDLE_POLL);
             }
         }
+        self.release_all(queue_num);
+        fatal.map_or(Ok(()), Err)
+    }
 
-        // Not receive failures, and never counted as ones: each reports an
-        // earlier verdict the kernel refused, almost always ENOENT for a held
-        // packet it flushed while a prompt was open (its interface went
-        // down, or another ruleset reloaded). A prompt timing out after a VPN
-        // drop answers dozens of those at once, and counting them towards
-        // MAX_RECV_ERRORS let that take the daemon down.
-        if let Some((n, errno)) = queue.take_ack_errors() {
-            let before = refused_verdicts;
-            refused_verdicts = refused_verdicts.saturating_add(u64::from(n));
-            if before.checked_ilog2() != refused_verdicts.checked_ilog2() {
+    /// Apply the verdicts the async side decided for held packets. Returns
+    /// whether any arrived.
+    fn release_decided(&mut self) -> bool {
+        let mut any = false;
+        while let Ok((seq, verdict)) = self.deps.verdict_rx.try_recv() {
+            any = true;
+            let Some(msg) = self.held.remove(&seq) else {
+                continue;
+            };
+            // Through the helper like every other policy verdict, with the
+            // mode read now, not when the packet was held: a packet is only
+            // held while enforcing, but the mode can flip while it waits, and
+            // "observe blocks nothing" is promised from the moment of the
+            // toggle.
+            let applied = applied_verdict(verdict, self.deps.settings.enforcing());
+            if let packet::Parsed::Flow(tuple) =
+                packet::parse(msg.get_payload(), msg.get_original_len())
+            {
+                if packet::is_dns_query(&tuple) {
+                    snoop_released_query(&self.deps, tuple, &msg, applied);
+                }
+            }
+            apply_verdict(&mut self.queue, msg, applied);
+        }
+        any
+    }
+
+    /// Decide one packet from the kernel: hand it straight back, or hold it
+    /// for a prompt.
+    fn on_packet(&mut self, msg: nfq::Message) {
+        // get_original_len is the on-wire length; the payload is capped by
+        // the queue's copy range, so the two differ for an oversized packet
+        // and parsing must tolerate the missing tail.
+        let parsed = packet::parse(msg.get_payload(), msg.get_original_len());
+        // One mode read governs this whole packet: the unhandled branch's log
+        // line and application, the prompt guard, and everything inside
+        // `commit`. Reading again at each site would let a toggle land
+        // between two of them and make the record disagree with what was
+        // done.
+        let enforcing = self.deps.settings.enforcing();
+        let packet::Parsed::Flow(tuple) = parsed else {
+            self.resolve_unhandled(msg, parsed, enforcing);
+            return;
+        };
+
+        let iface = self.iface_map.name(msg.get_outdev());
+        let ctx = DecideCtx {
+            attribution: &self.deps.attribution,
+            rules: &self.deps.rules,
+            dns_cache: &self.deps.dns_cache,
+            exe_hash: &self.deps.exe_hash,
+            sessions: &self.deps.sessions,
+        };
+        let decision = decide(tuple, iface, &ctx, self.seen.as_mut());
+        match decision {
+            Decision::Verdict(verdict, rule_name, conn) => {
+                self.commit(msg, verdict, Some(rule_name), conn, enforcing);
+            }
+            // Observe mode never holds a packet for a prompt: the operator
+            // would be asked to decide something that is not going to be
+            // applied, and answering would build policy from a dialog that
+            // changed nothing. Record the configured default instead, which
+            // is what an unanswered prompt resolves to anyway.
+            Decision::Prompt(conn, _) if !enforcing => {
+                let verdict = self.deps.settings.default_verdict();
+                self.commit(msg, verdict, None, conn, enforcing);
+            }
+            // Holding budget spent: decide with the default rather than take
+            // a kernel queue slot this daemon cannot give back in time. See
+            // MAX_HELD_PACKETS for why the budget exists; the counter is the
+            // pending-prompt table's overflow counter, because it is the same
+            // outcome: a connection nobody was asked about.
+            Decision::Prompt(conn, _) if self.held.len() >= MAX_HELD_PACKETS => {
+                self.deps.stats.record_prompt_overflow();
                 tracing::warn!(
-                    total = refused_verdicts,
-                    last = %std::io::Error::from_raw_os_error(errno),
-                    "the kernel refused verdicts for packets it no longer holds"
+                    held = self.held.len(),
+                    "held-packet budget full, applying default verdict"
                 );
+                let verdict = self.deps.settings.default_verdict();
+                self.commit(msg, verdict, None, conn, enforcing);
+            }
+            Decision::Prompt(conn, exe) => self.hold_for_prompt(msg, conn, exe, enforcing),
+        }
+    }
+
+    /// Resolve a packet the rule engine does not model: a transport other
+    /// than TCP or UDP (SCTP, ICMP, ...), or one that did not parse. Never
+    /// silently accepted: counted, and resolved by the configured policy.
+    fn resolve_unhandled(&mut self, msg: nfq::Message, parsed: packet::Parsed, enforcing: bool) {
+        self.deps.stats.record_other_proto();
+        // A lockdown posture reaches here too. Nothing on this branch goes
+        // through the rule engine, so the posture's suppression cannot touch
+        // it: without this, ICMP, SCTP, GRE, ESP and anything unparsable
+        // keep leaving a host whose operator was told everything unpinned is
+        // denied, and an ICMP tunnel survives the posture raised to stop it.
+        // There is no rule to pin these to, so a posture denies them outright.
+        //
+        // UDP-Lite is refused whatever the policy says. Any process can open
+        // a UDP-Lite socket and it carries anything UDP carries, so under an
+        // allowing policy it was UDP with no rule and no prompt. It cannot go
+        // to the rule engine as UDP either: its ports are a space of their
+        // own, and every attributor looks a flow up among UDP sockets, so a
+        // UDP-Lite socket on the port of some program's UDP socket would be
+        // judged as that program. Nothing on a desktop speaks it.
+        let udplite = matches!(parsed, packet::Parsed::OtherProto(packet::IPPROTO_UDPLITE));
+        let unhandled = if self.deps.settings.locked_down() || udplite {
+            Verdict::Deny
+        } else {
+            self.deps.unhandled_verdict
+        };
+        // These carry no Connection, so there is no event to emit and observe
+        // mode can only note it in the log.
+        if unhandled == Verdict::Allow {
+            tracing::debug!(?parsed, "unhandled packet allowed by policy");
+        } else if enforcing {
+            // Blocked traffic must be findable without debug logging: this is
+            // the only trace of e.g. a dead ping under the hardened policy.
+            tracing::info!(
+                ?parsed,
+                verdict = unhandled.as_str(),
+                "unhandled packet blocked by policy"
+            );
+        } else {
+            // Counted like any other unenforced block, and this counter is
+            // the only place these appear: an operator sizing a rollout from
+            // `observed_only` would otherwise read zero and then lose ping and
+            // path-MTU discovery on the day they switch to enforcing, which is
+            // exactly the breakage observe mode exists to predict.
+            self.deps.stats.record_observed_only();
+            tracing::info!(
+                ?parsed,
+                verdict = unhandled.as_str(),
+                "observe mode: unhandled packet would be blocked by policy"
+            );
+        }
+        apply_verdict(&mut self.queue, msg, applied_verdict(unhandled, enforcing));
+    }
+
+    /// Hold the packet and hand its connection to the prompt path.
+    ///
+    /// The only arm that pays for a hash no rule asked for. The operator may
+    /// answer "allow, and pin this binary", and the value pinned has to be
+    /// the value the prompt showed them rather than one computed behind them
+    /// at reply time.
+    ///
+    /// Still a whole-binary read on the verdict thread, which is the accepted
+    /// cost: this connection is already about to wait for a human, and
+    /// `ExeHashCache` keys on (dev, ino, mtime, ctime, size) so a program
+    /// that prompts often is read once. What is not accepted is charging it
+    /// to connections nobody will ever be asked about: the observe-mode and
+    /// budget-spent arms resolve with `default_verdict` and never show anyone
+    /// a hash, and the handler check here covers the other permanent case, a
+    /// host with no GUI and no `hallpass-cli watch` attached, where
+    /// `handle_new` takes the default verdict for the same reason.
+    ///
+    /// Not exhaustive, deliberately: `handle_new` also declines to prompt
+    /// when its packet budget is spent, when the pending table is full, and
+    /// when this connection coalesces into an open prompt. Those are bounded
+    /// load-shedding paths rather than steady states, and the cache makes the
+    /// second hash of a binary free, so they are not worth another
+    /// cross-thread signal. Do not read this as "the hash is now only paid
+    /// for prompts". Racing a handler that connects between this load and
+    /// `handle_new` costs that one prompt its pin control, the same outcome
+    /// as an unreadable binary, and the next connection has it.
+    ///
+    /// A `None` hash means the prompt offers no pin, which is the honest
+    /// answer rather than an unpinned rule that looks pinned. Only the
+    /// size-cap refusal is remembered (`ExeHashCache::sha256` caches `None`
+    /// there and nowhere else), so a binary that cannot be opened at all is
+    /// re-attempted per connection - two failed syscalls, not a read, and not
+    /// worth negative-caching a file that may become readable.
+    fn hold_for_prompt(
+        &mut self,
+        msg: nfq::Message,
+        conn: Connection,
+        exe: PromptExe,
+        enforcing: bool,
+    ) {
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        let exe_sha256 = exe.sha256.or_else(|| {
+            self.deps
+                .prompt_handler
+                .load(Ordering::Relaxed)
+                .then(|| self.deps.exe_hash.for_connection(&conn, exe.id))
+                .flatten()
+        });
+        let task = PromptTask {
+            seq,
+            conn,
+            exe_sha256,
+        };
+        match self.deps.prompt_tx.send(task) {
+            Ok(()) => {
+                self.held.insert(seq, msg);
+            }
+            Err(unsent) => {
+                // Prompt path gone. At shutdown that is expected; any other
+                // way for the channel to close is the prompt task dying,
+                // after which every unmatched packet takes the default
+                // verdict, as an unanswered prompt would - which must not
+                // happen in silence. Log rate-limited: the failure repeats
+                // per packet until the daemon restarts.
+                self.prompt_send_failures += 1;
+                if self.prompt_send_failures.is_power_of_two() {
+                    tracing::warn!(
+                        failures = self.prompt_send_failures,
+                        "prompt channel closed; unmatched connections \
+                         take the default verdict without prompting \
+                         (expected only at shutdown)"
+                    );
+                }
+                let verdict = self.deps.settings.default_verdict();
+                self.commit(msg, verdict, None, unsent.0.conn, enforcing);
             }
         }
+    }
 
-        if !busy {
-            std::thread::sleep(IDLE_POLL);
+    /// Commit a decision: count it, record it as an event, and hand the packet
+    /// back to the kernel.
+    ///
+    /// The verdict that is recorded and the verdict that is applied are the same
+    /// thing only while enforcing. In observe mode the packet is always accepted,
+    /// so the event carries what policy decided (stamped unenforced) and the
+    /// operator gets the rollout number without the outage.
+    ///
+    /// `enforcing` is the caller's one read for the whole packet: the guard that
+    /// skipped the prompt, this count, the event stamp and the application all
+    /// see the same mode, so a toggle landing mid-decision cannot make them
+    /// disagree about what happened to it.
+    fn commit(
+        &mut self,
+        msg: nfq::Message,
+        verdict: Verdict,
+        rule_name: Option<String>,
+        conn: Connection,
+        enforcing: bool,
+    ) {
+        let deps = &self.deps;
+        deps.stats.record_verdict(verdict);
+        if let Some(name) = &rule_name {
+            deps.rules.record_hit(name);
+        }
+        let applied = applied_verdict(verdict, enforcing);
+        if packet::is_dns_query(&conn.tuple) {
+            snoop_released_query(deps, conn.tuple, &msg, applied);
+        }
+        if !enforcing && verdict != Verdict::Allow {
+            deps.stats.record_observed_only();
+        }
+        deps.events.emit(conn, verdict, rule_name, enforcing);
+        apply_verdict(&mut self.queue, msg, applied);
+    }
+
+    /// Log verdicts the kernel refused, rate-limited.
+    ///
+    /// Not receive failures, and never counted as ones: each reports an
+    /// earlier verdict the kernel refused, almost always ENOENT for a held
+    /// packet it flushed while a prompt was open (its interface went down,
+    /// or another ruleset reloaded). A prompt timing out after a VPN drop
+    /// answers dozens of those at once, and counting them towards
+    /// MAX_RECV_ERRORS let that take the daemon down.
+    fn note_refused_verdicts(&mut self) {
+        let Some((n, errno)) = self.queue.take_ack_errors() else {
+            return;
+        };
+        let before = self.refused_verdicts;
+        self.refused_verdicts = before.saturating_add(u64::from(n));
+        if before.checked_ilog2() != self.refused_verdicts.checked_ilog2() {
+            tracing::warn!(
+                total = self.refused_verdicts,
+                last = %std::io::Error::from_raw_os_error(errno),
+                "the kernel refused verdicts for packets it no longer holds"
+            );
         }
     }
 
-    // Shutdown or fatal error: release anything still held so nothing
-    // hangs in the kernel, and unbind so packets stop being queued. Released
-    // with the default verdict, which is what their prompts would have come
-    // to: accepting them let every connection that was waiting on a question
-    // through, on the fail-closed fatal path too, where the table stays up
-    // precisely so that nothing gets through unjudged.
-    let on_exit = applied_verdict(deps.settings.default_verdict(), deps.settings.enforcing());
-    for (_, msg) in held.drain() {
-        apply_verdict(&mut queue, msg, on_exit);
-    }
-    if let Err(e) = queue.unbind(queue_num) {
-        tracing::warn!(queue_num, "nfqueue unbind failed: {e}");
-    }
-    match fatal {
-        Some(e) => Err(e),
-        None => Ok(()),
+    /// On shutdown or a fatal error: release anything still held so nothing
+    /// hangs in the kernel, and unbind so packets stop being queued.
+    ///
+    /// Released with the default verdict, which is what their prompts would
+    /// have come to: accepting them let every connection that was waiting
+    /// on a question through, on the fail-closed fatal path too, where the
+    /// table stays up precisely so that nothing gets through unjudged.
+    fn release_all(&mut self, queue_num: u16) {
+        let settings = &self.deps.settings;
+        let on_exit = applied_verdict(settings.default_verdict(), settings.enforcing());
+        for (_, msg) in self.held.drain() {
+            apply_verdict(&mut self.queue, msg, on_exit);
+        }
+        if let Err(e) = self.queue.unbind(queue_num) {
+            tracing::warn!(queue_num, "nfqueue unbind failed: {e}");
+        }
     }
 }
 
-/// Spawn the queue loop on its own thread over an already-bound queue.
-/// A persistent error is fatal for the whole daemon: with nftables still
-/// installed and nobody draining the queue, staying up would silently
-/// blackhole (fail-closed) or bypass (fail-open) all new traffic while
-/// looking healthy, so the loop signals `fatal_tx` and main shuts down.
-/// Start the verdict loop and the snoop loop, each on its own thread. The
-/// returned handle is the verdict thread's, which joins the snoop thread
-/// before it ends, so joining it waits for both.
+/// Start the verdict loop and the snoop loop, each on its own thread, over
+/// already-bound queues. The returned handle is the verdict thread's, which
+/// joins the snoop thread before it ends, so joining it waits for both.
+///
+/// A persistent verdict-loop error is fatal for the whole daemon: with
+/// nftables still installed and nobody draining the queue, staying up would
+/// silently blackhole (fail-closed) or bypass (fail-open) all new traffic
+/// while looking healthy, so the loop signals `fatal_tx` and main shuts down.
 pub fn spawn(queues: Queues, queue_num: u16, deps: QueueDeps) -> std::thread::JoinHandle<()> {
     let fatal_tx = deps.fatal_tx.clone();
     let snoop = {
@@ -1050,16 +1072,16 @@ fn run_snoop(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::attribution::{Attributor, ProcInfo};
+    use crate::session::{PeerProcess, SessionRegistry};
     use crate::testutil::TestDir;
     use etherparse::PacketBuilder;
-    use hallpass_types::{Action, Rule, RuleDuration, RuleMatch};
+    use hallpass_types::{Action, FirstSeen, Rule, RuleDuration, RuleMatch};
 
+    /// Attributes nothing.
     struct NoAttr;
-    impl crate::attribution::Attributor for NoAttr {
-        fn attribute(
-            &self,
-            _t: &hallpass_types::FlowTuple,
-        ) -> Option<crate::attribution::ProcInfo> {
+    impl Attributor for NoAttr {
+        fn attribute(&self, _t: &FlowTuple) -> Option<ProcInfo> {
             None
         }
     }
@@ -1067,85 +1089,105 @@ mod tests {
     /// Attributes every flow to one executable, for the paths that need a
     /// connection with an identity on it.
     struct FixedExe(&'static str);
-    impl crate::attribution::Attributor for FixedExe {
-        fn attribute(
-            &self,
-            _t: &hallpass_types::FlowTuple,
-        ) -> Option<crate::attribution::ProcInfo> {
-            Some(crate::attribution::ProcInfo {
-                pid: Some(1),
-                uid: 1000,
-                exe_path: Some(std::path::PathBuf::from(self.0)),
-                exe_id: None,
-                cmdline: None,
-                parent_exe: None,
-                app_id: None,
-                starttime: None,
-                socket_inode: None,
-            })
+    impl Attributor for FixedExe {
+        fn attribute(&self, _t: &FlowTuple) -> Option<ProcInfo> {
+            Some(proc_info(1, 1000, self.0))
         }
     }
 
     /// Attributes every flow to this test process, so a session rooted at
     /// it covers what it decides.
     struct SelfProc;
-    impl crate::attribution::Attributor for SelfProc {
-        fn attribute(
-            &self,
-            _t: &hallpass_types::FlowTuple,
-        ) -> Option<crate::attribution::ProcInfo> {
-            Some(crate::attribution::ProcInfo {
-                pid: Some(std::process::id()),
-                uid: crate::testutil::own_uid(),
-                exe_path: Some(std::path::PathBuf::from("/usr/bin/curl")),
-                exe_id: None,
-                cmdline: None,
-                parent_exe: None,
-                app_id: None,
-                starttime: None,
-                socket_inode: None,
-            })
+    impl Attributor for SelfProc {
+        fn attribute(&self, _t: &FlowTuple) -> Option<ProcInfo> {
+            Some(proc_info(
+                std::process::id(),
+                crate::testutil::own_uid(),
+                "/usr/bin/curl",
+            ))
         }
     }
 
-    fn setup(
-        tag: &str,
-        rules: Vec<Rule>,
-    ) -> (
-        AttributionChain,
-        Arc<RuleStore>,
-        IpDomainCache,
-        ExeHashCache,
-        TestDir,
-    ) {
-        let dir = TestDir::new(&format!("nfq-{tag}"));
-        let store = Arc::new(RuleStore::new(dir.path().to_path_buf()));
-        for r in rules {
-            store.add(r).unwrap();
+    fn proc_info(pid: u32, uid: u32, exe: &str) -> ProcInfo {
+        ProcInfo {
+            pid: Some(pid),
+            uid,
+            exe_path: Some(std::path::PathBuf::from(exe)),
+            exe_id: None,
+            cmdline: None,
+            parent_exe: None,
+            app_id: None,
+            starttime: None,
+            socket_inode: None,
         }
-        let chain = AttributionChain::new(vec![Box::new(NoAttr)]);
-        (
-            chain,
-            store,
-            IpDomainCache::new(16),
-            ExeHashCache::default(),
-            dir,
-        )
     }
 
-    fn ctx<'a>(
-        attribution: &'a AttributionChain,
-        rules: &'a Arc<RuleStore>,
-        dns_cache: &'a IpDomainCache,
-        exe_hash: &'a ExeHashCache,
-        sessions: &'a crate::session::SessionRegistry,
-    ) -> DecideCtx<'a> {
-        DecideCtx {
-            attribution,
-            rules,
-            dns_cache,
-            exe_hash,
-            sessions,
+    /// Everything `decide` reads, over a fresh rules directory.
+    struct Fixture {
+        chain: AttributionChain,
+        store: Arc<RuleStore>,
+        dns: IpDomainCache,
+        hash: ExeHashCache,
+        sessions: SessionRegistry,
+        dir: TestDir,
+    }
+
+    impl Fixture {
+        fn new(tag: &str, rules: Vec<Rule>, attributor: impl Attributor + 'static) -> Self {
+            let dir = TestDir::new(&format!("nfq-{tag}"));
+            let store = Arc::new(RuleStore::new(dir.path().to_path_buf()));
+            for r in rules {
+                store.add(r).unwrap();
+            }
+            Self {
+                chain: AttributionChain::new(vec![Box::new(attributor)]),
+                store,
+                dns: IpDomainCache::new(16),
+                hash: ExeHashCache::default(),
+                sessions: SessionRegistry::default(),
+                dir,
+            }
+        }
+
+        fn ctx(&self) -> DecideCtx<'_> {
+            DecideCtx {
+                attribution: &self.chain,
+                rules: &self.store,
+                dns_cache: &self.dns,
+                exe_hash: &self.hash,
+                sessions: &self.sessions,
+            }
+        }
+
+        /// `decide` with no interface and first-seen tracking off.
+        fn decide(&self, tuple: FlowTuple) -> Decision {
+            decide(tuple, None, &self.ctx(), None)
+        }
+
+        /// Open a session rooted at this test process for `uid`.
+        fn open_session(&self, uid: u32) -> u64 {
+            self.sessions
+                .register(
+                    PeerProcess::resolve(Some(std::process::id())),
+                    uid,
+                    "curl".into(),
+                )
+                .expect("register")
+        }
+    }
+
+    fn deny_443() -> Rule {
+        Rule {
+            name: "deny-443".into(),
+            action: Action::Deny,
+            duration: RuleDuration::Session,
+            priority: 1,
+            enabled: true,
+            tags: Vec::new(),
+            matcher: RuleMatch {
+                port: Some(443),
+                ..Default::default()
+            },
         }
     }
 
@@ -1178,32 +1220,14 @@ mod tests {
         buf
     }
 
-    fn tuple_of(buf: &[u8]) -> Option<FlowTuple> {
-        packet::parse_tuple(buf)
+    fn tuple_of(buf: &[u8]) -> FlowTuple {
+        packet::parse_tuple(buf).unwrap()
     }
 
     #[test]
     fn rule_match_decides_immediately() {
-        let deny = Rule {
-            name: "deny-443".into(),
-            action: Action::Deny,
-            duration: RuleDuration::Session,
-            priority: 1,
-            enabled: true,
-            tags: Vec::new(),
-            matcher: RuleMatch {
-                port: Some(443),
-                ..Default::default()
-            },
-        };
-        let sessions = crate::session::SessionRegistry::default();
-        let (chain, store, dns, hash, _dir) = setup("rule", vec![deny]);
-        match decide(
-            tuple_of(&tcp_packet([1, 1, 1, 1], 443)).unwrap(),
-            None,
-            &ctx(&chain, &store, &dns, &hash, &sessions),
-            None,
-        ) {
+        let fx = Fixture::new("rule", vec![deny_443()], NoAttr);
+        match fx.decide(tuple_of(&tcp_packet([1, 1, 1, 1], 443))) {
             Decision::Verdict(Verdict::Deny, name, conn) => {
                 assert_eq!(name, "deny-443");
                 assert_eq!(conn.tuple.dst.port(), 443);
@@ -1214,14 +1238,8 @@ mod tests {
 
     #[test]
     fn unmatched_goes_to_prompt() {
-        let sessions = crate::session::SessionRegistry::default();
-        let (chain, store, dns, hash, _dir) = setup("prompt", vec![]);
-        match decide(
-            tuple_of(&tcp_packet([1, 1, 1, 1], 8443)).unwrap(),
-            None,
-            &ctx(&chain, &store, &dns, &hash, &sessions),
-            None,
-        ) {
+        let fx = Fixture::new("prompt", vec![], NoAttr);
+        match fx.decide(tuple_of(&tcp_packet([1, 1, 1, 1], 8443))) {
             Decision::Prompt(conn, _) => {
                 assert_eq!(conn.tuple.dst.port(), 8443);
                 assert_eq!(conn.exe_path, None);
@@ -1272,38 +1290,20 @@ mod tests {
     /// when someone reaches for one.
     #[test]
     fn lockdown_denies_without_a_prompt_and_outranks_a_session_grant() {
-        let sessions = crate::session::SessionRegistry::default();
-        let (_chain, store, dns, hash, _dir) = setup("lockdown", vec![]);
-        let chain = AttributionChain::new(vec![Box::new(SelfProc)]);
-        let tuple = tuple_of(&tcp_packet([1, 1, 1, 1], 443)).unwrap();
-        let id = sessions
-            .register(
-                crate::session::PeerProcess::resolve(Some(std::process::id())),
-                crate::testutil::own_uid(),
-                "curl".into(),
-            )
-            .expect("register");
+        let fx = Fixture::new("lockdown", vec![], SelfProc);
+        let tuple = tuple_of(&tcp_packet([1, 1, 1, 1], 443));
+        let id = fx.open_session(crate::testutil::own_uid());
 
         // With no posture the grant answers, as it always has.
-        match decide(
-            tuple,
-            None,
-            &ctx(&chain, &store, &dns, &hash, &sessions),
-            None,
-        ) {
+        match fx.decide(tuple) {
             Decision::Verdict(Verdict::Allow, name, _) => {
                 assert_eq!(name, format!("run-session:{id}"));
             }
             other => panic!("expected the session grant to allow, got {other:?}"),
         }
 
-        store.rebuild_for_posture(Some(&["work".to_string()]));
-        match decide(
-            tuple,
-            None,
-            &ctx(&chain, &store, &dns, &hash, &sessions),
-            None,
-        ) {
+        fx.store.rebuild_for_posture(Some(&["work".to_string()]));
+        match fx.decide(tuple) {
             Decision::Verdict(Verdict::Deny, name, _) => {
                 assert_eq!(name, hallpass_types::LOCKDOWN_DENIED_RULE);
             }
@@ -1316,13 +1316,7 @@ mod tests {
 
         // Loopback is exempt: it never leaves the host, so refusing it costs
         // the resolver stub and every local service and buys nothing.
-        let local = tuple_of(&loopback_packet()).unwrap();
-        match decide(
-            local,
-            None,
-            &ctx(&chain, &store, &dns, &hash, &sessions),
-            None,
-        ) {
+        match fx.decide(tuple_of(&loopback_packet())) {
             Decision::Verdict(Verdict::Allow, name, _) => {
                 assert_eq!(name, hallpass_types::LOCKDOWN_LOOPBACK_RULE);
             }
@@ -1334,7 +1328,6 @@ mod tests {
     /// puts every rule back exactly as the operator left it.
     #[test]
     fn a_posture_suppresses_only_untagged_allows_on_the_packet_path() {
-        let sessions = crate::session::SessionRegistry::default();
         let allow_rule = |name: &str, port: u16, tags: Vec<String>| Rule {
             name: name.into(),
             action: Action::Allow,
@@ -1349,26 +1342,24 @@ mod tests {
         };
         let allow = allow_rule("allow-any", 443, Vec::new());
         let tagged = allow_rule("allow-work", 8443, vec!["work".to_string()]);
-        let (_chain, store, dns, hash, _dir) = setup("lockdown-rules", vec![allow, tagged]);
-        let chain = AttributionChain::new(vec![Box::new(SelfProc)]);
-        let untagged_hit = tuple_of(&tcp_packet([1, 1, 1, 1], 443)).unwrap();
-        let tagged_hit = tuple_of(&tcp_packet([1, 1, 1, 1], 8443)).unwrap();
-        let c = |t| decide(t, None, &ctx(&chain, &store, &dns, &hash, &sessions), None);
+        let fx = Fixture::new("lockdown-rules", vec![allow, tagged], SelfProc);
+        let untagged_hit = tuple_of(&tcp_packet([1, 1, 1, 1], 443));
+        let tagged_hit = tuple_of(&tcp_packet([1, 1, 1, 1], 8443));
 
-        store.rebuild_for_posture(Some(&["work".to_string()]));
-        match c(untagged_hit) {
+        fx.store.rebuild_for_posture(Some(&["work".to_string()]));
+        match fx.decide(untagged_hit) {
             Decision::Verdict(Verdict::Deny, name, _) => {
                 assert_eq!(name, hallpass_types::LOCKDOWN_DENIED_RULE);
             }
             other => panic!("expected the untagged allow to be suppressed, got {other:?}"),
         }
-        match c(tagged_hit) {
+        match fx.decide(tagged_hit) {
             Decision::Verdict(Verdict::Allow, name, _) => assert_eq!(name, "allow-work"),
             other => panic!("expected the pinned allow to decide, got {other:?}"),
         }
 
-        store.rebuild_for_posture(None);
-        match c(untagged_hit) {
+        fx.store.rebuild_for_posture(None);
+        match fx.decide(untagged_hit) {
             Decision::Verdict(Verdict::Allow, name, _) => assert_eq!(name, "allow-any"),
             other => panic!("lifting the posture must restore the rule, got {other:?}"),
         }
@@ -1378,35 +1369,17 @@ mod tests {
     /// prompted, and reports itself through the rule-name field.
     #[test]
     fn a_session_grant_allows_what_would_otherwise_prompt() {
-        let sessions = crate::session::SessionRegistry::default();
-        let (_chain, store, dns, hash, _dir) = setup("session-allow", vec![]);
-        let chain = AttributionChain::new(vec![Box::new(SelfProc)]);
-        let tuple = tuple_of(&tcp_packet([1, 1, 1, 1], 443)).unwrap();
+        let fx = Fixture::new("session-allow", vec![], SelfProc);
+        let tuple = tuple_of(&tcp_packet([1, 1, 1, 1], 443));
 
         // Without a session, this is the prompt the grant exists to remove.
-        match decide(
-            tuple,
-            None,
-            &ctx(&chain, &store, &dns, &hash, &sessions),
-            None,
-        ) {
+        match fx.decide(tuple) {
             Decision::Prompt(_, _) => {}
             other => panic!("expected a prompt with no session open, got {other:?}"),
         }
 
-        let id = sessions
-            .register(
-                crate::session::PeerProcess::resolve(Some(std::process::id())),
-                crate::testutil::own_uid(),
-                "curl".into(),
-            )
-            .expect("register");
-        match decide(
-            tuple,
-            None,
-            &ctx(&chain, &store, &dns, &hash, &sessions),
-            None,
-        ) {
+        let id = fx.open_session(crate::testutil::own_uid());
+        match fx.decide(tuple) {
             Decision::Verdict(Verdict::Allow, name, _) => {
                 assert_eq!(name, format!("run-session:{id}"));
             }
@@ -1415,13 +1388,8 @@ mod tests {
 
         // And it stops the moment the session does, even though the cache
         // has an answer for this process.
-        sessions.unregister(id);
-        match decide(
-            tuple,
-            None,
-            &ctx(&chain, &store, &dns, &hash, &sessions),
-            None,
-        ) {
+        fx.sessions.unregister(id);
+        match fx.decide(tuple) {
             Decision::Prompt(_, _) => {}
             other => panic!("expected a prompt once the session ended, got {other:?}"),
         }
@@ -1430,35 +1398,10 @@ mod tests {
     /// A grant suppresses a question; it never overrules an answer.
     #[test]
     fn an_explicit_rule_still_decides_inside_a_session() {
-        let deny = Rule {
-            name: "deny-443".into(),
-            action: Action::Deny,
-            duration: RuleDuration::Session,
-            priority: 1,
-            enabled: true,
-            tags: Vec::new(),
-            matcher: RuleMatch {
-                port: Some(443),
-                ..Default::default()
-            },
-        };
-        let sessions = crate::session::SessionRegistry::default();
-        let (_chain, store, dns, hash, _dir) = setup("session-deny", vec![deny]);
-        let chain = AttributionChain::new(vec![Box::new(SelfProc)]);
-        sessions
-            .register(
-                crate::session::PeerProcess::resolve(Some(std::process::id())),
-                crate::testutil::own_uid(),
-                "curl".into(),
-            )
-            .expect("register");
+        let fx = Fixture::new("session-deny", vec![deny_443()], SelfProc);
+        fx.open_session(crate::testutil::own_uid());
 
-        match decide(
-            tuple_of(&tcp_packet([1, 1, 1, 1], 443)).unwrap(),
-            None,
-            &ctx(&chain, &store, &dns, &hash, &sessions),
-            None,
-        ) {
+        match fx.decide(tuple_of(&tcp_packet([1, 1, 1, 1], 443))) {
             Decision::Verdict(Verdict::Deny, name, _) => assert_eq!(name, "deny-443"),
             other => panic!("a deny rule must still deny inside a session, got {other:?}"),
         }
@@ -1468,23 +1411,10 @@ mod tests {
     /// the tree (sudo) leaves it.
     #[test]
     fn a_session_does_not_cover_another_user() {
-        let sessions = crate::session::SessionRegistry::default();
-        let (_chain, store, dns, hash, _dir) = setup("session-uid", vec![]);
-        let chain = AttributionChain::new(vec![Box::new(SelfProc)]);
-        sessions
-            .register(
-                crate::session::PeerProcess::resolve(Some(std::process::id())),
-                crate::testutil::own_uid().wrapping_add(1),
-                "curl".into(),
-            )
-            .expect("register");
+        let fx = Fixture::new("session-uid", vec![], SelfProc);
+        fx.open_session(crate::testutil::own_uid().wrapping_add(1));
 
-        match decide(
-            tuple_of(&tcp_packet([1, 1, 1, 1], 443)).unwrap(),
-            None,
-            &ctx(&chain, &store, &dns, &hash, &sessions),
-            None,
-        ) {
+        match fx.decide(tuple_of(&tcp_packet([1, 1, 1, 1], 443))) {
             Decision::Prompt(_, _) => {}
             other => panic!("another user's connection must still prompt, got {other:?}"),
         }
@@ -1495,59 +1425,35 @@ mod tests {
     /// recording happens where the decision does, not where the display is.
     #[tokio::test]
     async fn first_seen_is_stamped_and_then_settles() {
-        let sessions = crate::session::SessionRegistry::default();
-        let dir = TestDir::new("nfq-firstseen");
-        let store = Arc::new(RuleStore::new(dir.path().to_path_buf()));
-        let chain = AttributionChain::new(vec![Box::new(FixedExe("/usr/bin/curl"))]);
-        let dns = IpDomainCache::new(16);
-        let hash = ExeHashCache::default();
-        let (mut seen, _writer) = crate::firstseen::start(dir.path().join("seen.toml"));
-
-        let tuple = tuple_of(&tcp_packet([1, 1, 1, 1], 443)).unwrap();
-        let first = match decide(
+        let fx = Fixture::new("firstseen", vec![], FixedExe("/usr/bin/curl"));
+        let (mut seen, _writer) = crate::firstseen::start(fx.dir.path().join("seen.toml"));
+        let tuple = tuple_of(&tcp_packet([1, 1, 1, 1], 443));
+        let first_seen = |seen: Option<&mut crate::firstseen::Tracker>| match decide(
             tuple,
             None,
-            &ctx(&chain, &store, &dns, &hash, &sessions),
-            Some(&mut seen),
+            &fx.ctx(),
+            seen,
         ) {
             Decision::Prompt(conn, _) => conn.first_seen,
             other => panic!("expected a prompt, got {other:?}"),
         };
+
         assert_eq!(
-            first,
-            Some(hallpass_types::FirstSeen {
+            first_seen(Some(&mut seen)),
+            Some(FirstSeen {
                 app: true,
                 dest: true
             })
         );
-
-        let again = match decide(
-            tuple,
-            None,
-            &ctx(&chain, &store, &dns, &hash, &sessions),
-            Some(&mut seen),
-        ) {
-            Decision::Prompt(conn, _) => conn.first_seen,
-            other => panic!("expected a prompt, got {other:?}"),
-        };
         assert_eq!(
-            again,
-            Some(hallpass_types::FirstSeen {
+            first_seen(Some(&mut seen)),
+            Some(FirstSeen {
                 app: false,
                 dest: false
             })
         );
-
         // Tracking off is not "seen before": the daemon has nothing to say.
-        match decide(
-            tuple,
-            None,
-            &ctx(&chain, &store, &dns, &hash, &sessions),
-            None,
-        ) {
-            Decision::Prompt(conn, _) => assert_eq!(conn.first_seen, None),
-            other => panic!("expected a prompt, got {other:?}"),
-        }
+        assert_eq!(first_seen(None), None);
     }
 
     /// A resolver query must not consume a program's first sighting.
@@ -1560,17 +1466,12 @@ mod tests {
     /// exists to show.
     #[tokio::test]
     async fn a_resolver_query_does_not_consume_the_first_sighting() {
-        let dir = TestDir::new("nfq-firstseen-dns");
-        let store = Arc::new(RuleStore::new(dir.path().to_path_buf()));
-        let chain = AttributionChain::new(vec![Box::new(FixedExe("/usr/bin/curl"))]);
-        let dns = IpDomainCache::new(16);
-        let hash = ExeHashCache::default();
-        let (mut seen, _writer) = crate::firstseen::start(dir.path().join("seen.toml"));
-        let sessions = crate::session::SessionRegistry::default();
-        let ctx = ctx(&chain, &store, &dns, &hash, &sessions);
+        let fx = Fixture::new("firstseen-dns", vec![], FixedExe("/usr/bin/curl"));
+        let (mut seen, _writer) = crate::firstseen::start(fx.dir.path().join("seen.toml"));
+        let ctx = fx.ctx();
 
         // The program resolves a name first, the way a real one does.
-        let query = tuple_of(&udp_packet([127, 0, 0, 53], 53)).unwrap();
+        let query = tuple_of(&udp_packet([127, 0, 0, 53], 53));
         let Decision::Prompt(conn, _) = decide(query, None, &ctx, Some(&mut seen)) else {
             panic!("expected a prompt for the query");
         };
@@ -1580,13 +1481,13 @@ mod tests {
         );
 
         // Then connects, and *that* is where the annotation belongs.
-        let real = tuple_of(&tcp_packet([1, 1, 1, 1], 443)).unwrap();
+        let real = tuple_of(&tcp_packet([1, 1, 1, 1], 443));
         let Decision::Prompt(conn, _) = decide(real, None, &ctx, Some(&mut seen)) else {
             panic!("expected a prompt for the connection");
         };
         assert_eq!(
             conn.first_seen,
-            Some(hallpass_types::FirstSeen {
+            Some(FirstSeen {
                 app: true,
                 dest: true
             })
@@ -1595,19 +1496,13 @@ mod tests {
 
     #[test]
     fn domain_enrichment_from_dns_cache() {
-        let sessions = crate::session::SessionRegistry::default();
-        let (chain, store, dns, hash, _dir) = setup("domain", vec![]);
-        dns.absorb(&crate::dns::SnoopedResponse {
+        let fx = Fixture::new("domain", vec![], NoAttr);
+        fx.dns.absorb(&crate::dns::SnoopedResponse {
             id: 1,
             query_name: "example.com".into(),
             addrs: vec![("1.1.1.1".parse().unwrap(), 300)],
         });
-        match decide(
-            tuple_of(&tcp_packet([1, 1, 1, 1], 443)).unwrap(),
-            None,
-            &ctx(&chain, &store, &dns, &hash, &sessions),
-            None,
-        ) {
+        match fx.decide(tuple_of(&tcp_packet([1, 1, 1, 1], 443))) {
             Decision::Prompt(conn, _) => assert_eq!(conn.domain.as_deref(), Some("example.com")),
             _ => panic!("expected prompt"),
         }
