@@ -42,8 +42,12 @@ use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::Duration;
+
+use tokio::sync::mpsc::UnboundedSender;
+
+use crate::stats::Counters;
 
 /// Packet mark the nfqueue thread sets to ask nftables to reject a packet.
 /// A large, distinctive value ("HALP") to avoid colliding with the small
@@ -239,7 +243,11 @@ const WATCHDOG_CALL_TIMEOUT: Duration = Duration::from_secs(30);
 /// exited. Poisoning is ignored: a panicking holder means the daemon is on
 /// its way out, and blocking the teardown behind a poisoned lock would be
 /// the worse outcome.
-static TABLE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static TABLE_LOCK: Mutex<()> = Mutex::new(());
+
+fn lock_table() -> MutexGuard<'static, ()> {
+    TABLE_LOCK.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 /// Watch for the hallpass table disappearing and put it back.
 ///
@@ -266,8 +274,8 @@ pub fn spawn_watchdog(
     verdict_bypass: bool,
     drop_unjudgeable: bool,
     shutdown: Arc<AtomicBool>,
-    fatal_tx: tokio::sync::mpsc::UnboundedSender<()>,
-    counters: Arc<crate::stats::Counters>,
+    fatal_tx: UnboundedSender<()>,
+    counters: Arc<Counters>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(WATCHDOG_INTERVAL);
@@ -289,46 +297,14 @@ pub fn spawn_watchdog(
             let counters = Arc::clone(&counters);
             let fatal = fatal_tx.clone();
             let check = tokio::task::spawn_blocking(move || {
-                let _guard = TABLE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-                // Under the lock, so this cannot straddle a teardown that is
-                // running right now.
-                if stopping.load(Ordering::Relaxed) || table_present() {
-                    return;
-                }
-                let repaired = install(queue_num, verdict_bypass, drop_unjudgeable);
-                // Still under the lock. A shutdown that started after the
-                // check dispatched is about to tear the table down anyway;
-                // counting or escalating its repair would be noise.
-                if stopping.load(Ordering::Relaxed) {
-                    return;
-                }
-                // Counted whether or not the repair succeeded: the number
-                // answers "how often was this host unfiltered because
-                // something flushed the table", and a failed repair is
-                // that too.
-                counters.record_nft_flush();
-                match repaired {
-                    Ok(()) => tracing::error!(
-                        "the hallpass nftables table was gone (something flushed it); \
-                         reinstalled it, but every connection in the meantime was unfiltered"
-                    ),
-                    Err(e) if verdict_bypass => {
-                        tracing::error!(
-                            "the hallpass nftables table is gone and reinstalling it failed, \
-                             traffic is unfiltered: {e}"
-                        );
-                    }
-                    Err(e) => {
-                        // Fail-closed was chosen to trade availability for
-                        // enforcement. With no table there is no enforcement,
-                        // so running on would silently deliver neither.
-                        tracing::error!(
-                            "the hallpass nftables table is gone, reinstalling it failed and \
-                             queue_bypass is off, shutting down: {e}"
-                        );
-                        let _ = fatal.send(());
-                    }
-                }
+                check_and_repair(
+                    queue_num,
+                    verdict_bypass,
+                    drop_unjudgeable,
+                    &stopping,
+                    &counters,
+                    &fatal,
+                );
             });
             // A hung `nft` would otherwise park this loop forever and the
             // watching would stop with no trace. The blocking thread stays
@@ -344,16 +320,70 @@ pub fn spawn_watchdog(
     })
 }
 
+/// One watchdog round, on a blocking thread: reinstall the table if it is
+/// gone, and count, log and (fail-closed) escalate the repair.
+fn check_and_repair(
+    queue_num: u16,
+    verdict_bypass: bool,
+    drop_unjudgeable: bool,
+    stopping: &AtomicBool,
+    counters: &Counters,
+    fatal: &UnboundedSender<()>,
+) {
+    let _guard = lock_table();
+    // Under the lock, so this cannot straddle a teardown that is running
+    // right now.
+    if stopping.load(Ordering::Relaxed) || table_present() {
+        return;
+    }
+    let repaired = install(queue_num, verdict_bypass, drop_unjudgeable);
+    // Still under the lock. A shutdown that started after the check
+    // dispatched is about to tear the table down anyway; counting or
+    // escalating its repair would be noise.
+    if stopping.load(Ordering::Relaxed) {
+        return;
+    }
+    // Counted whether or not the repair succeeded: the number answers "how
+    // often was this host unfiltered because something flushed the table",
+    // and a failed repair is that too.
+    counters.record_nft_flush();
+    match repaired {
+        Ok(()) => tracing::error!(
+            "the hallpass nftables table was gone (something flushed it); \
+             reinstalled it, but every connection in the meantime was unfiltered"
+        ),
+        Err(e) if verdict_bypass => {
+            tracing::error!(
+                "the hallpass nftables table is gone and reinstalling it failed, \
+                 traffic is unfiltered: {e}"
+            );
+        }
+        Err(e) => {
+            // Fail-closed was chosen to trade availability for enforcement.
+            // With no table there is no enforcement, so running on would
+            // silently deliver neither.
+            tracing::error!(
+                "the hallpass nftables table is gone, reinstalling it failed and \
+                 queue_bypass is off, shutting down: {e}"
+            );
+            let _ = fatal.send(());
+        }
+    }
+}
+
 /// Remove the hallpass table. Failure is logged, not fatal: this runs on
 /// shutdown paths where there is nothing better to do.
 pub fn teardown() {
     // Held for the delete so a watchdog repair cannot run between the check
     // it already made and this removal; see spawn_watchdog.
-    let _guard = TABLE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = lock_table();
     if let Err(e) = run_nft(&["delete", "table", "inet", "hallpass"], None) {
         tracing::warn!("nft teardown failed: {e}");
     }
 }
+
+/// Where distributions install `nft`, most common first.
+const NFT_PATHS: &[&str] = &["/usr/sbin/nft", "/sbin/nft", "/usr/bin/nft", "/bin/nft"];
 
 /// Absolute path of the `nft` binary.
 ///
@@ -365,17 +395,17 @@ pub fn teardown() {
 fn nft_binary() -> &'static str {
     static RESOLVED: OnceLock<&'static str> = OnceLock::new();
     RESOLVED.get_or_init(|| {
-        const CANDIDATES: &[&str] = &["/usr/sbin/nft", "/sbin/nft", "/usr/bin/nft", "/bin/nft"];
-        match CANDIDATES.iter().copied().find(|p| Path::new(p).is_file()) {
-            Some(p) => p,
-            None => {
+        NFT_PATHS
+            .iter()
+            .copied()
+            .find(|p| Path::new(p).is_file())
+            .unwrap_or_else(|| {
                 tracing::warn!(
                     "nft not found at a standard path; falling back to PATH lookup, \
                      which trusts the environment this daemon was started with"
                 );
                 "nft"
-            }
-        }
+            })
     })
 }
 
@@ -411,6 +441,14 @@ fn run_nft(args: &[&str], stdin: Option<&str>) -> std::io::Result<()> {
 mod tests {
     use super::*;
 
+    /// The `output` chain's body: everything before the reject chain.
+    fn output_chain(ruleset: &str) -> &str {
+        ruleset
+            .split("\tchain reject_marked {")
+            .next()
+            .expect("output chain precedes the reject chain")
+    }
+
     #[test]
     fn ruleset_contains_expected_rules() {
         let r = ruleset(3, true, false);
@@ -431,12 +469,8 @@ mod tests {
     #[test]
     fn reject_rules_live_in_their_own_later_chain() {
         let r = ruleset(3, true, false);
-        let output = r
-            .split("\tchain reject_marked {")
-            .next()
-            .expect("output chain precedes the reject chain");
         assert!(
-            !output.contains(&format!("meta mark {REJECT_MARK}")),
+            !output_chain(&r).contains(&format!("meta mark {REJECT_MARK}")),
             "reject rules must not sit in the chain that queues packets:\n{r}"
         );
         // Strictly after `output`'s priority: equal priorities give no
@@ -471,10 +505,7 @@ mod tests {
     /// and is the only thing this asserts on.
     #[test]
     fn rendered_ruleset_parses_under_real_nft() {
-        let Some(nft) = ["/usr/sbin/nft", "/sbin/nft", "/usr/bin/nft", "/bin/nft"]
-            .into_iter()
-            .find(|p| Path::new(p).is_file())
-        else {
+        let Some(nft) = NFT_PATHS.iter().find(|p| Path::new(p).is_file()) else {
             eprintln!("SKIP rendered_ruleset_parses_under_real_nft: no nft binary");
             return;
         };
@@ -513,10 +544,7 @@ mod tests {
     fn export_mark_is_accepted_before_the_queue_rule() {
         for bypass in [true, false] {
             let r = ruleset(3, bypass, false);
-            let output = r
-                .split("\tchain reject_marked {")
-                .next()
-                .expect("output chain precedes the reject chain");
+            let output = output_chain(&r);
             let accept = output
                 .find(&format!("meta skuid 0 meta mark {EXPORT_MARK} accept"))
                 .expect("the export exemption must be in the output chain, and root-only");
