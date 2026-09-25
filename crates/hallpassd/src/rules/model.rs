@@ -1,10 +1,13 @@
 //! Compiled form of a rule: match fields pre-parsed for fast evaluation.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use globset::GlobMatcher;
-use hallpass_types::{Action, Connection, Proto, Rule};
+use hallpass_types::{Action, Connection, Proto, Rule, RuleMatch};
 use ipnet::IpNet;
+
+use super::lists::{self, DomainSet, HashSet256, IpSet};
 
 /// Domain pattern from a rule's `domain` field.
 #[derive(Debug, Clone)]
@@ -26,7 +29,7 @@ impl DomainPattern {
     /// here, the rule is skipped with a warning naming it, or the IPC add
     /// fails with the reason. A trailing dot is the one spelling normalized
     /// rather than refused, since it names the same thing.
-    fn parse(raw: &str) -> Result<DomainPattern, String> {
+    fn parse(raw: &str) -> Result<Self, String> {
         let lower = raw.to_ascii_lowercase();
         let name = lower.strip_suffix('.').unwrap_or(&lower);
         let (suffix, body) = match name.strip_prefix("*.") {
@@ -49,17 +52,19 @@ impl DomainPattern {
                 "{raw:?}: expected a domain name, or \"*.\" followed by one"
             ));
         }
-        Ok(match suffix {
-            true => DomainPattern::Suffix(body.to_string()),
-            false => DomainPattern::Exact(body.to_string()),
+        let body = body.to_string();
+        Ok(if suffix {
+            Self::Suffix(body)
+        } else {
+            Self::Exact(body)
         })
     }
 
     /// Case-insensitive match without allocating (per-packet path).
     fn matches(&self, domain: &str) -> bool {
         match self {
-            DomainPattern::Exact(want) => domain.eq_ignore_ascii_case(want),
-            DomainPattern::Suffix(suffix) => {
+            Self::Exact(want) => domain.eq_ignore_ascii_case(want),
+            Self::Suffix(suffix) => {
                 if domain.eq_ignore_ascii_case(suffix) {
                     return true;
                 }
@@ -67,12 +72,9 @@ impl DomainPattern {
                 let Some(split) = domain.len().checked_sub(suffix.len()) else {
                     return false;
                 };
-                match (domain.get(..split), domain.get(split..)) {
-                    (Some(head), Some(tail)) => {
-                        head.ends_with('.') && tail.eq_ignore_ascii_case(suffix)
-                    }
-                    _ => false,
-                }
+                domain.split_at_checked(split).is_some_and(|(head, tail)| {
+                    head.ends_with('.') && tail.eq_ignore_ascii_case(suffix)
+                })
             }
         }
     }
@@ -104,9 +106,9 @@ pub struct CompiledRule {
     domain: Option<DomainPattern>,
     user: Option<u32>,
     proto: Option<Proto>,
-    domains_file: Option<std::sync::Arc<super::lists::DomainSet>>,
-    ips_file: Option<std::sync::Arc<super::lists::IpSet>>,
-    hashes_file: Option<std::sync::Arc<super::lists::HashSet256>>,
+    domains_file: Option<Arc<DomainSet>>,
+    ips_file: Option<Arc<IpSet>>,
+    hashes_file: Option<Arc<HashSet256>>,
     cmdline_contains: Option<String>,
     parent_exe: Option<PathBuf>,
     src: Option<IpNet>,
@@ -122,6 +124,33 @@ fn parse_net(field: &str, raw: &str) -> Result<IpNet, String> {
         .map_err(|e| format!("bad {field} {raw:?}: {e}"))
 }
 
+/// Compile an `exe_glob` operand for the rule named `rule`.
+///
+/// `literal_separator`, so `*` and `?` stop at a path separator the way a
+/// shell's do. Off (the crate default) `/usr/bin/*` also covered
+/// `/usr/bin/anything/deep/evil`, so a binary dropped in a writable
+/// subdirectory of an allowed tree inherited the verdict. A subtree is still
+/// expressible, on purpose: `/opt/app/**`.
+fn compile_exe_glob(rule: &str, glob: &str) -> Result<GlobMatcher, String> {
+    // The one shape where the narrowing bites silently: a deny written as
+    // `/opt/app/*` for a subtree now blocks only the top level, and blocking
+    // less produces no visible failure. Said at compile, because it reaches
+    // operators who never read a release note.
+    if glob.ends_with("/*") {
+        tracing::info!(
+            rule = %rule,
+            glob = %glob,
+            "exe_glob ending in /* matches one directory level; \
+             use /** for the whole subtree"
+        );
+    }
+    Ok(globset::GlobBuilder::new(glob)
+        .literal_separator(true)
+        .build()
+        .map_err(|e| format!("bad exe_glob {glob:?}: {e}"))?
+        .compile_matcher())
+}
+
 impl CompiledRule {
     /// Compile a rule, validating cidr/glob/range fields.
     ///
@@ -132,7 +161,7 @@ impl CompiledRule {
     /// ambiguity the reservation exists to remove - it would be
     /// indistinguishable from one in every event, listing and export - so
     /// the check belongs on the one path both entrances share.
-    pub fn compile(rule: &Rule) -> Result<CompiledRule, String> {
+    pub fn compile(rule: &Rule) -> Result<Self, String> {
         if let Some(prefix) = hallpass_types::RESERVED_RULE_PREFIXES
             .iter()
             .find(|p| rule.name.starts_with(**p))
@@ -155,7 +184,7 @@ impl CompiledRule {
         // A criteria-free matcher matches every connection. That is a valid
         // thing to want (a final catch-all), but it is never a thing to want
         // by accident, so say so at a level the operator will see.
-        if *m == hallpass_types::RuleMatch::default() {
+        if *m == RuleMatch::default() {
             tracing::warn!(
                 rule = %rule.name,
                 action = ?rule.action,
@@ -169,38 +198,11 @@ impl CompiledRule {
             .map(|s| parse_net("dest", s))
             .transpose()?;
         let src = m.src.as_deref().map(|s| parse_net("src", s)).transpose()?;
-        let exe_glob = match &m.exe_glob {
-            None => None,
-            // literal_separator, so `*` and `?` stop at a path separator the
-            // way a shell's do. Off (the crate default) `/usr/bin/*` also
-            // covered `/usr/bin/anything/deep/evil`, so a rule an operator
-            // wrote for one directory silently carried every subtree under
-            // it, and a binary dropped in a writable subdirectory of an
-            // allowed tree inherited the verdict. A subtree is still
-            // expressible, now on purpose: `/opt/app/**`.
-            Some(g) => {
-                // The one shape where the narrowing bites silently: a deny
-                // written as `/opt/app/*` for a subtree now blocks only the
-                // top level, and blocking less produces no visible failure.
-                // Said here, at compile, because it reaches operators who
-                // never read a release note.
-                if g.ends_with("/*") {
-                    tracing::info!(
-                        rule = %rule.name,
-                        glob = %g,
-                        "exe_glob ending in /* matches one directory level; \
-                         use /** for the whole subtree"
-                    );
-                }
-                Some(
-                    globset::GlobBuilder::new(g)
-                        .literal_separator(true)
-                        .build()
-                        .map_err(|e| format!("bad exe_glob {g:?}: {e}"))?
-                        .compile_matcher(),
-                )
-            }
-        };
+        let exe_glob = m
+            .exe_glob
+            .as_deref()
+            .map(|g| compile_exe_glob(&rule.name, g))
+            .transpose()?;
         if let Some((lo, hi)) = m.port_range {
             if lo > hi {
                 return Err(format!("bad port_range {lo}-{hi}: start exceeds end"));
@@ -223,25 +225,13 @@ impl CompiledRule {
         let exe_sha256 = m
             .exe_sha256
             .as_deref()
-            .map(super::lists::parse_sha256_hex)
+            .map(lists::parse_sha256_hex)
             .transpose()
             .map_err(|e| format!("bad exe_sha256: {e}"))?;
-        let domains_file = m
-            .domains_file
-            .as_deref()
-            .map(super::lists::DomainSet::load)
-            .transpose()?;
-        let ips_file = m
-            .ips_file
-            .as_deref()
-            .map(super::lists::IpSet::load)
-            .transpose()?;
-        let hashes_file = m
-            .hashes_file
-            .as_deref()
-            .map(super::lists::HashSet256::load)
-            .transpose()?;
-        Ok(CompiledRule {
+        let domains_file = m.domains_file.as_deref().map(DomainSet::load).transpose()?;
+        let ips_file = m.ips_file.as_deref().map(IpSet::load).transpose()?;
+        let hashes_file = m.hashes_file.as_deref().map(HashSet256::load).transpose()?;
+        Ok(Self {
             name: rule.name.clone(),
             action: rule.action,
             priority: rule.priority,
@@ -447,7 +437,27 @@ impl CompiledRule {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hallpass_types::{RuleDuration, RuleMatch};
+    use hallpass_types::{FlowTuple, RuleDuration};
+
+    /// A TCP connection from `src` to `dst` that carries nothing else.
+    fn bare(src: &str, dst: &str) -> Connection {
+        Connection {
+            tuple: FlowTuple {
+                proto: Proto::Tcp,
+                src: src.parse().unwrap(),
+                dst: dst.parse().unwrap(),
+            },
+            uid: None,
+            pid: None,
+            exe_path: None,
+            cmdline: None,
+            parent_exe: None,
+            domain: None,
+            iface: None,
+            app_id: None,
+            first_seen: None,
+        }
+    }
 
     fn rule_with(matcher: RuleMatch) -> Rule {
         tagged_rule_with(Vec::new(), matcher)
@@ -478,20 +488,8 @@ mod tests {
             }))
             .expect("valid glob");
             let c = Connection {
-                tuple: hallpass_types::FlowTuple {
-                    proto: Proto::Tcp,
-                    src: "10.0.0.1:40000".parse().unwrap(),
-                    dst: "1.2.3.4:443".parse().unwrap(),
-                },
-                uid: None,
-                pid: None,
                 exe_path: Some(exe.into()),
-                cmdline: None,
-                parent_exe: None,
-                domain: None,
-                iface: None,
-                app_id: None,
-                first_seen: None,
+                ..bare("10.0.0.1:40000", "1.2.3.4:443")
             };
             compiled.matches(&c, None)
         };
@@ -509,7 +507,7 @@ mod tests {
                 "/usr/lib/firefox/*",
                 "/usr/lib/firefox/plugins/writable/evil"
             ),
-            "the README's own example must not carry a whole subtree"
+            "a one-level glob must not carry a whole subtree"
         );
         assert!(
             matches("/opt/app/**", "/opt/app/deep/nested/bin"),
@@ -559,22 +557,7 @@ mod tests {
         });
         let compiled = CompiledRule::compile(&r).unwrap();
         assert!(compiled.wants_exe_hash());
-        let conn = Connection {
-            tuple: hallpass_types::FlowTuple {
-                proto: Proto::Tcp,
-                src: "10.0.0.1:40000".parse().unwrap(),
-                dst: "1.2.3.4:443".parse().unwrap(),
-            },
-            uid: None,
-            pid: None,
-            exe_path: None,
-            cmdline: None,
-            parent_exe: None,
-            domain: None,
-            iface: None,
-            app_id: None,
-            first_seen: None,
-        };
+        let conn = bare("10.0.0.1:40000", "1.2.3.4:443");
         assert!(compiled.matches(&conn, Some(&"ab".repeat(32))));
         // Wrong or missing hash: no match, but other criteria still do.
         assert!(!compiled.matches(&conn, Some(&"cd".repeat(32))));
@@ -590,20 +573,8 @@ mod tests {
         let ips = dir.write("bad.list", "10.0.0.0/8\n");
 
         let conn = |domain: Option<&str>, dst: &str| Connection {
-            tuple: hallpass_types::FlowTuple {
-                proto: Proto::Tcp,
-                src: "10.0.0.1:40000".parse().unwrap(),
-                dst: dst.parse().unwrap(),
-            },
-            uid: None,
-            pid: None,
-            exe_path: None,
-            cmdline: None,
-            parent_exe: None,
             domain: domain.map(String::from),
-            iface: None,
-            app_id: None,
-            first_seen: None,
+            ..bare("10.0.0.1:40000", dst)
         };
 
         let r = rule_with(RuleMatch {
@@ -646,20 +617,14 @@ mod tests {
     #[test]
     fn new_operand_matching() {
         let conn = Connection {
-            tuple: hallpass_types::FlowTuple {
-                proto: Proto::Tcp,
-                src: "192.168.1.5:40000".parse().unwrap(),
-                dst: "1.2.3.4:443".parse().unwrap(),
-            },
             uid: Some(1000),
             pid: Some(1),
             exe_path: Some("/usr/bin/python3".into()),
             cmdline: Some("python3 /opt/backup.py --full".into()),
             parent_exe: Some("/usr/bin/bash".into()),
-            domain: None,
             iface: Some("wg0".into()),
             app_id: Some("flatpak:org.mozilla.firefox".into()),
-            first_seen: None,
+            ..bare("192.168.1.5:40000", "1.2.3.4:443")
         };
         let check = |m: RuleMatch, expect: bool| {
             let compiled = CompiledRule::compile(&rule_with(m)).unwrap();
@@ -787,12 +752,13 @@ mod tests {
     /// operator looking for something their rule file does not contain.
     #[test]
     fn first_failing_field_names_the_toml_key() {
+        struct Case {
+            name: &'static str,
+            matcher: RuleMatch,
+            expect: Option<&'static str>,
+        }
+
         let conn = Connection {
-            tuple: hallpass_types::FlowTuple {
-                proto: Proto::Tcp,
-                src: "192.168.1.5:40000".parse().unwrap(),
-                dst: "1.2.3.4:443".parse().unwrap(),
-            },
             uid: Some(1000),
             pid: Some(1),
             exe_path: Some("/usr/bin/curl".into()),
@@ -801,14 +767,8 @@ mod tests {
             domain: Some("example.org".into()),
             iface: Some("wg0".into()),
             app_id: Some("snap:firefox".into()),
-            first_seen: None,
+            ..bare("192.168.1.5:40000", "1.2.3.4:443")
         };
-
-        struct Case {
-            name: &'static str,
-            matcher: RuleMatch,
-            expect: Option<&'static str>,
-        }
         let m = RuleMatch::default;
         let cases = vec![
             Case {
@@ -983,20 +943,8 @@ mod tests {
         let hashes = dir.write("h.sha256", format!("{}\n", "ab".repeat(32)));
 
         let conn = Connection {
-            tuple: hallpass_types::FlowTuple {
-                proto: Proto::Tcp,
-                src: "10.0.0.1:40000".parse().unwrap(),
-                dst: "1.2.3.4:443".parse().unwrap(),
-            },
-            uid: None,
-            pid: None,
-            exe_path: None,
-            cmdline: None,
-            parent_exe: None,
             domain: Some("example.org".into()),
-            iface: None,
-            app_id: None,
-            first_seen: None,
+            ..bare("10.0.0.1:40000", "1.2.3.4:443")
         };
 
         let compiled = CompiledRule::compile(&rule_with(RuleMatch {

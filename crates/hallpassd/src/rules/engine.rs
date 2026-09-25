@@ -1,6 +1,6 @@
 //! First-match-wins rule evaluation over a compiled, sorted rule set.
 
-use hallpass_types::{Connection, Rule, RuleTrace, TraceOutcome, Verdict};
+use hallpass_types::{Action, Connection, Rule, RuleTrace, TraceOutcome, Verdict};
 
 use super::model::CompiledRule;
 
@@ -26,8 +26,8 @@ pub struct RuleSet {
 
 impl RuleSet {
     /// Compile `rules` with no lockdown posture in force.
-    pub fn compile(rules: &[Rule]) -> RuleSet {
-        RuleSet::compile_with_lockdown(rules, None)
+    pub fn compile(rules: &[Rule]) -> Self {
+        Self::compile_with_lockdown(rules, None)
     }
 
     /// Compile `rules`, skipping (with a warning) any that fail validation.
@@ -38,7 +38,7 @@ impl RuleSet {
     /// snapshot a connection is judged against carries its own answer about
     /// whether the posture was on, so a posture change mid-decision cannot
     /// split enrichment from matching.
-    pub fn compile_with_lockdown(rules: &[Rule], lockdown: Option<&[String]>) -> RuleSet {
+    pub fn compile_with_lockdown(rules: &[Rule], lockdown: Option<&[String]>) -> Self {
         let mut compiled: Vec<CompiledRule> = rules
             .iter()
             .filter_map(|r| match CompiledRule::compile(r) {
@@ -64,11 +64,12 @@ impl RuleSet {
                 .then_with(|| strictness(a.action).cmp(&strictness(b.action)))
                 .then_with(|| a.name.cmp(&b.name))
         });
-        let mut set = RuleSet {
+        let mut set = Self {
             rules: compiled,
             has_hash_rules: false,
             locked_down: lockdown.is_some(),
         };
+        // Two steps: the iterator borrows `set` until the statement ends.
         let has_hash_rules = set.deciding_rules().any(CompiledRule::wants_exe_hash);
         set.has_hash_rules = has_hash_rules;
         set
@@ -262,40 +263,18 @@ impl RuleSet {
 }
 
 /// Order among rules of equal priority: a refusal before an allow.
-fn strictness(action: hallpass_types::Action) -> u8 {
+fn strictness(action: Action) -> u8 {
     match action {
-        hallpass_types::Action::Reject => 0,
-        hallpass_types::Action::Deny => 1,
-        hallpass_types::Action::Allow => 2,
+        Action::Reject => 0,
+        Action::Deny => 1,
+        Action::Allow => 2,
     }
 }
 
 #[cfg(test)]
 mod tests {
-
-    /// Equal priority: the refusal wins, whatever the names say.
-    #[test]
-    fn a_tie_goes_to_the_stricter_rule() {
-        let rule = |name: &str, action| Rule {
-            name: name.into(),
-            action,
-            duration: RuleDuration::Forever,
-            priority: 50,
-            enabled: true,
-            tags: Vec::new(),
-            matcher: RuleMatch::default(),
-        };
-        let set = RuleSet::compile(&[
-            rule("prompt-curl-x-10", Action::Allow),
-            rule("prompt-curl-x-9", Action::Deny),
-        ]);
-        let conn = conn("/usr/bin/curl", "1.1.1.1:443", Proto::Tcp, None, 1000);
-        let (winner, verdict) = set.match_conn(&conn, None).unwrap();
-        assert_eq!(winner.name, "prompt-curl-x-9");
-        assert_eq!(verdict, Verdict::Deny);
-    }
     use super::*;
-    use hallpass_types::{Action, FlowTuple, Proto, RuleDuration, RuleMatch};
+    use hallpass_types::{FlowTuple, Proto, RuleDuration, RuleMatch};
     use std::path::PathBuf;
 
     fn conn(exe: &str, dst: &str, proto: Proto, domain: Option<&str>, uid: u32) -> Connection {
@@ -621,6 +600,31 @@ mod tests {
                 expect: Some(("fallback", Verdict::Deny)),
             },
         ]
+    }
+
+    /// Equal priority: the refusal wins, whatever the names say.
+    #[test]
+    fn a_tie_goes_to_the_stricter_rule() {
+        let set = RuleSet::compile(&[
+            rule(
+                "prompt-curl-x-10",
+                Action::Allow,
+                50,
+                true,
+                RuleMatch::default(),
+            ),
+            rule(
+                "prompt-curl-x-9",
+                Action::Deny,
+                50,
+                true,
+                RuleMatch::default(),
+            ),
+        ]);
+        let conn = conn("/usr/bin/curl", "1.1.1.1:443", Proto::Tcp, None, 1000);
+        let (winner, verdict) = set.match_conn(&conn, None).unwrap();
+        assert_eq!(winner.name, "prompt-curl-x-9");
+        assert_eq!(verdict, Verdict::Deny);
     }
 
     #[test]

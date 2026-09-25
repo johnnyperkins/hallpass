@@ -59,8 +59,8 @@ const LIST_CACHE_BOUND: usize = 64;
 const MAX_LIST_BYTES: u64 = 64 * 1024 * 1024;
 
 impl<T> ListCache<T> {
-    fn new() -> ListCache<T> {
-        ListCache {
+    fn new() -> Self {
+        Self {
             entries: Mutex::new(HashMap::new()),
         }
     }
@@ -81,14 +81,13 @@ impl<T> ListCache<T> {
         // a directory a blocklist updater owns, say), and a path that came
         // over IPC is stored resolved, so no client-owned link is ever here.
         // The trust check is on the file reached, from this descriptor.
-        let mut file = std::fs::OpenOptions::new()
+        let io_err = |e: std::io::Error| format!("{}: {e}", path.display());
+        let file = std::fs::OpenOptions::new()
             .read(true)
             .custom_flags(super::store::O_NONBLOCK)
             .open(path)
-            .map_err(|e| format!("{}: {e}", path.display()))?;
-        let meta = file
-            .metadata()
-            .map_err(|e| format!("{}: {e}", path.display()))?;
+            .map_err(io_err)?;
+        let meta = file.metadata().map_err(io_err)?;
         let self_uid = super::store::effective_uid().unwrap_or(u32::MAX);
         if !super::store::file_perms_ok(meta.uid(), meta.mode(), self_uid) {
             return Err(format!(
@@ -116,10 +115,9 @@ impl<T> ListCache<T> {
         let mut text = String::new();
         // Bounded independently of the stat above: the size could have grown
         // between the two, and this read happens in a root daemon.
-        std::io::Read::by_ref(&mut file)
-            .take(MAX_LIST_BYTES)
+        file.take(MAX_LIST_BYTES)
             .read_to_string(&mut text)
-            .map_err(|e| format!("{}: {e}", path.display()))?;
+            .map_err(io_err)?;
         let parsed = Arc::new(parse(&text, path)?);
         let mut entries = self.entries.lock().unwrap();
         if entries.len() >= LIST_CACHE_BOUND {
@@ -155,7 +153,7 @@ pub struct DomainSet {
 }
 
 impl DomainSet {
-    pub fn load(path: &Path) -> Result<Arc<DomainSet>, String> {
+    pub fn load(path: &Path) -> Result<Arc<Self>, String> {
         DOMAIN_CACHE.load(path, |text, path| {
             let mut domains = HashSet::new();
             for (_, line) in content_lines(text) {
@@ -176,21 +174,17 @@ impl DomainSet {
                 }
             }
             tracing::debug!(file = %path.display(), count = domains.len(), "domain list loaded");
-            Ok(DomainSet { domains })
+            Ok(Self { domains })
         })
     }
 
     /// Exact, case-insensitive membership (the snooped domain is the exact
     /// name the client resolved, matching hosts-list semantics).
     pub fn contains(&self, domain: &str) -> bool {
-        if self.domains.contains(domain) {
-            return true;
-        }
-        // Avoid allocating in the common already-lowercase case.
-        if domain.bytes().any(|b| b.is_ascii_uppercase()) {
-            return self.domains.contains(&domain.to_ascii_lowercase());
-        }
-        false
+        // Allocates only for a name that is not already lowercase.
+        self.domains.contains(domain)
+            || (domain.bytes().any(|b| b.is_ascii_uppercase())
+                && self.domains.contains(&domain.to_ascii_lowercase()))
     }
 }
 
@@ -204,7 +198,7 @@ pub struct IpSet {
 }
 
 impl IpSet {
-    pub fn load(path: &Path) -> Result<Arc<IpSet>, String> {
+    pub fn load(path: &Path) -> Result<Arc<Self>, String> {
         IP_CACHE.load(path, |text, path| {
             let mut hosts = HashSet::new();
             let mut nets = Vec::new();
@@ -226,7 +220,7 @@ impl IpSet {
                 nets = nets.len(),
                 "ip list loaded"
             );
-            Ok(IpSet { hosts, nets })
+            Ok(Self { hosts, nets })
         })
     }
 
@@ -242,7 +236,7 @@ pub struct HashSet256 {
 }
 
 impl HashSet256 {
-    pub fn load(path: &Path) -> Result<Arc<HashSet256>, String> {
+    pub fn load(path: &Path) -> Result<Arc<Self>, String> {
         HASH_CACHE.load(path, |text, path| {
             let mut hashes = HashSet::new();
             for (no, line) in content_lines(text) {
@@ -257,7 +251,7 @@ impl HashSet256 {
                 hashes.insert(hash);
             }
             tracing::debug!(file = %path.display(), count = hashes.len(), "hash list loaded");
-            Ok(HashSet256 { hashes })
+            Ok(Self { hashes })
         })
     }
 
@@ -271,10 +265,6 @@ impl HashSet256 {
 mod tests {
     use super::*;
     use crate::testutil::TestDir;
-
-    fn write(dir: &TestDir, name: &str, text: &str) -> std::path::PathBuf {
-        dir.write(name, text)
-    }
 
     /// A non-regular file is refused before it is read. Reading a FIFO blocks
     /// forever and reading a character device never ends, either of which
@@ -319,12 +309,12 @@ mod tests {
         let d = TestDir::new("lists-no-echo");
         let secret = "root:$6$SUPERSECRETHASH:19000:0:99999:7:::";
 
-        let ips = write(&d, "ips.list", &format!("# comment\n{secret}\n"));
+        let ips = d.write("ips.list", format!("# comment\n{secret}\n"));
         let err = IpSet::load(&ips).unwrap_err();
         assert!(!err.contains("SUPERSECRETHASH"), "leaked content: {err}");
         assert!(err.contains("line 2"), "should name the line: {err}");
 
-        let hashes = write(&d, "hashes.list", &format!("{secret}\n"));
+        let hashes = d.write("hashes.list", format!("{secret}\n"));
         let err = HashSet256::load(&hashes).unwrap_err();
         assert!(!err.contains("SUPERSECRETHASH"), "leaked content: {err}");
         assert!(err.contains("line 1"), "should name the line: {err}");
@@ -333,8 +323,7 @@ mod tests {
     #[test]
     fn domain_list_hosts_and_plain_formats() {
         let dir = TestDir::new("lists-dom");
-        let path = write(
-            &dir,
+        let path = dir.write(
             "ads.list",
             "# ad hosts\n\
              0.0.0.0 ads.example.com tracker.example.com.\n\
@@ -353,38 +342,37 @@ mod tests {
     #[test]
     fn ip_list_hosts_and_cidrs() {
         let dir = TestDir::new("lists-ip");
-        let path = write(&dir, "bad.list", "1.2.3.4\n10.0.0.0/8\n2606:4700::1111\n");
+        let path = dir.write("bad.list", "1.2.3.4\n10.0.0.0/8\n2606:4700::1111\n");
         let set = IpSet::load(&path).unwrap();
         assert!(set.contains(&"1.2.3.4".parse().unwrap()));
         assert!(set.contains(&"10.9.8.7".parse().unwrap()));
         assert!(set.contains(&"2606:4700::1111".parse().unwrap()));
         assert!(!set.contains(&"1.2.3.5".parse().unwrap()));
 
-        let bad = write(&dir, "bad2.list", "not-an-ip\n");
+        let bad = dir.write("bad2.list", "not-an-ip\n");
         assert!(IpSet::load(&bad).is_err());
     }
 
     #[test]
     fn hash_list_validation() {
         let dir = TestDir::new("lists-hash");
-        let good = write(
-            &dir,
+        let good = dir.write(
             "h.list",
-            &format!("{}\n{}\n", "A".repeat(64), "b".repeat(64)),
+            format!("{}\n{}\n", "A".repeat(64), "b".repeat(64)),
         );
         let set = HashSet256::load(&good).unwrap();
         assert!(set.contains(&"a".repeat(64)));
         assert!(set.contains(&"b".repeat(64)));
         assert!(!set.contains(&"c".repeat(64)));
 
-        let bad = write(&dir, "short.list", "abc123\n");
+        let bad = dir.write("short.list", "abc123\n");
         assert!(HashSet256::load(&bad).is_err());
     }
 
     #[test]
     fn cache_serves_same_content_and_follows_changes() {
         let dir = TestDir::new("lists-cache");
-        let path = write(&dir, "c.list", "one.example.com\n");
+        let path = dir.write("c.list", "one.example.com\n");
         let a = DomainSet::load(&path).unwrap();
         let b = DomainSet::load(&path).unwrap();
         assert!(Arc::ptr_eq(&a, &b), "unchanged file served from cache");
