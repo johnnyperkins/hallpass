@@ -1,6 +1,4 @@
-//! The link between the prompt agent and one window process it started: a
-//! prompt window, or the management window, which only ever hears
-//! [`ToWindow::Raise`] on it.
+//! The link between the prompt agent and one prompt window it started.
 //!
 //! A connected socket pair, one end kept by the agent and the other handed
 //! to the window as its stdin, which the window moves off fd 0 at once.
@@ -45,8 +43,6 @@ pub enum ToWindow {
     Gone { id: u64 },
     /// Nothing is left for this window. Exit without answering anything.
     Close,
-    /// Ask the operator's attention for this window.
-    Raise,
 }
 
 /// Window to agent.
@@ -185,7 +181,6 @@ mod tests {
         let sent = [
             ToWindow::Show(Box::new(prompt())),
             ToWindow::Gone { id: 7 },
-            ToWindow::Raise,
             ToWindow::Close,
         ];
         let mut buf = Vec::new();
@@ -252,7 +247,7 @@ mod tests {
     #[test]
     fn a_peer_leaving_unread_frames_behind_ends_cleanly() {
         let (mut agent, mut window) = UnixStream::pair().unwrap();
-        write_frame(&mut agent, &ToWindow::Raise).unwrap();
+        write_frame(&mut agent, &ToWindow::Gone { id: 7 }).unwrap();
         let last = FromWindow::Dismissed { ids: vec![7] };
         write_frame(&mut window, &last).unwrap();
         drop(window);

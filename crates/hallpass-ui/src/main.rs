@@ -15,6 +15,7 @@ mod agent;
 mod app;
 mod backend;
 mod editor;
+mod instance;
 mod link;
 mod net;
 mod notify;
@@ -98,9 +99,17 @@ fn main() -> eframe::Result {
         }
     };
 
-    // Started by the agent's tray, stdin is a link it raises the window
-    // through; started any other way, there is none.
-    let raise = link::from_stdin().ok();
+    // One window per user and daemon: a second launch, from the app menu
+    // or the tray, raises the open one and leaves. Without a runtime
+    // directory there is no lock to take, and every launch is a window.
+    let raise = match instance::claim(&socket) {
+        Ok(instance::Instance::Raised) => return Ok(()),
+        Ok(instance::Instance::First(holder)) => Some(holder),
+        Err(e) => {
+            tracing::warn!("not single-instance: {e}");
+            None
+        }
+    };
 
     let mut options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()

@@ -333,9 +333,10 @@ carries what an upgrade changes on a running host.
 - **Tray icon for the UI.** The prompt agent shows a status icon
   (StatusNotifierItem; on stock GNOME this needs the AppIndicator
   extension, which Ubuntu ships enabled). Its menu opens the management
-  window, or asks the one it opened for attention, and its Quit denies open
-  prompts once, releases the prompt-handler slot, and exits. Prompts and
-  notifications work without it.
+  window, and its Quit denies open prompts once, releases the
+  prompt-handler slot, and exits. Prompts and notifications work without
+  it. The management window is one per user: opening it again, from the
+  tray or the app menu, asks the open one for attention instead.
 
 ### Changed
 

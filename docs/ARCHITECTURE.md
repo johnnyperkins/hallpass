@@ -582,7 +582,10 @@ and on XWayland any X client could type into it.
   `UnixStream::pair()` from stdin, then moves it off fd 0 so nothing it
   starts inherits it.
 - **`hallpass-ui`** is the management window, an ordinary client that
-  subscribes with `prompts: false`.
+  subscribes with `prompts: false`. One per user and daemon socket: the
+  first takes a lock in `$XDG_RUNTIME_DIR` and listens beside it, and a
+  later launch (app menu or tray Show) connects, which asks the open window
+  for attention, and exits (`instance.rs`).
 
 `router.rs` holds the rules the agent enforces, as pure bookkeeping with no
 I/O: the agent is the only authority on which prompt belongs to which

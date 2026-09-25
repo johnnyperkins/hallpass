@@ -57,7 +57,7 @@ impl PromptWindow {
         }
     }
 
-    fn drain(&mut self, ctx: &egui::Context) {
+    fn drain(&mut self) {
         while let Ok(msg) = self.from_agent.try_recv() {
             match msg {
                 ToWindow::Show(p) => {
@@ -72,11 +72,6 @@ impl PromptWindow {
                     }
                 }
                 ToWindow::Gone { id } => self.prompts.retain(|p| p.id != id),
-                ToWindow::Raise => {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
-                        egui::UserAttentionType::Critical,
-                    ));
-                }
                 // Handled on the reader thread, which exits the process.
                 ToWindow::Close => {}
             }
@@ -104,7 +99,7 @@ impl PromptWindow {
         } else {
             Vec::new()
         };
-        self.drain(&ctx);
+        self.drain();
         let now_ms = hallpass_types::unix_ms_now();
         // Past its deadline the daemon has applied its default; the agent's
         // Gone is on its way, and until then there is nothing to answer.
