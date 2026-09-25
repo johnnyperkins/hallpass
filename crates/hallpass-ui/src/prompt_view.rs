@@ -279,19 +279,25 @@ fn prompt_tone(p: &PromptState) -> Tone {
 fn prompt_actions_ui(ui: &mut egui::Ui, p: &mut PromptState, now_ms: u64) -> Option<ClientMsg> {
     let mut answer = None;
     ui.horizontal(|ui| {
-        ui.label(RichText::new("For").small().color(MUTED));
-        for d in [
+        picker_label(ui, "For");
+        // Segmented rather than a drop-down: both pickers are two clicks
+        // deep in a window that answers itself on a timer, and what they
+        // are set to has to be readable without opening anything.
+        const DURATIONS: [RuleDuration; 3] = [
             RuleDuration::Once,
             RuleDuration::Session,
             RuleDuration::Forever,
-        ] {
-            // Segmented rather than a drop-down: both pickers are two
-            // clicks deep in a window that answers itself on a timer, and
-            // what they are set to has to be readable without opening
-            // anything.
-            if theme::chip(ui, p.duration == d, duration_label(d)).clicked() {
-                p.duration = d;
-            }
+        ];
+        let items = DURATIONS.map(|d| (duration_label(d), theme::ACCENT));
+        let current = DURATIONS.iter().position(|d| *d == p.duration).unwrap_or(0);
+        if let Some(i) = theme::segmented(
+            ui,
+            ("duration", p.id),
+            &items,
+            current,
+            theme::Segments::Picker,
+        ) {
+            p.duration = DURATIONS[i];
         }
         // Only when the daemon computed a hash for this prompt: it pins the
         // value shown here and nothing else, so a prompt without one has
@@ -314,15 +320,33 @@ fn prompt_actions_ui(ui: &mut egui::Ui, p: &mut PromptState, now_ms: u64) -> Opt
         }
     });
     ui.horizontal(|ui| {
-        ui.label(RichText::new("To").small().color(MUTED));
-        for sc in [
+        picker_label(ui, "To");
+        const SCOPES: [PromptScope; 3] = [
             PromptScope::ThisPort,
             PromptScope::ThisHost,
             PromptScope::AppAnywhere,
-        ] {
-            if theme::chip(ui, p.scope == sc, scope_label(sc)).clicked() {
-                p.scope = sc;
-            }
+        ];
+        // The widest scope in the warning's colour, so the indicator says
+        // what the warning under it is about before it is read.
+        let items = SCOPES.map(|sc| {
+            (
+                scope_label(sc),
+                if sc == PromptScope::AppAnywhere {
+                    REJECT_COLOR
+                } else {
+                    theme::ACCENT
+                },
+            )
+        });
+        let current = SCOPES.iter().position(|sc| *sc == p.scope).unwrap_or(0);
+        if let Some(i) = theme::segmented(
+            ui,
+            ("scope", p.id),
+            &items,
+            current,
+            theme::Segments::Picker,
+        ) {
+            p.scope = SCOPES[i];
         }
     });
     ui.add_space(4.0);
@@ -414,6 +438,15 @@ fn prompt_actions_ui(ui: &mut egui::Ui, p: &mut PromptState, now_ms: u64) -> Opt
         &format!("{}s until default verdict", p.remaining_secs(now_ms)),
     );
     answer
+}
+
+/// The word in front of a picker, in a column of its own so both pickers
+/// start at the same x.
+fn picker_label(ui: &mut egui::Ui, text: &str) {
+    ui.add_sized(
+        egui::vec2(20.0, 22.0),
+        egui::Label::new(RichText::new(text).small().color(MUTED)),
+    );
 }
 
 fn duration_label(d: RuleDuration) -> &'static str {

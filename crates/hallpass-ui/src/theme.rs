@@ -26,6 +26,8 @@ pub const SURFACE: Color32 = Color32::from_rgb(0x14, 0x18, 0x21);
 pub const SURFACE_RAISED: Color32 = Color32::from_rgb(0x1a, 0x1f, 0x2b);
 /// One step above that, for controls at rest.
 pub const SURFACE_CONTROL: Color32 = Color32::from_rgb(0x22, 0x29, 0x37);
+/// Sunk below the window: the track a picker's options sit in.
+pub const WELL: Color32 = Color32::from_rgb(0x0a, 0x0d, 0x13);
 /// Borders and separators. Visible, never loud.
 pub const HAIRLINE: Color32 = Color32::from_rgb(0x2a, 0x32, 0x42);
 /// Body text.
@@ -183,7 +185,7 @@ fn install(ctx: &egui::Context) {
         color: Color32::from_black_alpha(120),
     };
     v.menu_corner_radius = CornerRadius::same(CONTROL_RADIUS);
-    v.extreme_bg_color = Color32::from_rgb(0x0a, 0x0d, 0x13);
+    v.extreme_bg_color = WELL;
     v.faint_bg_color = Color32::from_rgb(0x15, 0x1a, 0x24);
     v.code_bg_color = Color32::from_rgb(0x18, 0x1e, 0x29);
     v.hyperlink_color = ACCENT;
@@ -568,87 +570,225 @@ pub fn switch(ui: &mut Ui, on: &mut bool, label: &str) -> Response {
     response
 }
 
-/// The tab-bar button: a pill that fills in when its tab is the one on
-/// screen, and lights its own underline on the way.
-pub fn tab(ui: &mut Ui, selected: bool, text: &str) -> Response {
-    tab_sized(ui, selected, text, 28.0, ACCENT)
+/// How a [`segmented`] control is drawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Segments {
+    /// The window's tab bar: full height, floating on the header.
+    Tabs,
+    /// A filter or a picker: shorter, and sunk into a track so its options
+    /// read as one control with one answer.
+    Picker,
 }
 
-/// The same control at the height a dense panel can afford. The prompt
-/// window is a fixed 440x330 and every point the pickers take is a point
-/// the process description does not get.
-pub fn chip(ui: &mut Ui, selected: bool, text: &str) -> Response {
-    tab_sized(ui, selected, text, 22.0, ACCENT)
-}
+/// How long the selection takes to slide from one option to the next.
+/// Long enough to be seen travelling, short enough that a quick second
+/// click never waits on the first.
+const SLIDE_SECS: f64 = 0.2;
 
-/// A chip that lights up in a colour of its own when picked.
+/// Where a segmented control's indicator is, and where it was heading.
 ///
-/// For the pickers whose options are verdicts: the choice is the colour
-/// everywhere else in this window, so the control that sets it says so in
-/// the same language instead of explaining itself in a second widget.
-pub fn chip_colored(ui: &mut Ui, selected: bool, text: &str, accent: Color32) -> Response {
-    tab_sized(ui, selected, text, 22.0, accent)
+/// Kept relative to the control, so a window resize or a scroll moves the
+/// indicator with its options instead of animating it across the screen.
+#[derive(Debug, Clone, Copy)]
+struct Slide {
+    to: usize,
+    start: f64,
+    from: egui::Rect,
+    from_color: Color32,
+    shown: egui::Rect,
+    shown_color: Color32,
 }
 
-fn tab_sized(ui: &mut Ui, selected: bool, text: &str, height: f32, accent: Color32) -> Response {
+/// A row of options with one highlight that slides to whichever is picked.
+/// Returns the option clicked this pass, if any.
+///
+/// One moving indicator rather than a fill per option: the eye follows the
+/// motion from the old choice to the new one, so a click that landed on the
+/// wrong option is noticed at once. Each option carries its own colour, so
+/// a picker whose options are verdicts says which one is set in the same
+/// language the rest of the window uses, and the indicator changes colour
+/// on its way across.
+///
+/// Every option is its own focus stop and is announced as a selectable
+/// label, the same as the separate buttons this replaces.
+pub fn segmented(
+    ui: &mut Ui,
+    id_salt: impl std::hash::Hash + std::fmt::Debug,
+    items: &[(&str, Color32)],
+    selected: usize,
+    kind: Segments,
+) -> Option<usize> {
+    let (height, pad_x, inset, gap, radius) = match kind {
+        Segments::Tabs => (28.0, 11.0, 0.0, 4.0, CONTROL_RADIUS),
+        Segments::Picker => (22.0, 9.0, 2.0, 1.0, CONTROL_RADIUS - 1),
+    };
+    let id = ui.make_persistent_id(("segmented", id_salt));
     let font = egui::TextStyle::Button.resolve(ui.style());
-    let galley = ui
-        .painter()
-        .layout_no_wrap(text.to_owned(), font, Color32::PLACEHOLDER);
-    let size = Vec2::new(galley.size().x + height * 0.8, height);
-    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
-    let label = text.to_owned();
-    response.widget_info(|| {
-        egui::WidgetInfo::selected(
-            egui::WidgetType::SelectableLabel,
-            true,
-            selected,
-            label.clone(),
-        )
-    });
-    if ui.is_rect_visible(rect) {
-        let how_on = ui.ctx().animate_bool_responsive(response.id, selected);
-        let hovered = response.hovered() && !selected;
-        let fill = if hovered {
-            SURFACE_CONTROL.gamma_multiply(0.7)
-        } else {
-            Color32::TRANSPARENT
+    let galleys: Vec<_> = items
+        .iter()
+        .map(|(text, _)| {
+            ui.painter()
+                .layout_no_wrap((*text).to_owned(), font.clone(), Color32::PLACEHOLDER)
+        })
+        .collect();
+    let widths: Vec<f32> = galleys.iter().map(|g| g.size().x + pad_x * 2.0).collect();
+    let total =
+        widths.iter().sum::<f32>() + gap * items.len().saturating_sub(1) as f32 + inset * 2.0;
+    let (outer, _) =
+        ui.allocate_exact_size(Vec2::new(total, height + inset * 2.0), egui::Sense::hover());
+
+    let mut rects = Vec::with_capacity(items.len());
+    let mut x = outer.left() + inset;
+    for w in &widths {
+        rects.push(egui::Rect::from_min_size(
+            egui::pos2(x, outer.top() + inset),
+            Vec2::new(*w, height),
+        ));
+        x += w + gap;
+    }
+
+    let enabled = ui.is_enabled();
+    let mut clicked = None;
+    let mut responses = Vec::with_capacity(items.len());
+    for (i, rect) in rects.iter().enumerate() {
+        let response = ui.interact(*rect, id.with(i), egui::Sense::click());
+        let label = items[i].0.to_owned();
+        let is_selected = i == selected;
+        response.widget_info(|| {
+            egui::WidgetInfo::selected(
+                egui::WidgetType::SelectableLabel,
+                enabled,
+                is_selected,
+                label.clone(),
+            )
+        });
+        if response.clicked() {
+            clicked = Some(i);
+        }
+        responses.push(response);
+    }
+    if !ui.is_rect_visible(outer) || items.is_empty() {
+        return clicked;
+    }
+
+    let selected = selected.min(items.len() - 1);
+    let target = rects[selected].translate(-outer.min.to_vec2());
+    let target_color = items[selected].1;
+    let now = ui.input(|i| i.time);
+    let animate = ui.style().animation_time > 0.0;
+    let mut slide = ui
+        .data(|d| d.get_temp::<Slide>(id))
+        .filter(|_| animate)
+        .unwrap_or(Slide {
+            to: selected,
+            start: f64::NEG_INFINITY,
+            from: target,
+            from_color: target_color,
+            shown: target,
+            shown_color: target_color,
+        });
+    if slide.to != selected {
+        slide = Slide {
+            to: selected,
+            start: now,
+            from: slide.shown,
+            from_color: slide.shown_color,
+            ..slide
         };
-        let fill = fill.lerp_to_gamma(tint(accent), how_on);
-        ui.painter()
-            .rect_filled(rect, CornerRadius::same(CONTROL_RADIUS), fill);
-        // The underline is what makes the selection legible when several
-        // tabs are tinted mid-animation.
-        if how_on > 0.01 {
-            let w = rect.width() * 0.55 * how_on;
-            let y = rect.bottom() - 3.0;
-            ui.painter().line_segment(
-                [
-                    egui::pos2(rect.center().x - w / 2.0, y),
-                    egui::pos2(rect.center().x + w / 2.0, y),
-                ],
-                Stroke::new(2.0, accent),
+    }
+    let t = ((now - slide.start) / SLIDE_SECS).clamp(0.0, 1.0) as f32;
+    let eased = 1.0 - (1.0 - t).powi(3);
+    slide.shown = egui::Rect::from_min_max(
+        slide.from.min.lerp(target.min, eased),
+        slide.from.max.lerp(target.max, eased),
+    );
+    slide.shown_color = slide.from_color.lerp_to_gamma(target_color, eased);
+    ui.data_mut(|d| d.insert_temp(id, slide));
+    if t < 1.0 {
+        ui.ctx().request_repaint();
+    }
+
+    let painter = ui.painter();
+    if kind == Segments::Picker {
+        painter.rect(
+            outer,
+            CornerRadius::same(radius + inset as u8),
+            WELL,
+            Stroke::new(1.0, HAIRLINE),
+            egui::StrokeKind::Inside,
+        );
+    }
+    for (i, response) in responses.iter().enumerate() {
+        if i != selected && response.hovered() {
+            painter.rect_filled(
+                rects[i],
+                CornerRadius::same(radius),
+                SURFACE_CONTROL.gamma_multiply(0.6),
             );
         }
-        let color = if selected {
+    }
+    let indicator = slide.shown.translate(outer.min.to_vec2());
+    let color = slide.shown_color;
+    match kind {
+        Segments::Tabs => {
+            painter.rect_filled(indicator, CornerRadius::same(radius), tint(color));
+            // The underline is what makes the selection legible at a
+            // glance across the room, where the wash alone is faint.
+            let w = indicator.width() * 0.5;
+            let y = indicator.bottom() - 3.0;
+            painter.line_segment(
+                [
+                    egui::pos2(indicator.center().x - w / 2.0, y),
+                    egui::pos2(indicator.center().x + w / 2.0, y),
+                ],
+                Stroke::new(2.0, color),
+            );
+        }
+        Segments::Picker => {
+            painter.rect(
+                indicator,
+                CornerRadius::same(radius),
+                SURFACE_CONTROL.lerp_to_gamma(color, 0.22),
+                Stroke::new(1.0, color.gamma_multiply(0.55)),
+                egui::StrokeKind::Inside,
+            );
+        }
+    }
+    for (i, (galley, response)) in galleys.into_iter().zip(&responses).enumerate() {
+        let text = if i == selected {
             TEXT
-        } else if hovered {
+        } else if response.hovered() {
             TEXT.gamma_multiply(0.9)
         } else {
             MUTED
         };
-        let galley = ui.painter().layout_no_wrap(
-            text.to_owned(),
-            egui::TextStyle::Button.resolve(ui.style()),
-            color,
-        );
-        ui.painter().galley(
-            rect.center() - galley.size() / 2.0 + Vec2::new(0.0, -1.0),
+        let text = if enabled {
+            text
+        } else {
+            text.gamma_multiply(0.5)
+        };
+        let nudge = if kind == Segments::Tabs { -1.0 } else { 0.0 };
+        painter.galley(
+            rects[i].center() - galley.size() / 2.0 + Vec2::new(0.0, nudge),
             galley,
-            color,
+            text,
         );
+        if response.has_focus() {
+            focus_ring(ui, rects[i], radius);
+        }
     }
-    response
+    clicked
+}
+
+/// The keyboard focus outline every painted control here draws, so a
+/// Tab press is visible whichever control it lands on.
+fn focus_ring(ui: &Ui, rect: egui::Rect, radius: u8) {
+    ui.painter().rect_stroke(
+        rect.expand(1.5),
+        CornerRadius::same(radius + 1),
+        Stroke::new(1.5, ACCENT),
+        egui::StrokeKind::Outside,
+    );
 }
 
 /// A sortable column heading: the title, plus an arrow when this is the

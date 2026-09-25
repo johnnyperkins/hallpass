@@ -451,17 +451,17 @@ impl RuleEditor {
 
                 field_label(ui, "Action");
                 ui.horizontal(|ui| {
-                    for a in [Action::Allow, Action::Deny, Action::Reject] {
-                        if crate::theme::chip_colored(
-                            ui,
-                            self.action == a,
-                            a.as_str(),
-                            action_color(a),
-                        )
-                        .clicked()
-                        {
-                            self.action = a;
-                        }
+                    const ACTIONS: [Action; 3] = [Action::Allow, Action::Deny, Action::Reject];
+                    let items = ACTIONS.map(|a| (a.as_str(), action_color(a)));
+                    let current = ACTIONS.iter().position(|a| *a == self.action).unwrap_or(0);
+                    if let Some(i) = crate::theme::segmented(
+                        ui,
+                        "rule-action",
+                        &items,
+                        current,
+                        crate::theme::Segments::Picker,
+                    ) {
+                        self.action = ACTIONS[i];
                     }
                 });
                 ui.end_row();

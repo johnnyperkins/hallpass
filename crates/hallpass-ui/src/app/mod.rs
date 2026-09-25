@@ -955,10 +955,10 @@ impl HallpassApp {
             ui.add_space(2.0);
             theme::wordmark(ui);
             ui.add_space(10.0);
-            for tab in Tab::ALL {
-                if theme::tab(ui, self.tab == tab, tab.label()).clicked() {
-                    self.select_tab(tab);
-                }
+            let items = Tab::ALL.map(|t| (t.label(), theme::ACCENT));
+            let current = Tab::ALL.iter().position(|t| *t == self.tab).unwrap_or(0);
+            if let Some(i) = theme::segmented(ui, "tabs", &items, current, theme::Segments::Tabs) {
+                self.select_tab(Tab::ALL[i]);
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 self.mode_toggle(ui);
@@ -1279,11 +1279,24 @@ impl HallpassApp {
             if !self.filter.is_empty() && ui.small_button("Clear").clicked() {
                 self.filter.clear();
             }
-            ui.add_space(4.0);
-            for lens in [Lens::All, Lens::Allowed, Lens::Blocked] {
-                if theme::tab(ui, self.lens == lens, lens.label()).clicked() {
-                    self.lens = lens;
-                }
+            ui.add_space(6.0);
+            // Each lens in the colour of what it keeps, like the pills in
+            // the rows it narrows to.
+            const LENSES: [Lens; 3] = [Lens::All, Lens::Allowed, Lens::Blocked];
+            let items = LENSES.map(|l| {
+                (
+                    l.label(),
+                    match l {
+                        Lens::All => theme::ACCENT,
+                        Lens::Allowed => ALLOW_COLOR,
+                        Lens::Blocked => DENY_COLOR,
+                    },
+                )
+            });
+            let current = LENSES.iter().position(|l| *l == self.lens).unwrap_or(0);
+            if let Some(i) = theme::segmented(ui, "lens", &items, current, theme::Segments::Picker)
+            {
+                self.lens = LENSES[i];
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let narrowed = shown != total;
@@ -1454,14 +1467,17 @@ impl HallpassApp {
         self.filter_row(ui, count, total);
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new("Group by").small().color(MUTED));
-            for g in [
+            const GROUPS: [traffic::GroupBy; 3] = [
                 traffic::GroupBy::Exe,
                 traffic::GroupBy::Domain,
                 traffic::GroupBy::Rule,
-            ] {
-                if theme::tab(ui, self.group_by == g, g.label()).clicked() {
-                    self.group_by = g;
-                }
+            ];
+            let items = GROUPS.map(|g| (g.label(), theme::ACCENT));
+            let current = GROUPS.iter().position(|g| *g == self.group_by).unwrap_or(0);
+            if let Some(i) =
+                theme::segmented(ui, "group-by", &items, current, theme::Segments::Picker)
+            {
+                self.group_by = GROUPS[i];
             }
         });
         ui.add_space(8.0);
@@ -2178,17 +2194,20 @@ impl HallpassApp {
                 "Default action",
                 "Applied when no rule matches and nobody answers in time",
                 |ui| {
-                    for v in [Verdict::Allow, Verdict::Deny, Verdict::Reject] {
-                        if theme::chip_colored(
-                            ui,
-                            self.settings_verdict == v,
-                            verdict_label(v),
-                            verdict_color(v),
-                        )
-                        .clicked()
-                        {
-                            self.settings_verdict = v;
-                        }
+                    const VERDICTS: [Verdict; 3] = [Verdict::Allow, Verdict::Deny, Verdict::Reject];
+                    let items = VERDICTS.map(|v| (verdict_label(v), verdict_color(v)));
+                    let current = VERDICTS
+                        .iter()
+                        .position(|v| *v == self.settings_verdict)
+                        .unwrap_or(0);
+                    if let Some(i) = theme::segmented(
+                        ui,
+                        "default-verdict",
+                        &items,
+                        current,
+                        theme::Segments::Picker,
+                    ) {
+                        self.settings_verdict = VERDICTS[i];
                     }
                 },
             );
