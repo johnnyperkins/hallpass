@@ -18,15 +18,18 @@
 //! odd socket mode, missing BTF, a forwarding host); `skip` is a check that
 //! could not run. The exit code is non-zero exactly when something failed.
 
-use std::path::Path;
+use std::fmt::Write as _;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use hallpass_types::{sanitize_for_display, ClientMsg, DaemonMsg, Stats, PROTOCOL_VERSION};
+use hallpass_types::{
+    format_ts, sanitize_for_display, ClientMsg, DaemonMsg, Stats, PROTOCOL_VERSION,
+};
 use serde::Serialize;
 
 use crate::client::{CliError, Client};
-use crate::fmt::{Output, Palette, Style};
+use crate::fmt::{pinned_tags, Output, Palette, Style};
 use crate::{EXIT_ERR, EXIT_OK};
 
 /// Host facts every check may need, read once: the effective UID and the
@@ -210,6 +213,27 @@ fn unit_hint() -> String {
 
 /// The checks that read the daemon's own accounting.
 fn stats_checks(s: &Stats, checks: &mut Vec<Check>) {
+    posture_checks(s, checks);
+    prompt_checks(s, checks);
+    queue_checks(s, checks);
+    table_flush_check(s, checks);
+
+    if s.rules_skipped > 0 {
+        checks.push(Check::warn(
+            "rules",
+            format!(
+                "{} loaded, but {} rule files were skipped",
+                s.rules_loaded, s.rules_skipped
+            ),
+            Some("`journalctl -u hallpassd -b` names each skipped file and why".into()),
+        ));
+    } else {
+        checks.push(Check::ok("rules", format!("{} loaded", s.rules_loaded)));
+    }
+}
+
+/// Enforcement mode, and any lockdown posture in force.
+fn posture_checks(s: &Stats, checks: &mut Vec<Check>) {
     if s.enforcing {
         checks.push(Check::ok("mode", "enforcing".into()));
     } else {
@@ -230,18 +254,17 @@ fn stats_checks(s: &Stats, checks: &mut Vec<Check>) {
             format!(
                 "on since {}: only the allow rules tagged {} decide connections, \
                  {} suppressed",
-                hallpass_types::format_ts(l.since_ms),
-                if l.tags.is_empty() {
-                    "nothing".to_string()
-                } else {
-                    l.tags.join(",")
-                },
+                format_ts(l.since_ms),
+                pinned_tags(&l.tags),
                 l.rules_suppressed
             ),
             Some("lift it with `hallpass-cli lockdown off`".into()),
         ));
     }
+}
 
+/// Whether anyone is answering prompts, and what went unanswered.
+fn prompt_checks(s: &Stats, checks: &mut Vec<Check>) {
     if s.prompt_handler_connected {
         checks.push(Check::ok("prompts", "a prompt handler is connected".into()));
     } else {
@@ -266,7 +289,10 @@ fn stats_checks(s: &Stats, checks: &mut Vec<Check>) {
         s.prompts_overflowed,
         "connections took the default because a prompt hold limit was reached",
     );
+}
 
+/// Both nfqueues, and the daemon's own DNS-snoop shedding.
+fn queue_checks(s: &Stats, checks: &mut Vec<Check>) {
     // The verdict queue is enforcement itself, so its problems are failures;
     // the snoop queue only feeds domain annotations, so its problems warn.
     queue_check(
@@ -304,12 +330,14 @@ fn stats_checks(s: &Stats, checks: &mut Vec<Check>) {
         s.dns_snoop_dropped,
         "DNS packets were dropped by the daemon under load (annotations, not verdicts)",
     );
+}
 
+/// Whether something has flushed the nftables table since the daemon started.
+fn table_flush_check(s: &Stats, checks: &mut Vec<Check>) {
     if s.nft_flushes > 0 {
         let last = s
             .nft_last_flush_ms
-            .map(hallpass_types::format_ts)
-            .unwrap_or_else(|| "unknown".into());
+            .map_or_else(|| "unknown".into(), format_ts);
         checks.push(Check::warn(
             "table-flushes",
             format!(
@@ -325,19 +353,6 @@ fn stats_checks(s: &Stats, checks: &mut Vec<Check>) {
                     .into(),
             ),
         ));
-    }
-
-    if s.rules_skipped > 0 {
-        checks.push(Check::warn(
-            "rules",
-            format!(
-                "{} loaded, but {} rule files were skipped",
-                s.rules_loaded, s.rules_skipped
-            ),
-            Some("`journalctl -u hallpassd -b` names each skipped file and why".into()),
-        ));
-    } else {
-        checks.push(Check::ok("rules", format!("{} loaded", s.rules_loaded)));
     }
 }
 
@@ -440,7 +455,7 @@ const CONTROL_SOCKET_NAME: &str = "hallpass.sock";
 /// differently on purpose.
 ///
 /// The pair is worked out from which of the two `--socket` names, because the
-/// README tells an observer to run `hallpass-cli --socket
+/// docs/guide.md tells an observer to run `hallpass-cli --socket
 /// /run/hallpass/observe.sock doctor` and deriving a sibling unconditionally
 /// resolved that to itself: the control socket went unchecked, and the
 /// read-only one was compared against the control group, so the one command
@@ -459,7 +474,7 @@ fn socket_check(socket: &Path, env: &Env, checks: &mut Vec<Check>) {
 
 /// The (control, read-only) pair implied by the socket this invocation was
 /// pointed at. Split out to be testable without either file existing.
-fn socket_pair(socket: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
+fn socket_pair(socket: &Path) -> (PathBuf, PathBuf) {
     if socket.file_name().is_some_and(|n| n == OBSERVE_SOCKET_NAME) {
         (
             socket.with_file_name(CONTROL_SOCKET_NAME),
@@ -502,20 +517,17 @@ fn one_socket_check(
         return;
     }
     let mode = md.mode() & 0o7777;
-    let owner =
-        name_for_id(env.etc_passwd.as_deref(), md.uid()).unwrap_or_else(|| md.uid().to_string());
-    let group =
-        name_for_id(env.etc_group.as_deref(), md.gid()).unwrap_or_else(|| md.gid().to_string());
+    let owner = id_name(env.etc_passwd.as_deref(), md.uid());
+    let group = id_name(env.etc_group.as_deref(), md.gid());
     let mut detail = format!("{} mode {mode:04o} {owner}:{group}", socket.display());
     let mut warn = mode != 0o660 || md.uid() != 0 || group != want_group;
-    if let Some(dir) = socket.parent() {
-        if let Ok(dmd) = std::fs::metadata(dir) {
-            let dmode = dmd.mode() & 0o7777;
-            if dmode != SOCKET_DIR_MODE {
-                detail.push_str(&format!(", directory mode {dmode:04o}"));
-                warn = true;
-            }
-        }
+    let dir_mode = socket
+        .parent()
+        .and_then(|dir| std::fs::metadata(dir).ok())
+        .map(|dmd| dmd.mode() & 0o7777);
+    if let Some(dmode) = dir_mode.filter(|&m| m != SOCKET_DIR_MODE) {
+        let _ = write!(detail, ", directory mode {dmode:04o}");
+        warn = true;
     }
     if warn {
         checks.push(Check::warn(
@@ -566,8 +578,7 @@ fn policy_dirs_check(env: &Env, checks: &mut Vec<Check>) {
             DirTrust::Ok(mode) => details.push(format!("{} mode {mode:04o}", dir.display())),
             DirTrust::Unreadable(e) => details.push(format!("{}: {e}", dir.display())),
             DirTrust::Writable { uid, mode } => {
-                let owner =
-                    name_for_id(env.etc_passwd.as_deref(), uid).unwrap_or_else(|| uid.to_string());
+                let owner = id_name(env.etc_passwd.as_deref(), uid);
                 details.push(format!("{} mode {mode:04o} {owner}", dir.display()));
                 bad.push(dir.display().to_string());
             }
@@ -637,16 +648,16 @@ fn dir_trust(dir: &Path, env: &Env) -> DirTrust {
 /// usually succeeds, and when it does not, checking the default is still
 /// worth more than checking nothing - a moved rules directory is rare, and
 /// the reported path says which one was looked at either way.
-fn configured_rules_dir() -> std::path::PathBuf {
+fn configured_rules_dir() -> PathBuf {
     #[derive(serde::Deserialize)]
     struct JustRulesDir {
-        rules_dir: Option<std::path::PathBuf>,
+        rules_dir: Option<PathBuf>,
     }
     std::fs::read_to_string(DEFAULT_CONFIG)
         .ok()
         .and_then(|t| toml::from_str::<JustRulesDir>(&t).ok())
         .and_then(|c| c.rules_dir)
-        .unwrap_or_else(|| std::path::PathBuf::from(DEFAULT_RULES_DIR))
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_RULES_DIR))
 }
 
 /// Which tier this invocation can reach by group, and the one diagnosis a
@@ -817,7 +828,7 @@ fn chain_order(listing: &str) -> Result<(), &'static str> {
 /// not a gap in the install: every attributor resolves a local process
 /// (`/proc/<pid>`, socket inodes, the eBPF connect kprobes) and a forwarded
 /// packet has none, so a `forward` chain would be a different product with a
-/// rule model of its own. The README says so; a host that is actually
+/// rule model of its own. docs/security.md says so; a host that is actually
 /// forwarding should not have to find out by reading it.
 ///
 /// `warn`, not `fail`, and by the same rule [`policy_dirs_check`] states in
@@ -919,7 +930,7 @@ fn forwarding_verdict(state: &ForwardingState, bridges: &[String]) -> Check {
 
     let mut detail = format!("forwarding is on: {}", state.on.join(", "));
     if !bridges.is_empty() {
-        detail.push_str(&format!(" (bridges: {})", bridges.join(" ")));
+        let _ = write!(detail, " (bridges: {})", bridges.join(" "));
     }
     Check::warn(
         "forwarding",
@@ -1041,6 +1052,11 @@ fn group_entry(etc_group: &str, name: &str) -> Option<(u32, Vec<String>)> {
     })
 }
 
+/// [`name_for_id`], falling back to the number itself.
+fn id_name(text: Option<&str>, id: u32) -> String {
+    name_for_id(text, id).unwrap_or_else(|| id.to_string())
+}
+
 /// The name whose third colon-separated field is `id`, over /etc/passwd or
 /// /etc/group format text (`name:passwd:id:...`). `None` text (an unreadable
 /// file) finds nothing, and callers fall back to the numeric id.
@@ -1071,6 +1087,9 @@ fn print_json(checks: &[Check]) -> Result<(), CliError> {
     Ok(())
 }
 
+/// Width of the status column: `FAIL` plus a space.
+const LABEL_WIDTH: usize = 5;
+
 /// The report as aligned lines, one per check, hints indented beneath.
 fn print_human(checks: &[Check], pal: Palette) {
     let name_width = checks.iter().map(|c| c.name.len()).max().unwrap_or(0);
@@ -1082,12 +1101,12 @@ fn print_human(checks: &[Check], pal: Palette) {
             Status::Skip => ("skip", None),
         };
         let label = match style {
-            Some(style) => crate::fmt::cell(pal, style, label, 5),
-            None => format!("{label:<5}"),
+            Some(style) => crate::fmt::cell(pal, style, label, LABEL_WIDTH),
+            None => format!("{label:<LABEL_WIDTH$}"),
         };
         println!("{label}{:<name_width$}  {}", c.name, c.detail);
         if let Some(hint) = &c.hint {
-            println!("{:>width$}{}", "", hint, width = 5 + name_width + 2);
+            println!("{:>width$}{hint}", "", width = LABEL_WIDTH + name_width + 2);
         }
     }
     println!(
@@ -1219,7 +1238,7 @@ mod tests {
 
     fn forwarding(on: &[&str], blind: bool) -> ForwardingState {
         ForwardingState {
-            on: on.iter().map(|s| s.to_string()).collect(),
+            on: on.iter().map(ToString::to_string).collect(),
             blind,
         }
     }
@@ -1240,13 +1259,13 @@ mod tests {
         ] {
             assert_eq!(
                 Path::new(control).with_file_name(OBSERVE_SOCKET_NAME),
-                std::path::PathBuf::from(want),
+                PathBuf::from(want),
                 "doctor looked for the read-only socket in the wrong place for {control}"
             );
         }
     }
 
-    /// The README tells an observer to run
+    /// docs/guide.md tells an observer to run
     /// `hallpass-cli --socket /run/hallpass/observe.sock doctor`, and on that
     /// invocation deriving a sibling unconditionally resolved to the same
     /// file: the control socket went unchecked and the read-only one was
