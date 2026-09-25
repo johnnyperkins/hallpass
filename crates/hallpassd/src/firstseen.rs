@@ -32,13 +32,14 @@
 
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use hallpass_types::{unix_ms_now, Connection, FirstSeen};
 use lru::LruCache;
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 /// Applications remembered at once. Reached only on a host that has run
 /// thousands of distinct executables; past it the least recently seen is
@@ -124,8 +125,8 @@ pub struct Seen {
 
 impl Seen {
     /// An empty store.
-    pub fn new() -> Seen {
-        Seen {
+    pub fn new() -> Self {
+        Self {
             apps: LruCache::new(NonZeroUsize::new(MAX_APPS).expect("nonzero")),
             dests: LruCache::new(NonZeroUsize::new(MAX_DESTS).expect("nonzero")),
             scratch: String::with_capacity(MAX_KEY_BYTES),
@@ -182,39 +183,45 @@ impl Seen {
             ActorKey::None => return None,
         }
         let app = touch(&mut self.apps, key, now, &mut self.dirty);
-        // A destination is only new if it was recorded; an over-long one is
-        // not, and stays new. Deliberately not folded into the app arm: an
-        // application whose *first* connection this is has a new destination
-        // by definition, and reporting both is what lets a display say
-        // "and", but the record still has to exist for the second one.
+        // Deliberately not folded into the app arm: an application whose
+        // *first* connection this is has a new destination by definition,
+        // but the record still has to exist for the second connection.
         let actor_len = key.len();
         let ip = conn.tuple.dst.ip();
         let dest = match &conn.domain {
             Some(domain) => {
-                let new = write_dest(domain, key, actor_len)
-                    .map(|()| touch(&mut self.dests, key, now, &mut self.dirty));
+                let new = self.touch_dest(key, actor_len, domain, now);
                 // The address is recorded alongside the name, and its answer
                 // is thrown away. A snooped name expires (the domain cache
                 // clamps to a 30s TTL and then forgets), and every connection
                 // decided after that carries no domain at all, so a
-                // name-keyed record would miss and report a destination the
+                // name-keyed record alone would report a destination the
                 // operator approved months ago as new - once per address, on
-                // a CDN forever. Recording both means the address-keyed
-                // lookup below finds it. Only the name decides what is
-                // reported, so a genuinely new name is still loud even when
-                // it resolves to an address this application already reached.
-                if write_dest(&ip, key, actor_len).is_some() {
-                    touch(&mut self.dests, key, now, &mut self.dirty);
-                }
+                // a CDN forever. Only the name decides what is reported, so a
+                // genuinely new name is still loud even when it resolves to
+                // an address this application already reached.
+                self.touch_dest(key, actor_len, &ip, now);
                 new
             }
-            None => write_dest(&ip, key, actor_len)
-                .map(|()| touch(&mut self.dests, key, now, &mut self.dirty)),
+            None => self.touch_dest(key, actor_len, &ip, now),
         };
-        Some(FirstSeen {
-            app,
-            dest: dest.unwrap_or(true),
-        })
+        Some(FirstSeen { app, dest })
+    }
+
+    /// Record `dest` for the application whose key fills the first
+    /// `actor_len` bytes of `key`, reporting whether it was new. An
+    /// over-long destination is never recorded, so it reports new.
+    fn touch_dest(
+        &mut self,
+        key: &mut String,
+        actor_len: usize,
+        dest: &dyn std::fmt::Display,
+        now: &dyn Fn() -> u64,
+    ) -> bool {
+        match write_dest(dest, key, actor_len) {
+            Some(()) => touch(&mut self.dests, key, now, &mut self.dirty),
+            None => true,
+        }
     }
 
     /// How many identities are held, as (applications, destinations).
@@ -247,8 +254,8 @@ struct Snapshot {
 }
 
 impl Default for Seen {
-    fn default() -> Seen {
-        Seen::new()
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -364,10 +371,10 @@ impl Entry {
     ///
     /// The inverse of [`write_actor_key`] plus [`write_dest`], and the
     /// only place that knows the layout in this direction.
-    fn from_key(key: &str, first_ms: u64) -> Entry {
+    fn from_key(key: &str, first_ms: u64) -> Self {
         let mut parts = key.split(SEP);
         let field = |p: Option<&str>| p.filter(|s| !s.is_empty()).map(str::to_string);
-        Entry {
+        Self {
             app_id: field(parts.next()),
             exe: field(parts.next()),
             dest: field(parts.next()),
@@ -420,13 +427,13 @@ struct StateFile {
 impl From<Snapshot> for StateFile {
     /// Runs on the writer task, not the verdict thread: this is where the
     /// keys are split and copied into owned strings.
-    fn from(snap: Snapshot) -> StateFile {
+    fn from(snap: Snapshot) -> Self {
         let entries = |v: Vec<(Arc<str>, u64)>| {
             v.into_iter()
                 .map(|(key, ms)| Entry::from_key(&key, ms))
                 .collect()
         };
-        StateFile {
+        Self {
             version: STATE_VERSION,
             app: entries(snap.apps),
             dest: entries(snap.dests),
@@ -496,20 +503,22 @@ pub fn load(path: &Path) -> Seen {
     // the most recent ones, so after an over-long file the applications the
     // host actually uses were the ones reported new while long-dead
     // executables stayed familiar - the exact inverse of what the LRU is for.
-    let newest = |v: &[Entry], cap: usize| v.len().saturating_sub(cap);
-    for e in &state.app[newest(&state.app, MAX_APPS)..] {
-        if let Some(key) = e.key() {
-            seen.apps.put(Arc::from(key), e.first_ms);
-        }
-    }
-    for e in &state.dest[newest(&state.dest, MAX_DESTS)..] {
-        if let Some(key) = e.key() {
-            seen.dests.put(Arc::from(key), e.first_ms);
-        }
-    }
+    restore(&mut seen.apps, &state.app, MAX_APPS);
+    restore(&mut seen.dests, &state.dest, MAX_DESTS);
     let (apps, dests) = seen.len();
     tracing::info!(apps, dests, path = %path.display(), "first-seen state loaded");
     seen
+}
+
+/// Put the newest `cap` of `entries` (a snapshot writes oldest first) into
+/// `map`, in file order so the LRU order is restored too. Entries no key
+/// could have produced are dropped.
+fn restore(map: &mut LruCache<Arc<str>, u64>, entries: &[Entry], cap: usize) {
+    for e in &entries[entries.len().saturating_sub(cap)..] {
+        if let Some(key) = e.key() {
+            map.put(Arc::from(key), e.first_ms);
+        }
+    }
 }
 
 /// Read the state file, refusing a symlink at the path.
@@ -545,14 +554,11 @@ pub struct Tracker {
     /// Set by the writer task when a write fails, cleared when one succeeds.
     ///
     /// Without it a failed write was final: `flush` clears `dirty` before
-    /// handing the snapshot over, so a full disk at minute five meant nothing
-    /// was ever written again unless some later miss happened to re-dirty the
-    /// store - and on a warmed-up host, none does. The whole run's record was
-    /// then lost at restart with one warning in the journal to explain it.
-    /// An atomic rather than a lock: the verdict thread reads it, and the
-    /// architecture's one-lock promise is about locks, which this is not (the
-    /// same reasoning `RuntimeSettings` is built on).
-    write_failed: Arc<std::sync::atomic::AtomicBool>,
+    /// handing the snapshot over, so on a warmed-up host that never misses
+    /// again nothing would ever be written. An atomic rather than a lock:
+    /// the verdict thread reads it, and the architecture's one-lock promise
+    /// is about locks (the same reasoning `RuntimeSettings` is built on).
+    write_failed: Arc<AtomicBool>,
 }
 
 impl Tracker {
@@ -576,7 +582,7 @@ impl Tracker {
     /// recorded, or the last attempt to write did not land. A snapshot is
     /// the whole state, so re-sending one after a failure is idempotent.
     fn needs_write(&self) -> bool {
-        self.seen.dirty || self.write_failed.load(std::sync::atomic::Ordering::Relaxed)
+        self.seen.dirty || self.write_failed.load(Ordering::Relaxed)
     }
 
     /// Hand over a snapshot now. Called on the periodic path and once more
@@ -609,53 +615,10 @@ impl Drop for Tracker {
 /// queue loop ends, which closes the channel, which ends the task after it
 /// has drained what it was given.
 pub fn start(path: PathBuf) -> (Tracker, tokio::task::JoinHandle<()>) {
-    use std::sync::atomic::{AtomicBool, Ordering};
-
     let seen = load(&path);
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Snapshot>();
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let write_failed = Arc::new(AtomicBool::new(false));
-    let writer_failed = Arc::clone(&write_failed);
-    let writer = tokio::spawn(async move {
-        // Warn once per failure kind, not once per flush: an unwritable
-        // state directory would otherwise fill the journal at flush cadence
-        // for the life of the daemon, and the first line already says
-        // everything the operator has to act on.
-        let mut warned = false;
-        while let Some(snapshot) = rx.recv().await {
-            let path = path.clone();
-            // spawn_blocking: this splits every key, serializes, writes and
-            // fsyncs a file, and the runtime workers it would otherwise sit
-            // on are the ones serving IPC.
-            let result =
-                tokio::task::spawn_blocking(move || write_state(&path, &StateFile::from(snapshot)))
-                    .await;
-            // The flag, not just the log line: the verdict thread cleared
-            // `dirty` when it handed this over, so without it a write that
-            // failed is one nothing ever retries.
-            match result {
-                Ok(Ok(())) => {
-                    warned = false;
-                    writer_failed.store(false, Ordering::Relaxed);
-                }
-                Ok(Err(e)) => {
-                    writer_failed.store(true, Ordering::Relaxed);
-                    if !warned {
-                        warned = true;
-                        tracing::warn!(
-                            "cannot write the first-seen state, retrying every \
-                             {}s until it succeeds: {e}",
-                            FLUSH_INTERVAL.as_secs()
-                        );
-                    }
-                }
-                // The blocking pool is gone (shutdown) or the write panicked.
-                Err(e) => {
-                    writer_failed.store(true, Ordering::Relaxed);
-                    tracing::warn!("first-seen state write did not run: {e}");
-                }
-            }
-        }
-    });
+    let writer = tokio::spawn(write_snapshots(path, rx, Arc::clone(&write_failed)));
     (
         Tracker {
             seen,
@@ -668,6 +631,54 @@ pub fn start(path: PathBuf) -> (Tracker, tokio::task::JoinHandle<()>) {
         },
         writer,
     )
+}
+
+/// The writer task: write each snapshot to `path`, off the runtime workers,
+/// and keep `failed` saying whether the last write landed.
+///
+/// The flag, not just a log line: the verdict thread cleared `dirty` when it
+/// handed the snapshot over, so without it a failed write is one nothing
+/// ever retries.
+async fn write_snapshots(
+    path: PathBuf,
+    mut rx: UnboundedReceiver<Snapshot>,
+    failed: Arc<AtomicBool>,
+) {
+    // Warn once per failure run, not once per flush: an unwritable state
+    // directory would otherwise fill the journal at flush cadence, and the
+    // first line already says everything the operator has to act on.
+    let mut warned = false;
+    while let Some(snapshot) = rx.recv().await {
+        let path = path.clone();
+        // spawn_blocking: this splits every key, serializes, writes and
+        // fsyncs a file, and the runtime workers it would otherwise sit on
+        // are the ones serving IPC.
+        let result =
+            tokio::task::spawn_blocking(move || write_state(&path, &StateFile::from(snapshot)))
+                .await;
+        match result {
+            Ok(Ok(())) => {
+                warned = false;
+                failed.store(false, Ordering::Relaxed);
+            }
+            Ok(Err(e)) => {
+                failed.store(true, Ordering::Relaxed);
+                if !warned {
+                    warned = true;
+                    tracing::warn!(
+                        "cannot write the first-seen state, retrying every \
+                         {}s until it succeeds: {e}",
+                        FLUSH_INTERVAL.as_secs()
+                    );
+                }
+            }
+            // The blocking pool is gone (shutdown) or the write panicked.
+            Err(e) => {
+                failed.store(true, Ordering::Relaxed);
+                tracing::warn!("first-seen state write did not run: {e}");
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1058,12 +1069,12 @@ mod tests {
     /// the ones reported new while long-dead ones stayed familiar.
     #[test]
     fn an_over_long_state_file_keeps_the_newest_entries() {
+        use std::fmt::Write as _;
+
         let dir = TestDir::new("firstseen-overlong");
         let mut text = String::from("version = 1\n");
         for i in 0..MAX_APPS + 3 {
-            text.push_str(&format!(
-                "[[app]]\nexe = \"/usr/bin/p{i}\"\nfirst_ms = {i}\n"
-            ));
+            let _ = write!(text, "[[app]]\nexe = \"/usr/bin/p{i}\"\nfirst_ms = {i}\n");
         }
         let path = dir.write("seen.toml", text);
 
@@ -1091,8 +1102,7 @@ mod tests {
         let made = std::process::Command::new("mkfifo")
             .arg(&path)
             .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
+            .is_ok_and(|s| s.success());
         if !made {
             eprintln!("SKIP: mkfifo unavailable");
             return;
