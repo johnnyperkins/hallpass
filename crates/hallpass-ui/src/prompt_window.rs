@@ -244,14 +244,15 @@ fn spawn_reader(mut link: UnixStream, to_ui: Sender<ToWindow>, wake: crate::Wake
 
 /// The window this process shows.
 ///
-/// Fixed, and 30 points taller than the 440x330 the prompt view's layout
-/// tests hold it to: those prove the buttons and the destination stay on
-/// screen at the smaller size, and the difference goes to the details the
-/// operator scrolls through today.
+/// Fixed, and larger than the 440x330 the prompt view's layout tests hold
+/// it to: those prove the buttons and the destination stay on screen at
+/// the smaller size. The difference goes to the details, so a prompt with
+/// every one of them (ancestry, first sighting, denials, the hash) reads
+/// without scrolling.
 pub fn viewport() -> egui::ViewportBuilder {
     egui::ViewportBuilder::default()
         .with_title("Connection request")
-        .with_inner_size([440.0, 360.0])
+        .with_inner_size([500.0, 540.0])
         .with_resizable(false)
         // Honoured on X11 only; Wayland leaves stacking to the compositor.
         .with_always_on_top()

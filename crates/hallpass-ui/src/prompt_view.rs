@@ -270,9 +270,11 @@ fn prompt_info_ui(ui: &mut egui::Ui, p: &PromptState, rest: &[String]) {
         ui.add_space(6.0);
         ui.label(RichText::new("Executable SHA-256").small().color(MUTED));
         ui.label(
+            // A size under the small text's, so all 64 digits sit on one
+            // line: a hash broken across two reads as two values.
             RichText::new(prompt::truncate(hash, 64))
-                .small()
                 .monospace()
+                .size(10.0)
                 .color(TEXT)
                 .background_color(theme::SURFACE),
         );
