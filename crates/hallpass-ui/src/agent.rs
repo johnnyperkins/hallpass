@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use hallpass_types::wire::WireError;
-use hallpass_types::{ClientMsg, DaemonMsg, Stats};
+use hallpass_types::{ClientMsg, DaemonMsg, Stats, Verdict};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::link::{self, FromWindow, Prompt, ToWindow};
@@ -176,6 +176,11 @@ struct Agent {
     tray: Option<crate::tray::Tray>,
     tray_state: TrayState,
     stats_asked: Option<Instant>,
+    /// The daemon's default verdict as it last reported it, passed on to
+    /// every prompt window so its countdown can say what it ends in.
+    /// Asked for with every stats poll: a settings change from another
+    /// client is never pushed, and the setting is one byte.
+    default_verdict: Option<Verdict>,
     socket: PathBuf,
     /// Management windows this agent started, reaped once they exit.
     managers: Vec<Child>,
@@ -226,6 +231,7 @@ pub fn run(socket: PathBuf) -> i32 {
         tray: Some(crate::tray::spawn(wake)),
         tray_state: TrayState::Unknown,
         stats_asked: None,
+        default_verdict: None,
         socket,
         managers: Vec::new(),
         claims: Claims::default(),
@@ -309,6 +315,9 @@ impl Agent {
         {
             self.stats_asked = Some(now);
             let _ = self.to_daemon.send(ClientMsg::Stats);
+            // Answered with `Config`, never `Ok` or `Err`, so it takes no
+            // place in the claim and reply bookkeeping.
+            let _ = self.to_daemon.send(ClientMsg::ConfigGet);
         }
         self.reap_managers();
         let state = self.host.tray_state();
@@ -381,6 +390,15 @@ impl Agent {
             // the daemon writes replies ahead of this notice, so a stats
             // reply showing the slot empty can overtake it and have claimed
             // already.
+            DaemonMsg::Config(cfg) => {
+                if self.default_verdict != Some(cfg.default_verdict) {
+                    self.default_verdict = Some(cfg.default_verdict);
+                    for win in self.windows.values() {
+                        let _ = win.to_window.send(ToWindow::Default(cfg.default_verdict));
+                    }
+                }
+                Vec::new()
+            }
             DaemonMsg::PromptHandlerRevoked => {
                 if !self.claims.in_flight() {
                     self.claim_slot();
@@ -607,6 +625,11 @@ impl Agent {
                     }
                 }
             })?;
+        // Ahead of anything the router sends it, so its first prompt is
+        // drawn already knowing what it defaults to.
+        if let Some(verdict) = self.default_verdict {
+            let _ = to_window.send(ToWindow::Default(verdict));
+        }
         self.windows.insert(
             w,
             WindowProc {

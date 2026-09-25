@@ -37,6 +37,9 @@ pub struct PromptWindow {
     announced: bool,
     /// Prompts already reported to the agent as on screen.
     reported: std::collections::BTreeSet<u64>,
+    /// The daemon's default verdict as the agent last passed it on; `None`
+    /// until then, and the countdown names no verdict rather than a guess.
+    default_verdict: Option<hallpass_types::Verdict>,
 }
 
 impl PromptWindow {
@@ -48,6 +51,7 @@ impl PromptWindow {
             done: false,
             announced: false,
             reported: std::collections::BTreeSet::new(),
+            default_verdict: None,
         }
     }
 
@@ -77,6 +81,7 @@ impl PromptWindow {
                 ToWindow::Gone { id } => self.prompts.retain(|p| p.id != id),
                 // Handled on the reader thread, which exits the process.
                 ToWindow::Close => {}
+                ToWindow::Default(verdict) => self.default_verdict = Some(verdict),
             }
         }
     }
@@ -122,7 +127,13 @@ impl PromptWindow {
                 .map(|p| format!("{} {}", p.conn.tuple.proto, prompt::format_dest(&p.conn)))
                 .collect();
             // An answer is always the front prompt's: it is the only one drawn.
-            let answer = prompt_ui(ui, &mut self.prompts[0], now_ms, &rest);
+            let answer = prompt_ui(
+                ui,
+                &mut self.prompts[0],
+                now_ms,
+                &rest,
+                self.default_verdict,
+            );
             // What this pass put on screen: the front prompt, and the others
             // the list names. Told to the agent once each, so quitting denies
             // what was seen and leaves the rest to the default verdict.
@@ -319,6 +330,21 @@ mod tests {
         harness.get_by_label("curl");
         harness.get_by_label_contains("1 more request(s) pending");
         assert_eq!(harness.state().prompts.len(), 2, "a repeat is not stacked");
+    }
+
+    /// The countdown says what it ends in once the agent has passed the
+    /// default on, including a change to it while the prompt is open: the
+    /// daemon resolves an unanswered prompt with the setting in force at
+    /// its deadline, not the one when it was raised.
+    #[test]
+    fn the_countdown_follows_the_default_the_agent_passes_on() {
+        let (mut harness, _, to_ui) = window_fed(vec![ToWindow::Default(Verdict::Deny), show(1)]);
+        harness.step();
+        harness.get_by_label_contains("denied in");
+        to_ui.send(ToWindow::Default(Verdict::Allow)).unwrap();
+        harness.step();
+        harness.get_by_label_contains("allowed in");
+        assert!(harness.query_by_label_contains("denied in").is_none());
     }
 
     #[test]

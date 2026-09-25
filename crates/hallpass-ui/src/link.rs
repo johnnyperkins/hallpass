@@ -43,6 +43,12 @@ pub enum ToWindow {
     Gone { id: u64 },
     /// Nothing is left for this window. Exit without answering anything.
     Close,
+    /// What an unanswered prompt resolves to, as the daemon last reported
+    /// it: sent when the window starts and again whenever it changes. The
+    /// daemon reads the setting when a prompt expires rather than when it
+    /// is raised, so this is kept current rather than stamped on each
+    /// prompt, and the countdown can name what it is counting down to.
+    Default(Verdict),
 }
 
 /// Window to agent.
@@ -185,6 +191,7 @@ mod tests {
             ToWindow::Show(Box::new(prompt())),
             ToWindow::Gone { id: 7 },
             ToWindow::Close,
+            ToWindow::Default(Verdict::Reject),
         ];
         let mut buf = Vec::new();
         for msg in &sent {

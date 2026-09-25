@@ -29,6 +29,9 @@ pub(crate) const REST_SHOWN: usize = 5;
 /// to the width, so the question itself - which program, to where - stays
 /// on screen however far the body scrolls or the actions grow.
 ///
+/// `default` is the verdict an unanswered prompt resolves to, when the
+/// agent has passed it on, and the countdown names it.
+///
 /// Returns this pass's answer, if a button gave one.
 #[must_use = "a dropped answer is a click that never reaches the daemon"]
 pub(crate) fn prompt_ui(
@@ -36,6 +39,7 @@ pub(crate) fn prompt_ui(
     p: &mut PromptState,
     now_ms: u64,
     rest: &[String],
+    default: Option<Verdict>,
 ) -> Option<ClientMsg> {
     theme::ensure_installed(ui.ctx());
     // First pass with this prompt in front: restart the visible countdown
@@ -58,7 +62,7 @@ pub(crate) fn prompt_ui(
                 .inner_margin(egui::Margin::symmetric(10, 8)),
         )
         .show_separator_line(false)
-        .show(ui, |ui| prompt_actions_ui(ui, p, now_ms))
+        .show(ui, |ui| prompt_actions_ui(ui, p, now_ms, default))
         .inner;
     egui::Panel::top(egui::Id::new(("prompt-summary", p.id)))
         .frame(
@@ -329,7 +333,12 @@ fn prompt_tone(p: &PromptState) -> Tone {
 /// verdict buttons, and the countdown. The warning lives here rather than
 /// in the scrolling body because it must be on screen at the moment the
 /// scope it warns about is selected.
-fn prompt_actions_ui(ui: &mut egui::Ui, p: &mut PromptState, now_ms: u64) -> Option<ClientMsg> {
+fn prompt_actions_ui(
+    ui: &mut egui::Ui,
+    p: &mut PromptState,
+    now_ms: u64,
+    default: Option<Verdict>,
+) -> Option<ClientMsg> {
     let mut answer = None;
     ui.horizontal(|ui| {
         picker_label(ui, "For");
@@ -485,11 +494,7 @@ fn prompt_actions_ui(ui: &mut egui::Ui, p: &mut PromptState, now_ms: u64) -> Opt
     ui.add_space(4.0);
 
     let frac = p.remaining_fraction(now_ms);
-    theme::countdown(
-        ui,
-        frac,
-        &format!("default verdict in {}s", p.remaining_secs(now_ms)),
-    );
+    theme::countdown(ui, frac, &countdown_text(default, p.remaining_secs(now_ms)));
     answer
 }
 
@@ -500,6 +505,19 @@ fn picker_label(ui: &mut egui::Ui, text: &str) {
         egui::vec2(20.0, 22.0),
         egui::Label::new(RichText::new(text).small().color(MUTED)),
     );
+}
+
+/// What the countdown says: the verdict it ends in, when known. Unknown
+/// (the agent has not heard from the daemon yet) says so in general terms
+/// rather than guessing, since the guess would be the one line on this
+/// window that is wrong about what is about to happen.
+fn countdown_text(default: Option<Verdict>, secs: u64) -> String {
+    match default {
+        Some(Verdict::Allow) => format!("allowed in {secs}s if unanswered"),
+        Some(Verdict::Deny) => format!("denied in {secs}s if unanswered"),
+        Some(Verdict::Reject) => format!("rejected in {secs}s if unanswered"),
+        None => format!("default verdict in {secs}s"),
+    }
 }
 
 fn duration_label(d: RuleDuration) -> &'static str {
@@ -610,7 +628,7 @@ mod tests {
                 |ui, state: &mut PromptFixture| {
                     state
                         .answered
-                        .extend(prompt_ui(ui, &mut state.prompt, NOW_MS, &[]));
+                        .extend(prompt_ui(ui, &mut state.prompt, NOW_MS, &[], None));
                 },
                 state,
             )
@@ -645,7 +663,7 @@ mod tests {
                 move |ui, state: &mut PromptFixture| {
                     state
                         .answered
-                        .extend(prompt_ui(ui, &mut state.prompt, NOW_MS, &rest));
+                        .extend(prompt_ui(ui, &mut state.prompt, NOW_MS, &rest, None));
                 },
                 state,
             );
@@ -726,7 +744,7 @@ mod tests {
                 |ui, state: &mut PromptFixture| {
                     state
                         .answered
-                        .extend(prompt_ui(ui, &mut state.prompt, NOW_MS, &[]));
+                        .extend(prompt_ui(ui, &mut state.prompt, NOW_MS, &[], None));
                 },
                 fixture,
             );
@@ -888,6 +906,21 @@ mod tests {
             1,
             "Deny still answers at once"
         );
+    }
+
+    /// The countdown names the verdict it ends in, and makes no claim
+    /// before the daemon has said what that is.
+    #[test]
+    fn the_countdown_names_the_default_only_when_known() {
+        assert_eq!(
+            countdown_text(Some(Verdict::Deny), 21),
+            "denied in 21s if unanswered"
+        );
+        assert_eq!(
+            countdown_text(Some(Verdict::Allow), 3),
+            "allowed in 3s if unanswered"
+        );
+        assert_eq!(countdown_text(None, 9), "default verdict in 9s");
     }
 
     #[test]
