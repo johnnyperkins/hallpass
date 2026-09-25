@@ -8,16 +8,21 @@
 use std::collections::HashMap;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
-use hallpass_types::{wire, ClientMsg, DaemonMsg, PROTOCOL_VERSION};
+use hallpass_types::{wire, ClientMsg, DaemonMsg, Verdict, PROTOCOL_VERSION};
+use tokio::net::unix::UCred;
 use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::mpsc;
 
+use crate::config::RuntimeSettings;
 use crate::events::EventBus;
 use crate::prompt::PromptTable;
 use crate::rules::store::RuleStore;
-use crate::stats::Counters;
+use crate::session::{PeerProcess, SessionRegistry};
+use crate::stats::{Counters, QueueStats};
 
 /// Shared dependencies for connection handlers.
 pub struct IpcDeps {
@@ -25,7 +30,7 @@ pub struct IpcDeps {
     pub prompts: Arc<PromptTable>,
     pub events: Arc<EventBus>,
     pub stats: Arc<Counters>,
-    pub settings: Arc<crate::config::RuntimeSettings>,
+    pub settings: Arc<RuntimeSettings>,
     /// What bind established, when this run bound its nfqueues: the queue
     /// numbers and each queue's effective fail-open flag. None (development
     /// runs, bind failure) keeps the kernel queue counters out of the stats
@@ -34,7 +39,7 @@ pub struct IpcDeps {
     pub queues: Option<crate::nfqueue::BoundQueues>,
     /// Live session grants. A client opens one over its own connection and
     /// it ends with that connection, whatever ends it.
-    pub sessions: Arc<crate::session::SessionRegistry>,
+    pub sessions: Arc<SessionRegistry>,
     /// The lockdown posture, and the file it is persisted in.
     pub lockdown: Arc<crate::lockdown::Posture>,
 }
@@ -178,6 +183,24 @@ fn parse_group_line(line: &str, group: &str) -> Option<u32> {
     fields.next()?.parse().ok()
 }
 
+/// Give `target` the group `group`, warning rather than failing: a failed
+/// chown costs reachability, not safety, because `target` stays at the
+/// tighter owner-only access (and non-root development runs cannot chown at
+/// all). `what` and `shown` name the thing in the log.
+fn chown_to_group(target: &Path, group: &str, what: &str, shown: &Path) {
+    match lookup_gid(group) {
+        Some(gid) => {
+            if let Err(e) = std::os::unix::fs::chown(target, None, Some(gid)) {
+                tracing::warn!("chown {} to group {group} failed: {e}", shown.display());
+            }
+        }
+        None => tracing::warn!(
+            "group '{group}' not found; {what} {} stays root-only",
+            shown.display()
+        ),
+    }
+}
+
 /// Mode of the directory holding both sockets.
 ///
 /// **0751, not 0750, and the `x` for others is load bearing.** Two sockets
@@ -197,8 +220,7 @@ const DIR_MODE: u32 = 0o751;
 /// Bind the socket with restrictive permissions: parent dir [`DIR_MODE`]
 /// owned by [`CONTROL_GROUP`], socket 0660 owned by `group` if it exists.
 /// `hallpass-cli doctor` states this contract independently in its socket
-/// check; changing it means updating
-/// the expectations there.
+/// check; changing it means updating the expectations there.
 ///
 /// Separate from [`serve`] so the daemon can take the socket before it
 /// installs any nftables rules: losing the control channel is a security
@@ -219,22 +241,7 @@ pub fn bind(path: &Path, group: &str) -> std::io::Result<UnixListener> {
     std::fs::set_permissions(parent, std::fs::Permissions::from_mode(DIR_MODE))?;
     // The directory keeps the control group, not this socket's: two sockets
     // with two groups live here and a directory has room for one.
-    match lookup_gid(CONTROL_GROUP) {
-        Some(gid) => {
-            if let Err(e) = std::os::unix::fs::chown(parent, None, Some(gid)) {
-                tracing::warn!(
-                    "chown {} to group {CONTROL_GROUP} failed: {e}",
-                    parent.display()
-                );
-            }
-        }
-        // Same tradeoff as the socket below: no group means owner-only, which
-        // is tighter than intended rather than looser.
-        None => tracing::warn!(
-            "group '{CONTROL_GROUP}' not found; directory {} stays root-only",
-            parent.display()
-        ),
-    }
+    chown_to_group(parent, CONTROL_GROUP, "directory", parent);
 
     // Bind inside a staging directory only root can enter, then move the
     // finished socket into place. `bind` applies the umask to the new
@@ -251,20 +258,7 @@ pub fn bind(path: &Path, group: &str) -> std::io::Result<UnixListener> {
     let bound = (|| {
         let listener = UnixListener::bind(&staged)?;
         std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o660))?;
-        // A failed chown costs reachability, not safety: the socket stays
-        // at the tighter owner-only access, so warn rather than refuse to
-        // start (non-root development runs cannot chown at all).
-        match lookup_gid(group) {
-            Some(gid) => {
-                if let Err(e) = std::os::unix::fs::chown(&staged, None, Some(gid)) {
-                    tracing::warn!("chown {} to group {group} failed: {e}", path.display());
-                }
-            }
-            None => tracing::warn!(
-                "group '{group}' not found; socket {} stays root-only",
-                path.display()
-            ),
-        }
+        chown_to_group(&staged, group, "socket", path);
         // Atomic, and it replaces any stale socket from a previous run
         // without a window where the path does not exist.
         std::fs::rename(&staged, path)?;
@@ -289,7 +283,7 @@ pub async fn serve(listener: UnixListener, deps: Arc<IpcDeps>, tier: Tier) -> st
     // Per socket, so a full observe socket never costs a control client its
     // connection.
     let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
-    let per_uid = Arc::new(std::sync::Mutex::new(HashMap::<u32, usize>::new()));
+    let per_uid = UidCounts::default();
     let mut refused: u64 = 0;
     loop {
         let stream = match listener.accept().await {
@@ -349,23 +343,26 @@ const MAX_CONNECTIONS: usize = 64;
 /// Most connections one uid holds on one socket; see [`UidSlot`].
 const MAX_CONNECTIONS_PER_UID: usize = 16;
 
+/// Open connections per peer uid, on one socket.
+type UidCounts = Arc<Mutex<HashMap<u32, usize>>>;
+
 /// One connection counted against its peer's uid, released on drop.
 struct UidSlot {
-    counts: Arc<std::sync::Mutex<HashMap<u32, usize>>>,
+    counts: UidCounts,
     uid: u32,
 }
 
 impl UidSlot {
     /// Count a connection for `uid`, or `None` when it already holds
     /// [`MAX_CONNECTIONS_PER_UID`].
-    fn take(counts: &Arc<std::sync::Mutex<HashMap<u32, usize>>>, uid: u32) -> Option<UidSlot> {
-        let mut map = counts.lock().unwrap_or_else(|e| e.into_inner());
+    fn take(counts: &UidCounts, uid: u32) -> Option<Self> {
+        let mut map = counts.lock().unwrap_or_else(PoisonError::into_inner);
         let n = map.entry(uid).or_insert(0);
         if *n >= MAX_CONNECTIONS_PER_UID {
             return None;
         }
         *n += 1;
-        Some(UidSlot {
+        Some(Self {
             counts: Arc::clone(counts),
             uid,
         })
@@ -374,7 +371,7 @@ impl UidSlot {
 
 impl Drop for UidSlot {
     fn drop(&mut self) {
-        let mut map = self.counts.lock().unwrap_or_else(|e| e.into_inner());
+        let mut map = self.counts.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(n) = map.get_mut(&self.uid) {
             *n -= 1;
             if *n == 0 {
@@ -387,7 +384,7 @@ impl Drop for UidSlot {
 /// How long a new connection has to say Hello before it is closed. The
 /// connection limit only helps if connections that never speak give their
 /// slot back.
-const HELLO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Replies queued for one client at once. Replies are built whole before
 /// they are queued and some run to half a megabyte (the event history, the
@@ -398,7 +395,7 @@ const HELLO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const REPLY_QUEUE_CAP: usize = 4;
 
 /// Pause after a failed `accept` before trying again.
-const ACCEPT_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
+const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 /// Per-client queue depth for pushed messages (events, prompts). Bounded so
 /// a client that stops reading cannot grow daemon memory; events are
@@ -428,7 +425,7 @@ async fn handle_conn(
     tier: Tier,
 ) -> Result<(), wire::WireError> {
     let peer = stream.peer_cred().ok();
-    let peer_uid = peer.as_ref().map(|c| c.uid());
+    let peer_uid = peer.as_ref().map(UCred::uid);
     // Resolved once, here: a session is rooted at the process on the other
     // end of this socket, and asking the kernel who that is at accept time
     // is what makes the root unclaimable. This also reads that process's
@@ -437,8 +434,7 @@ async fn handle_conn(
     // `SessionRegistry::register` for the recycled-pid attack that
     // comparison closes. `pid()` is None when the peer lives in a pid
     // namespace this daemon cannot name a process in.
-    let peer_process =
-        crate::session::PeerProcess::resolve(peer.as_ref().and_then(|c| c.pid()).map(|p| p as u32));
+    let peer_process = PeerProcess::resolve(peer.as_ref().and_then(UCred::pid).map(|p| p as u32));
     let (mut reader, mut writer) = stream.into_split();
 
     // Pushed traffic goes through one channel so the prompt table and the
@@ -497,10 +493,9 @@ async fn handle_conn(
 /// Answer "what would policy do with this connection, and why".
 ///
 /// The connection is described entirely by the client, so this reports what
-/// the rules say about the stated facts. It deliberately reuses the same
-/// ruleset snapshot, the same hash cache, and the same evaluation order the
-/// verdict path uses: an explanation that could disagree with enforcement
-/// would be worse than none.
+/// the rules say about the stated facts. It deliberately reuses the ruleset
+/// snapshot and the evaluation order the verdict path uses: an explanation
+/// that could disagree with enforcement would be worse than none.
 fn explain(req: &hallpass_types::ExplainRequest, deps: &IpcDeps) -> hallpass_types::Explanation {
     let set = deps.store.ruleset();
     // The hash is whatever the client stated, and nothing else. Hashing on
@@ -513,7 +508,6 @@ fn explain(req: &hallpass_types::ExplainRequest, deps: &IpcDeps) -> hallpass_typ
     // the caller a call to sha256sum, and a hash-pinning rule simply reports
     // exe_sha256 as the criterion that did not hold.
     let result = set.explain(&req.conn, req.exe_sha256.as_deref());
-    let default_verdict = deps.prompts.default_verdict();
     // The no-match arm has to answer the way `decide` does, or the tool an
     // operator uses to predict policy contradicts the thing enforcing it.
     // Under a posture that means no prompt at all, deny for anything leaving
@@ -523,21 +517,17 @@ fn explain(req: &hallpass_types::ExplainRequest, deps: &IpcDeps) -> hallpass_typ
     // block the packet path does not apply.
     let (verdict, rule_name, would_prompt) = match result.matched {
         Some((name, verdict)) => (verdict, Some(name), false),
-        None if set.locked_down() => match crate::nfqueue::stays_on_host(&req.conn) {
-            true => (
-                hallpass_types::Verdict::Allow,
-                Some(hallpass_types::LOCKDOWN_LOOPBACK_RULE.to_string()),
-                false,
-            ),
-            false => (
-                hallpass_types::Verdict::Deny,
-                Some(hallpass_types::LOCKDOWN_DENIED_RULE.to_string()),
-                false,
-            ),
-        },
+        None if set.locked_down() => {
+            let (verdict, rule) = if crate::nfqueue::stays_on_host(&req.conn) {
+                (Verdict::Allow, hallpass_types::LOCKDOWN_LOOPBACK_RULE)
+            } else {
+                (Verdict::Deny, hallpass_types::LOCKDOWN_DENIED_RULE)
+            };
+            (verdict, Some(rule.to_string()), false)
+        }
         // No rule matched, so the connection would raise a prompt and the
         // configured default is what applies if nobody answers in time.
-        None => (default_verdict, None, true),
+        None => (deps.prompts.default_verdict(), None, true),
     };
     hallpass_types::Explanation {
         verdict,
@@ -561,7 +551,7 @@ async fn send(reply_tx: &mpsc::Sender<DaemonMsg>, msg: DaemonMsg) {
 #[derive(Debug, Clone, Copy)]
 struct PeerCreds {
     uid: Option<u32>,
-    process: crate::session::PeerProcess,
+    process: PeerProcess,
 }
 
 /// The session grant opened on one connection, ended when this drops.
@@ -569,7 +559,7 @@ struct PeerCreds {
 /// Not a convenience: this is the only thing that guarantees a grant cannot
 /// outlive its connection, including when the task holding it unwinds.
 struct SessionGuard {
-    sessions: Arc<crate::session::SessionRegistry>,
+    sessions: Arc<SessionRegistry>,
     id: Option<u64>,
 }
 
@@ -590,61 +580,16 @@ async fn message_loop(
     session: &mut SessionGuard,
     tier: Tier,
 ) -> Result<(), wire::WireError> {
-    let peer_uid = peer.uid;
-    let hello = tokio::time::timeout(HELLO_TIMEOUT, wire::read_msg::<ClientMsg, _>(reader))
-        .await
-        .map_err(|_| {
-            wire::WireError::Io(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "no Hello within the handshake timeout",
-            ))
-        })??;
-    match hello {
-        ClientMsg::Hello { version } if version == PROTOCOL_VERSION => {
-            send(
-                reply_tx,
-                DaemonMsg::HelloAck {
-                    version: PROTOCOL_VERSION,
-                },
-            )
-            .await;
-        }
-        ClientMsg::Hello { version } => {
-            send(
-                reply_tx,
-                DaemonMsg::Err {
-                    message: format!(
-                        "protocol version mismatch: client {version}, daemon {PROTOCOL_VERSION}"
-                    ),
-                },
-            )
-            .await;
-            return Ok(());
-        }
-        _ => {
-            send(
-                reply_tx,
-                DaemonMsg::Err {
-                    message: "expected Hello as first message".into(),
-                },
-            )
-            .await;
-            return Ok(());
-        }
+    if !handshake(reader, reply_tx).await? {
+        return Ok(());
     }
-
-    // One event forwarder per connection. Each Subscribe used to spawn another
-    // task and another broadcast receiver unconditionally, so a client looping
-    // Subscribe created unbounded tasks and receivers, and every EventBus::emit
-    // runs on the verdict path and must walk that receiver set: one socket
-    // became a per-packet multiplier on the loop that decides every connection.
-    //
-    // Aborted when this function returns. The forwarder holds a sender, and
-    // the writer only ends when every sender is gone, so left to notice the
-    // closed connection by itself it lingered, descriptor and all, until two
-    // more events had gone by: forever, on a quiet host.
-    let mut forwarder = AbortOnDrop(None);
-
+    let mut client = Client {
+        deps,
+        out_tx,
+        peer,
+        session,
+        forwarder: AbortOnDrop(None),
+    };
     loop {
         let msg = match wire::read_msg::<ClientMsg, _>(reader).await {
             Ok(m) => m,
@@ -657,66 +602,100 @@ async fn message_loop(
         // behind cannot be forgotten by a future arm, and `observe_allows` is
         // exhaustive, so a new `ClientMsg` variant stops the build here rather
         // than arriving on the read-only socket by default.
-        if tier == Tier::Observe && !observe_allows(&msg) {
+        let reply = if tier == Tier::Observe && !observe_allows(&msg) {
             // Named, because the operator's next question is which one: a
             // monitoring tool wired to the wrong socket otherwise reports a
             // bare error per poll with nothing to act on. The variant name is
             // this daemon's own text, not the client's.
             let refused = client_msg_name(&msg);
             tracing::debug!(msg = refused, "refused on the read-only socket");
-            send(
-                reply_tx,
-                DaemonMsg::Err {
-                    message: format!(
-                        "{refused} is not available on the read-only socket; \
-                         use the control socket for anything that changes policy"
-                    ),
-                },
-            )
-            .await;
-            continue;
-        }
-        let reply = match msg {
-            ClientMsg::Hello { .. } => DaemonMsg::Err {
-                message: "duplicate Hello".into(),
+            refusal(format!(
+                "{refused} is not available on the read-only socket; \
+                 use the control socket for anything that changes policy"
+            ))
+        } else {
+            client.dispatch(msg)
+        };
+        send(reply_tx, reply).await;
+    }
+}
+
+/// Read the client's Hello and answer it. `Ok(false)` when the client was
+/// refused (wrong version, or something other than Hello first) and has
+/// been told why.
+async fn handshake(
+    reader: &mut (impl tokio::io::AsyncRead + Unpin),
+    reply_tx: &mpsc::Sender<DaemonMsg>,
+) -> Result<bool, wire::WireError> {
+    let hello = tokio::time::timeout(HELLO_TIMEOUT, wire::read_msg::<ClientMsg, _>(reader))
+        .await
+        .map_err(|_| {
+            wire::WireError::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "no Hello within the handshake timeout",
+            ))
+        })??;
+    let (reply, accepted) = match hello {
+        ClientMsg::Hello { version } if version == PROTOCOL_VERSION => (
+            DaemonMsg::HelloAck {
+                version: PROTOCOL_VERSION,
             },
-            ClientMsg::Subscribe { events, prompts } => {
-                // The two subscriptions are independent: a taken prompt
-                // slot must not silently drop the events half of the
-                // same request, so events are wired up either way and
-                // the reply reports the prompt-slot outcome.
-                let prompt_denied = prompts && !deps.prompts.set_handler(out_tx.clone());
-                if events && forwarder.0.is_none() {
-                    let mut rx = deps.events.subscribe();
-                    let tx = out_tx.clone();
-                    forwarder.0 = Some(tokio::spawn(async move {
-                        loop {
-                            match rx.recv().await {
-                                // try_send: a client that stops draining
-                                // loses events instead of growing the queue.
-                                Ok(ev) => match tx.try_send(DaemonMsg::Event(ev)) {
-                                    Ok(()) => {}
-                                    Err(mpsc::error::TrySendError::Full(_)) => {
-                                        tracing::debug!("dropping event for slow client");
-                                    }
-                                    Err(mpsc::error::TrySendError::Closed(_)) => break,
-                                },
-                                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                                    tracing::warn!("event subscriber lagged, skipped {n} events");
-                                }
-                                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                            }
-                        }
-                    }));
-                }
-                if prompt_denied {
-                    DaemonMsg::Err {
-                        message: "a prompt handler is already connected".into(),
-                    }
-                } else {
-                    DaemonMsg::Ok
-                }
-            }
+            true,
+        ),
+        ClientMsg::Hello { version } => (
+            refusal(format!(
+                "protocol version mismatch: client {version}, daemon {PROTOCOL_VERSION}"
+            )),
+            false,
+        ),
+        _ => (refusal("expected Hello as first message"), false),
+    };
+    send(reply_tx, reply).await;
+    Ok(accepted)
+}
+
+/// `Ok` for success, the error text otherwise.
+fn ack(result: Result<(), String>) -> DaemonMsg {
+    match result {
+        Ok(()) => DaemonMsg::Ok,
+        Err(message) => DaemonMsg::Err { message },
+    }
+}
+
+/// An error reply carrying `message`.
+fn refusal(message: impl Into<String>) -> DaemonMsg {
+    DaemonMsg::Err {
+        message: message.into(),
+    }
+}
+
+/// One connection past its handshake, as the request handlers see it.
+struct Client<'a> {
+    deps: &'a IpcDeps,
+    /// This connection's push channel, and its identity as a prompt handler.
+    out_tx: &'a mpsc::Sender<DaemonMsg>,
+    peer: PeerCreds,
+    session: &'a mut SessionGuard,
+    /// The connection's one event forwarder, once it has subscribed.
+    ///
+    /// One per connection: each Subscribe used to spawn another task and
+    /// another broadcast receiver, so a client looping Subscribe created
+    /// unbounded receivers, and every `EventBus::emit` on the verdict path
+    /// walks that set. Aborted when the connection ends: the forwarder holds
+    /// a sender, and the writer only ends when every sender is gone, so left
+    /// to notice the closed connection itself it lingered until two more
+    /// events had gone by - forever, on a quiet host.
+    forwarder: AbortOnDrop,
+}
+
+impl Client<'_> {
+    /// Answer one request.
+    fn dispatch(&mut self, msg: ClientMsg) -> DaemonMsg {
+        let deps = self.deps;
+        let peer_uid = self.peer.uid;
+        match msg {
+            ClientMsg::Hello { .. } => refusal("duplicate Hello"),
+            ClientMsg::Subscribe { events, prompts } => self.subscribe(events, prompts),
             ClientMsg::PromptReply {
                 id,
                 verdict,
@@ -725,71 +704,32 @@ async fn message_loop(
                 pin_exe,
             } => {
                 tracing::info!(?peer_uid, id, ?verdict, pin_exe, "prompt reply");
-                match deps
+                ack(deps
                     .prompts
-                    .reply(out_tx, id, verdict, duration, scope, pin_exe)
-                {
-                    Ok(()) => DaemonMsg::Ok,
-                    Err(message) => DaemonMsg::Err { message },
-                }
+                    .reply(self.out_tx, id, verdict, duration, scope, pin_exe))
             }
             ClientMsg::RuleList => DaemonMsg::Rules(deps.store.list()),
             ClientMsg::RuleAdd(rule) => {
                 tracing::info!(?peer_uid, rule = %rule.name, "rule add");
-                match deps.store.add(rule.clone()) {
-                    Ok(()) => {
-                        // Same sweep the prompt-reply path does: prompts
-                        // already on screen that this rule covers must
-                        // resolve with its action, not sit until the
-                        // timeout applies the default verdict.
-                        deps.prompts.resolve_covered_by(&rule);
-                        DaemonMsg::Ok
-                    }
-                    Err(message) => DaemonMsg::Err { message },
+                let added = deps.store.add(rule.clone());
+                if added.is_ok() {
+                    // Same sweep the prompt-reply path does: prompts already
+                    // on screen that this rule covers must resolve with its
+                    // action, not sit until the timeout applies the default.
+                    deps.prompts.resolve_covered_by(&rule);
                 }
+                ack(added)
             }
             ClientMsg::RuleDelete { name } => {
                 tracing::info!(?peer_uid, rule = %name, "rule delete");
-                match deps.store.delete(&name) {
-                    Ok(()) => DaemonMsg::Ok,
-                    Err(message) => DaemonMsg::Err { message },
-                }
+                ack(deps.store.delete(&name))
             }
             ClientMsg::RuleToggle { name, enabled } => {
                 tracing::info!(?peer_uid, rule = %name, enabled, "rule toggle");
-                match deps.store.toggle(&name, enabled) {
-                    Ok(()) => DaemonMsg::Ok,
-                    Err(message) => DaemonMsg::Err { message },
-                }
+                ack(deps.store.toggle(&name, enabled))
             }
             ClientMsg::LockdownGet => DaemonMsg::LockdownState(deps.lockdown.snapshot(&deps.store)),
-            ClientMsg::LockdownSet { tags, on, force } => {
-                // Warn, not info, and with the peer on it: this is the one
-                // change that decides every unmatched connection on the
-                // host, and the journal is where an operator reconstructs
-                // when it happened and who asked. Any socket-group member
-                // can lift it, exactly as any of them can delete a deny
-                // rule; that is the existing trust boundary, not a new one.
-                tracing::warn!(
-                    ?peer_uid,
-                    peer_pid = ?peer.process.pid,
-                    ?tags,
-                    on,
-                    force,
-                    "lockdown set"
-                );
-                match crate::lockdown::apply(
-                    &deps.lockdown,
-                    &deps.store,
-                    &deps.settings,
-                    tags,
-                    on,
-                    force,
-                ) {
-                    Ok(state) => DaemonMsg::LockdownState(state),
-                    Err(message) => DaemonMsg::Err { message },
-                }
-            }
+            ClientMsg::LockdownSet { tags, on, force } => self.set_lockdown(tags, on, force),
             ClientMsg::RuleToggleTag { tag, enabled } => {
                 tracing::info!(?peer_uid, tag = %tag, enabled, "rule toggle by tag");
                 match deps.store.toggle_tag(&tag, enabled) {
@@ -797,34 +737,7 @@ async fn message_loop(
                     Err(message) => DaemonMsg::Err { message },
                 }
             }
-            ClientMsg::Stats => {
-                let rules = deps.store.ruleset().rule_count() as u32;
-                let skipped = deps.store.rules_skipped();
-                // Read on demand, here and nowhere else: one small /proc
-                // read per status request, on the async side. The verdict
-                // thread takes no new dependency for observability. The
-                // fail-open flags ride along from bind, because they are
-                // what makes the drop counters readable and /proc does not
-                // carry them.
-                let queues = match deps.queues {
-                    Some(q) => {
-                        let mut s = crate::stats::read_queue_stats(q.queue_num);
-                        s.verdict_fail_open = Some(q.verdict_fail_open);
-                        s.snoop_fail_open = Some(q.snoop_fail_open);
-                        s.verdict_max_len = q.verdict_max_len;
-                        s
-                    }
-                    None => Default::default(),
-                };
-                DaemonMsg::Stats(deps.stats.snapshot(
-                    rules,
-                    skipped,
-                    deps.prompts.has_handler(),
-                    deps.settings.enforcing(),
-                    deps.lockdown.snapshot(&deps.store),
-                    queues,
-                ))
-            }
+            ClientMsg::Stats => self.stats(),
             ClientMsg::EventHistory { limit } => {
                 DaemonMsg::Events(deps.events.history(limit as usize))
             }
@@ -837,891 +750,136 @@ async fn message_loop(
                 // allow rule outright), so the settings are not a wider
                 // grant; the log line is what makes the change auditable.
                 tracing::info!(?peer_uid, ?new, "runtime settings change");
-                match deps.settings.apply(&new) {
-                    Ok(()) => {
-                        // Prompts opened while enforcing would otherwise
-                        // keep their packets held across the toggle, which
-                        // is a delay observe mode promises not to impose.
-                        if !new.enforce {
-                            deps.prompts.resolve_pending_for_observe();
-                        }
-                        DaemonMsg::Ok
-                    }
-                    Err(message) => DaemonMsg::Err { message },
+                let applied = deps.settings.apply(&new);
+                // Prompts opened while enforcing would otherwise keep their
+                // packets held across the toggle, which is a delay observe
+                // mode promises not to impose.
+                if applied.is_ok() && !new.enforce {
+                    deps.prompts.resolve_pending_for_observe();
                 }
+                ack(applied)
             }
-            ClientMsg::RunSessionStart { label } => {
-                // One session per connection. A second request is refused
-                // rather than replacing the first, because the first is
-                // what the wrapper's child is already running under and
-                // nothing here can tell which one the client meant to keep.
-                if session.id.is_some() {
-                    DaemonMsg::Err {
-                        message: "this connection already has a session".into(),
-                    }
-                } else {
-                    match peer.uid {
-                        // The grant is scoped to a user, so a peer whose
-                        // uid the kernel did not report cannot have one.
-                        None => DaemonMsg::Err {
-                            message: "the daemon cannot see this client's user".into(),
-                        },
-                        Some(uid) => match deps.sessions.register(peer.process, uid, label) {
-                            Ok(id) => {
-                                session.id = Some(id);
-                                DaemonMsg::RunSessionStarted { id }
-                            }
-                            Err(message) => DaemonMsg::Err { message },
-                        },
-                    }
-                }
-            }
+            ClientMsg::RunSessionStart { label } => self.start_session(label),
             ClientMsg::RunSessionList => DaemonMsg::RunSessions(deps.sessions.list()),
-        };
-        send(reply_tx, reply).await;
+        }
     }
+
+    /// Wire up the event stream and/or claim the prompt slot.
+    ///
+    /// The two are independent: a taken prompt slot must not silently drop
+    /// the events half of the same request, so events are wired up either
+    /// way and the reply reports the prompt-slot outcome.
+    fn subscribe(&mut self, events: bool, prompts: bool) -> DaemonMsg {
+        let prompt_denied = prompts && !self.deps.prompts.set_handler(self.out_tx.clone());
+        if events && self.forwarder.0.is_none() {
+            self.forwarder.0 = Some(spawn_event_forwarder(
+                &self.deps.events,
+                self.out_tx.clone(),
+            ));
+        }
+        if prompt_denied {
+            refusal("a prompt handler is already connected")
+        } else {
+            DaemonMsg::Ok
+        }
+    }
+
+    fn set_lockdown(&self, tags: Vec<String>, on: bool, force: bool) -> DaemonMsg {
+        // Warn, not info, and with the peer on it: this is the one change
+        // that decides every unmatched connection on the host, and the
+        // journal is where an operator reconstructs when it happened and who
+        // asked. Any socket-group member can lift it, exactly as any of them
+        // can delete a deny rule; that is the existing trust boundary.
+        tracing::warn!(
+            peer_uid = ?self.peer.uid,
+            peer_pid = ?self.peer.process.pid,
+            ?tags,
+            on,
+            force,
+            "lockdown set"
+        );
+        let deps = self.deps;
+        match crate::lockdown::apply(&deps.lockdown, &deps.store, &deps.settings, tags, on, force) {
+            Ok(state) => DaemonMsg::LockdownState(state),
+            Err(message) => DaemonMsg::Err { message },
+        }
+    }
+
+    fn stats(&self) -> DaemonMsg {
+        let deps = self.deps;
+        // Read on demand, here and nowhere else: one small /proc read per
+        // status request, on the async side, so the verdict thread takes no
+        // new dependency for observability. The fail-open flags ride along
+        // from bind, because they are what makes the drop counters readable
+        // and /proc does not carry them.
+        let queues = deps
+            .queues
+            .map_or_else(QueueStats::default, |q| QueueStats {
+                verdict_fail_open: Some(q.verdict_fail_open),
+                snoop_fail_open: Some(q.snoop_fail_open),
+                verdict_max_len: q.verdict_max_len,
+                ..crate::stats::read_queue_stats(q.queue_num)
+            });
+        DaemonMsg::Stats(deps.stats.snapshot(
+            deps.store.ruleset().rule_count() as u32,
+            deps.store.rules_skipped(),
+            deps.prompts.has_handler(),
+            deps.settings.enforcing(),
+            deps.lockdown.snapshot(&deps.store),
+            queues,
+        ))
+    }
+
+    fn start_session(&mut self, label: String) -> DaemonMsg {
+        // One session per connection. A second request is refused rather
+        // than replacing the first, because the first is what the wrapper's
+        // child is already running under and nothing here can tell which one
+        // the client meant to keep.
+        if self.session.id.is_some() {
+            return refusal("this connection already has a session");
+        }
+        // The grant is scoped to a user, so a peer whose uid the kernel did
+        // not report cannot have one.
+        let Some(uid) = self.peer.uid else {
+            return refusal("the daemon cannot see this client's user");
+        };
+        match self.deps.sessions.register(self.peer.process, uid, label) {
+            Ok(id) => {
+                self.session.id = Some(id);
+                DaemonMsg::RunSessionStarted { id }
+            }
+            Err(message) => DaemonMsg::Err { message },
+        }
+    }
+}
+
+/// Forward every event on `events` to a client's push channel until the
+/// client goes away.
+fn spawn_event_forwarder(
+    events: &EventBus,
+    tx: mpsc::Sender<DaemonMsg>,
+) -> tokio::task::JoinHandle<()> {
+    let mut rx = events.subscribe();
+    tokio::spawn(async move {
+        loop {
+            match rx.recv().await {
+                // try_send: a client that stops draining loses events
+                // instead of growing the queue.
+                Ok(ev) => match tx.try_send(DaemonMsg::Event(ev)) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        tracing::debug!("dropping event for slow client");
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => break,
+                },
+                Err(RecvError::Lagged(n)) => {
+                    tracing::warn!("event subscriber lagged, skipped {n} events");
+                }
+                Err(RecvError::Closed) => break,
+            }
+        }
+    })
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use hallpass_types::{Action, Rule, RuleDuration, RuleMatch, Verdict};
-    use std::time::Duration;
-
-    fn parse(line: &str) -> Option<u32> {
-        parse_group_line(line, "hallpass")
-    }
-
-    /// The socket must never be reachable at a mode looser than 0660,
-    /// including for the window between creating it and tightening it.
-    /// Binding under a permissive umask is what would expose that window.
-    #[tokio::test]
-    async fn bind_publishes_a_socket_no_looser_than_0660() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let dir = std::env::temp_dir().join(format!("hallpass-bind-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("hallpass.sock");
-
-        let listener = bind(&path, CONTROL_GROUP).expect("bind");
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o660, "socket mode {mode:o}");
-        assert!(
-            !dir.join(".hallpass-bind").exists(),
-            "staging dir should be cleaned up"
-        );
-
-        // Rebinding over a live socket replaces it rather than failing,
-        // so a restart never leaves the path missing.
-        drop(listener);
-        let _ = bind(&path, CONTROL_GROUP).expect("rebind over an existing socket");
-        assert!(path.exists());
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// The daemon binds two sockets into one directory, back to back, which
-    /// is the sequence this bind was only ever asked to do once. The staging
-    /// directory is created and removed per call, and the second call
-    /// re-applies the directory's mode and group, so the two must not fight
-    /// over it: the risk is the second bind leaving the first socket's
-    /// directory in a state the first would not have accepted.
-    #[tokio::test]
-    async fn both_sockets_bind_into_one_directory() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let dir = std::env::temp_dir().join(format!("hallpass-bind-two-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let control = dir.join("hallpass.sock");
-        let observe = dir.join("observe.sock");
-
-        let _c = bind(&control, CONTROL_GROUP).expect("control bind");
-        let _o = bind(&observe, OBSERVE_GROUP).expect("observe bind");
-
-        assert!(control.exists(), "the control socket did not survive");
-        assert!(observe.exists());
-        for path in [&control, &observe] {
-            let mode = std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
-            assert_eq!(mode, 0o660, "{} is not 0660", path.display());
-        }
-        let dmode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
-        assert_eq!(
-            dmode, DIR_MODE,
-            "the directory must be traversable by both groups"
-        );
-        // The staging directory is an implementation detail that must not
-        // outlive either call: it is 0700 and would otherwise accumulate.
-        assert!(!dir.join(".hallpass-bind").exists());
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn group_line_parsing() {
-        assert_eq!(parse("hallpass:x:990:alice,bob"), Some(990));
-        assert_eq!(parse("hallpass:x:990:"), Some(990));
-        assert_eq!(parse("other:x:1:"), None);
-        assert_eq!(parse("hallpass"), None);
-        assert_eq!(parse(""), None);
-    }
-
-    fn test_deps(tag: &str) -> (Arc<IpcDeps>, crate::testutil::TestDir) {
-        let dir = crate::testutil::TestDir::new(&format!("ipc-{tag}"));
-        let store = Arc::new(RuleStore::new(dir.path().join("rules")));
-        let settings = Arc::new(crate::config::RuntimeSettings::new(
-            crate::testutil::runtime_config(5, Verdict::Allow),
-        ));
-        let events = Arc::new(EventBus::default());
-        let stats = Arc::new(Counters::default());
-        let (verdict_tx, _verdict_rx) = mpsc::unbounded_channel();
-        let prompts = Arc::new(PromptTable::new(
-            verdict_tx,
-            Arc::clone(&events),
-            Arc::clone(&stats),
-            Arc::clone(&store),
-            Arc::clone(&settings),
-            8,
-        ));
-        (
-            Arc::new(IpcDeps {
-                lockdown: Arc::new(crate::lockdown::Posture::load(
-                    &dir.path().join("posture.toml"),
-                )),
-                store,
-                prompts,
-                events,
-                stats,
-                settings,
-                // No queues bound in tests; the reply must carry None for
-                // every kernel queue counter, not another process's row.
-                queues: None,
-                sessions: Arc::new(crate::session::SessionRegistry::default()),
-            }),
-            dir,
-        )
-    }
-
-    async fn client(path: &Path) -> UnixStream {
-        let s = UnixStream::connect(path).await.unwrap();
-        s
-    }
-
-    /// A session lives exactly as long as the connection that opened it,
-    /// which is what makes a SIGKILLed wrapper leave nothing behind.
-    #[tokio::test]
-    async fn a_session_opens_on_a_connection_and_dies_with_it() {
-        let (deps, dir) = test_deps("session");
-        let sock = dir.path().join("test.sock");
-        let listener = UnixListener::bind(&sock).unwrap();
-        let server_deps = Arc::clone(&deps);
-        tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let _ = handle_conn(stream, server_deps, Tier::Control).await;
-        });
-
-        let mut c = client(&sock).await;
-        wire::write_msg(
-            &mut c,
-            &ClientMsg::Hello {
-                version: PROTOCOL_VERSION,
-            },
-        )
-        .await
-        .unwrap();
-        let ack: DaemonMsg = wire::read_msg(&mut c).await.unwrap();
-        assert_eq!(
-            ack,
-            DaemonMsg::HelloAck {
-                version: PROTOCOL_VERSION
-            }
-        );
-
-        wire::write_msg(
-            &mut c,
-            &ClientMsg::RunSessionStart {
-                label: "curl".into(),
-            },
-        )
-        .await
-        .unwrap();
-        let id = match wire::read_msg::<DaemonMsg, _>(&mut c).await.unwrap() {
-            DaemonMsg::RunSessionStarted { id } => id,
-            other => panic!("expected the session to open, got {other:?}"),
-        };
-        // Rooted at this test process, which is what is on the other end.
-        let listed = deps.sessions.list();
-        assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].id, id);
-        assert_eq!(listed[0].root_pid, std::process::id());
-        assert_eq!(listed[0].label, "curl");
-
-        // A second request is refused rather than replacing the first: the
-        // wrapper's child is already running under the first one.
-        wire::write_msg(
-            &mut c,
-            &ClientMsg::RunSessionStart {
-                label: "again".into(),
-            },
-        )
-        .await
-        .unwrap();
-        assert!(matches!(
-            wire::read_msg::<DaemonMsg, _>(&mut c).await.unwrap(),
-            DaemonMsg::Err { .. }
-        ));
-
-        wire::write_msg(&mut c, &ClientMsg::RunSessionList)
-            .await
-            .unwrap();
-        match wire::read_msg::<DaemonMsg, _>(&mut c).await.unwrap() {
-            DaemonMsg::RunSessions(v) => assert_eq!(v.len(), 1),
-            other => panic!("expected the session list, got {other:?}"),
-        }
-
-        // Dropping the socket is every way a wrapper can end, including the
-        // one that runs no cleanup code.
-        drop(c);
-        for _ in 0..100 {
-            if deps.sessions.list().is_empty() {
-                return;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        panic!("the session outlived the connection that opened it");
-    }
-
-    /// A rule the tests add over the socket. Session-scoped, so nothing
-    /// touches disk.
-    fn ipc_rule(name: &str, tags: Vec<String>) -> Rule {
-        Rule {
-            name: name.into(),
-            action: Action::Deny,
-            duration: RuleDuration::Session,
-            priority: 3,
-            enabled: true,
-            tags,
-            matcher: RuleMatch {
-                port: Some(25),
-                ..Default::default()
-            },
-        }
-    }
-
-    #[tokio::test]
-    async fn hello_rules_and_stats_roundtrip() {
-        let (deps, dir) = test_deps("roundtrip");
-        let sock = dir.path().join("test.sock");
-        let listener = UnixListener::bind(&sock).unwrap();
-        let server_deps = Arc::clone(&deps);
-        tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let _ = handle_conn(stream, server_deps, Tier::Control).await;
-        });
-
-        let mut c = client(&sock).await;
-        wire::write_msg(
-            &mut c,
-            &ClientMsg::Hello {
-                version: PROTOCOL_VERSION,
-            },
-        )
-        .await
-        .unwrap();
-        let ack: DaemonMsg = wire::read_msg(&mut c).await.unwrap();
-        assert_eq!(
-            ack,
-            DaemonMsg::HelloAck {
-                version: PROTOCOL_VERSION
-            }
-        );
-
-        let rule = ipc_rule("via-ipc", Vec::new());
-        wire::write_msg(&mut c, &ClientMsg::RuleAdd(rule.clone()))
-            .await
-            .unwrap();
-        assert_eq!(
-            wire::read_msg::<DaemonMsg, _>(&mut c).await.unwrap(),
-            DaemonMsg::Ok
-        );
-
-        wire::write_msg(&mut c, &ClientMsg::RuleList).await.unwrap();
-        assert_eq!(
-            wire::read_msg::<DaemonMsg, _>(&mut c).await.unwrap(),
-            DaemonMsg::Rules(vec![rule])
-        );
-
-        wire::write_msg(
-            &mut c,
-            &ClientMsg::RuleDelete {
-                name: "nope".into(),
-            },
-        )
-        .await
-        .unwrap();
-        assert!(matches!(
-            wire::read_msg::<DaemonMsg, _>(&mut c).await.unwrap(),
-            DaemonMsg::Err { .. }
-        ));
-
-        wire::write_msg(&mut c, &ClientMsg::Stats).await.unwrap();
-        match wire::read_msg::<DaemonMsg, _>(&mut c).await.unwrap() {
-            DaemonMsg::Stats(s) => assert_eq!(s.rules_loaded, 1),
-            other => panic!("expected stats, got {other:?}"),
-        }
-    }
-
-    /// The bulk toggle over IPC: the reply carries what changed, a tag no
-    /// rule carries is refused, and the rules a client lists afterwards show
-    /// the new state.
-    #[tokio::test]
-    async fn rule_toggle_tag_roundtrip() {
-        let (deps, dir) = test_deps("toggle-tag");
-        let sock = dir.path().join("test.sock");
-        let listener = UnixListener::bind(&sock).unwrap();
-        let server_deps = Arc::clone(&deps);
-        tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let _ = handle_conn(stream, server_deps, Tier::Control).await;
-        });
-
-        let mut c = client(&sock).await;
-        wire::write_msg(
-            &mut c,
-            &ClientMsg::Hello {
-                version: PROTOCOL_VERSION,
-            },
-        )
-        .await
-        .unwrap();
-        let _: DaemonMsg = wire::read_msg(&mut c).await.unwrap();
-
-        for (name, tags) in [("t1", vec!["work".to_string()]), ("t2", Vec::new())] {
-            wire::write_msg(&mut c, &ClientMsg::RuleAdd(ipc_rule(name, tags)))
-                .await
-                .unwrap();
-            assert_eq!(
-                wire::read_msg::<DaemonMsg, _>(&mut c).await.unwrap(),
-                DaemonMsg::Ok
-            );
-        }
-
-        wire::write_msg(
-            &mut c,
-            &ClientMsg::RuleToggleTag {
-                tag: "work".into(),
-                enabled: false,
-            },
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            wire::read_msg::<DaemonMsg, _>(&mut c).await.unwrap(),
-            DaemonMsg::RulesToggled {
-                changed: 1,
-                failed: Vec::new()
-            }
-        );
-
-        wire::write_msg(
-            &mut c,
-            &ClientMsg::RuleToggleTag {
-                tag: "absent".into(),
-                enabled: false,
-            },
-        )
-        .await
-        .unwrap();
-        assert!(matches!(
-            wire::read_msg::<DaemonMsg, _>(&mut c).await.unwrap(),
-            DaemonMsg::Err { .. }
-        ));
-
-        wire::write_msg(&mut c, &ClientMsg::RuleList).await.unwrap();
-        match wire::read_msg::<DaemonMsg, _>(&mut c).await.unwrap() {
-            DaemonMsg::Rules(rules) => {
-                let by_name = |n: &str| rules.iter().find(|r| r.name == n).unwrap().enabled;
-                assert!(!by_name("t1"), "the tagged rule is off");
-                assert!(by_name("t2"), "the untagged rule is untouched");
-            }
-            other => panic!("expected rules, got {other:?}"),
-        }
-    }
-
-    /// The runtime-settings round trip: get reports the config values, a
-    /// valid set changes what the next get reports, an invalid one is
-    /// refused and changes nothing.
-    #[tokio::test]
-    async fn config_get_and_set_roundtrip() {
-        let (deps, dir) = test_deps("config");
-        let sock = dir.path().join("test.sock");
-        let listener = UnixListener::bind(&sock).unwrap();
-        let server_deps = Arc::clone(&deps);
-        tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let _ = handle_conn(stream, server_deps, Tier::Control).await;
-        });
-
-        let mut c = client(&sock).await;
-        wire::write_msg(
-            &mut c,
-            &ClientMsg::Hello {
-                version: PROTOCOL_VERSION,
-            },
-        )
-        .await
-        .unwrap();
-        let _: DaemonMsg = wire::read_msg(&mut c).await.unwrap();
-
-        wire::write_msg(&mut c, &ClientMsg::ConfigGet)
-            .await
-            .unwrap();
-        assert_eq!(
-            wire::read_msg::<DaemonMsg, _>(&mut c).await.unwrap(),
-            DaemonMsg::Config(crate::testutil::runtime_config(5, Verdict::Allow))
-        );
-
-        // The mode rides the same set: this one turns observe on.
-        let new = hallpass_types::RuntimeConfig {
-            enforce: false,
-            ..crate::testutil::runtime_config(30, Verdict::Deny)
-        };
-        wire::write_msg(&mut c, &ClientMsg::ConfigSet(new))
-            .await
-            .unwrap();
-        assert_eq!(
-            wire::read_msg::<DaemonMsg, _>(&mut c).await.unwrap(),
-            DaemonMsg::Ok
-        );
-        wire::write_msg(&mut c, &ClientMsg::ConfigGet)
-            .await
-            .unwrap();
-        assert_eq!(
-            wire::read_msg::<DaemonMsg, _>(&mut c).await.unwrap(),
-            DaemonMsg::Config(new)
-        );
-
-        // Out of range: refused with the same bounds the config file has,
-        // and the settings stay where the last valid set put them.
-        wire::write_msg(
-            &mut c,
-            &ClientMsg::ConfigSet(crate::testutil::runtime_config(3601, Verdict::Allow)),
-        )
-        .await
-        .unwrap();
-        assert!(matches!(
-            wire::read_msg::<DaemonMsg, _>(&mut c).await.unwrap(),
-            DaemonMsg::Err { .. }
-        ));
-        wire::write_msg(&mut c, &ClientMsg::ConfigGet)
-            .await
-            .unwrap();
-        assert_eq!(
-            wire::read_msg::<DaemonMsg, _>(&mut c).await.unwrap(),
-            DaemonMsg::Config(new)
-        );
-    }
-
-    /// Every wire message, classified, asserted one at a time.
-    ///
-    /// A table rather than a handful of spot checks, because the thing that
-    /// can go wrong here is a message nobody thought about being reachable,
-    /// and spot checks only cover the ones somebody thought about. It is also
-    /// the reader's list of what the read-only tier is: the enum arm groups
-    /// what is allowed, this says what each decision is.
-    #[test]
-    fn the_read_only_tier_allows_exactly_the_non_mutating_messages() {
-        let rule = ipc_rule("r", Vec::new());
-        let allowed: Vec<ClientMsg> = vec![
-            ClientMsg::Hello {
-                version: PROTOCOL_VERSION,
-            },
-            ClientMsg::Stats,
-            ClientMsg::EventHistory { limit: 10 },
-            ClientMsg::RuleList,
-            ClientMsg::RuleStats,
-            ClientMsg::Explain(hallpass_types::ExplainRequest {
-                conn: hallpass_types::Connection {
-                    tuple: hallpass_types::FlowTuple {
-                        proto: hallpass_types::Proto::Tcp,
-                        src: "10.0.0.1:40000".parse().unwrap(),
-                        dst: "1.1.1.1:443".parse().unwrap(),
-                    },
-                    uid: None,
-                    pid: None,
-                    exe_path: None,
-                    cmdline: None,
-                    parent_exe: None,
-                    domain: None,
-                    iface: None,
-                    app_id: None,
-                    first_seen: None,
-                },
-                exe_sha256: None,
-            }),
-            ClientMsg::LockdownGet,
-            ClientMsg::ConfigGet,
-            ClientMsg::Subscribe {
-                events: true,
-                prompts: false,
-            },
-        ];
-        let refused: Vec<ClientMsg> = vec![
-            // A subscription is a read only while it does not claim the
-            // prompt slot: answering prompts is deciding policy.
-            ClientMsg::Subscribe {
-                events: true,
-                prompts: true,
-            },
-            ClientMsg::PromptReply {
-                id: 1,
-                verdict: Verdict::Allow,
-                duration: hallpass_types::RuleDuration::Once,
-                scope: hallpass_types::PromptScope::ThisPort,
-                pin_exe: false,
-            },
-            ClientMsg::RuleAdd(rule.clone()),
-            ClientMsg::RuleDelete { name: "r".into() },
-            ClientMsg::RuleToggle {
-                name: "r".into(),
-                enabled: false,
-            },
-            ClientMsg::RuleToggleTag {
-                tag: "t".into(),
-                enabled: false,
-            },
-            ClientMsg::LockdownSet {
-                tags: Vec::new(),
-                on: true,
-                force: false,
-            },
-            ClientMsg::ConfigSet(crate::testutil::runtime_config(30, Verdict::Deny)),
-            ClientMsg::RunSessionStart {
-                label: "curl".into(),
-            },
-            ClientMsg::RunSessionList,
-        ];
-
-        for msg in &allowed {
-            assert!(
-                observe_allows(msg),
-                "{} must be readable on the read-only socket",
-                client_msg_name(msg)
-            );
-        }
-        for msg in &refused {
-            assert!(
-                !observe_allows(msg),
-                "{} reached the read-only socket",
-                client_msg_name(msg)
-            );
-        }
-
-        // The table has to stay complete as the wire grows, and a missing
-        // entry is invisible otherwise. Subscribe appears twice, once per
-        // outcome, so the distinct names are what is counted.
-        let mut names: Vec<&str> = allowed
-            .iter()
-            .chain(refused.iter())
-            .map(client_msg_name)
-            .collect();
-        names.sort_unstable();
-        names.dedup();
-        assert_eq!(
-            names.len(),
-            CLIENT_MSG_VARIANTS,
-            "a ClientMsg variant is missing from this table: {names:?}"
-        );
-    }
-
-    /// The gate is on the connection, not on the message: the same daemon,
-    /// the same dependencies, and the answer depends only on which listener
-    /// the client reached.
-    #[tokio::test]
-    async fn the_read_only_socket_refuses_a_mutation_and_serves_a_read() {
-        let (deps, dir) = test_deps("tier");
-        let sock = dir.path().join("observe.sock");
-        let listener = UnixListener::bind(&sock).unwrap();
-        let server_deps = Arc::clone(&deps);
-        tokio::spawn(async move {
-            loop {
-                let (stream, _) = listener.accept().await.unwrap();
-                let d = Arc::clone(&server_deps);
-                tokio::spawn(async move {
-                    let _ = handle_conn(stream, d, Tier::Observe).await;
-                });
-            }
-        });
-
-        let mut c = client(&sock).await;
-        wire::write_msg(
-            &mut c,
-            &ClientMsg::Hello {
-                version: PROTOCOL_VERSION,
-            },
-        )
-        .await
-        .unwrap();
-        assert!(matches!(
-            wire::read_msg::<DaemonMsg, _>(&mut c).await.unwrap(),
-            DaemonMsg::HelloAck { .. }
-        ));
-
-        // Refused, and the rule is not created.
-        wire::write_msg(&mut c, &ClientMsg::RuleAdd(ipc_rule("sneak", Vec::new())))
-            .await
-            .unwrap();
-        let reply = wire::read_msg::<DaemonMsg, _>(&mut c).await.unwrap();
-        match reply {
-            DaemonMsg::Err { message } => assert!(
-                message.contains("RuleAdd"),
-                "the refusal must name what was refused: {message}"
-            ),
-            other => panic!("a mutation was accepted on the read-only socket: {other:?}"),
-        }
-        assert!(
-            deps.store.list().iter().all(|r| r.name != "sneak"),
-            "the refused RuleAdd still reached the store"
-        );
-
-        // The connection survives the refusal and still serves reads: a
-        // monitoring client must not have to reconnect after asking for
-        // something it was not allowed to have.
-        wire::write_msg(&mut c, &ClientMsg::RuleList).await.unwrap();
-        assert!(matches!(
-            wire::read_msg::<DaemonMsg, _>(&mut c).await.unwrap(),
-            DaemonMsg::Rules(_)
-        ));
-    }
-
-    /// The prompt slot is the one a read-only client could take by accident,
-    /// and taking it would make every unmatched connection wait on a client
-    /// that cannot answer.
-    #[tokio::test]
-    async fn the_read_only_socket_cannot_claim_the_prompt_slot() {
-        let (deps, dir) = test_deps("tier-prompt");
-        let sock = dir.path().join("observe.sock");
-        let listener = UnixListener::bind(&sock).unwrap();
-        let server_deps = Arc::clone(&deps);
-        tokio::spawn(async move {
-            loop {
-                let (stream, _) = listener.accept().await.unwrap();
-                let d = Arc::clone(&server_deps);
-                tokio::spawn(async move {
-                    let _ = handle_conn(stream, d, Tier::Observe).await;
-                });
-            }
-        });
-
-        let mut c = client(&sock).await;
-        wire::write_msg(
-            &mut c,
-            &ClientMsg::Hello {
-                version: PROTOCOL_VERSION,
-            },
-        )
-        .await
-        .unwrap();
-        let _ = wire::read_msg::<DaemonMsg, _>(&mut c).await.unwrap();
-
-        wire::write_msg(
-            &mut c,
-            &ClientMsg::Subscribe {
-                events: true,
-                prompts: true,
-            },
-        )
-        .await
-        .unwrap();
-        assert!(matches!(
-            wire::read_msg::<DaemonMsg, _>(&mut c).await.unwrap(),
-            DaemonMsg::Err { .. }
-        ));
-        assert!(
-            !deps.prompts.has_handler(),
-            "a read-only client claimed the prompt-handler slot"
-        );
-
-        // Events alone are fine, and the reply is an ordinary Ok.
-        wire::write_msg(
-            &mut c,
-            &ClientMsg::Subscribe {
-                events: true,
-                prompts: false,
-            },
-        )
-        .await
-        .unwrap();
-        assert!(matches!(
-            wire::read_msg::<DaemonMsg, _>(&mut c).await.unwrap(),
-            DaemonMsg::Ok
-        ));
-        assert!(!deps.prompts.has_handler());
-    }
-
-    /// A connection that never says Hello gives its slot back.
-    #[tokio::test(start_paused = true)]
-    async fn a_silent_connection_is_closed_at_the_hello_deadline() {
-        let (deps, _dir) = test_deps("hello-deadline");
-        let (server, _client) = UnixStream::pair().unwrap();
-        let err = handle_conn(server, deps, Tier::Control).await.unwrap_err();
-        assert!(
-            matches!(&err, wire::WireError::Io(e) if e.kind() == std::io::ErrorKind::TimedOut),
-            "{err}"
-        );
-    }
-
-    /// Past its limit a socket closes new connections at once, so idle ones
-    /// cannot run the daemon out of descriptors. One test process is one
-    /// uid, so the limit this reaches is the per-account one, which is the
-    /// one that stops a single observer holding every slot.
-    #[tokio::test]
-    async fn connections_past_the_limit_are_closed() {
-        let (deps, dir) = test_deps("conn-limit");
-        let sock = dir.path().join("test.sock");
-        let listener = UnixListener::bind(&sock).unwrap();
-        tokio::spawn(serve(listener, deps, Tier::Observe));
-
-        let mut held = Vec::new();
-        for _ in 0..MAX_CONNECTIONS_PER_UID {
-            let mut c = client(&sock).await;
-            wire::write_msg(
-                &mut c,
-                &ClientMsg::Hello {
-                    version: PROTOCOL_VERSION,
-                },
-            )
-            .await
-            .unwrap();
-            // Answered, so the server has taken this one's slot.
-            assert!(matches!(
-                wire::read_msg::<DaemonMsg, _>(&mut c).await.unwrap(),
-                DaemonMsg::HelloAck { .. }
-            ));
-            held.push(c);
-        }
-        let mut over = client(&sock).await;
-        let _ = wire::write_msg(
-            &mut over,
-            &ClientMsg::Hello {
-                version: PROTOCOL_VERSION,
-            },
-        )
-        .await;
-        let reply = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            wire::read_msg::<DaemonMsg, _>(&mut over),
-        )
-        .await
-        .expect("the refused connection was closed, not left hanging");
-        assert!(reply.is_err(), "a connection past the limit was served");
-
-        // A slot freed is a slot available again.
-        drop(held.pop());
-        let mut c = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            loop {
-                let mut c = client(&sock).await;
-                let _ = wire::write_msg(
-                    &mut c,
-                    &ClientMsg::Hello {
-                        version: PROTOCOL_VERSION,
-                    },
-                )
-                .await;
-                if let Ok(DaemonMsg::HelloAck { .. }) = wire::read_msg::<DaemonMsg, _>(&mut c).await
-                {
-                    break c;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .expect("the freed slot was never reused");
-        wire::write_msg(&mut c, &ClientMsg::Stats).await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn version_mismatch_and_missing_hello_rejected() {
-        let (deps, dir) = test_deps("hello");
-        let sock = dir.path().join("test.sock");
-        let listener = UnixListener::bind(&sock).unwrap();
-        let server_deps = Arc::clone(&deps);
-        tokio::spawn(async move {
-            loop {
-                let (stream, _) = listener.accept().await.unwrap();
-                let d = Arc::clone(&server_deps);
-                tokio::spawn(async move {
-                    let _ = handle_conn(stream, d, Tier::Control).await;
-                });
-            }
-        });
-
-        let mut c = client(&sock).await;
-        wire::write_msg(&mut c, &ClientMsg::Hello { version: 9999 })
-            .await
-            .unwrap();
-        assert!(matches!(
-            wire::read_msg::<DaemonMsg, _>(&mut c).await.unwrap(),
-            DaemonMsg::Err { .. }
-        ));
-
-        let mut c = client(&sock).await;
-        wire::write_msg(&mut c, &ClientMsg::RuleList).await.unwrap();
-        assert!(matches!(
-            wire::read_msg::<DaemonMsg, _>(&mut c).await.unwrap(),
-            DaemonMsg::Err { .. }
-        ));
-    }
-
-    #[tokio::test]
-    async fn prompt_handler_slot_is_exclusive_and_freed_on_disconnect() {
-        let (deps, dir) = test_deps("promptslot");
-        let sock = dir.path().join("test.sock");
-        let listener = UnixListener::bind(&sock).unwrap();
-        let server_deps = Arc::clone(&deps);
-        tokio::spawn(async move {
-            loop {
-                let (stream, _) = listener.accept().await.unwrap();
-                let d = Arc::clone(&server_deps);
-                tokio::spawn(async move {
-                    let _ = handle_conn(stream, d, Tier::Control).await;
-                });
-            }
-        });
-
-        let hello = ClientMsg::Hello {
-            version: PROTOCOL_VERSION,
-        };
-        let sub = ClientMsg::Subscribe {
-            events: false,
-            prompts: true,
-        };
-
-        let mut c1 = client(&sock).await;
-        wire::write_msg(&mut c1, &hello).await.unwrap();
-        let _: DaemonMsg = wire::read_msg(&mut c1).await.unwrap();
-        wire::write_msg(&mut c1, &sub).await.unwrap();
-        assert_eq!(
-            wire::read_msg::<DaemonMsg, _>(&mut c1).await.unwrap(),
-            DaemonMsg::Ok
-        );
-
-        let mut c2 = client(&sock).await;
-        wire::write_msg(&mut c2, &hello).await.unwrap();
-        let _: DaemonMsg = wire::read_msg(&mut c2).await.unwrap();
-        wire::write_msg(&mut c2, &sub).await.unwrap();
-        assert!(matches!(
-            wire::read_msg::<DaemonMsg, _>(&mut c2).await.unwrap(),
-            DaemonMsg::Err { .. }
-        ));
-
-        // First handler disconnects; the slot frees up for the second.
-        drop(c1);
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        wire::write_msg(&mut c2, &sub).await.unwrap();
-        assert_eq!(
-            wire::read_msg::<DaemonMsg, _>(&mut c2).await.unwrap(),
-            DaemonMsg::Ok
-        );
-    }
-}
+mod tests;
