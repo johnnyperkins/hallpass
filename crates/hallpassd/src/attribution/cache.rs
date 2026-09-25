@@ -36,7 +36,7 @@ impl Default for AttrCache {
 impl AttrCache {
     /// Cache with explicit TTLs (tests use short ones).
     pub fn with_ttls(positive_ttl: Duration, negative_ttl: Duration) -> Self {
-        AttrCache {
+        Self {
             inner: Mutex::new(LruCache::new(NonZeroUsize::new(CAPACITY).unwrap())),
             positive_ttl,
             negative_ttl,

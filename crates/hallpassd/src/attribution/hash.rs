@@ -43,8 +43,8 @@ pub(crate) struct FileId {
 }
 
 impl FileId {
-    pub(crate) fn of(meta: &std::fs::Metadata) -> FileId {
-        FileId {
+    pub(crate) fn of(meta: &std::fs::Metadata) -> Self {
+        Self {
             dev: meta.dev(),
             ino: meta.ino(),
             mtime: meta.mtime(),
@@ -87,20 +87,20 @@ pub struct ExeHashCache {
 
 impl Default for ExeHashCache {
     fn default() -> Self {
-        ExeHashCache::new(1024)
+        Self::new(1024)
     }
 }
 
 impl ExeHashCache {
-    pub fn new(max_entries: usize) -> ExeHashCache {
-        ExeHashCache::with_max_bytes(max_entries, MAX_HASHED_BYTES)
+    pub fn new(max_entries: usize) -> Self {
+        Self::with_max_bytes(max_entries, MAX_HASHED_BYTES)
     }
 
     /// Cache with an explicit size cap, so the refusal can be exercised
     /// without writing a quarter of a gigabyte to disk.
-    pub fn with_max_bytes(max_entries: usize, max_bytes: u64) -> ExeHashCache {
+    pub fn with_max_bytes(max_entries: usize, max_bytes: u64) -> Self {
         let cap = NonZeroUsize::new(max_entries.max(1)).unwrap();
-        ExeHashCache {
+        Self {
             entries: Mutex::new(LruCache::new(cap)),
             max_bytes,
         }

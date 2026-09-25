@@ -28,9 +28,9 @@ pub struct ExeId {
 }
 
 impl ExeId {
-    pub(crate) fn of(meta: &std::fs::Metadata) -> ExeId {
+    pub(crate) fn of(meta: &std::fs::Metadata) -> Self {
         use std::os::unix::fs::MetadataExt;
-        ExeId {
+        Self {
             dev: meta.dev(),
             ino: meta.ino(),
         }
@@ -67,7 +67,7 @@ pub struct ProcInfo {
 }
 
 /// A source of process attribution. Implementations are tried in order;
-/// the first hit wins. An eBPF-based attributor will slot in here later.
+/// the first hit wins.
 pub trait Attributor: Send + Sync {
     /// Resolve the process behind `tuple`, if this source can.
     fn attribute(&self, tuple: &FlowTuple) -> Option<ProcInfo>;
@@ -87,7 +87,7 @@ pub struct AttributionChain {
 impl AttributionChain {
     /// Build a chain from ordered sources with the default cache sizing.
     pub fn new(sources: Vec<Box<dyn Attributor>>) -> Self {
-        AttributionChain {
+        Self {
             sources,
             cache: cache::AttrCache::default(),
             proc_root: PathBuf::from("/proc"),
@@ -97,10 +97,9 @@ impl AttributionChain {
     /// A chain reading a fixture instead of the real `/proc`.
     #[cfg(test)]
     fn with_proc_root(sources: Vec<Box<dyn Attributor>>, proc_root: PathBuf) -> Self {
-        AttributionChain {
-            sources,
-            cache: cache::AttrCache::default(),
+        Self {
             proc_root,
+            ..Self::new(sources)
         }
     }
 
@@ -124,16 +123,14 @@ impl AttributionChain {
     /// Resolve `tuple`, consulting the cache first. Misses (including
     /// negative results) are cached to avoid /proc scan storms.
     pub fn attribute(&self, tuple: &FlowTuple) -> Option<ProcInfo> {
-        if let Some(cached) = self.cache.get(tuple) {
-            match &cached {
-                None => return None,
-                // Source ports are reused, so an entry outlives the flow it
-                // was resolved from and serving it would hand one process's
-                // identity, and its allow rules, to whatever owns the port
-                // now. Every positive hit is checked before it is trusted.
-                Some(info) if cached_still_valid(&self.proc_root, info) => return cached,
-                _ => {}
-            }
+        match self.cache.get(tuple) {
+            Some(None) => return None,
+            // Source ports are reused, so an entry outlives the flow it was
+            // resolved from and serving it would hand one process's
+            // identity, and its allow rules, to whatever owns the port now.
+            // Every positive hit is checked before it is trusted.
+            Some(Some(info)) if cached_still_valid(&self.proc_root, &info) => return Some(info),
+            _ => {}
         }
         let info = self.sources.iter().find_map(|s| s.attribute(tuple));
         self.cache.put(*tuple, info.clone());
@@ -249,8 +246,8 @@ mod tests {
     struct Fixed(Arc<(Option<ProcInfo>, AtomicUsize)>);
 
     impl Fixed {
-        fn new(info: Option<ProcInfo>) -> Fixed {
-            Fixed(Arc::new((info, AtomicUsize::new(0))))
+        fn new(info: Option<ProcInfo>) -> Self {
+            Self(Arc::new((info, AtomicUsize::new(0))))
         }
         fn calls(&self) -> usize {
             self.0 .1.load(Ordering::SeqCst)
@@ -297,6 +294,11 @@ mod tests {
         .unwrap();
     }
 
+    /// A chain over `source` alone, reading the fixture `/proc` in `td`.
+    fn chain_over(td: &crate::testutil::TestDir, source: &Fixed) -> AttributionChain {
+        AttributionChain::with_proc_root(vec![Box::new(source.clone())], td.path().to_path_buf())
+    }
+
     fn info() -> ProcInfo {
         ProcInfo {
             pid: Some(PID),
@@ -337,10 +339,7 @@ mod tests {
     fn a_reused_source_port_is_not_judged_as_the_previous_owner() {
         let td = fake_proc("port-reuse");
         let source = Fixed::new(Some(info()));
-        let chain = AttributionChain::with_proc_root(
-            vec![Box::new(source.clone())],
-            td.path().to_path_buf(),
-        );
+        let chain = chain_over(&td, &source);
         assert_eq!(chain.attribute(&tuple()), Some(info()));
 
         // The victim closes the socket. It is still alive, still running the
@@ -357,10 +356,7 @@ mod tests {
     fn a_recycled_pid_is_not_judged_as_the_process_that_left() {
         let td = fake_proc("pid-reuse");
         let source = Fixed::new(Some(info()));
-        let chain = AttributionChain::with_proc_root(
-            vec![Box::new(source.clone())],
-            td.path().to_path_buf(),
-        );
+        let chain = chain_over(&td, &source);
         assert_eq!(chain.attribute(&tuple()), Some(info()));
         write_starttime(&td, 901);
         assert_eq!(chain.attribute(&tuple()), Some(info()));
@@ -374,10 +370,7 @@ mod tests {
     fn an_exec_in_place_invalidates_the_entry() {
         let td = fake_proc("exec");
         let source = Fixed::new(Some(info()));
-        let chain = AttributionChain::with_proc_root(
-            vec![Box::new(source.clone())],
-            td.path().to_path_buf(),
-        );
+        let chain = chain_over(&td, &source);
         assert_eq!(chain.attribute(&tuple()), Some(info()));
         let exe = td.path().join(PID.to_string()).join("exe");
         std::fs::remove_file(&exe).unwrap();
@@ -396,10 +389,7 @@ mod tests {
         let mut i = info();
         i.socket_inode = None;
         let source = Fixed::new(Some(i.clone()));
-        let chain = AttributionChain::with_proc_root(
-            vec![Box::new(source.clone())],
-            td.path().to_path_buf(),
-        );
+        let chain = chain_over(&td, &source);
         assert_eq!(chain.attribute(&tuple()), Some(i.clone()));
         assert_eq!(chain.attribute(&tuple()), Some(i));
         assert_eq!(source.calls(), 2);

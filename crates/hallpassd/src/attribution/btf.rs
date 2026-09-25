@@ -51,16 +51,26 @@ fn u32_at(data: &[u8], off: usize) -> Option<u32> {
     Some(u32::from_le_bytes(data.get(off..off + 4)?.try_into().ok()?))
 }
 
+/// The kind packed into a `btf_type` info word (bits 24-28).
+fn info_kind(info: u32) -> u32 {
+    (info >> 24) & 0x1f
+}
+
+/// The member/entry count packed into a `btf_type` info word (bits 0-15).
+fn info_vlen(info: u32) -> u32 {
+    info & 0xffff
+}
+
 impl Btf {
     /// Parse the kernel's BTF from /sys/kernel/btf/vmlinux.
-    pub fn from_sys_fs() -> Result<Btf, String> {
+    pub fn from_sys_fs() -> Result<Self, String> {
         let data = std::fs::read("/sys/kernel/btf/vmlinux")
             .map_err(|e| format!("read /sys/kernel/btf/vmlinux: {e}"))?;
-        Btf::from_bytes(data)
+        Self::from_bytes(data)
     }
 
     /// Parse a raw BTF blob (header + type section + string section).
-    pub fn from_bytes(data: Vec<u8>) -> Result<Btf, String> {
+    pub fn from_bytes(data: Vec<u8>) -> Result<Self, String> {
         if u16_at(&data, 0) != Some(0xeb9f) {
             return Err("bad BTF magic".into());
         }
@@ -85,8 +95,8 @@ impl Btf {
         let mut pos = type_start;
         while pos < type_end {
             let info = u32_at(&data, pos + 4).ok_or("truncated type record")?;
-            let kind = (info >> 24) & 0x1f;
-            let vlen = (info & 0xffff) as usize;
+            let kind = info_kind(info);
+            let vlen = info_vlen(info) as usize;
             if kind > KIND_MAX {
                 return Err(format!("unknown BTF kind {kind}"));
             }
@@ -103,7 +113,7 @@ impl Btf {
                 .filter(|p| *p <= type_end)
                 .ok_or("type record exceeds section")?;
         }
-        Ok(Btf {
+        Ok(Self {
             data,
             types,
             str_start,
@@ -121,7 +131,7 @@ impl Btf {
     }
 
     fn kind_of(&self, rec: usize) -> Option<u32> {
-        Some((u32_at(&self.data, rec + 4)? >> 24) & 0x1f)
+        u32_at(&self.data, rec + 4).map(info_kind)
     }
 
     /// Record offset for a type id (ids are 1-based; 0 is `void`).
@@ -165,11 +175,10 @@ impl Btf {
         }
         let rec = self.record(self.resolve(type_id)?)?;
         let info = u32_at(&self.data, rec + 4)?;
-        let kind = (info >> 24) & 0x1f;
-        if kind != KIND_STRUCT && kind != KIND_UNION {
+        if !matches!(info_kind(info), KIND_STRUCT | KIND_UNION) {
             return None;
         }
-        let vlen = info & 0xffff;
+        let vlen = info_vlen(info);
         let kind_flag = info >> 31 == 1;
         for i in 0..vlen {
             // btf_member { name_off, type, offset } after the 12-byte header.
@@ -224,8 +233,8 @@ mod tests {
     }
 
     impl Blob {
-        fn new() -> Blob {
-            Blob {
+        fn new() -> Self {
+            Self {
                 types: Vec::new(),
                 strings: vec![0], // offset 0 = anonymous
                 count: 0,
