@@ -26,8 +26,8 @@ use std::time::Duration;
 
 use hallpass_types::wire::{read_msg, write_msg};
 use hallpass_types::{
-    ClientMsg, Connection, DaemonMsg, FirstSeen, FlowTuple, PromptContext, Proto, RuntimeConfig,
-    Stats, Verdict, PROTOCOL_VERSION,
+    ClientMsg, Connection, DaemonMsg, FirstSeen, FlowTuple, PromptContext, PromptScope, Proto,
+    RuleDuration, RuntimeConfig, Stats, Verdict, PROTOCOL_VERSION,
 };
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc;
@@ -271,12 +271,36 @@ fn handle(
             pin_exe,
         } => {
             let is_handler = st.handler.as_ref().is_some_and(|h| h.same_channel(tx));
-            if !is_handler || st.pending.remove(&id).is_none() {
+            let Some(DaemonMsg::PromptRequest { conn: answered, .. }) =
+                st.pending.remove(&id).filter(|_| is_handler)
+            else {
                 return Some(DaemonMsg::Err {
                     message: format!("no pending prompt {id} for this client"),
                 });
-            }
+            };
             println!("prompt {id}: {verdict:?} {duration:?} {scope:?} pin={pin_exe}");
+            // A remembered answer settles the other pending prompts its scope
+            // covers, as the daemon's rule sweep does, so the windows show
+            // what they would against the real one. A one-off answer covers
+            // only its own.
+            if duration != RuleDuration::Once {
+                let covered: Vec<u64> = st
+                    .pending
+                    .iter()
+                    .filter(|(_, msg)| {
+                        matches!(msg, DaemonMsg::PromptRequest { conn, .. }
+                            if covers(&answered, scope, conn))
+                    })
+                    .map(|(id, _)| *id)
+                    .collect();
+                for other in covered {
+                    st.pending.remove(&other);
+                    println!("prompt {other}: settled by the answer to {id}");
+                    if let Some(handler) = &st.handler {
+                        let _ = handler.send(DaemonMsg::PromptExpired { id: other });
+                    }
+                }
+            }
             DaemonMsg::Ok
         }
         ClientMsg::Stats => DaemonMsg::Stats(Stats {
@@ -297,4 +321,18 @@ fn handle(
             message: format!("the demo daemon does not do {other:?}"),
         },
     })
+}
+
+/// Whether a rule made from an answer to `answered` at `scope` covers
+/// `other`: the same program, and as much of the destination as the scope
+/// names. Close enough to the daemon's generated rule for trying windows by
+/// hand; the daemon's own matching is what decides for real.
+fn covers(answered: &Connection, scope: PromptScope, other: &Connection) -> bool {
+    let (a, b) = (answered.tuple, other.tuple);
+    answered.exe_path == other.exe_path
+        && match scope {
+            PromptScope::ThisPort => a.dst == b.dst && a.proto == b.proto,
+            PromptScope::ThisHost => a.dst.ip() == b.dst.ip(),
+            PromptScope::AppAnywhere => true,
+        }
 }
