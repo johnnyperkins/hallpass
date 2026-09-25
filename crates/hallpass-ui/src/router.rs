@@ -35,9 +35,10 @@ use crate::prompt::close_reply;
 /// Most prompt windows alive at once. Each is a process with its own GL
 /// context; past this, prompts for further applications wait for a window
 /// to close (their notifications still fire). One that times out still
-/// waiting takes the daemon's default verdict, like any prompt nobody
-/// answered: the one exception to the rules above, and deliberate, since
-/// denying it unseen would answer for a program the operator never saw.
+/// waiting, or is still waiting when the agent quits, takes the daemon's
+/// default verdict, like any prompt nobody answered: the one exception to
+/// the rules above, and deliberate, since denying it unseen would answer for
+/// a program the operator never saw.
 ///
 /// A window counts until [`Router::window_exited`] says it ended, retired
 /// or not, so the agent must see a window it told to close actually go
@@ -269,13 +270,22 @@ impl Router {
         out
     }
 
-    /// The agent is quitting: deny every prompt it holds, once, and close
-    /// every window.
+    /// The agent is quitting: deny, once, every prompt a window is showing,
+    /// as closing that window would, and close every window.
+    ///
+    /// A prompt still waiting past [`MAX_WINDOWS`] is left unanswered: nobody
+    /// saw it, so it takes the daemon's default verdict at its deadline, like
+    /// any prompt nobody answered, unless an agent that starts before then
+    /// is handed it again and shows it.
     pub fn quit(&mut self) -> Vec<Effect> {
-        let mut out: Vec<Effect> = self
-            .prompts
-            .keys()
-            .map(|&id| Effect::Daemon(Box::new(close_reply(id))))
+        let shown: Vec<u64> = self
+            .windows
+            .values()
+            .flat_map(|win| win.ids.iter().copied())
+            .collect();
+        let mut out: Vec<Effect> = shown
+            .into_iter()
+            .map(|id| Effect::Daemon(Box::new(close_reply(id))))
             .collect();
         self.prompts.clear();
         out.extend(self.disconnected());
@@ -549,16 +559,23 @@ mod tests {
         );
     }
 
+    /// Quitting denies what is on screen and leaves what nobody saw to the
+    /// daemon's default.
     #[test]
-    fn quitting_denies_everything_including_what_waits() {
+    fn quitting_denies_what_is_shown_and_leaves_what_waits() {
         let mut r = Router::new();
         for id in 0..=MAX_WINDOWS as u64 {
             r.request(prompt(id, None));
         }
         let out = r.quit();
-        for id in 0..=MAX_WINDOWS as u64 {
-            assert!(out.contains(&deny(id)), "prompt {id} not denied");
+        for id in 0..MAX_WINDOWS as u64 {
+            assert!(out.contains(&deny(id)), "shown prompt {id} not denied");
         }
+        let waiting = MAX_WINDOWS as u64;
+        assert!(
+            !out.contains(&deny(waiting)),
+            "a prompt nobody saw was denied"
+        );
         assert_eq!(
             out.iter()
                 .filter(|e| matches!(e, Effect::Window(_, ToWindow::Close)))

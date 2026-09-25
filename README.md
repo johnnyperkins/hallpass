@@ -549,8 +549,10 @@ instead. A prompt window that dies without answering denies what it held,
 once. Allow only answers once a prompt has been at the front of its window
 for a moment, so a click or keypress aimed at whatever was there before it
 cannot approve it. At most eight prompt windows are open at once; prompts
-for further applications wait for one to close, and one that times out
-waiting takes the default verdict like any unanswered prompt.
+for further applications wait for one to close, and one still waiting
+when it times out, or when the agent quits, takes the default verdict like
+any unanswered prompt. Quitting the agent denies the prompts on screen, as
+closing their windows would.
 
 Every hallpass window runs on native Wayland whenever the session has it,
 even with `DISPLAY` set. Under XWayland any client of the X server can
