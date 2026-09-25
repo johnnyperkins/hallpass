@@ -81,16 +81,42 @@ install -Dm755 target/release/hallpassd   /usr/bin/hallpassd
 install -Dm755 target/release/hallpass-cli /usr/bin/hallpass-cli
 install -Dm755 target/release/hallpass-ui  /usr/bin/hallpass-ui
 
-# Config and example rule: never clobber admin-edited policy. The example
-# rule is guarded like the config, so editing it (or deleting it outright)
-# survives a reinstall instead of being silently restored.
+# Config and shipped rules: never clobber admin-edited policy. An existing
+# config or rule file is left as it is, and a shipped rule is only ever
+# offered once: its name is recorded when it is installed (or found already
+# installed), so one the operator deleted stays deleted on a reinstall
+# instead of a baseline allow silently coming back. HALLPASS_PURGE in
+# uninstall.sh removes the record with the rest of /var/lib/hallpass.
 #
 # Explicit mode on the directories: the rule-trust design depends on rules.d
 # not being group-writable, so do not lean on coreutils' implicit default.
 install -d -m755 /etc/hallpass /etc/hallpass/rules.d
 [ -f /etc/hallpass/config.toml ] || install -m644 "$posture_file" /etc/hallpass/config.toml
-[ -e /etc/hallpass/rules.d/example-allow-dns.toml ] \
-	|| install -m644 etc/rules.d/example-allow-dns.toml /etc/hallpass/rules.d/example-allow-dns.toml
+
+offered=/var/lib/hallpass/offered-rules
+install -d -m700 /var/lib/hallpass
+[ -f "$offered" ] || install -m600 /dev/null "$offered"
+# True when the shipped rule $1 should be left alone: installed now, or
+# offered before. Records a file it finds in place, so an install from
+# before this record existed is covered from here on.
+already_offered() {
+	if grep -qxF "$1" "$offered"; then
+		return 0
+	fi
+	if [ -e "/etc/hallpass/rules.d/$1" ]; then
+		echo "$1" >>"$offered"
+		return 0
+	fi
+	return 1
+}
+# Install shipped rule $1 from $2 and record it.
+offer() {
+	install -m644 "$2" "/etc/hallpass/rules.d/$1"
+	echo "$1" >>"$offered"
+}
+
+already_offered example-allow-dns.toml \
+	|| offer example-allow-dns.toml etc/rules.d/example-allow-dns.toml
 
 # The LLMNR deny is installed unconditionally rather than through the loop
 # below. It names no executable, on purpose: a block should cover whatever
@@ -98,15 +124,16 @@ install -d -m755 /etc/hallpass /etc/hallpass/rules.d
 # also means there is no binary to check for, and nothing to skip when the
 # host has no systemd-resolved, since anything else reaching that port is
 # what the rule is for.
-[ -e /etc/hallpass/rules.d/20-deny-llmnr.toml ] \
-	|| install -m644 etc/rules.d/20-deny-llmnr.toml /etc/hallpass/rules.d/20-deny-llmnr.toml
+already_offered 20-deny-llmnr.toml \
+	|| offer 20-deny-llmnr.toml etc/rules.d/20-deny-llmnr.toml
 
 # Baseline rules for the daemons that run before anyone can answer a prompt.
 # Installed only when the binary the rule names is actually on this host: a
 # rule pointing at a systemd-timesyncd that a chrony machine does not have
 # matches nothing, and a rules.d full of those makes the real policy harder
-# to read. Guarded like the example above, so an edit or a deletion survives
-# a reinstall.
+# to read. Offered once, like the example above, so an edit or a deletion
+# survives a reinstall; one skipped for a missing binary is not recorded, and
+# is offered again once the binary is there.
 #
 # The exe path is read out of the rule rather than repeated here, so the file
 # stays the single statement of what it grants. It is then canonicalized,
@@ -122,7 +149,7 @@ for baseline in etc/rules.d/20-system-*.toml; do
 	[ -e "$baseline" ] || continue
 	name=$(basename "$baseline")
 	target="/etc/hallpass/rules.d/$name"
-	[ -e "$target" ] && continue
+	already_offered "$name" && continue
 	exe=$(sed -n 's/^exe = "\(.*\)"$/\1/p' "$baseline" | head -1)
 	if [ -z "$exe" ]; then
 		# Every baseline rule is scoped to a binary. One that is not - or that
@@ -155,7 +182,7 @@ for baseline in etc/rules.d/20-system-*.toml; do
 				;;
 		esac
 	fi
-	install -m644 "$baseline" "$target"
+	offer "$name" "$baseline"
 	if [ "$real" != "$exe" ]; then
 		sed -i "s|^exe = \".*\"\$|exe = \"$real\"|" "$target"
 		echo "  $name: exe rewritten to $real, the path /proc/<pid>/exe reports"

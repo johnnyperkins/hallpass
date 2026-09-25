@@ -109,6 +109,10 @@ restarted together; a version mismatch is refused at connect.
 
 ### Changed
 
+- **The installer offers each shipped rule once.** A shipped rule you deleted
+  is no longer reinstalled by `install.sh`; the record is
+  `/var/lib/hallpass/offered-rules`. Upgrade: a rule deleted before this
+  change comes back once more on the next install; delete it again.
 - **Unmatched connections are denied by default.** `default_verdict` now ships
   and defaults to `"deny"`, which also applies with no prompt handler attached,
   before login, and when a held-packet budget is spent. `queue_bypass` still

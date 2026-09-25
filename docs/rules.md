@@ -233,6 +233,11 @@ host: the match is exact, and where `/usr/sbin` is a symlink to `/usr/bin` a
 shipped path can match nothing. A host running chrony, ntpd,
 systemd-networkd or dhcpcd needs its own rule on the same pattern.
 
+The installer offers each shipped rule once. A rule you edit or delete stays
+that way across reinstalls; the record is `/var/lib/hallpass/offered-rules`,
+and a purge (`HALLPASS_PURGE=1 ./uninstall.sh`) resets it. A baseline rule
+skipped because its binary was missing is offered again on the next install.
+
 `example-allow-dns.toml` ships **disabled**. Port 53 to anywhere lets every
 process on the host send arbitrary UDP to any server, a classic exfiltration
 channel. Scope it with `dest` or `exe` before enabling it. (Installs from
