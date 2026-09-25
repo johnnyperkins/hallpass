@@ -10,6 +10,7 @@
 //! closing it ends the process, and none of the machinery a child viewport
 //! needed (a parent frame to declare it, parking, reaping) exists.
 
+use std::collections::BTreeSet;
 use std::os::unix::net::UnixStream;
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::Duration;
@@ -18,7 +19,7 @@ use eframe::egui::{self, RichText};
 
 use crate::link::{self, FromWindow, ToWindow};
 use crate::prompt::{self, PromptState};
-use crate::prompt_view::prompt_ui;
+use crate::prompt_view::{prompt_ui, REST_SHOWN};
 use crate::theme::{self, MUTED};
 
 /// How a window reports to the agent. A failed write means the agent is
@@ -36,7 +37,7 @@ pub struct PromptWindow {
     /// Whether the window has asked for the operator yet.
     announced: bool,
     /// Prompts already reported to the agent as on screen.
-    reported: std::collections::BTreeSet<u64>,
+    reported: BTreeSet<u64>,
     /// The daemon's default verdict as the agent last passed it on; `None`
     /// until then, and the countdown names no verdict rather than a guess.
     default_verdict: Option<hallpass_types::Verdict>,
@@ -50,7 +51,7 @@ impl PromptWindow {
             prompts: Vec::new(),
             done: false,
             announced: false,
-            reported: std::collections::BTreeSet::new(),
+            reported: BTreeSet::new(),
             default_verdict: None,
         }
     }
@@ -120,37 +121,7 @@ impl PromptWindow {
                 });
             });
         } else {
-            // Oldest (lowest id) in front, stable across frames.
-            self.prompts.sort_unstable_by_key(|p| p.id);
-            let rest: Vec<String> = self.prompts[1..]
-                .iter()
-                .map(|p| format!("{} {}", p.conn.tuple.proto, prompt::format_dest(&p.conn)))
-                .collect();
-            // An answer is always the front prompt's: it is the only one drawn.
-            let answer = prompt_ui(
-                ui,
-                &mut self.prompts[0],
-                now_ms,
-                &rest,
-                self.default_verdict,
-            );
-            // What this pass put on screen: the front prompt, and the others
-            // the list names. Told to the agent once each, so quitting denies
-            // what was seen and leaves the rest to the default verdict.
-            let drawn: Vec<u64> = self
-                .prompts
-                .iter()
-                .take(1 + crate::prompt_view::REST_SHOWN)
-                .map(|p| p.id)
-                .filter(|id| self.reported.insert(*id))
-                .collect();
-            if !drawn.is_empty() {
-                self.send(&FromWindow::Shown { ids: drawn });
-            }
-            if let Some(answer) = answer.and_then(FromWindow::answer) {
-                self.prompts.remove(0);
-                self.send(&answer);
-            }
+            self.draw_prompts(ui, now_ms);
         }
 
         if dismissed {
@@ -183,6 +154,44 @@ impl PromptWindow {
         if !self.prompts.is_empty() {
             // The countdown moves on its own.
             ctx.request_repaint_after(Duration::from_millis(100));
+        }
+    }
+}
+
+impl PromptWindow {
+    /// The front prompt, and the list of the rest under it; then tell the
+    /// agent what reached the screen and what was answered.
+    fn draw_prompts(&mut self, ui: &mut egui::Ui, now_ms: u64) {
+        // Oldest (lowest id) in front, stable across frames.
+        self.prompts.sort_unstable_by_key(|p| p.id);
+        let rest: Vec<String> = self.prompts[1..]
+            .iter()
+            .map(|p| format!("{} {}", p.conn.tuple.proto, prompt::format_dest(&p.conn)))
+            .collect();
+        // An answer is always the front prompt's: it is the only one drawn.
+        let answer = prompt_ui(
+            ui,
+            &mut self.prompts[0],
+            now_ms,
+            &rest,
+            self.default_verdict,
+        );
+        // What this pass put on screen: the front prompt, and the others
+        // the list names. Told to the agent once each, so quitting denies
+        // what was seen and leaves the rest to the default verdict.
+        let drawn: Vec<u64> = self
+            .prompts
+            .iter()
+            .take(1 + REST_SHOWN)
+            .map(|p| p.id)
+            .filter(|id| self.reported.insert(*id))
+            .collect();
+        if !drawn.is_empty() {
+            self.send(&FromWindow::Shown { ids: drawn });
+        }
+        if let Some(answer) = answer.and_then(FromWindow::answer) {
+            self.prompts.remove(0);
+            self.send(&answer);
         }
     }
 }
@@ -226,7 +235,7 @@ fn spawn_reader(mut link: UnixStream, to_ui: Sender<ToWindow>, wake: crate::Wake
         .name("agent-link".into())
         .spawn(move || loop {
             match link::read_frame::<ToWindow>(&mut link) {
-                Ok(Some(ToWindow::Close)) | Ok(None) => std::process::exit(0),
+                Ok(Some(ToWindow::Close) | None) => std::process::exit(0),
                 Ok(Some(msg)) => {
                     if to_ui.send(msg).is_err() {
                         std::process::exit(0);

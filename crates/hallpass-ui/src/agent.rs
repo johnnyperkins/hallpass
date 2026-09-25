@@ -14,6 +14,8 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::fs::File;
 use std::io::ErrorKind;
+use std::os::fd::OwnedFd;
+use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::process::{Child, Command};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
@@ -160,7 +162,7 @@ struct WindowProc {
     to_window: Sender<ToWindow>,
     /// Signals this process and no other: a pid alone could be reused once
     /// the reader thread reaps it, before its exit reaches this thread.
-    pidfd: std::os::fd::OwnedFd,
+    pidfd: OwnedFd,
     /// Set when it was told to close, or said its last word (Dismissed);
     /// past this it is killed.
     close_by: Option<Instant>,
@@ -384,12 +386,9 @@ impl Agent {
                 self.host.stats = Some(stats);
                 Vec::new()
             }
-            // Taken back after prompts went unanswered. This agent is alive
-            // and reading, so the operator was away, not the agent: claim it
-            // again rather than leave every connection to the default. Once:
-            // the daemon writes replies ahead of this notice, so a stats
-            // reply showing the slot empty can overtake it and have claimed
-            // already.
+            // Passed on to every window, so each countdown names the verdict
+            // it ends in; the daemon reads the setting at expiry, so a change
+            // matters to the prompts already open.
             DaemonMsg::Config(cfg) => {
                 if self.default_verdict != Some(cfg.default_verdict) {
                     self.default_verdict = Some(cfg.default_verdict);
@@ -399,6 +398,12 @@ impl Agent {
                 }
                 Vec::new()
             }
+            // Taken back after prompts went unanswered. This agent is alive
+            // and reading, so the operator was away, not the agent: claim it
+            // again rather than leave every connection to the default. Once:
+            // the daemon writes replies ahead of this notice, so a stats
+            // reply showing the slot empty can overtake it and have claimed
+            // already.
             DaemonMsg::PromptHandlerRevoked => {
                 if !self.claims.in_flight() {
                     self.claim_slot();
@@ -562,7 +567,7 @@ impl Agent {
             let writer_pidfd = pidfd.try_clone()?;
             Ok((link.try_clone()?, pidfd, writer_pidfd))
         };
-        let (mut reader, pidfd, writer_pidfd) = match setup() {
+        let (reader, pidfd, writer_pidfd) = match setup() {
             Ok(parts) => parts,
             // Started but not set up: reaped here, or it lingers as a
             // zombie for as long as the agent runs.
@@ -575,56 +580,11 @@ impl Agent {
         let inputs = self.inputs.clone();
         std::thread::Builder::new()
             .name(format!("window-{w}"))
-            .spawn(move || {
-                loop {
-                    match link::read_frame::<FromWindow>(&mut reader) {
-                        Ok(Some(msg)) => {
-                            if inputs.send(Input::Window(w, msg)).is_err() {
-                                break;
-                            }
-                        }
-                        Ok(None) => break,
-                        // Not a frame: whatever it is, it is not an answer.
-                        Err(e) => {
-                            tracing::warn!(window = w, "prompt window link: {e}");
-                            let _ = child.kill();
-                            break;
-                        }
-                    }
-                }
-                let _ = child.wait();
-                let _ = inputs.send(Input::WindowExited(w));
-            })?;
+            .spawn(move || read_window(w, reader, child, &inputs))?;
         let (to_window, frames) = mpsc::channel::<ToWindow>();
-        let mut writer = link;
         std::thread::Builder::new()
             .name(format!("window-{w}-out"))
-            .spawn(move || {
-                // Ends when the agent drops the sender (the window exited)
-                // or a write fails. A window that does not read within the
-                // write timeout is killed.
-                for msg in frames {
-                    if let Err(e) = link::write_frame(&mut writer, &msg) {
-                        // One already gone (a Show that crossed its
-                        // Dismissed) is routine; one still there and not
-                        // reading is not.
-                        let gone = matches!(&e, WireError::Io(io) if matches!(
-                            io.kind(),
-                            ErrorKind::BrokenPipe | ErrorKind::ConnectionReset
-                        ));
-                        if gone {
-                            tracing::debug!(window = w, "prompt window already gone ({e})");
-                        } else {
-                            tracing::warn!(
-                                window = w,
-                                "prompt window not reading ({e}); killing it"
-                            );
-                        }
-                        kill(&writer_pidfd);
-                        break;
-                    }
-                }
-            })?;
+            .spawn(move || write_window(w, link, &frames, &writer_pidfd))?;
         // Ahead of anything the router sends it, so its first prompt is
         // drawn already knowing what it defaults to.
         if let Some(verdict) = self.default_verdict {
@@ -642,9 +602,56 @@ impl Agent {
     }
 }
 
+/// A window's reader thread: pass on what it says until it hangs up or
+/// says something that is not a frame, then reap it and report its exit.
+fn read_window(w: WindowId, mut reader: UnixStream, mut child: Child, inputs: &Sender<Input>) {
+    loop {
+        match link::read_frame::<FromWindow>(&mut reader) {
+            Ok(Some(msg)) => {
+                if inputs.send(Input::Window(w, msg)).is_err() {
+                    break;
+                }
+            }
+            Ok(None) => break,
+            // Not a frame: whatever it is, it is not an answer.
+            Err(e) => {
+                tracing::warn!(window = w, "prompt window link: {e}");
+                let _ = child.kill();
+                break;
+            }
+        }
+    }
+    let _ = child.wait();
+    let _ = inputs.send(Input::WindowExited(w));
+}
+
+/// A window's writer thread. Ends when the agent drops the sender (the
+/// window exited) or a write fails. A window that does not read within the
+/// write timeout is killed.
+fn write_window(w: WindowId, mut writer: UnixStream, frames: &Receiver<ToWindow>, pidfd: &OwnedFd) {
+    for msg in frames {
+        let Err(e) = link::write_frame(&mut writer, &msg) else {
+            continue;
+        };
+        // One already gone (a Show that crossed its Dismissed) is routine;
+        // one still there and not reading is not.
+        let gone = matches!(&e, WireError::Io(io) if matches!(
+            io.kind(),
+            ErrorKind::BrokenPipe | ErrorKind::ConnectionReset
+        ));
+        if gone {
+            tracing::debug!(window = w, "prompt window already gone ({e})");
+        } else {
+            tracing::warn!(window = w, "prompt window not reading ({e}); killing it");
+        }
+        kill(pidfd);
+        break;
+    }
+}
+
 /// Kill a window that stopped cooperating. Its exit still arrives through
 /// its reader thread, which is what removes it.
-fn kill(pidfd: &std::os::fd::OwnedFd) {
+fn kill(pidfd: &OwnedFd) {
     let _ = rustix::process::pidfd_send_signal(pidfd, rustix::process::Signal::KILL);
 }
 

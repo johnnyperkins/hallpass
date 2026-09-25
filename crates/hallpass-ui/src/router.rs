@@ -65,10 +65,10 @@ enum Group {
 }
 
 impl Group {
-    fn of(p: &Prompt) -> Group {
+    fn of(p: &Prompt) -> Self {
         match &p.conn.exe_path {
-            Some(exe) => Group::App(exe.clone(), p.conn.app_id.clone()),
-            None => Group::Anon(p.id),
+            Some(exe) => Self::App(exe.clone(), p.conn.app_id.clone()),
+            None => Self::Anon(p.id),
         }
     }
 
@@ -110,6 +110,18 @@ struct Window {
     /// Of `ids`, the ones the window says it has drawn. Quitting denies
     /// these and leaves the rest, which nobody saw, to the default verdict.
     shown: BTreeSet<u64>,
+}
+
+impl Window {
+    fn new(group: Group) -> Self {
+        Self {
+            group,
+            ids: BTreeSet::new(),
+            retired: false,
+            dismissed: false,
+            shown: BTreeSet::new(),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -169,11 +181,7 @@ impl Router {
             .filter(|(_, p)| p.deadline_ms <= now_ms)
             .map(|(&id, _)| id)
             .collect();
-        let mut out = Vec::new();
-        for id in due {
-            out.extend(self.gone(id));
-        }
-        out
+        due.into_iter().flat_map(|id| self.gone(id)).collect()
     }
 
     /// A window said something.
@@ -235,8 +243,8 @@ impl Router {
             }
             FromWindow::Shown { ids } => {
                 // Only its own: a window cannot mark another's prompt seen.
-                let held: Vec<u64> = ids.into_iter().filter(|id| win.ids.contains(id)).collect();
-                win.shown.extend(held);
+                win.shown
+                    .extend(ids.into_iter().filter(|id| win.ids.contains(id)));
             }
         }
         out
@@ -320,11 +328,13 @@ impl Router {
     /// against [`MAX_WINDOWS`] until it exits, and no waiting prompt's
     /// group had an open window (it would have been sent to it).
     fn close_if_empty(&mut self, w: WindowId, out: &mut Vec<Effect>) {
-        if let Some(win) = self.windows.get_mut(&w) {
-            if win.ids.is_empty() && !win.retired {
-                win.retired = true;
-                out.push(Effect::Window(w, ToWindow::Close));
-            }
+        if let Some(win) = self
+            .windows
+            .get_mut(&w)
+            .filter(|win| win.ids.is_empty() && !win.retired)
+        {
+            win.retired = true;
+            out.push(Effect::Window(w, ToWindow::Close));
         }
     }
 
@@ -351,16 +361,7 @@ impl Router {
                 None if self.windows.len() < MAX_WINDOWS => {
                     let w = self.next_window;
                     self.next_window += 1;
-                    self.windows.insert(
-                        w,
-                        Window {
-                            group: Group::of(p),
-                            ids: BTreeSet::new(),
-                            retired: false,
-                            dismissed: false,
-                            shown: BTreeSet::new(),
-                        },
-                    );
+                    self.windows.insert(w, Window::new(Group::of(p)));
                     out.push(Effect::Spawn(w));
                     w
                 }

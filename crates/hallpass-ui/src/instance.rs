@@ -339,29 +339,29 @@ impl Holder {
             .name("window-raise".into())
             .spawn(move || {
                 for conn in listener.incoming() {
-                    match conn {
-                        Ok(mut conn) => {
-                            if !starting.load(Ordering::Relaxed) {
-                                let _ = conn.write_all(&[STARTING]);
-                                continue;
-                            }
-                            let Ok(watch) = conn.try_clone() else {
-                                continue;
-                            };
-                            let state = Arc::new(AtomicU8::new(WAITING));
-                            watch_launch(watch, Arc::clone(&state), Arc::clone(&held));
-                            if tx.send(RaiseRequest { conn, state }).is_err() {
-                                break;
-                            }
-                            wake();
-                        }
+                    let mut conn = match conn {
+                        Ok(conn) => conn,
                         // Out of descriptors, most likely. The connection
                         // stays queued, so retrying at once would spin.
                         Err(e) => {
                             tracing::debug!("accepting a raise request: {e}");
                             std::thread::sleep(CONNECT_PAUSE);
+                            continue;
                         }
+                    };
+                    if !starting.load(Ordering::Relaxed) {
+                        let _ = conn.write_all(&[STARTING]);
+                        continue;
                     }
+                    let Ok(watch) = conn.try_clone() else {
+                        continue;
+                    };
+                    let state = Arc::new(AtomicU8::new(WAITING));
+                    watch_launch(watch, Arc::clone(&state), Arc::clone(&held));
+                    if tx.send(RaiseRequest { conn, state }).is_err() {
+                        break;
+                    }
+                    wake();
                 }
             });
         if let Err(e) = spawned {
