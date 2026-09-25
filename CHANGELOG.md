@@ -351,7 +351,8 @@ carries what an upgrade changes on a running host.
   `hallpass-ui agent`, autostarted at login, now holds the prompt-handler
   role, the tray icon and the notifications, and opens one window per
   application with prompts waiting; `hallpass-ui` alone opens the management
-  window, which takes no prompts and says when nobody does. Both pin native
+  window, which takes no prompts but starts the agent when nobody does, and
+  says why when that cannot work. Both pin native
   Wayland whenever the session has it. On Wayland no hallpass window can
   stay on top, and whether a new prompt window gets focus is the
   compositor's call; it asks for attention and the notification is the
@@ -360,12 +361,11 @@ carries what an upgrade changes on a running host.
   **Upgrade notes.** `--hidden` is gone: `install.sh` replaces the autostart
   entry with one that runs `hallpass-ui agent`, but a per-user copy in
   `~/.config/autostart` that still passes `--hidden` now starts nothing.
-  A `hallpass-ui` left running from before is not the agent: across this
-  release's protocol bump the daemon refuses it and it retries behind its
-  tray icon, and on a matching protocol it holds the prompt slot until it
-  quits. Quit it (its tray's Quit, or its window where there is no tray),
-  then start `hallpass-ui agent` or log in again. `hallpass-cli doctor`'s
-  no-handler hint now names the agent.
+  `install.sh` stops a `hallpass-ui` left running from before (the old
+  single-process UI or an older agent) and starts the new agent, when the
+  installing session is already in the `hallpass` group; otherwise the agent
+  starts at the next login, or when the management window is opened.
+  `hallpass-cli doctor`'s no-handler hint now names the agent.
 - **Executable paths are checked against the host's own file.** A process
   whose `/proc/<pid>/exe` names a path the host has a different file at (a
   bind mount in a private mount namespace, a container on the host network)

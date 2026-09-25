@@ -33,6 +33,11 @@ const STATS_POLL: Duration = Duration::from_secs(3);
 /// claim, and for a few stats polls to see the claim.
 const AGENT_GRACE: Duration = Duration::from_secs(10);
 
+/// How soon the window starts another agent after one it started ended
+/// without taking the slot. Often enough to recover from a crash while the
+/// window is open; not so often that a failing agent is started in a loop.
+const AGENT_RETRY: Duration = Duration::from_secs(60);
+
 const MAX_EVENTS: usize = 1000;
 
 /// Events requested from the daemon's history when a connection comes up.
@@ -316,6 +321,11 @@ pub struct HallpassApp {
     /// Why the last agent this window started is gone, shown beside the
     /// button that starts another rather than as a daemon error.
     agent_error: Option<String>,
+    /// When this window last started an agent by itself, for [`AGENT_RETRY`].
+    agent_started: Option<std::time::Instant>,
+    /// The daemon socket refused this user: the session predates the
+    /// account's `hallpass` group, and retrying will not change that.
+    denied: bool,
 }
 
 impl HallpassApp {
@@ -395,6 +405,8 @@ impl HallpassApp {
             raise: None,
             agent: None,
             agent_error: None,
+            agent_started: None,
+            denied: false,
         }
     }
 
@@ -416,6 +428,7 @@ impl HallpassApp {
             match ev {
                 UiEvent::Connected => {
                     self.status = ConnStatus::Connected;
+                    self.denied = false;
                     self.last_error = None;
                     self.history_keys.clear();
                     // A count from before the reconnect describes a daemon
@@ -451,8 +464,9 @@ impl HallpassApp {
                         limit: EVENT_HISTORY_LIMIT,
                     });
                 }
-                UiEvent::Disconnected { retry_in } => {
+                UiEvent::Disconnected { retry_in, denied } => {
                     self.status = ConnStatus::Reconnecting { retry_in };
+                    self.denied = denied;
                     // In-flight acks are dead with the connection.
                     self.link.pending_acks.clear();
                     if let Some(editor) = self.editor.as_mut().filter(|e| e.awaiting_ack()) {
@@ -984,47 +998,84 @@ impl HallpassApp {
         // This window takes no prompts, so on a host where the agent is not
         // running it would otherwise look healthy while every connection no
         // rule matches is decided with nothing on screen.
+        // The one thing about the connection itself worth a banner: the
+        // socket refused this user, which no retry fixes.
+        if self.denied && !matches!(self.status, ConnStatus::Connected) {
+            theme::banner(
+                ui,
+                Tone::Bad,
+                "\u{26a0}",
+                "LOG OUT AND BACK IN",
+                "your account is in the 'hallpass' group, but this login session \
+                 started before it was added, so it cannot reach the firewall yet",
+            );
+            ui.add_space(8.0);
+        }
+        // Only once the agent could not be started or cannot take prompts:
+        // an agent that is simply not running yet is started by this
+        // window (see `keep_agent`), not reported.
         if let Some(text) = self.no_handler_banner() {
-            theme::banner(ui, Tone::Bad, "\u{26a0}", "NO PROMPTS", &text);
-            // Still running past the grace with the slot still free: it is
-            // not going to take it (one on a read-only socket never can), and
-            // a label saying "starting" for as long as it runs would hide that.
             let stalled = self
                 .agent
                 .as_ref()
                 .is_some_and(|(_, at)| at.elapsed() >= AGENT_GRACE);
-            let label = match (&self.agent, stalled) {
-                (None, _) => "Start the prompt agent",
-                (Some(_), false) => "Starting the prompt agent...",
-                (Some(_), true) => "Prompt agent running",
-            };
-            if ui
-                .add_enabled(self.agent.is_none(), egui::Button::new(label))
-                .clicked()
-            {
-                self.start_agent();
-            }
-            let note = if stalled {
+            let why = if stalled {
                 Some(
-                    "it has not taken the prompt slot, which it never can on a \
-                     read-only socket; its log says why",
+                    "the prompt agent is running but cannot take prompts on this \
+                     socket; it never can on the read-only one",
                 )
             } else {
                 self.agent_error.as_deref()
             };
-            if let Some(note) = note {
-                ui.label(
-                    RichText::new(prompt::ui_text(note))
-                        .small()
-                        .color(DENY_COLOR),
+            if let Some(why) = why {
+                theme::banner(
+                    ui,
+                    Tone::Bad,
+                    "\u{26a0}",
+                    "PROMPTS OFF",
+                    &format!("{text}: {why}"),
                 );
+                if self.agent.is_none() && ui.button("Try again").clicked() {
+                    self.start_agent();
+                }
+                ui.add_space(8.0);
             }
-            ui.add_space(8.0);
         } else {
             // Whatever it said was about a slot that has since been taken,
             // or a daemon this window is no longer speaking to.
             self.agent_error = None;
         }
+    }
+
+    /// Start the prompt agent when nobody holds the prompt slot.
+    ///
+    /// The window takes no prompts itself, so without an agent every
+    /// connection no rule covers would be decided with nothing on screen,
+    /// while this window looked healthy. The agent autostarts at login, but
+    /// not before the first one after an install, not after a crash, and
+    /// not after Quit in its tray; opening this window brings it back. At
+    /// most once per [`AGENT_RETRY`], so one that cannot start is reported
+    /// (see `banners`) rather than started in a loop. An agent already
+    /// running for this user exits at once, which is reported too.
+    fn keep_agent(&mut self) {
+        if self.wants_agent() {
+            self.agent_started = Some(std::time::Instant::now());
+            self.start_agent();
+        }
+    }
+
+    /// Whether [`Self::keep_agent`] should start one now.
+    fn wants_agent(&self) -> bool {
+        let unhandled = self.mode_is_known()
+            && self
+                .stats
+                .as_ref()
+                .is_some_and(|s| !s.prompt_handler_connected);
+        unhandled
+            && self.agent.is_none()
+            && self
+                .agent_started
+                .is_none_or(|at| at.elapsed() >= AGENT_RETRY)
     }
 
     /// The no-handler banner's text, when nobody holds the prompt slot on a
@@ -1041,16 +1092,14 @@ impl HallpassApp {
         if stats.prompt_handler_connected || stats.lockdown.is_some() {
             return None;
         }
-        // The slot being free is all `Stats` says: an agent may be running
-        // without it (on a read-only socket, or between an eviction and its
-        // reclaim), so the text claims no more than that.
-        let verdict = match self.daemon_config {
-            Some(c) => format!("the default verdict ({})", verdict_label(c.default_verdict)),
-            None => "the default verdict".to_string(),
+        let verdict = match self.daemon_config.map(|c| c.default_verdict) {
+            Some(Verdict::Allow) => "allowed",
+            Some(Verdict::Deny) => "denied",
+            Some(Verdict::Reject) => "rejected",
+            None => "decided by the default verdict",
         };
         Some(format!(
-            "no prompt handler is connected: connections no rule matches take {verdict} \
-             with nothing on screen"
+            "connections no rule covers are {verdict} without asking"
         ))
     }
 
@@ -1089,7 +1138,17 @@ impl HallpassApp {
         };
         let exited = match child.try_wait() {
             Ok(None) => return,
-            Ok(Some(status)) => format!("the prompt agent exited ({status}); its log says why"),
+            Ok(Some(status)) if status.code() == Some(crate::agent::ALREADY_RUNNING) => {
+                "another prompt agent is running for your account but not taking \
+                 prompts from this daemon; if you were added to the 'hallpass' group \
+                 since logging in, log out and back in"
+                    .to_string()
+            }
+            Ok(Some(status)) if status.success() => "the prompt agent was quit".to_string(),
+            Ok(Some(status)) => format!(
+                "the prompt agent stopped ({status}); run `hallpass-ui agent` in a \
+                 terminal to see why"
+            ),
             Err(e) => format!("the prompt agent: {e}"),
         };
         self.agent = None;
@@ -2116,6 +2175,7 @@ impl eframe::App for HallpassApp {
         let ctx = ui.ctx().clone();
         self.drain_net();
         self.reap_agent();
+        self.keep_agent();
         // The posture banner and the mode both come from `Stats`, which
         // until now only the Stats tab refetched: a lockdown entered by
         // another client never appeared while the operator sat on Events,

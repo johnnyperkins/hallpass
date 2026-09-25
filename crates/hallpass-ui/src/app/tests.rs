@@ -564,6 +564,7 @@ fn a_lost_connection_clears_what_cannot_survive_it() {
 
     t.feed(UiEvent::Disconnected {
         retry_in: Duration::from_secs(1),
+        denied: false,
     });
     assert!(t.app.pending_ack_kinds().is_empty());
     let editor = t.app.editor.as_ref().expect("the form survives");
@@ -803,6 +804,7 @@ fn observe_mode_is_not_announced_before_the_daemon_says_so() {
 
     t.feed(UiEvent::Disconnected {
         retry_in: Duration::from_secs(1),
+        denied: false,
     });
     assert!(
         !t.app.observe_banner(),
@@ -825,6 +827,7 @@ fn observe_mode_is_not_announced_before_the_daemon_says_so() {
     // describing a daemon this window can no longer reach.
     t.feed(UiEvent::Disconnected {
         retry_in: Duration::from_secs(1),
+        denied: false,
     });
     assert!(
         !t.app.observe_banner(),
@@ -862,6 +865,7 @@ fn the_mark_never_claims_enforcement_it_cannot_vouch_for() {
     // reach: the posture may have changed, or the daemon may be gone.
     t.feed(UiEvent::Disconnected {
         retry_in: Duration::from_secs(1),
+        denied: false,
     });
     assert_eq!(
         t.app.tray_state(),
@@ -888,6 +892,7 @@ fn a_reconnect_does_not_restore_the_previous_daemons_mode() {
 
     t.feed(UiEvent::Disconnected {
         retry_in: Duration::from_secs(1),
+        denied: false,
     });
     assert_eq!(t.app.tray_state(), TrayState::Unknown);
 
@@ -922,6 +927,7 @@ fn a_stale_posture_does_not_survive_a_reconnect() {
 
     t.feed(UiEvent::Disconnected {
         retry_in: Duration::from_secs(1),
+        denied: false,
     });
     t.feed(UiEvent::Connected);
     assert!(
@@ -994,6 +1000,7 @@ fn the_window_says_when_nobody_takes_prompts() {
     t.daemon(DaemonMsg::Stats(unhandled.clone()));
     t.feed(UiEvent::Disconnected {
         retry_in: Duration::from_secs(1),
+        denied: false,
     });
     t.feed(UiEvent::Connected);
     assert!(
@@ -1025,7 +1032,40 @@ fn an_agent_that_exits_without_the_slot_says_so() {
 
     assert!(t.app.agent.is_none(), "the button comes back");
     let note = t.app.agent_error.as_deref().expect("the exit is reported");
-    assert!(note.contains("exited"), "{note}");
+    assert!(note.contains("stopped"), "{note}");
+}
+
+/// Opening the window with nobody taking prompts starts the agent, once
+/// per retry period, and not while the daemon has not answered or someone
+/// already holds the slot.
+#[test]
+fn the_window_starts_the_agent_when_nobody_takes_prompts() {
+    let mut t = TestApp::new();
+    assert!(!t.app.wants_agent(), "nothing known yet");
+    t.feed(UiEvent::Connected);
+    let mut handled = stats(true);
+    handled.prompt_handler_connected = true;
+    t.daemon(DaemonMsg::Stats(handled));
+    assert!(!t.app.wants_agent(), "the slot is held");
+
+    t.daemon(DaemonMsg::Stats(stats(true)));
+    assert!(t.app.wants_agent());
+    t.app.agent_started = Some(std::time::Instant::now());
+    assert!(!t.app.wants_agent(), "not again within the retry period");
+}
+
+/// A session that predates the account's group membership is told what to
+/// do, since reconnecting forever will not fix it.
+#[test]
+fn a_refused_socket_is_remembered_until_a_connection_succeeds() {
+    let mut t = TestApp::new();
+    t.feed(UiEvent::Disconnected {
+        retry_in: Duration::from_secs(1),
+        denied: true,
+    });
+    assert!(t.app.denied);
+    t.feed(UiEvent::Connected);
+    assert!(!t.app.denied);
 }
 
 /// Opening a data tab refreshes what it shows, rather than rendering

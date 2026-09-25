@@ -25,7 +25,9 @@ pub enum UiEvent {
     /// Socket connected and handshake completed.
     Connected,
     /// Socket lost or connect failed; next retry after this delay.
-    Disconnected { retry_in: Duration },
+    /// `denied` when the socket refused this user outright, which retrying
+    /// will not change (see `app::HallpassApp::banners`).
+    Disconnected { retry_in: Duration, denied: bool },
     /// A message was consumed but never reached the daemon; it will not be
     /// retried (the daemon's prompt timeout backstops lost replies).
     SendFailed { msg: ClientMsg },
@@ -150,7 +152,15 @@ async fn run(
                 // survivors on reconnect, which re-raises the banners.
                 let _ = to_notify.send(NotifyEvent::Disconnected);
                 tracing::warn!("daemon connection failed: {}", e.message);
-                if !send_ui(&to_ui, &wake, UiEvent::Disconnected { retry_in: backoff }) {
+                let denied = e.denied;
+                if !send_ui(
+                    &to_ui,
+                    &wake,
+                    UiEvent::Disconnected {
+                        retry_in: backoff,
+                        denied,
+                    },
+                ) {
                     return;
                 }
                 tokio::time::sleep(backoff).await;
@@ -164,6 +174,8 @@ async fn run(
 struct SessionError {
     /// Whether the handshake had completed before the failure.
     handshaken: bool,
+    /// Whether connecting was refused for lack of permission.
+    denied: bool,
     message: String,
 }
 
@@ -171,6 +183,7 @@ impl SessionError {
     fn early(message: String) -> Self {
         Self {
             handshaken: false,
+            denied: false,
             message,
         }
     }
@@ -198,7 +211,10 @@ async fn connect_and_serve(
 ) -> Result<(), SessionError> {
     let stream = UnixStream::connect(socket)
         .await
-        .map_err(|e| SessionError::early(format!("connect {}: {e}", socket.display())))?;
+        .map_err(|e| SessionError {
+            denied: e.kind() == std::io::ErrorKind::PermissionDenied,
+            ..SessionError::early(format!("connect {}: {e}", socket.display()))
+        })?;
     let (mut reader, mut writer) = stream.into_split();
 
     // Handshake: Hello -> HelloAck. Everything the UI wants after that
@@ -245,6 +261,7 @@ async fn connect_and_serve(
 
     let fail = |message: String| SessionError {
         handshaken: true,
+        denied: false,
         message,
     };
     // Reads happen on their own task. `read_msg` is not cancel-safe: raced

@@ -182,6 +182,10 @@ struct Agent {
     claims: Claims,
 }
 
+/// Exit status of an agent that found another already running, so a window
+/// that started it can say so rather than guess.
+pub const ALREADY_RUNNING: i32 = 3;
+
 /// Run the agent until the tray's Quit.
 /// Returns the process exit status.
 pub fn run(socket: PathBuf) -> i32 {
@@ -189,7 +193,7 @@ pub fn run(socket: PathBuf) -> i32 {
         Ok(Some(lock)) => Some(lock),
         Ok(None) => {
             eprintln!("hallpass-ui agent is already running for this user");
-            return 0;
+            return ALREADY_RUNNING;
         }
         // Run without it rather than not at all: exiting would leave every
         // prompt to the default verdict, and a second agent without the

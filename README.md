@@ -115,8 +115,11 @@ It builds the release binaries as your user, then uses `sudo` (prompting
 once) to install them to `/usr/bin`, drop the config and example rule into
 `/etc/hallpass` (an existing `config.toml` is never overwritten), install the
 systemd unit and desktop entry, autostart the prompt agent, add you to the
-`hallpass` group, and `systemctl enable --now hallpassd`. Log out and back in
-once so the group membership and the agent's autostart take effect.
+`hallpass` group, and `systemctl enable --now hallpassd`. When your session
+is already in the group (any install after the first) it also starts the
+agent, replacing one from an older build, so prompts work at once. After the
+first install, log out and back in once so the group membership takes
+effect.
 
 It installs, as root, the binaries it just built in your checkout, so it is
 exactly as trustworthy as the account that ran the build: anything running as
@@ -535,10 +538,11 @@ it holds the daemon's prompt-handler role, the tray icon and the desktop
 notifications, and opens a **prompt window** for each application with
 connections waiting (allow/deny, scope, duration). The **management window**
 (`hallpass-ui`, from the app menu or the tray) is an ordinary client for
-rules, live events, statistics and settings. It takes no prompts, and on an
-enforcing host with no lockdown posture it says so in a banner, with a
-button that starts the agent, whenever nobody holds the prompt-handler role.
-Only one client at a time can hold it.
+rules, live events, statistics and settings. It takes no prompts itself, but
+opening it starts the agent when nobody holds the prompt-handler role, and
+it shows a banner only when that cannot work, saying why (usually: log out
+and back in so the `hallpass` group takes effect). Only one client at a time
+can hold the role.
 
 Deny leads a prompt window's keyboard traversal, and closing the window
 denies every connection it was showing rather than leaving them to the
