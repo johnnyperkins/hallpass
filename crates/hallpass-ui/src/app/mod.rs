@@ -64,6 +64,9 @@ fn filter_id() -> egui::Id {
 /// stays a few pixels wide on the narrowest window this app allows.
 const ACTIVITY_COLUMNS: usize = 72;
 
+/// How long a tab takes to fade in after a switch.
+const TAB_FADE_SECS: f64 = 0.14;
+
 /// Which tab of the main window is active.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Tab {
@@ -341,6 +344,10 @@ pub struct HallpassApp {
     /// the account's group, sometimes an account in neither; retrying will
     /// not change either.
     denied: bool,
+    /// The tab the last frame drew, and when the one on screen now began
+    /// to fade in (egui's clock), for the fade between tabs.
+    drawn_tab: Option<Tab>,
+    tab_fade_from: f64,
 }
 
 impl HallpassApp {
@@ -424,6 +431,8 @@ impl HallpassApp {
             agent_wanted: None,
             slot_free_since: None,
             denied: false,
+            drawn_tab: None,
+            tab_fade_from: f64::NEG_INFINITY,
         }
     }
 
@@ -867,18 +876,20 @@ impl HallpassApp {
         theme::ensure_installed(&ctx);
         self.shortcuts(&ctx);
 
-        egui::Panel::top("tabs")
+        let header = egui::Panel::top("tabs")
             .frame(
                 egui::Frame::new()
                     .fill(theme::SURFACE)
-                    .inner_margin(egui::Margin::symmetric(12, 7)),
+                    .inner_margin(egui::Margin::symmetric(12, 8)),
             )
             .show_separator_line(false)
             .show(ui, |ui| {
                 self.header(ui);
-            });
+            })
+            .response
+            .rect;
 
-        egui::Panel::bottom("status")
+        let status = egui::Panel::bottom("status")
             .frame(
                 egui::Frame::new()
                     .fill(theme::SURFACE)
@@ -887,7 +898,15 @@ impl HallpassApp {
             .show_separator_line(false)
             .show(ui, |ui| {
                 self.status_bar(ui);
-            });
+            })
+            .response
+            .rect;
+        // Hairlines rather than the panels' own separators: those are drawn
+        // in the interactive stroke, which is brighter than an edge that is
+        // only there to end a surface should be.
+        let edge = egui::Stroke::new(1.0, theme::HAIRLINE);
+        ui.painter().hline(header.x_range(), header.bottom(), edge);
+        ui.painter().hline(status.x_range(), status.top(), edge);
 
         egui::CentralPanel::default()
             .frame(
@@ -896,6 +915,22 @@ impl HallpassApp {
                     .inner_margin(egui::Margin::symmetric(12, 10)),
             )
             .show(ui, |ui| {
+                // A new tab fades in over a moment instead of cutting, so
+                // the switch reads as the same window changing view.
+                let now = ui.input(|i| i.time);
+                if self.drawn_tab != Some(self.tab) {
+                    // Not on the first frame: a window opening has nothing
+                    // to fade from.
+                    if self.drawn_tab.is_some() {
+                        self.tab_fade_from = now;
+                    }
+                    self.drawn_tab = Some(self.tab);
+                }
+                let fade = ((now - self.tab_fade_from) / TAB_FADE_SECS).clamp(0.0, 1.0) as f32;
+                if fade < 1.0 {
+                    ui.ctx().request_repaint();
+                    ui.multiply_opacity(0.25 + 0.75 * fade);
+                }
                 self.banners(ui);
                 match self.tab {
                     Tab::Events => self.events_tab(ui),
@@ -905,6 +940,16 @@ impl HallpassApp {
                     Tab::Settings => self.settings_tab(ui),
                 }
             });
+
+        // With the rule editor open the window behind it dims, so the form
+        // reads as the thing in front without taking the rest away: the
+        // rows stay readable, which matters when the rule is being written
+        // from one of them. Painted last on this layer, under the editor's
+        // own, and only painted, so it takes no clicks.
+        if self.editor.is_some() {
+            ui.painter()
+                .rect_filled(ui.ctx().content_rect(), 0.0, Color32::from_black_alpha(110));
+        }
     }
 
     /// Keyboard routes into the two things this window is opened for:
@@ -1449,7 +1494,11 @@ impl HallpassApp {
                         .strong()
                         .color(MUTED),
                 );
-                ui.label(theme::num_muted(format!("last {}", format_span(span))));
+                ui.label(
+                    egui::RichText::new(format!("last {}", format_span(span)))
+                        .small()
+                        .color(MUTED),
+                );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     // Right to left, so the counts read in the order the
                     // columns are stacked in.
@@ -1460,8 +1509,20 @@ impl HallpassApp {
                     theme::pill(ui, &format!("{allowed} allowed"), ALLOW_COLOR);
                 });
             });
-            ui.add_space(4.0);
-            theme::activity_strip(ui, 44.0, &buckets);
+            ui.add_space(6.0);
+            let (first, last) = (
+                shown.first().map_or(0, |e| e.unix_ms),
+                shown.last().map_or(0, |e| e.unix_ms),
+            );
+            let slice = last.saturating_sub(first) / ACTIVITY_COLUMNS as u64;
+            theme::activity_strip(ui, 52.0, &buckets, |i| {
+                let from = first + slice * i as u64;
+                format!(
+                    "{} - {}",
+                    format_time(from),
+                    format_time(from + slice.max(1000))
+                )
+            });
         });
     }
 
@@ -2140,93 +2201,111 @@ impl HallpassApp {
             );
             return;
         };
-        theme::card(ui, "RUNTIME SETTINGS", |ui| {
-            ui.set_max_width(660.0);
-            setting_row(
-                ui,
-                "Prompt timeout",
-                "How long a prompt waits before the default action applies",
-                |ui| {
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.settings_timeout).desired_width(56.0),
-                    );
-                    ui.label(egui::RichText::new("seconds").color(MUTED));
-                },
-            );
-            setting_row(
-                ui,
-                "Default action",
-                "Applied when no rule matches and nobody answers in time",
-                |ui| {
-                    const VERDICTS: [Verdict; 3] = [Verdict::Allow, Verdict::Deny, Verdict::Reject];
-                    let items = VERDICTS.map(|v| (verdict_label(v), verdict_color(v)));
-                    let current = VERDICTS
-                        .iter()
-                        .position(|v| *v == self.settings_verdict)
-                        .unwrap_or(0);
-                    if let Some(i) = theme::segmented(
-                        ui,
-                        "default-verdict",
-                        &items,
-                        current,
-                        theme::Segments::Picker,
-                    ) {
-                        self.settings_verdict = VERDICTS[i];
-                    }
-                },
-            );
-            // The consequence, not just the name: this is what happens to
-            // every connection on this host that nobody answers for.
-            ui.label(
-                egui::RichText::new(match self.settings_verdict {
-                    Verdict::Allow => "Unanswered connections go out.",
-                    Verdict::Deny => "Unanswered connections are dropped.",
-                    Verdict::Reject => "Unanswered connections are refused.",
-                })
-                .small()
-                .color(verdict_color(self.settings_verdict)),
-            );
-        });
-        ui.add_space(8.0);
-        if let Some(err) = &self.settings_error {
-            theme::banner(ui, Tone::Bad, "\u{26a0}", err, "");
-            ui.add_space(8.0);
-        }
-        ui.horizontal(|ui| {
-            if ui.add(theme::primary_button("Apply")).clicked() {
-                match self.settings_timeout.trim().parse::<u64>() {
-                    Ok(prompt_timeout_secs) => {
-                        self.settings_error = None;
-                        // `..current` carries the mode (and any future
-                        // knob without its own form row) along unchanged.
-                        self.send(ClientMsg::ConfigSet(RuntimeConfig {
-                            prompt_timeout_secs,
-                            default_verdict: self.settings_verdict,
-                            ..current
-                        }));
-                    }
-                    Err(_) => {
-                        self.settings_error =
-                            Some("prompt timeout must be a number of seconds".to_string());
-                    }
+        // A form reads down one column; stretched across a wide window its
+        // controls end up a long way from the words that explain them.
+        let width = ui.available_width().min(720.0);
+        ui.allocate_ui(egui::vec2(width, ui.available_height()), |ui| {
+            theme::card(ui, "RUNTIME SETTINGS", |ui| {
+                ui.add_space(4.0);
+                setting_row(
+                    ui,
+                    "Prompt timeout",
+                    "How long a prompt waits before the default action applies",
+                    |ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.settings_timeout)
+                                .desired_width(56.0)
+                                .min_size(egui::vec2(0.0, 26.0))
+                                .vertical_align(egui::Align::Center),
+                        );
+                        ui.label(egui::RichText::new("seconds").color(MUTED));
+                    },
+                );
+                setting_row(
+                    ui,
+                    "Default action",
+                    "Applied when no rule matches and nobody answers in time",
+                    |ui| {
+                        ui.vertical(|ui| {
+                            const VERDICTS: [Verdict; 3] =
+                                [Verdict::Allow, Verdict::Deny, Verdict::Reject];
+                            let items = VERDICTS.map(|v| (verdict_label(v), verdict_color(v)));
+                            let current = VERDICTS
+                                .iter()
+                                .position(|v| *v == self.settings_verdict)
+                                .unwrap_or(0);
+                            if let Some(i) = theme::segmented(
+                                ui,
+                                "default-verdict",
+                                &items,
+                                current,
+                                theme::Segments::Picker,
+                            ) {
+                                self.settings_verdict = VERDICTS[i];
+                            }
+                            // The consequence, not just the name: this is what
+                            // happens to every connection on this host that
+                            // nobody answers for.
+                            ui.label(
+                                egui::RichText::new(match self.settings_verdict {
+                                    Verdict::Allow => "Unanswered connections go out.",
+                                    Verdict::Deny => "Unanswered connections are dropped.",
+                                    Verdict::Reject => "Unanswered connections are refused.",
+                                })
+                                .small()
+                                .color(verdict_color(self.settings_verdict)),
+                            );
+                        });
+                    },
+                );
+                if let Some(err) = &self.settings_error {
+                    theme::banner(ui, Tone::Bad, "\u{26a0}", err, "");
+                    ui.add_space(8.0);
                 }
-            }
-            if theme::ghost_button(ui, "Revert", theme::ACCENT, true).clicked() {
-                self.settings_timeout = current.prompt_timeout_secs.to_string();
-                self.settings_verdict = current.default_verdict;
-                self.settings_error = None;
-            }
+                let y = ui.cursor().top();
+                ui.painter().hline(
+                    ui.max_rect().x_range(),
+                    y,
+                    egui::Stroke::new(1.0, theme::HAIRLINE),
+                );
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if ui.add(theme::primary_button("Apply")).clicked() {
+                        match self.settings_timeout.trim().parse::<u64>() {
+                            Ok(prompt_timeout_secs) => {
+                                self.settings_error = None;
+                                // `..current` carries the mode (and any future
+                                // knob without its own form row) along unchanged.
+                                self.send(ClientMsg::ConfigSet(RuntimeConfig {
+                                    prompt_timeout_secs,
+                                    default_verdict: self.settings_verdict,
+                                    ..current
+                                }));
+                            }
+                            Err(_) => {
+                                self.settings_error =
+                                    Some("prompt timeout must be a number of seconds".to_string());
+                            }
+                        }
+                    }
+                    if theme::ghost_button(ui, "Revert", theme::ACCENT, true).clicked() {
+                        self.settings_timeout = current.prompt_timeout_secs.to_string();
+                        self.settings_verdict = current.default_verdict;
+                        self.settings_error = None;
+                    }
+                });
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new(
+                        "Changes apply immediately and last until the daemon restarts; \
+                     make them permanent in /etc/hallpass/config.toml. Prompts already \
+                     on screen keep the deadline they were created with.",
+                    )
+                    .small()
+                    .color(MUTED),
+                );
+            });
         });
-        ui.add_space(10.0);
-        ui.label(
-            RichText::new(
-                "Changes apply immediately and last until the daemon restarts; \
-                 make them permanent in /etc/hallpass/config.toml. Prompts already \
-                 on screen keep the deadline they were created with.",
-            )
-            .small()
-            .color(MUTED),
-        );
     }
 }
 
@@ -2375,11 +2454,17 @@ fn setting_row(ui: &mut egui::Ui, title: &str, hint: &str, control: impl FnOnce(
 
 /// What a tab says when it has nothing to show: the reason, and what would
 /// change it.
+///
+/// Around the mark, drawn large and quiet: a blank pane reads as broken,
+/// and one with the brand in it reads as waiting.
 fn empty_state(ui: &mut egui::Ui, headline: &str, hint: &str) {
-    ui.add_space(28.0);
+    ui.add_space((ui.available_height() * 0.18).clamp(24.0, 90.0));
     ui.vertical_centered(|ui| {
-        ui.label(RichText::new(headline).color(TEXT).size(15.0));
-        ui.label(RichText::new(hint).color(MUTED).small());
+        theme::mark(ui, 44.0, theme::HAIRLINE.lerp_to_gamma(MUTED, 0.35));
+        ui.add_space(10.0);
+        ui.label(RichText::new(headline).color(TEXT).size(16.0));
+        ui.add_space(2.0);
+        ui.label(RichText::new(hint).color(MUTED));
     });
 }
 

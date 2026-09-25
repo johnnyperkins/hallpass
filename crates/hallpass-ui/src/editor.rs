@@ -341,7 +341,10 @@ impl RuleEditor {
             .id(egui::Id::new("rule-editor"))
             .open(&mut open)
             .collapsible(false)
-            .default_width(420.0)
+            .pivot(egui::Align2::CENTER_CENTER)
+            .default_pos(ctx.content_rect().center())
+            .default_width(460.0)
+            .default_height(max_height.min(560.0))
             .max_height(max_height)
             .show(ctx, |ui| {
                 self.form(ui, &mut saved);

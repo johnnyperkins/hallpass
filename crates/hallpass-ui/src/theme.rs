@@ -351,6 +351,9 @@ pub fn banner(ui: &mut Ui, tone: Tone, glyph: &str, title: &str, body: &str) {
         });
     let rect = frame
         .show(ui, |ui| {
+            // Edge to edge: a whole-host notice that hugs its own words
+            // reads as one more card, not as the state of the window.
+            ui.set_width(ui.available_width());
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing.x = 6.0;
                 ui.label(egui::RichText::new(glyph).color(color).strong());
@@ -429,23 +432,57 @@ pub fn ratio_bar(ui: &mut Ui, size: Vec2, segments: &[(u64, Color32)]) -> Respon
 ///
 /// A thousand rows of feed say what happened; this says when, and whether
 /// the denies are a steady trickle or the last ten seconds. Scaled to its
-/// own busiest column, so an idle machine still shows its shape.
-pub fn activity_strip(ui: &mut Ui, height: f32, buckets: &[crate::traffic::Bucket]) -> Response {
+/// own busiest column, so an idle machine still shows its shape. Hovering
+/// a column lights it and names its counts, so a spike can be read as
+/// numbers without leaving the feed.
+pub fn activity_strip(
+    ui: &mut Ui,
+    height: f32,
+    buckets: &[crate::traffic::Bucket],
+    describe: impl Fn(usize) -> String,
+) -> Response {
     let width = ui.available_width();
     let (rect, response) = ui.allocate_exact_size(Vec2::new(width, height), egui::Sense::hover());
     if !ui.is_rect_visible(rect) || buckets.is_empty() {
         return response;
     }
-    ui.painter()
-        .rect_filled(rect, CornerRadius::same(CARD_RADIUS - 2), SURFACE);
+    let painter = ui.painter();
+    painter.rect_filled(rect, CornerRadius::same(CARD_RADIUS - 2), WELL);
+    let inner = rect.shrink2(Vec2::new(8.0, 6.0));
+    // Quarter lines, so a column's height reads against something.
+    for f in [0.25, 0.5, 0.75] {
+        painter.hline(
+            inner.x_range(),
+            inner.bottom() - inner.height() * f,
+            Stroke::new(1.0, HAIRLINE.gamma_multiply(0.35)),
+        );
+    }
     let peak = buckets.iter().map(|b| b.total()).max().unwrap_or(0).max(1) as f32;
-    let inner = rect.shrink2(Vec2::new(6.0, 5.0));
     let step = inner.width() / buckets.len() as f32;
-    let bar_w = (step - 2.0).clamp(1.0, 9.0);
+    let bar_w = (step - 2.0).clamp(1.0, 10.0);
+    let hovered = response
+        .hover_pos()
+        .filter(|p| inner.x_range().contains(p.x))
+        .map(|p| (((p.x - inner.left()) / step) as usize).min(buckets.len() - 1));
+    if let Some(i) = hovered {
+        let x = inner.left() + step * i as f32;
+        painter.rect_filled(
+            egui::Rect::from_x_y_ranges(x..=x + step, rect.y_range()),
+            CornerRadius::same(2),
+            SURFACE_CONTROL.gamma_multiply(0.7),
+        );
+    }
     for (i, b) in buckets.iter().enumerate() {
         if b.total() == 0 {
             continue;
         }
+        // The rest dim while one column is under the pointer, so the one
+        // being read stands out of the shape it belongs to.
+        let dim = if hovered.is_some_and(|h| h != i) {
+            0.55
+        } else {
+            1.0
+        };
         let x = inner.left() + step * i as f32 + (step - bar_w) / 2.0;
         let mut y = inner.bottom();
         // Stacked blocked-first from the bottom, so the red base line is
@@ -463,20 +500,37 @@ pub fn activity_strip(ui: &mut Ui, height: f32, buckets: &[crate::traffic::Bucke
                 egui::pos2(x, (y - h).max(inner.top())),
                 egui::pos2(x + bar_w, y),
             );
-            ui.painter().rect_filled(seg, CornerRadius::same(2), color);
+            painter.rect_filled(seg, CornerRadius::same(2), color.gamma_multiply(dim));
             y -= h + 0.5;
         }
     }
     // Baseline, so an empty stretch still reads as time rather than as a
     // gap in the widget.
-    ui.painter().line_segment(
-        [
-            egui::pos2(inner.left(), inner.bottom() + 1.0),
-            egui::pos2(inner.right(), inner.bottom() + 1.0),
-        ],
+    painter.hline(
+        inner.x_range(),
+        inner.bottom() + 1.0,
         Stroke::new(1.0, HAIRLINE),
     );
-    response
+    match hovered {
+        Some(i) => response.on_hover_ui_at_pointer(|ui| {
+            let b = buckets[i];
+            ui.label(RichText::new(describe(i)).small().color(MUTED));
+            for (n, what, color) in [
+                (b.allowed, "allowed", ALLOW_COLOR),
+                (b.blocked, "blocked", DENY_COLOR),
+                (b.would_block, "not enforced", REJECT_COLOR),
+            ] {
+                if n > 0 || what != "not enforced" {
+                    ui.horizontal(|ui| {
+                        status_dot(ui, color);
+                        ui.label(num(n.to_string()));
+                        ui.label(RichText::new(what).color(MUTED));
+                    });
+                }
+            }
+        }),
+        None => response,
+    }
 }
 
 /// A headline number in a card: what the Stats tab leads with.
@@ -1086,7 +1140,14 @@ pub fn countdown(ui: &mut Ui, fraction: f32, text: &str) {
 /// window is often glanced at rather than read, and the top-left corner is
 /// where a glance lands first.
 pub fn brand(ui: &mut Ui, color: Color32) -> Response {
-    let (rect, response) = ui.allocate_exact_size(Vec2::new(20.0, 22.0), egui::Sense::hover());
+    mark(ui, 20.0, color)
+}
+
+/// The mark at any size: the corner brand, and the large quiet one an empty
+/// tab is drawn around.
+pub fn mark(ui: &mut Ui, width: f32, color: Color32) -> Response {
+    let (rect, response) =
+        ui.allocate_exact_size(Vec2::new(width, width * 1.1), egui::Sense::hover());
     if !ui.is_rect_visible(rect) {
         return response;
     }
@@ -1094,7 +1155,7 @@ pub fn brand(ui: &mut Ui, color: Color32) -> Response {
     ui.painter().add(egui::epaint::PathShape::convex_polygon(
         outline,
         tint(color),
-        Stroke::new(1.4, color),
+        Stroke::new((width / 14.0).max(1.4), color),
     ));
     ui.painter().add(egui::epaint::PathShape::convex_polygon(
         bolt,

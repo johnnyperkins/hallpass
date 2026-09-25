@@ -126,7 +126,7 @@ fn main() -> eframe::Result {
 
     let mut options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([820.0, 520.0])
+            .with_inner_size([1000.0, 640.0])
             .with_min_inner_size([480.0, 320.0])
             .with_app_id("hallpass-ui")
             // The mark, painted rather than shipped as a file. Grey until
