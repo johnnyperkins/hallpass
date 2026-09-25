@@ -1,7 +1,7 @@
 //! Integration test: mock daemon on a temp Unix socket speaking the wire
 //! protocol. Asserts the Hello handshake and command round-trips.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use hallpass_cli::client::Client;
 use hallpass_types::wire;
@@ -9,12 +9,13 @@ use hallpass_types::{
     ClientMsg, DaemonMsg, Explanation, Proto, RuleTrace, RuntimeConfig, Stats, TraceOutcome,
     Verdict, PROTOCOL_VERSION,
 };
-use tokio::net::UnixListener;
+use tokio::net::{UnixListener, UnixStream};
+use tokio::task::JoinHandle;
 
 /// Arguments for [`hallpass_cli::run`], with `--socket` pointed at `path`.
-fn argv(path: &std::path::Path, rest: &[&str]) -> Vec<String> {
+fn argv(path: &Path, rest: &[&str]) -> Vec<String> {
     let mut argv = vec!["--socket".to_string(), path.display().to_string()];
-    argv.extend(rest.iter().map(|s| s.to_string()));
+    argv.extend(rest.iter().map(ToString::to_string));
     argv
 }
 
@@ -27,120 +28,121 @@ fn temp_sock(tag: &str) -> PathBuf {
     path
 }
 
-/// Accept one connection, verify the Hello handshake, then run `serve`.
-async fn mock_daemon<F, Fut>(listener: UnixListener, serve: F)
-where
-    F: FnOnce(tokio::net::UnixStream) -> Fut + Send + 'static,
-    Fut: std::future::Future<Output = ()> + Send,
-{
-    let (mut stream, _) = listener.accept().await.expect("accept");
-    let hello: ClientMsg = wire::read_msg(&mut stream).await.expect("read hello");
-    assert_eq!(
-        hello,
-        ClientMsg::Hello {
-            version: PROTOCOL_VERSION
-        }
-    );
-    wire::write_msg(
-        &mut stream,
-        &DaemonMsg::HelloAck {
-            version: PROTOCOL_VERSION,
-        },
-    )
-    .await
-    .expect("write ack");
-    serve(stream).await;
+/// Read the next request, asserting it is `want`.
+async fn expect(stream: &mut UnixStream, want: ClientMsg) {
+    assert_eq!(recv(stream).await, want);
+}
+
+/// Read the next request.
+async fn recv(stream: &mut UnixStream) -> ClientMsg {
+    wire::read_msg(stream).await.expect("read request")
+}
+
+/// Write one reply.
+async fn reply(stream: &mut UnixStream, msg: DaemonMsg) {
+    wire::write_msg(stream, &msg).await.expect("write reply");
+}
+
+/// A mock daemon on a fresh socket: it accepts one connection, checks the
+/// Hello handshake, then runs a test's side of the exchange.
+struct MockDaemon {
+    path: PathBuf,
+    task: JoinHandle<()>,
+}
+
+impl MockDaemon {
+    /// Bind a socket named after `tag` and serve its first connection with
+    /// `serve`, once the handshake is done.
+    fn spawn<F, Fut>(tag: &str, serve: F) -> Self
+    where
+        F: FnOnce(UnixStream) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send,
+    {
+        let path = temp_sock(tag);
+        let listener = UnixListener::bind(&path).expect("bind");
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let hello = ClientMsg::Hello {
+                version: PROTOCOL_VERSION,
+            };
+            expect(&mut stream, hello).await;
+            let ack = DaemonMsg::HelloAck {
+                version: PROTOCOL_VERSION,
+            };
+            reply(&mut stream, ack).await;
+            serve(stream).await;
+        });
+        Self { path, task }
+    }
+
+    /// Run the CLI against this daemon.
+    async fn run(&self, rest: &[&str]) -> i32 {
+        hallpass_cli::run(&argv(&self.path, rest)).await
+    }
+
+    /// Wait for the daemon's side to finish, surfacing its assertion
+    /// failures, then remove the socket.
+    async fn finish(self) {
+        self.task.await.expect("daemon task");
+        let _ = std::fs::remove_file(&self.path);
+    }
 }
 
 #[tokio::test]
 async fn handshake_and_stats_roundtrip() {
-    let path = temp_sock("stats");
-    let listener = UnixListener::bind(&path).expect("bind");
-
     let stats = Stats {
         connections_total: 42,
         allowed: 40,
         denied: 1,
         prompted: 1,
         rules_loaded: 5,
-        lockdown: None,
         uptime_secs: 61,
-        dns_spoof_rejected: 0,
-        rules_skipped: 0,
-        prompts_overflowed: 0,
-        other_proto_total: 0,
-        observed_only: 0,
-        dns_snoop_dropped: 0,
-        enforcing: true,
-        prompt_handler_connected: true,
-        prompts_unanswered: 0,
-        prompt_handlers_evicted: 0,
         verdict_queue_dropped: Some(1),
-        verdict_queue_user_dropped: Some(0),
         verdict_queue_depth: Some(2),
         snoop_queue_dropped: None,
         snoop_queue_user_dropped: None,
         snoop_queue_depth: None,
-        verdict_queue_fail_open: Some(true),
         snoop_queue_fail_open: None,
-        verdict_queue_max_len: Some(4096),
-        nft_flushes: 0,
-        nft_last_flush_ms: None,
-        flows_accounted: 0,
-        flow_bytes: 0,
-        flow_packets: 0,
+        ..healthy_stats()
     };
     let expected = stats.clone();
-    let daemon = tokio::spawn(mock_daemon(listener, move |mut stream| async move {
-        let req: ClientMsg = wire::read_msg(&mut stream).await.expect("read req");
-        assert_eq!(req, ClientMsg::Stats);
-        wire::write_msg(&mut stream, &DaemonMsg::Stats(stats))
-            .await
-            .expect("write stats");
-    }));
+    let daemon = MockDaemon::spawn("stats", move |mut stream| async move {
+        expect(&mut stream, ClientMsg::Stats).await;
+        reply(&mut stream, DaemonMsg::Stats(stats)).await;
+    });
 
-    let mut client = Client::connect(&path).await.expect("connect + handshake");
+    let mut client = Client::connect(&daemon.path)
+        .await
+        .expect("connect + handshake");
     match client.request(ClientMsg::Stats).await.expect("request") {
         DaemonMsg::Stats(got) => assert_eq!(got, expected),
         other => panic!("unexpected reply: {other:?}"),
     }
 
-    daemon.await.expect("daemon task");
-    let _ = std::fs::remove_file(&path);
+    daemon.finish().await;
 }
 
 /// `config` is one `ConfigGet`; the daemon's reply is what gets printed.
 #[tokio::test]
 async fn config_show_roundtrip() {
-    let path = temp_sock("config-show");
-    let listener = UnixListener::bind(&path).expect("bind");
-
-    let daemon = tokio::spawn(mock_daemon(listener, |mut stream| async move {
-        let req: ClientMsg = wire::read_msg(&mut stream).await.expect("read req");
-        assert_eq!(req, ClientMsg::ConfigGet);
-        let reply = DaemonMsg::Config(RuntimeConfig {
+    let daemon = MockDaemon::spawn("config-show", |mut stream| async move {
+        expect(&mut stream, ClientMsg::ConfigGet).await;
+        let config = DaemonMsg::Config(RuntimeConfig {
             prompt_timeout_secs: 30,
             default_verdict: Verdict::Deny,
             enforce: true,
         });
-        wire::write_msg(&mut stream, &reply)
-            .await
-            .expect("write config");
+        reply(&mut stream, config).await;
         // `config` asks about the posture too: the settings reply carries
         // what the operator set, so a locked-down host needs the extra line
         // to explain why it is not what is in force.
-        let req: ClientMsg = wire::read_msg(&mut stream).await.expect("read posture req");
-        assert_eq!(req, ClientMsg::LockdownGet);
-        wire::write_msg(&mut stream, &DaemonMsg::LockdownState(None))
-            .await
-            .expect("write posture");
-    }));
+        expect(&mut stream, ClientMsg::LockdownGet).await;
+        reply(&mut stream, DaemonMsg::LockdownState(None)).await;
+    });
 
-    let args = argv(&path, &["config"]);
-    assert_eq!(hallpass_cli::run(&args).await, hallpass_cli::EXIT_OK);
+    assert_eq!(daemon.run(&["config"]).await, hallpass_cli::EXIT_OK);
 
-    daemon.await.expect("daemon task");
-    let _ = std::fs::remove_file(&path);
+    daemon.finish().await;
 }
 
 /// `config set` is a read-modify-write: the settings not named on the
@@ -148,22 +150,16 @@ async fn config_show_roundtrip() {
 /// defaults. The final `ConfigGet` is the refetch that gets printed.
 #[tokio::test]
 async fn config_set_carries_unnamed_settings_forward() {
-    let path = temp_sock("config-set");
-    let listener = UnixListener::bind(&path).expect("bind");
-
     let current = RuntimeConfig {
         prompt_timeout_secs: 30,
         default_verdict: Verdict::Deny,
         enforce: false,
     };
-    let daemon = tokio::spawn(mock_daemon(listener, move |mut stream| async move {
-        let req: ClientMsg = wire::read_msg(&mut stream).await.expect("read get");
-        assert_eq!(req, ClientMsg::ConfigGet);
-        wire::write_msg(&mut stream, &DaemonMsg::Config(current))
-            .await
-            .expect("write current");
+    let daemon = MockDaemon::spawn("config-set", move |mut stream| async move {
+        expect(&mut stream, ClientMsg::ConfigGet).await;
+        reply(&mut stream, DaemonMsg::Config(current)).await;
 
-        let req: ClientMsg = wire::read_msg(&mut stream).await.expect("read set");
+        let req = recv(&mut stream).await;
         let ClientMsg::ConfigSet(new) = req else {
             panic!("expected ConfigSet, got {req:?}");
         };
@@ -176,85 +172,66 @@ async fn config_set_carries_unnamed_settings_forward() {
                 ..current
             }
         );
-        wire::write_msg(&mut stream, &DaemonMsg::Ok)
-            .await
-            .expect("write ok");
+        reply(&mut stream, DaemonMsg::Ok).await;
 
-        let req: ClientMsg = wire::read_msg(&mut stream).await.expect("read refetch");
-        assert_eq!(req, ClientMsg::ConfigGet);
-        wire::write_msg(&mut stream, &DaemonMsg::Config(new))
-            .await
-            .expect("write refetch");
+        expect(&mut stream, ClientMsg::ConfigGet).await;
+        reply(&mut stream, DaemonMsg::Config(new)).await;
 
         // And the posture, which is what says whether the two settings it
         // owns are the ones in force.
-        let req: ClientMsg = wire::read_msg(&mut stream).await.expect("read posture req");
-        assert_eq!(req, ClientMsg::LockdownGet);
-        wire::write_msg(&mut stream, &DaemonMsg::LockdownState(None))
-            .await
-            .expect("write posture");
-    }));
+        expect(&mut stream, ClientMsg::LockdownGet).await;
+        reply(&mut stream, DaemonMsg::LockdownState(None)).await;
+    });
 
-    let args = argv(&path, &["config", "set", "--timeout", "60"]);
-    assert_eq!(hallpass_cli::run(&args).await, hallpass_cli::EXIT_OK);
+    assert_eq!(
+        daemon.run(&["config", "set", "--timeout", "60"]).await,
+        hallpass_cli::EXIT_OK
+    );
 
-    daemon.await.expect("daemon task");
-    let _ = std::fs::remove_file(&path);
+    daemon.finish().await;
 }
 
 /// A daemon that refuses the change (an out-of-bounds timeout) surfaces its
 /// message and the exit code says so; nothing gets printed as if applied.
 #[tokio::test]
 async fn config_set_surfaces_daemon_rejection() {
-    let path = temp_sock("config-reject");
-    let listener = UnixListener::bind(&path).expect("bind");
-
-    let daemon = tokio::spawn(mock_daemon(listener, |mut stream| async move {
-        let req: ClientMsg = wire::read_msg(&mut stream).await.expect("read get");
-        assert_eq!(req, ClientMsg::ConfigGet);
-        let reply = DaemonMsg::Config(RuntimeConfig {
+    let daemon = MockDaemon::spawn("config-reject", |mut stream| async move {
+        expect(&mut stream, ClientMsg::ConfigGet).await;
+        let config = DaemonMsg::Config(RuntimeConfig {
             prompt_timeout_secs: 30,
             default_verdict: Verdict::Deny,
             enforce: true,
         });
-        wire::write_msg(&mut stream, &reply)
-            .await
-            .expect("write current");
+        reply(&mut stream, config).await;
 
-        let req: ClientMsg = wire::read_msg(&mut stream).await.expect("read set");
+        let req = recv(&mut stream).await;
         assert!(matches!(req, ClientMsg::ConfigSet(_)));
         let err = DaemonMsg::Err {
             message: "prompt_timeout_secs must be at most 3600".into(),
         };
-        wire::write_msg(&mut stream, &err).await.expect("write err");
-    }));
+        reply(&mut stream, err).await;
+    });
 
-    let args = argv(&path, &["config", "set", "--timeout", "9999"]);
-    assert_eq!(hallpass_cli::run(&args).await, hallpass_cli::EXIT_ERR);
+    assert_eq!(
+        daemon.run(&["config", "set", "--timeout", "9999"]).await,
+        hallpass_cli::EXIT_ERR
+    );
 
-    daemon.await.expect("daemon task");
-    let _ = std::fs::remove_file(&path);
+    daemon.finish().await;
 }
 
 #[tokio::test]
 async fn daemon_err_is_surfaced() {
-    let path = temp_sock("err");
-    let listener = UnixListener::bind(&path).expect("bind");
-
-    let daemon = tokio::spawn(mock_daemon(listener, |mut stream| async move {
-        let req: ClientMsg = wire::read_msg(&mut stream).await.expect("read req");
+    let daemon = MockDaemon::spawn("err", |mut stream| async move {
+        let req = recv(&mut stream).await;
         assert!(matches!(req, ClientMsg::RuleDelete { .. }));
-        wire::write_msg(
-            &mut stream,
-            &DaemonMsg::Err {
-                message: "no such rule".into(),
-            },
-        )
-        .await
-        .expect("write err");
-    }));
+        let err = DaemonMsg::Err {
+            message: "no such rule".into(),
+        };
+        reply(&mut stream, err).await;
+    });
 
-    let mut client = Client::connect(&path).await.expect("connect");
+    let mut client = Client::connect(&daemon.path).await.expect("connect");
     let err = client
         .request(ClientMsg::RuleDelete {
             name: "nope".into(),
@@ -264,19 +241,15 @@ async fn daemon_err_is_surfaced() {
     assert_eq!(err.exit_code(), hallpass_cli::EXIT_ERR);
     assert!(err.to_string().contains("no such rule"));
 
-    daemon.await.expect("daemon task");
-    let _ = std::fs::remove_file(&path);
+    daemon.finish().await;
 }
 
 /// End to end: the flags become one `Explain` request describing the stated
 /// connection, and the daemon's answer is rendered without a packet in sight.
 #[tokio::test]
 async fn explain_roundtrip() {
-    let path = temp_sock("explain");
-    let listener = UnixListener::bind(&path).expect("bind");
-
-    let daemon = tokio::spawn(mock_daemon(listener, |mut stream| async move {
-        let msg: ClientMsg = wire::read_msg(&mut stream).await.expect("read req");
+    let daemon = MockDaemon::spawn("explain", |mut stream| async move {
+        let msg = recv(&mut stream).await;
         let ClientMsg::Explain(req) = msg else {
             panic!("expected Explain, got {msg:?}");
         };
@@ -288,7 +261,7 @@ async fn explain_roundtrip() {
         // Stated by the client, so the daemon does not go hashing anything.
         assert_eq!(req.exe_sha256, Some("ab".repeat(32)));
 
-        let reply = DaemonMsg::Explanation(Explanation {
+        let explanation = DaemonMsg::Explanation(Explanation {
             verdict: Verdict::Allow,
             rule_name: Some("allow-curl".into()),
             would_prompt: false,
@@ -306,46 +279,38 @@ async fn explain_roundtrip() {
                 },
             ],
         });
-        wire::write_msg(&mut stream, &reply)
-            .await
-            .expect("write explanation");
-    }));
+        reply(&mut stream, explanation).await;
+    });
 
     let hash = "ab".repeat(32);
-    let args = argv(
-        &path,
-        &[
-            "explain",
-            "--exe",
-            "/usr/bin/curl",
-            "--dest",
-            "93.184.216.34",
-            "--port",
-            "443",
-            "--proto",
-            "udp",
-            "--domain",
-            "example.org",
-            "--user",
-            "1000",
-            "--exe-sha256",
-            &hash,
-        ],
-    );
-    assert_eq!(hallpass_cli::run(&args).await, hallpass_cli::EXIT_OK);
+    let args = [
+        "explain",
+        "--exe",
+        "/usr/bin/curl",
+        "--dest",
+        "93.184.216.34",
+        "--port",
+        "443",
+        "--proto",
+        "udp",
+        "--domain",
+        "example.org",
+        "--user",
+        "1000",
+        "--exe-sha256",
+        &hash,
+    ];
+    assert_eq!(daemon.run(&args).await, hallpass_cli::EXIT_OK);
 
-    daemon.await.expect("daemon task");
-    let _ = std::fs::remove_file(&path);
+    daemon.finish().await;
 }
 
 /// A rejected rule does not end the import: the rest are still offered, and
 /// the exit code says something failed.
 #[tokio::test]
 async fn import_reports_each_rule_and_exits_non_zero() {
-    let path = temp_sock("import");
-    let listener = UnixListener::bind(&path).expect("bind");
-
     let doc = std::env::temp_dir().join(format!("hallpass-cli-test-{}.toml", std::process::id()));
+    let doc_arg = doc.display().to_string();
     // Written by hand rather than exported, so the documented shape is what
     // is being tested and not just this build's serializer.
     std::fs::write(
@@ -370,9 +335,9 @@ async fn import_reports_each_rule_and_exits_non_zero() {
     )
     .expect("write doc");
 
-    let daemon = tokio::spawn(mock_daemon(listener, |mut stream| async move {
+    let daemon = MockDaemon::spawn("import", |mut stream| async move {
         // The first is refused; the second must still be offered.
-        let msg: ClientMsg = wire::read_msg(&mut stream).await.expect("read add 1");
+        let msg = recv(&mut stream).await;
         let ClientMsg::RuleAdd(rule) = msg else {
             panic!("expected RuleAdd, got {msg:?}");
         };
@@ -381,24 +346,21 @@ async fn import_reports_each_rule_and_exits_non_zero() {
         let err = DaemonMsg::Err {
             message: "duplicate rule name".into(),
         };
-        wire::write_msg(&mut stream, &err).await.expect("write err");
+        reply(&mut stream, err).await;
 
-        let msg: ClientMsg = wire::read_msg(&mut stream).await.expect("read add 2");
+        let msg = recv(&mut stream).await;
         let ClientMsg::RuleAdd(rule) = msg else {
             panic!("expected RuleAdd, got {msg:?}");
         };
         assert_eq!(rule.name, "second");
         assert_eq!(rule.matcher.domain.as_deref(), Some("example.org"));
-        wire::write_msg(&mut stream, &DaemonMsg::Ok)
-            .await
-            .expect("write ok");
-    }));
+        reply(&mut stream, DaemonMsg::Ok).await;
+    });
 
-    let args = argv(&path, &["rules", "import", &doc.display().to_string()]);
-    assert_eq!(hallpass_cli::run(&args).await, hallpass_cli::EXIT_ERR);
+    let code = daemon.run(&["rules", "import", &doc_arg]).await;
+    assert_eq!(code, hallpass_cli::EXIT_ERR);
 
-    daemon.await.expect("daemon task");
-    let _ = std::fs::remove_file(&path);
+    daemon.finish().await;
     let _ = std::fs::remove_file(&doc);
 }
 
@@ -417,21 +379,10 @@ fn healthy_stats() -> Stats {
     Stats {
         connections_total: 10,
         allowed: 10,
-        denied: 0,
-        prompted: 0,
         rules_loaded: 3,
-        lockdown: None,
         uptime_secs: 5,
-        dns_spoof_rejected: 0,
-        rules_skipped: 0,
-        prompts_overflowed: 0,
-        other_proto_total: 0,
-        observed_only: 0,
-        dns_snoop_dropped: 0,
         enforcing: true,
         prompt_handler_connected: true,
-        prompts_unanswered: 0,
-        prompt_handlers_evicted: 0,
         verdict_queue_dropped: Some(0),
         verdict_queue_user_dropped: Some(0),
         verdict_queue_depth: Some(0),
@@ -441,11 +392,7 @@ fn healthy_stats() -> Stats {
         verdict_queue_fail_open: Some(true),
         snoop_queue_fail_open: Some(true),
         verdict_queue_max_len: Some(4096),
-        nft_flushes: 0,
-        nft_last_flush_ms: None,
-        flows_accounted: 0,
-        flow_bytes: 0,
-        flow_packets: 0,
+        ..Stats::default()
     }
 }
 
@@ -464,22 +411,14 @@ async fn doctor_healthy_daemon_exits_zero() {
     if running_as_root() {
         return;
     }
-    let path = temp_sock("doctor-ok");
-    let listener = UnixListener::bind(&path).expect("bind");
+    let daemon = MockDaemon::spawn("doctor-ok", |mut stream| async move {
+        expect(&mut stream, ClientMsg::Stats).await;
+        reply(&mut stream, DaemonMsg::Stats(healthy_stats())).await;
+    });
 
-    let daemon = tokio::spawn(mock_daemon(listener, move |mut stream| async move {
-        let req: ClientMsg = wire::read_msg(&mut stream).await.expect("read req");
-        assert_eq!(req, ClientMsg::Stats);
-        wire::write_msg(&mut stream, &DaemonMsg::Stats(healthy_stats()))
-            .await
-            .expect("write stats");
-    }));
+    assert_eq!(daemon.run(&["doctor"]).await, hallpass_cli::EXIT_OK);
 
-    let args = argv(&path, &["doctor"]);
-    assert_eq!(hallpass_cli::run(&args).await, hallpass_cli::EXIT_OK);
-
-    daemon.await.expect("daemon task");
-    let _ = std::fs::remove_file(&path);
+    daemon.finish().await;
 }
 
 /// Kernel-counted verdict-queue drops are packets resolved without policy,
@@ -489,26 +428,18 @@ async fn doctor_fails_on_verdict_queue_drops() {
     if running_as_root() {
         return;
     }
-    let path = temp_sock("doctor-drops");
-    let listener = UnixListener::bind(&path).expect("bind");
-
-    let daemon = tokio::spawn(mock_daemon(listener, move |mut stream| async move {
-        let req: ClientMsg = wire::read_msg(&mut stream).await.expect("read req");
-        assert_eq!(req, ClientMsg::Stats);
+    let daemon = MockDaemon::spawn("doctor-drops", |mut stream| async move {
+        expect(&mut stream, ClientMsg::Stats).await;
         let stats = Stats {
             verdict_queue_dropped: Some(7),
             ..healthy_stats()
         };
-        wire::write_msg(&mut stream, &DaemonMsg::Stats(stats))
-            .await
-            .expect("write stats");
-    }));
+        reply(&mut stream, DaemonMsg::Stats(stats)).await;
+    });
 
-    let args = argv(&path, &["doctor"]);
-    assert_eq!(hallpass_cli::run(&args).await, hallpass_cli::EXIT_ERR);
+    assert_eq!(daemon.run(&["doctor"]).await, hallpass_cli::EXIT_ERR);
 
-    daemon.await.expect("daemon task");
-    let _ = std::fs::remove_file(&path);
+    daemon.finish().await;
 }
 
 /// An unreachable daemon is doctor's headline finding, reported with exit 1
@@ -528,11 +459,8 @@ async fn doctor_reports_unreachable_daemon() {
 async fn suggest_folds_history_into_rules() {
     use hallpass_types::{ConnEvent, Connection, FlowTuple};
 
-    let path = temp_sock("suggest");
-    let listener = UnixListener::bind(&path).expect("bind");
-
-    let daemon = tokio::spawn(mock_daemon(listener, move |mut stream| async move {
-        let req: ClientMsg = wire::read_msg(&mut stream).await.expect("read req");
+    let daemon = MockDaemon::spawn("suggest", |mut stream| async move {
+        let req = recv(&mut stream).await;
         assert!(matches!(req, ClientMsg::EventHistory { .. }));
         let ev = ConnEvent {
             conn: Connection {
@@ -556,36 +484,25 @@ async fn suggest_folds_history_into_rules() {
             unix_ms: 0,
             enforced: true,
         };
-        wire::write_msg(&mut stream, &DaemonMsg::Events(vec![ev]))
-            .await
-            .expect("write events");
-    }));
+        reply(&mut stream, DaemonMsg::Events(vec![ev])).await;
+    });
 
-    let args = argv(&path, &["suggest"]);
-    assert_eq!(hallpass_cli::run(&args).await, hallpass_cli::EXIT_OK);
+    assert_eq!(daemon.run(&["suggest"]).await, hallpass_cli::EXIT_OK);
 
-    daemon.await.expect("daemon task");
-    let _ = std::fs::remove_file(&path);
+    daemon.finish().await;
 }
 
 /// An empty history is a non-zero exit: nothing was proposed, and a script
 /// piping the output into a file must not mistake silence for policy.
 #[tokio::test]
 async fn suggest_with_no_history_exits_non_zero() {
-    let path = temp_sock("suggest-empty");
-    let listener = UnixListener::bind(&path).expect("bind");
-
-    let daemon = tokio::spawn(mock_daemon(listener, move |mut stream| async move {
-        let req: ClientMsg = wire::read_msg(&mut stream).await.expect("read req");
+    let daemon = MockDaemon::spawn("suggest-empty", |mut stream| async move {
+        let req = recv(&mut stream).await;
         assert!(matches!(req, ClientMsg::EventHistory { .. }));
-        wire::write_msg(&mut stream, &DaemonMsg::Events(vec![]))
-            .await
-            .expect("write events");
-    }));
+        reply(&mut stream, DaemonMsg::Events(vec![])).await;
+    });
 
-    let args = argv(&path, &["suggest"]);
-    assert_eq!(hallpass_cli::run(&args).await, hallpass_cli::EXIT_ERR);
+    assert_eq!(daemon.run(&["suggest"]).await, hallpass_cli::EXIT_ERR);
 
-    daemon.await.expect("daemon task");
-    let _ = std::fs::remove_file(&path);
+    daemon.finish().await;
 }
