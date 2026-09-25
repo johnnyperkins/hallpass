@@ -278,16 +278,14 @@ impl Router {
     /// any prompt nobody answered, unless an agent that starts before then
     /// is handed it again and shows it.
     pub fn quit(&mut self) -> Vec<Effect> {
-        let shown: Vec<u64> = self
+        let mut out: Vec<Effect> = self
             .windows
             .values()
-            .flat_map(|win| win.ids.iter().copied())
+            .flat_map(|win| &win.ids)
+            .map(|&id| Effect::Daemon(Box::new(close_reply(id))))
             .collect();
-        let mut out: Vec<Effect> = shown
-            .into_iter()
-            .map(|id| Effect::Daemon(Box::new(close_reply(id))))
-            .collect();
-        self.prompts.clear();
+        // Forgets every prompt, waiting ones included, and closes every
+        // window.
         out.extend(self.disconnected());
         out
     }

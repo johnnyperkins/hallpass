@@ -2080,15 +2080,24 @@ impl HallpassApp {
 }
 
 impl eframe::App for HallpassApp {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        let ctx = ui.ctx().clone();
-        self.drain_net();
-        self.reap_agent();
-        let raises: Vec<_> = self
-            .raise
-            .as_ref()
-            .map_or_else(Vec::new, |r| r.try_iter().collect());
+    /// Raise requests, here rather than in `ui`: eframe skips `ui` for a
+    /// window that reports itself minimized or covered (X11 does), and a
+    /// window it can still bring back must not send the launch off to open
+    /// a second one.
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // A launch that gave up has opened a window of its own; raising this
+        // one for it would pull the operator away from that one.
+        let raises: Vec<_> = self.raise.as_ref().map_or_else(Vec::new, |r| {
+            r.try_iter()
+                .filter(crate::instance::RaiseRequest::waiting)
+                .collect()
+        });
         if !raises.is_empty() {
+            // X11 ignores a focus request on a minimized window; Wayland
+            // cannot say it is minimized, and cannot un-minimize.
+            if ctx.input(|i| i.viewport().minimized == Some(true)) {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+            }
             // Focus works on X11; on Wayland the attention request is what
             // gets the shell to flag the window.
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
@@ -2096,12 +2105,18 @@ impl eframe::App for HallpassApp {
                 egui::UserAttentionType::Informational,
             ));
             // Answered from the frame, not the socket's thread: a window
-            // that draws nothing never gets here, and the launch that asked
-            // opens a window of its own instead.
+            // that gets no frame (hidden, on Wayland) never gets here, and
+            // the launch that asked opens a window of its own instead.
             for raise in raises {
                 raise.done();
             }
         }
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+        self.drain_net();
+        self.reap_agent();
         // The posture banner and the mode both come from `Stats`, which
         // until now only the Stats tab refetched: a lockdown entered by
         // another client never appeared while the operator sat on Events,

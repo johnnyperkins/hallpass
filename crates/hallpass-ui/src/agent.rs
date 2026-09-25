@@ -186,14 +186,17 @@ struct Agent {
 /// Returns the process exit status.
 pub fn run(socket: PathBuf) -> i32 {
     let _lock = match single_instance() {
-        Ok(Some(lock)) => lock,
+        Ok(Some(lock)) => Some(lock),
         Ok(None) => {
             eprintln!("hallpass-ui agent is already running for this user");
             return 0;
         }
+        // Run without it rather than not at all: exiting would leave every
+        // prompt to the default verdict, and a second agent without the
+        // lock only finds the slot taken and backs off.
         Err(e) => {
-            eprintln!("hallpass-ui agent: {e}");
-            return 1;
+            tracing::warn!("no single-instance lock for the agent: {e}");
+            None
         }
     };
 
@@ -465,8 +468,10 @@ impl Agent {
     }
 
     /// Open the management window. One already open for this socket takes
-    /// the launch as a request to raise itself and the new process exits
-    /// (see `instance`), whether that window came from here or the app menu.
+    /// the launch as a request to raise itself and the new process exits,
+    /// whether that window came from here or the app menu; only one that
+    /// cannot answer (hidden, on Wayland) leaves it to open a second (see
+    /// `instance`).
     fn show_manager(&mut self) {
         use std::os::unix::process::CommandExt as _;
         let spawned = Command::new("/proc/self/exe")

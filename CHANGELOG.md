@@ -335,9 +335,11 @@ carries what an upgrade changes on a running host.
   extension, which Ubuntu ships enabled). Its menu opens the management
   window, and its Quit denies the prompts on screen once, releases the
   prompt-handler slot, and exits; prompts still queued unseen take the
-  default verdict. Prompts and notifications work without
-  it. The management window is one per user: opening it again, from the
-  tray or the app menu, asks the open one for attention instead.
+  default verdict. Prompts and notifications work without it. The
+  management window is one per user and daemon socket: opening it again,
+  from the tray or the app menu, asks the open one for attention instead,
+  and opens a second only when the open one cannot answer (minimized, on
+  Wayland).
 
 ### Changed
 

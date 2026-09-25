@@ -1,13 +1,14 @@
 //! One management window per user and daemon socket.
 //!
 //! The first window takes a lock in the user's runtime directory, which
-//! every session of that user shares, and listens on a socket beside it. A later launch, from the app menu or the
-//! tray, finds the lock taken and connects to the socket: connecting is the
-//! request. The open window answers with one byte once its frame has asked
-//! the shell for attention, and the launch exits. A window that draws
-//! nothing (minimized, or on another workspace, on Wayland) cannot ask, so
-//! a launch that hears nothing within [`ACK_TIMEOUT`] opens a window of its
-//! own rather than exiting with nothing on screen.
+//! every session of that user shares, and listens on a socket beside it. A
+//! later launch, from the app menu or the tray, finds the lock taken and
+//! connects to the socket: connecting is the request. The open window
+//! answers with one byte once its frame has asked the shell for attention,
+//! and the launch exits. A window that gets no frame (minimized, or on
+//! another workspace, on Wayland) cannot ask, so a launch that hears nothing
+//! within [`ACK_TIMEOUT`] opens a window of its own rather than exiting with
+//! nothing on screen.
 //!
 //! The runtime directory is the user's own (mode 0700), so only the user's
 //! processes can reach the socket, and all they can do there is ask a
@@ -45,6 +46,23 @@ pub enum Instance {
 pub struct RaiseRequest(UnixStream);
 
 impl RaiseRequest {
+    /// Whether the launch that asked is still waiting for the answer, rather
+    /// than past [`ACK_TIMEOUT`] and off opening a window of its own.
+    pub fn waiting(&self) -> bool {
+        use std::io::Read as _;
+        if self.0.set_nonblocking(true).is_err() {
+            return true;
+        }
+        // The launch never writes: nothing to read means it is still there,
+        // end of file that it has gone.
+        let waiting = matches!(
+            (&self.0).read(&mut [0u8; 1]),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock
+        );
+        let _ = self.0.set_nonblocking(false);
+        waiting
+    }
+
     /// Tell the launch that asked that the window asked for attention.
     pub fn done(mut self) {
         use std::io::Write as _;
@@ -229,6 +247,17 @@ mod tests {
             Instance::Unanswered
         ));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A request whose launch gave up is told apart from one still waiting,
+    /// so a window that draws again later does not raise itself for it.
+    #[test]
+    fn a_request_whose_launch_gave_up_is_not_waiting() {
+        let (ours, launch) = UnixStream::pair().unwrap();
+        let req = RaiseRequest(ours);
+        assert!(req.waiting());
+        drop(launch);
+        assert!(!req.waiting());
     }
 
     /// A window on another daemon socket is another window.
