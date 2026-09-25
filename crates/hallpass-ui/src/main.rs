@@ -14,6 +14,7 @@
 mod agent;
 mod app;
 mod backend;
+mod columns;
 mod editor;
 mod instance;
 mod link;

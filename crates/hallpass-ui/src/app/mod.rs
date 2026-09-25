@@ -11,6 +11,7 @@ use egui_extras::{Column, TableBuilder};
 use hallpass_types::{ClientMsg, ConnEvent, Connection, Rule, RuntimeConfig, Stats, Verdict};
 use tokio::sync::mpsc::UnboundedSender;
 
+use crate::columns::Col;
 use crate::editor::RuleEditor;
 use crate::net::{self, UiEvent};
 use crate::prompt;
@@ -63,6 +64,10 @@ fn filter_id() -> egui::Id {
 /// Columns in the activity strip above the event feed. Chosen so a column
 /// stays a few pixels wide on the narrowest window this app allows.
 const ACTIVITY_COLUMNS: usize = 72;
+
+/// Below this width the header drops its wordmark, and the Stats tab
+/// stacks its tiles and cards instead of setting them side by side.
+const NARROW: f32 = 640.0;
 
 /// How long a tab takes to fade in after a switch.
 const TAB_FADE_SECS: f64 = 0.14;
@@ -821,7 +826,7 @@ impl HallpassApp {
     /// points would have to lie. (`daemon_config`, not `enforcing`: the
     /// send needs the other settings to carry along unchanged, so the
     /// switch and its payload must come from the same reply.)
-    fn mode_toggle(&mut self, ui: &mut egui::Ui) {
+    fn mode_toggle(&mut self, ui: &mut egui::Ui, narrow: bool) {
         let Some(current) = self.daemon_config else {
             // Nothing is claimed before the daemon has spoken, but the
             // space is still held: a control that appears a second after
@@ -837,7 +842,13 @@ impl HallpassApp {
         let locked = self.lockdown_banner().is_some();
         let mut enforce = current.enforce || locked;
         let response = ui
-            .add_enabled_ui(!locked, |ui| theme::switch(ui, &mut enforce, "Enforce"))
+            .add_enabled_ui(!locked, |ui| {
+                if narrow {
+                    theme::switch_bare(ui, &mut enforce, "Enforce")
+                } else {
+                    theme::switch(ui, &mut enforce, "Enforce")
+                }
+            })
             .inner
             .on_hover_text(
                 "On: rules and prompts decide what connects (active). \
@@ -999,9 +1010,14 @@ impl HallpassApp {
     fn header(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             let state = self.tray_state();
+            // Narrow, the wordmark and the switch's label give way before
+            // the tabs start running into the switch.
+            let narrow = ui.available_width() < NARROW;
             theme::brand(ui, tray_state_color(state)).on_hover_text(tray_state_summary(state));
             ui.add_space(2.0);
-            theme::wordmark(ui);
+            if !narrow {
+                theme::wordmark(ui);
+            }
             ui.add_space(10.0);
             let items = Tab::ALL.map(|t| (t.label(), theme::ACCENT));
             let current = Tab::ALL.iter().position(|t| *t == self.tab).unwrap_or(0);
@@ -1009,7 +1025,7 @@ impl HallpassApp {
                 self.select_tab(Tab::ALL[i]);
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                self.mode_toggle(ui);
+                self.mode_toggle(ui, narrow);
             });
         });
     }
@@ -1321,7 +1337,7 @@ impl HallpassApp {
                 &mut self.filter,
                 filter_id(),
                 "app, domain, address or rule",
-                260.0,
+                (ui.available_width() * 0.35).clamp(150.0, 260.0),
             )
             .on_hover_text("Ctrl+F from anywhere; Ctrl+1 to Ctrl+5 switch tabs");
             ui.add_space(6.0);
@@ -1345,11 +1361,22 @@ impl HallpassApp {
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let narrowed = shown != total;
-                ui.label(theme::num_muted(if narrowed {
+                let text = theme::num_muted(if narrowed {
                     format!("{shown} of {total}")
                 } else {
                     format!("{total} events")
-                }));
+                });
+                // Left out rather than drawn over the pickers when the row
+                // has no room for it: the rows below say the same.
+                let galley = egui::WidgetText::from(text.clone()).into_galley(
+                    ui,
+                    Some(egui::TextWrapMode::Extend),
+                    f32::INFINITY,
+                    egui::TextStyle::Monospace,
+                );
+                if galley.size().x <= ui.available_width() {
+                    ui.label(text);
+                }
             });
         });
         ui.add_space(8.0);
@@ -1379,14 +1406,32 @@ impl HallpassApp {
             );
             return;
         }
-        self.activity_card(ui, &shown);
-        ui.add_space(8.0);
+        // Only with room for the rows as well: on a short window the strip
+        // would leave the feed a line or two.
+        if ui.available_height() >= 360.0 {
+            self.activity_card(ui, &shown);
+            ui.add_space(8.0);
+        }
         let mut new_rule_from: Option<Connection> = None;
         let (header_h, row_h) = table_heights(ui);
         // Where the rows are, so a row's action can light up while the
         // pointer is anywhere on that row rather than only on the button.
-        let table_area = ui.available_rect_before_wrap();
+        let rows_rect = ui.available_rect_before_wrap();
         let pointer = ui.ctx().pointer_hover_pos();
+        // The destination is the widest and the most read, so it takes the
+        // most of any spare width; the rule goes first on a narrow window,
+        // then the time, and never the button that acts on the row.
+        let fitted = fit_table(
+            ui,
+            &[
+                Col::fixed(70.0).dropped(1),                         // Time
+                Col::fixed(92.0),                                    // Verdict
+                Col::flex(90.0, 150.0, 1.0).up_to(260.0),            // Application
+                Col::flex(150.0, 250.0, 3.0),                        // Destination
+                Col::flex(90.0, 150.0, 1.0).up_to(300.0).dropped(2), // Rule
+                Col::fixed(66.0),                                    // rule-from-row button
+            ],
+        );
         // A table, not a Grid inside show_rows: show_rows assumed every
         // virtual row was exactly one body-text line, while the grid added
         // its own header row and button-height rows, so the estimated and
@@ -1394,78 +1439,76 @@ impl HallpassApp {
         // offset bounced as rows arrived. The table owns both its header
         // and its virtualization, so the two heights cannot drift, and
         // the remainder column keeps the grid tracking the window width.
-        data_table(ui, "events_table", header_h)
-            .stick_to_bottom(true)
-            .column(Column::initial(72.0).at_least(64.0)) // Time
-            .column(Column::initial(96.0).at_least(80.0)) // Verdict
-            .column(Column::initial(170.0).clip(true).at_least(90.0)) // Application
-            .column(Column::initial(230.0).clip(true).at_least(140.0)) // Destination
-            .column(Column::remainder().clip(true).at_least(90.0)) // Rule
-            .column(Column::initial(76.0).at_least(70.0)) // rule-from-row button
-            .header(header_h, |mut header| {
-                for title in ["Time", "Verdict", "Application", "Destination", "Rule", ""] {
-                    header.col(|ui| {
-                        ui.label(column_title(title));
-                    });
-                }
-            })
-            .body(|body| {
-                body.rows(row_h, shown.len(), |mut row| {
-                    let ev = shown[row.index()];
-                    row.col(|ui| {
-                        ui.label(theme::num_muted(format_time(ev.unix_ms)));
-                    });
-                    row.col(|ui| {
-                        // verdict_label comes from the event, not the
-                        // verdict, so an unenforced deny reads
-                        // "would-deny": the connection went out.
-                        theme::pill(ui, ev.verdict_label(), event_color(ev));
-                    });
-                    row.col(|ui| {
-                        // The column shows the file name; the path is what
-                        // a rule keys on, and it is one hover away rather
-                        // than a tab away.
-                        ui.label(egui::RichText::new(prompt::exe_name(&ev.conn)).color(TEXT))
-                            .on_hover_text(match &ev.conn.exe_path {
-                                Some(exe) => prompt::path_text(exe),
-                                None => "unattributed".to_string(),
-                            });
-                    });
-                    row.col(|ui| {
-                        ui.spacing_mut().item_spacing.x = 5.0;
-                        ui.label(
-                            egui::RichText::new(ev.conn.tuple.proto.to_string())
-                                .small()
-                                .color(MUTED),
-                        );
-                        ui.label(theme::num(prompt::format_dest(&ev.conn)))
-                            .on_hover_text(prompt::format_dest(&ev.conn));
-                    });
-                    row.col(|ui| match ev.rule_name.as_deref() {
-                        Some(name) => {
-                            theme::ghost_pill(ui, &prompt::ui_text(name))
-                                .on_hover_text(prompt::ui_text(name));
-                        }
-                        // Not a rule name: this connection was decided by
-                        // the default verdict, and saying so is the point
-                        // of the column.
-                        None => {
-                            ui.label(egui::RichText::new("default").small().color(MUTED));
-                        }
-                    });
-                    row.col(|ui| {
-                        let on_row = pointer.is_some_and(|p| {
-                            table_area.contains(p) && ui.max_rect().y_range().contains(p.y)
+        table_area(ui, &fitted, "events", |ui| {
+            data_table(ui, "events_table", header_h, &fitted)
+                .stick_to_bottom(true)
+                .header(header_h, |mut header| {
+                    let mut header = Cells::new(&mut header, &fitted);
+                    for title in ["Time", "Verdict", "Application", "Destination", "Rule", ""] {
+                        header.col(|ui| {
+                            ui.label(column_title(title));
                         });
-                        if theme::ghost_button(ui, "+ Rule", theme::ACCENT, on_row)
-                            .on_hover_text("Create a rule from this connection")
-                            .clicked()
-                        {
-                            new_rule_from = Some(ev.conn.clone());
-                        }
+                    }
+                })
+                .body(|body| {
+                    body.rows(row_h, shown.len(), |mut row| {
+                        let ev = shown[row.index()];
+                        let mut row = Cells::new(&mut row, &fitted);
+                        row.col(|ui| {
+                            ui.label(theme::num_muted(format_time(ev.unix_ms)));
+                        });
+                        row.col(|ui| {
+                            // verdict_label comes from the event, not the
+                            // verdict, so an unenforced deny reads
+                            // "would-deny": the connection went out.
+                            theme::pill(ui, ev.verdict_label(), event_color(ev));
+                        });
+                        row.col(|ui| {
+                            // The column shows the file name; the path is what
+                            // a rule keys on, and it is one hover away rather
+                            // than a tab away.
+                            ui.label(egui::RichText::new(prompt::exe_name(&ev.conn)).color(TEXT))
+                                .on_hover_text(match &ev.conn.exe_path {
+                                    Some(exe) => prompt::path_text(exe),
+                                    None => "unattributed".to_string(),
+                                });
+                        });
+                        row.col(|ui| {
+                            ui.spacing_mut().item_spacing.x = 5.0;
+                            ui.label(
+                                egui::RichText::new(ev.conn.tuple.proto.to_string())
+                                    .small()
+                                    .color(MUTED),
+                            );
+                            ui.label(theme::num(prompt::format_dest(&ev.conn)))
+                                .on_hover_text(prompt::format_dest(&ev.conn));
+                        });
+                        row.col(|ui| match ev.rule_name.as_deref() {
+                            Some(name) => {
+                                theme::ghost_pill(ui, &prompt::ui_text(name))
+                                    .on_hover_text(prompt::ui_text(name));
+                            }
+                            // Not a rule name: this connection was decided by
+                            // the default verdict, and saying so is the point
+                            // of the column.
+                            None => {
+                                ui.label(egui::RichText::new("default").small().color(MUTED));
+                            }
+                        });
+                        row.col(|ui| {
+                            let on_row = pointer.is_some_and(|p| {
+                                rows_rect.contains(p) && ui.max_rect().y_range().contains(p.y)
+                            });
+                            if theme::ghost_button(ui, "+ Rule", theme::ACCENT, on_row)
+                                .on_hover_text("Create a rule from this connection")
+                                .clicked()
+                            {
+                                new_rule_from = Some(ev.conn.clone());
+                            }
+                        });
                     });
                 });
-            });
+        });
         if let Some(conn) = new_rule_from {
             self.editor = Some(RuleEditor::from_connection(&conn));
         }
@@ -1584,106 +1627,122 @@ impl HallpassApp {
         ui.add_space(6.0);
         let rows = agg.top(TRAFFIC_ROWS, self.traffic_sort.0, self.traffic_sort.1);
         let (header_h, row_h) = table_heights(ui);
-        data_table(ui, "traffic_table", header_h)
-            .column(Column::remainder().clip(true).at_least(160.0)) // key
-            .column(Column::initial(116.0).at_least(70.0)) // Mix
-            .column(Column::initial(70.0).at_least(56.0)) // Total
-            .column(Column::initial(84.0).at_least(64.0)) // Allowed
-            .column(Column::initial(84.0).at_least(64.0)) // Blocked
-            .column(Column::initial(108.0).at_least(80.0)) // Would block
-            .column(Column::initial(70.0).at_least(56.0)) // Peers
-            .column(Column::initial(90.0).at_least(76.0)) // Last seen
-            .header(header_h, |mut header| {
-                // Every column but the mix bar sorts; the bar is the four
-                // counts beside it drawn as one shape, so it has nothing
-                // of its own to order by.
-                let (active, descending) = self.traffic_sort;
-                let mut clicked = None;
-                for (title, sort) in [
-                    (self.group_by.label(), Some(traffic::SortBy::Key)),
-                    ("Mix", None),
-                    ("Total", Some(traffic::SortBy::Total)),
-                    ("Allowed", Some(traffic::SortBy::Allowed)),
-                    ("Blocked", Some(traffic::SortBy::Blocked)),
-                    ("Would block", Some(traffic::SortBy::WouldBlock)),
-                    ("Peers", Some(traffic::SortBy::Peers)),
-                    ("Last seen", Some(traffic::SortBy::LastSeen)),
-                ] {
-                    header.col(|ui| match sort {
-                        Some(sort) => {
-                            let direction = (sort == active).then_some(descending);
-                            if theme::sort_header(ui, title, direction).clicked() {
-                                clicked = Some(sort);
+        // The key and the bar take the spare width, the key most; the
+        // counts stay at the width their headings need. Narrowed, the
+        // secondary columns go before the counts the bar is drawn from.
+        let fitted = fit_table(
+            ui,
+            &[
+                Col::flex(140.0, 240.0, 2.0),             // key
+                Col::flex(70.0, 110.0, 1.0).up_to(220.0), // Mix
+                Col::fixed(64.0),                         // Total
+                Col::fixed(86.0),                         // Allowed
+                Col::fixed(86.0),                         // Blocked
+                Col::fixed(108.0).dropped(2),             // Would block
+                Col::fixed(64.0).dropped(3),              // Peers
+                Col::fixed(92.0).dropped(1),              // Last seen
+            ],
+        );
+        let (active, descending) = self.traffic_sort;
+        let mut clicked = None;
+        let group_label = self.group_by.label();
+        table_area(ui, &fitted, "traffic", |ui| {
+            data_table(ui, "traffic_table", header_h, &fitted)
+                .header(header_h, |mut header| {
+                    let mut header = Cells::new(&mut header, &fitted);
+                    // Every column but the mix bar sorts; the bar is the four
+                    // counts beside it drawn as one shape, so it has nothing
+                    // of its own to order by.
+                    for (title, sort) in [
+                        (group_label, Some(traffic::SortBy::Key)),
+                        ("Mix", None),
+                        ("Total", Some(traffic::SortBy::Total)),
+                        ("Allowed", Some(traffic::SortBy::Allowed)),
+                        ("Blocked", Some(traffic::SortBy::Blocked)),
+                        ("Would block", Some(traffic::SortBy::WouldBlock)),
+                        ("Peers", Some(traffic::SortBy::Peers)),
+                        ("Last seen", Some(traffic::SortBy::LastSeen)),
+                    ] {
+                        header.col(|ui| match sort {
+                            Some(sort) => {
+                                let direction = (sort == active).then_some(descending);
+                                if theme::sort_header(ui, title, direction).clicked() {
+                                    clicked = Some(sort);
+                                }
                             }
-                        }
-                        None => {
-                            ui.label(column_title(title))
-                                .on_hover_text("Allowed, blocked, and recorded but not enforced");
-                        }
-                    });
-                }
-                if let Some(sort) = clicked {
-                    // A second click on the column already sorted flips
-                    // it; a first click on another starts from the end
-                    // that answers the question, which is the largest
-                    // count or the most recent time, but the first name.
-                    self.traffic_sort = if sort == active {
-                        (sort, !descending)
-                    } else {
-                        (sort, sort != traffic::SortBy::Key)
-                    };
-                }
-            })
-            .body(|body| {
-                body.rows(row_h, rows.len(), |mut table_row| {
-                    let row = &rows[table_row.index()];
-                    table_row.col(|ui| {
-                        ui.label(egui::RichText::new(prompt::ui_text(&row.key)).color(TEXT))
-                            .on_hover_text(prompt::ui_text(&row.key));
-                    });
-                    // The column four numbers cannot replace: whether this
-                    // row is mostly getting out or mostly being stopped is
-                    // a proportion, and a proportion is a shape.
-                    table_row.col(|ui| {
-                        theme::ratio_bar(
-                            ui,
-                            egui::vec2(ui.available_width().min(100.0), 8.0),
-                            &[
-                                (row.allowed, ALLOW_COLOR),
-                                (row.blocked, DENY_COLOR),
-                                (row.would_block, REJECT_COLOR),
-                            ],
-                        )
-                        .on_hover_text(format!(
-                            "{} allowed, {} blocked, {} recorded but not enforced",
-                            row.allowed, row.blocked, row.would_block
-                        ));
-                    });
-                    table_row.col(|ui| {
-                        ui.label(theme::num(row.total.to_string()));
-                    });
-                    table_row.col(|ui| {
-                        ui.label(count_text(row.allowed, ALLOW_COLOR));
-                    });
-                    table_row.col(|ui| {
-                        ui.label(count_text(row.blocked, DENY_COLOR));
-                    });
-                    table_row.col(|ui| {
-                        ui.label(count_text(row.would_block, REJECT_COLOR));
-                    });
-                    table_row.col(|ui| {
-                        ui.label(theme::num_muted(row.peers.to_string()));
-                    });
-                    table_row.col(|ui| {
-                        ui.label(theme::num_muted(format_time(row.last_ms)));
+                            None => {
+                                ui.label(column_title(title)).on_hover_text(
+                                    "Allowed, blocked, and recorded but not enforced",
+                                );
+                            }
+                        });
+                    }
+                })
+                .body(|body| {
+                    body.rows(row_h, rows.len(), |mut table_row| {
+                        let row = &rows[table_row.index()];
+                        let mut table_row = Cells::new(&mut table_row, &fitted);
+                        table_row.col(|ui| {
+                            ui.label(egui::RichText::new(prompt::ui_text(&row.key)).color(TEXT))
+                                .on_hover_text(prompt::ui_text(&row.key));
+                        });
+                        // The column four numbers cannot replace: whether this
+                        // row is mostly getting out or mostly being stopped is
+                        // a proportion, and a proportion is a shape.
+                        table_row.col(|ui| {
+                            theme::ratio_bar(
+                                ui,
+                                egui::vec2(ui.available_width() - 6.0, 8.0),
+                                &[
+                                    (row.allowed, ALLOW_COLOR),
+                                    (row.blocked, DENY_COLOR),
+                                    (row.would_block, REJECT_COLOR),
+                                ],
+                            )
+                            .on_hover_text(format!(
+                                "{} allowed, {} blocked, {} recorded but not enforced",
+                                row.allowed, row.blocked, row.would_block
+                            ));
+                        });
+                        table_row.col(|ui| {
+                            ui.label(theme::num(row.total.to_string()));
+                        });
+                        table_row.col(|ui| {
+                            ui.label(count_text(row.allowed, ALLOW_COLOR));
+                        });
+                        table_row.col(|ui| {
+                            ui.label(count_text(row.blocked, DENY_COLOR));
+                        });
+                        table_row.col(|ui| {
+                            ui.label(count_text(row.would_block, REJECT_COLOR));
+                        });
+                        table_row.col(|ui| {
+                            ui.label(theme::num_muted(row.peers.to_string()));
+                        });
+                        table_row.col(|ui| {
+                            ui.label(theme::num_muted(format_time(row.last_ms)));
+                        });
                     });
                 });
-            });
+        });
+        if let Some(sort) = clicked {
+            // A second click on the column already sorted flips it; a
+            // first click on another starts from the end that answers the
+            // question, which is the largest count or the most recent
+            // time, but the first name.
+            self.traffic_sort = if sort == active {
+                (sort, !descending)
+            } else {
+                (sort, sort != traffic::SortBy::Key)
+            };
+        }
     }
 
     fn rules_tab(&mut self, ui: &mut egui::Ui) {
         let mut bulk: Option<(String, bool)> = None;
-        ui.horizontal(|ui| {
+        // Wrapped, so a narrow window moves the tag picker to a second line
+        // instead of cutting it off.
+        ui.horizontal_wrapped(|ui| {
             if ui.add(theme::primary_button("+ Add rule")).clicked() {
                 self.editor = Some(RuleEditor::add());
             }
@@ -1735,7 +1794,7 @@ impl HallpassApp {
             None => Vec::new(),
         };
         let (header_h, row_h) = table_heights(ui);
-        let table_area = ui.available_rect_before_wrap();
+        let rows_rect = ui.available_rect_before_wrap();
         let pointer = ui.ctx().pointer_hover_pos();
         let shown: Vec<&Rule> = match &self.rule_tag_filter {
             Some(tag) => self.rules.iter().filter(|r| r.has_tag(tag)).collect(),
@@ -1750,73 +1809,87 @@ impl HallpassApp {
         // Only once some rule carries one, as in the CLI listing: a column
         // of dashes costs width on a table that already has seven.
         let tagged = self.rules.iter().any(|r| !r.tags.is_empty());
-        let mut table = data_table(ui, "rules_table", header_h)
-            .column(Column::initial(50.0).at_least(44.0)) // On
-            .column(Column::initial(200.0).clip(true).at_least(110.0)) // Name
-            .column(Column::initial(80.0).at_least(70.0)); // Action
-        if tagged {
-            table = table.column(Column::initial(150.0).clip(true).at_least(80.0));
-            // Tags
+        // The match is the long one and takes the spare width. On a narrow
+        // window the tags go first, then the priority, then the action
+        // (the name still dims when a rule decides nothing); never the
+        // switch or the two buttons, which are the only way to act on one.
+        let cols = [
+            Col::fixed(50.0),                                    // On
+            Col::flex(90.0, 180.0, 1.0).up_to(280.0),            // Name
+            Col::fixed(72.0).dropped(1),                         // Action
+            Col::flex(70.0, 140.0, 0.5).up_to(240.0).dropped(3), // Tags
+            Col::flex(100.0, 260.0, 3.0),                        // Match
+            Col::fixed(70.0).dropped(2),                         // Priority
+            Col::fixed(48.0),                                    // Edit
+            Col::fixed(62.0),                                    // Delete
+        ];
+        let mut fitted = fit_table(
+            ui,
+            &cols
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| tagged || *i != 3)
+                .map(|(_, c)| *c)
+                .collect::<Vec<_>>(),
+        );
+        if !tagged {
+            // Back in the table's own column order, with the tag column
+            // dropped, so the cells below can be written the same way
+            // whether or not it is shown.
+            fitted.widths.insert(3, None);
         }
-        let titles: &[&str] = if tagged {
-            &["On", "Name", "Action", "Tags", "Match", "Priority", "", ""]
-        } else {
-            &["On", "Name", "Action", "Match", "Priority", "", ""]
-        };
-        table
-            .column(Column::remainder().clip(true).at_least(120.0)) // Match
-            .column(Column::initial(76.0).at_least(64.0)) // Priority
-            .column(Column::initial(52.0).at_least(48.0)) // Edit
-            .column(Column::initial(66.0).at_least(60.0)) // Delete
-            .header(header_h, |mut header| {
-                for title in titles {
-                    header.col(|ui| {
-                        ui.label(column_title(title));
-                    });
-                }
-            })
-            .body(|body| {
-                body.rows(row_h, shown.len(), |mut row| {
-                    let rule = shown[row.index()];
-                    let stopped = suppressed.iter().any(|n| n == &rule.name);
-                    row.col(|ui| {
-                        let mut enabled = rule.enabled;
-                        let changed = theme::switch_bare(
-                            ui,
-                            &mut enabled,
-                            &format!("Enable {}", prompt::ui_text(&rule.name)),
-                        )
-                        .changed();
-                        // A rule the posture stops decides nothing, and the
-                        // checkbox alone says the opposite: this is the view
-                        // an operator opens to see what is in force, so the
-                        // difference between "on" and "on but not deciding"
-                        // has to be on the row.
-                        if stopped {
-                            ui.colored_label(REJECT_COLOR, "!")
-                                .on_hover_text("suppressed by lockdown");
-                        }
-                        if changed {
-                            toggle = Some((rule.name.clone(), enabled));
-                        }
-                    });
-                    row.col(|ui| {
-                        // Dimmed when the rule decides nothing, so a
-                        // disabled or suppressed row reads as inert from
-                        // the shape of the line rather than from its box.
-                        let name = egui::RichText::new(prompt::ui_text(&rule.name));
-                        ui.label(if rule.enabled && !stopped {
-                            name.color(TEXT)
-                        } else {
-                            name.color(MUTED).strikethrough()
-                        })
-                        .on_hover_text(prompt::ui_text(&rule.name));
-                    });
-                    row.col(|ui| {
-                        let v = Verdict::from(rule.action);
-                        theme::pill(ui, verdict_label(v), verdict_color(v));
-                    });
-                    if tagged {
+        table_area(ui, &fitted, "rules", |ui| {
+            data_table(ui, "rules_table", header_h, &fitted)
+                .header(header_h, |mut header| {
+                    let mut header = Cells::new(&mut header, &fitted);
+                    for title in ["On", "Name", "Action", "Tags", "Match", "Priority", "", ""] {
+                        header.col(|ui| {
+                            ui.label(column_title(title));
+                        });
+                    }
+                })
+                .body(|body| {
+                    body.rows(row_h, shown.len(), |mut row| {
+                        let rule = shown[row.index()];
+                        let stopped = suppressed.iter().any(|n| n == &rule.name);
+                        let mut row = Cells::new(&mut row, &fitted);
+                        row.col(|ui| {
+                            let mut enabled = rule.enabled;
+                            let changed = theme::switch_bare(
+                                ui,
+                                &mut enabled,
+                                &format!("Enable {}", prompt::ui_text(&rule.name)),
+                            )
+                            .changed();
+                            // A rule the posture stops decides nothing, and the
+                            // checkbox alone says the opposite: this is the view
+                            // an operator opens to see what is in force, so the
+                            // difference between "on" and "on but not deciding"
+                            // has to be on the row.
+                            if stopped {
+                                ui.colored_label(REJECT_COLOR, "!")
+                                    .on_hover_text("suppressed by lockdown");
+                            }
+                            if changed {
+                                toggle = Some((rule.name.clone(), enabled));
+                            }
+                        });
+                        row.col(|ui| {
+                            // Dimmed when the rule decides nothing, so a
+                            // disabled or suppressed row reads as inert from
+                            // the shape of the line rather than from its box.
+                            let name = egui::RichText::new(prompt::ui_text(&rule.name));
+                            ui.label(if rule.enabled && !stopped {
+                                name.color(TEXT)
+                            } else {
+                                name.color(MUTED).strikethrough()
+                            })
+                            .on_hover_text(prompt::ui_text(&rule.name));
+                        });
+                        row.col(|ui| {
+                            let v = Verdict::from(rule.action);
+                            theme::pill(ui, verdict_label(v), verdict_color(v));
+                        });
                         row.col(|ui| {
                             ui.spacing_mut().item_spacing.x = 4.0;
                             // Through ui_text like every other daemon-supplied
@@ -1829,37 +1902,36 @@ impl HallpassApp {
                                 ui.label(theme::num_muted("-"));
                             }
                         });
-                    }
-                    row.col(|ui| {
-                        ui.label(theme::num(prompt::ui_text(&rule.matcher.summary())))
-                            .on_hover_text(prompt::ui_text(&rule.matcher.summary()));
-                    });
-                    row.col(|ui| {
-                        ui.label(theme::num_muted(rule.priority.to_string()));
-                    });
-                    row.col(|ui| {
-                        let on_row = pointer.is_some_and(|p| {
-                            table_area.contains(p) && ui.max_rect().y_range().contains(p.y)
+                        row.col(|ui| {
+                            ui.label(theme::num(prompt::ui_text(&rule.matcher.summary())))
+                                .on_hover_text(prompt::ui_text(&rule.matcher.summary()));
                         });
-                        if theme::ghost_button(ui, "Edit", theme::ACCENT, on_row).clicked() {
-                            edit = Some(RuleEditor::edit(rule));
-                        }
-                    });
-                    row.col(|ui| {
-                        // The only destructive control in the window, and
-                        // the one row-level mistake nothing else undoes: red
-                        // only once the pointer is on its row, so a column of
-                        // it does not shout over the rules themselves.
-                        let on_row = pointer.is_some_and(|p| {
-                            table_area.contains(p) && ui.max_rect().y_range().contains(p.y)
+                        row.col(|ui| {
+                            ui.label(theme::num_muted(rule.priority.to_string()));
                         });
-                        if theme::ghost_button(ui, "Delete", DENY_COLOR, on_row).clicked() {
-                            delete = Some(rule.name.clone());
-                        }
+                        row.col(|ui| {
+                            let on_row = pointer.is_some_and(|p| {
+                                rows_rect.contains(p) && ui.max_rect().y_range().contains(p.y)
+                            });
+                            if theme::ghost_button(ui, "Edit", theme::ACCENT, on_row).clicked() {
+                                edit = Some(RuleEditor::edit(rule));
+                            }
+                        });
+                        row.col(|ui| {
+                            // The only destructive control in the window, and
+                            // the one row-level mistake nothing else undoes: red
+                            // only once the pointer is on its row, so a column of
+                            // it does not shout over the rules themselves.
+                            let on_row = pointer.is_some_and(|p| {
+                                rows_rect.contains(p) && ui.max_rect().y_range().contains(p.y)
+                            });
+                            if theme::ghost_button(ui, "Delete", DENY_COLOR, on_row).clicked() {
+                                delete = Some(rule.name.clone());
+                            }
+                        });
                     });
                 });
-            });
-
+        });
         if let Some(editor) = edit {
             self.editor = Some(editor);
         }
@@ -1968,43 +2040,48 @@ impl HallpassApp {
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
+                // Two rows of two when four would be too narrow to read,
+                // and the cards below stacked for the same reason.
+                let narrow = ui.available_width() < NARROW;
+                let per_row = if narrow { 2 } else { 4 };
                 // Less each tile's margins and stroke, which the frame adds
                 // outside the width it is given.
-                let tile_w = ((ui.available_width() - 3.0 * 8.0) / 4.0 - 28.0).max(90.0);
-                ui.horizontal(|ui| {
-                    theme::stat_tile(
-                        ui,
-                        tile_w,
+                let tile_w = ((ui.available_width() - (per_row - 1) as f32 * 8.0) / per_row as f32
+                    - 28.0)
+                    .max(90.0);
+                let tiles = [
+                    (
                         "CONNECTIONS",
-                        &compact(s.connections_total),
+                        compact(s.connections_total),
                         TEXT,
-                        &format!("up {}", format_uptime(s.uptime_secs)),
-                    );
-                    theme::stat_tile(
-                        ui,
-                        tile_w,
+                        format!("up {}", format_uptime(s.uptime_secs)),
+                    ),
+                    (
                         "ALLOWED",
-                        &compact(s.allowed),
+                        compact(s.allowed),
                         ALLOW_COLOR,
-                        &percent_of(s.allowed, s.connections_total),
-                    );
-                    theme::stat_tile(
-                        ui,
-                        tile_w,
+                        percent_of(s.allowed, s.connections_total),
+                    ),
+                    (
                         "DENIED / REJECTED",
-                        &compact(s.denied),
+                        compact(s.denied),
                         DENY_COLOR,
-                        &percent_of(s.denied, s.connections_total),
-                    );
-                    theme::stat_tile(
-                        ui,
-                        tile_w,
+                        percent_of(s.denied, s.connections_total),
+                    ),
+                    (
                         "PROMPTED",
-                        &compact(s.prompted),
+                        compact(s.prompted),
                         REJECT_COLOR,
-                        &format!("{} unanswered", s.prompts_unanswered),
-                    );
-                });
+                        format!("{} unanswered", s.prompts_unanswered),
+                    ),
+                ];
+                for row in tiles.chunks(per_row) {
+                    ui.horizontal(|ui| {
+                        for (label, value, color, sub) in row {
+                            theme::stat_tile(ui, tile_w, label, value, *color, sub);
+                        }
+                    });
+                }
                 ui.add_space(8.0);
                 theme::ratio_bar(
                     ui,
@@ -2017,7 +2094,10 @@ impl HallpassApp {
                 ));
                 ui.add_space(10.0);
 
-                ui.columns(2, |cols| {
+                ui.columns(if narrow { 1 } else { 2 }, |cols| {
+                    // The right-hand card goes under the left one when
+                    // there is only the one column.
+                    let right = cols.len() - 1;
                     // Whether anyone is being asked at all, and how often
                     // nobody answered. Without this card an agent that is
                     // not running, or has quietly lost the prompt slot,
@@ -2044,7 +2124,7 @@ impl HallpassApp {
                     // Volume from conntrack teardown accounting; zeros when
                     // flow_accounting is off, like any counter the host is
                     // not producing.
-                    theme::card(&mut cols[1], "VOLUME", |ui| {
+                    theme::card(&mut cols[right], "VOLUME", |ui| {
                         theme::stat_row(ui, "Flows accounted", |ui| {
                             ui.label(theme::num(grouped(s.flows_accounted)));
                         });
@@ -2061,7 +2141,10 @@ impl HallpassApp {
                 });
                 ui.add_space(8.0);
 
-                ui.columns(2, |cols| {
+                ui.columns(if narrow { 1 } else { 2 }, |cols| {
+                    // The right-hand card goes under the left one when
+                    // there is only the one column.
+                    let right = cols.len() - 1;
                     theme::card(&mut cols[0], "KERNEL QUEUES", |ui| {
                         // A packet dropped from a full verdict queue never
                         // reached the daemon, so no counter above moved for
@@ -2149,7 +2232,7 @@ impl HallpassApp {
                     // unfiltered. The watchdog repairs each one; a failed
                     // repair is in the journal, so this card claims
                     // detection, not success.
-                    theme::card(&mut cols[1], "RULESET INTEGRITY", |ui| {
+                    theme::card(&mut cols[right], "RULESET INTEGRITY", |ui| {
                         match (s.nft_flushes, s.nft_last_flush_ms) {
                             (0, _) => {
                                 ui.add_space(4.0);
@@ -2389,32 +2472,110 @@ fn table_heights(ui: &egui::Ui) -> (f32, f32) {
 }
 
 /// The style every data table shares, so it cannot drift per tab. The
-/// columns and cells stay at each call site, where they are load-bearing.
+/// cells stay at each call site, where they are load-bearing; the widths
+/// come from [`fit_table`].
 ///
 /// Sensed for hover, which egui_extras turns into a highlight across the
 /// whole row: these rows are dense and several columns wide, and the
 /// pointer is the only thing saying which one a click is about to act on.
 ///
-/// Also draws the rule under the header row, and quiets the column
-/// dividers: they run the full height of the table, and at the stroke the
-/// rest of the window uses they turned a short table into a grid of empty
-/// lanes. They still light up under the pointer, where a drag resizes.
-/// The quieter stroke stays inside this panel's `Ui`, and the table is the
-/// last thing each tab draws.
-fn data_table<'a>(ui: &'a mut egui::Ui, salt: &'static str, header_h: f32) -> TableBuilder<'a> {
+/// Also draws the rule under the header row. Not resizable by hand: the
+/// widths are refitted to the window every frame, and a width dragged by
+/// hand was stored by the table and kept through every resize after it,
+/// which is how a narrowed window lost its right-hand columns.
+fn data_table<'a>(
+    ui: &'a mut egui::Ui,
+    salt: &'static str,
+    header_h: f32,
+    fitted: &Fitted,
+) -> TableBuilder<'a> {
     let area = ui.available_rect_before_wrap();
     let y = area.top() + header_h + ui.spacing().item_spacing.y / 2.0;
-    ui.painter()
-        .hline(area.x_range(), y, egui::Stroke::new(1.0, theme::HAIRLINE));
-    ui.visuals_mut().widgets.noninteractive.bg_stroke =
-        egui::Stroke::new(1.0, theme::HAIRLINE.gamma_multiply(0.35));
-    TableBuilder::new(ui)
+    let right = area.left() + fitted.width.max(area.width());
+    ui.painter().hline(
+        area.left()..=right,
+        y,
+        egui::Stroke::new(1.0, theme::HAIRLINE),
+    );
+    let mut table = TableBuilder::new(ui)
         .id_salt(salt)
         .striped(true)
-        .resizable(true)
+        .resizable(false)
         .sense(egui::Sense::hover())
         .auto_shrink([false, false])
-        .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+        .cell_layout(egui::Layout::left_to_right(egui::Align::Center));
+    for width in fitted.widths.iter().flatten() {
+        table = table.column(Column::exact(*width).clip(true));
+    }
+    table
+}
+
+/// A table's columns fitted to the room it has.
+struct Fitted {
+    /// Each column's width, `None` where it was dropped.
+    widths: Vec<Option<f32>>,
+    /// The width the shown columns take, gaps included.
+    width: f32,
+    /// Wider than the room: the table scrolls sideways.
+    overflow: bool,
+}
+
+/// Fit `cols` to the width left in `ui`, less the scroll bar the table's
+/// body keeps room for.
+fn fit_table(ui: &egui::Ui, cols: &[Col]) -> Fitted {
+    let gap = ui.spacing().item_spacing.x;
+    let avail = ui.available_width() - ui.spacing().scroll.allocated_width();
+    let widths = crate::columns::fit(avail, gap, cols);
+    let shown: Vec<f32> = widths.iter().flatten().copied().collect();
+    let width = shown.iter().sum::<f32>() + gap * shown.len().saturating_sub(1) as f32;
+    Fitted {
+        overflow: width > avail + 0.5,
+        width,
+        widths,
+    }
+}
+
+/// Lay a table out, scrolling sideways when even its narrowest fit is
+/// wider than the window: past the columns that can be dropped, a column
+/// cut off at the edge is worse than one scrolled to.
+fn table_area(ui: &mut egui::Ui, fitted: &Fitted, salt: &str, add: impl FnOnce(&mut egui::Ui)) {
+    if fitted.overflow {
+        egui::ScrollArea::horizontal()
+            .id_salt(("table-scroll", salt))
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.set_width(fitted.width + ui.spacing().scroll.allocated_width());
+                add(ui);
+            });
+    } else {
+        add(ui);
+    }
+}
+
+/// A table row, header or body, that skips the cells of dropped columns,
+/// so each call site writes every cell and says nothing about which are
+/// on screen.
+struct Cells<'r, 'a, 'b> {
+    row: &'r mut egui_extras::TableRow<'a, 'b>,
+    widths: &'r [Option<f32>],
+    next: usize,
+}
+
+impl<'r, 'a, 'b> Cells<'r, 'a, 'b> {
+    fn new(row: &'r mut egui_extras::TableRow<'a, 'b>, fitted: &'r Fitted) -> Self {
+        Self {
+            row,
+            widths: &fitted.widths,
+            next: 0,
+        }
+    }
+
+    fn col(&mut self, add: impl FnOnce(&mut egui::Ui)) {
+        if self.widths.get(self.next).is_some_and(Option::is_some) {
+            self.row.col(add);
+        }
+        self.next += 1;
+    }
 }
 
 /// A table's column heading: small, muted, and out of the way of the data.
