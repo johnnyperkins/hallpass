@@ -1,26 +1,21 @@
 //! Synthetic connections for client development. Never in a release
 //! build: gated behind the non-default `dev-fixtures` feature.
 //!
-//! Without root the daemon cannot bind an nfqueue, so no traffic is ever
+//! Without root the daemon cannot bind an nfqueue, so no traffic is
 //! intercepted and every event-driven view (the CLI's `top`, the GUI's
-//! traffic tab and event feed) renders an empty machine. That made the
-//! observability surface the one part of the project a contributor could not
-//! iterate on without privileges. This feeds the same event bus the verdict
-//! path feeds, so those views exercise their real code.
+//! traffic tab and event feed) renders an empty machine. This feeds the same
+//! event bus the verdict path feeds, so those views exercise their real code
+//! without privileges.
 //!
-//! What is fabricated is the connection, and only the connection. Each one is
-//! run through the loaded ruleset the way [`crate::nfqueue`] runs a real one,
-//! so the verdict, the rule name and the hit counters are the engine's
-//! answers rather than a script's. That is the difference between a dev loop
-//! that exercises the rule path and one that impersonates it: editing a rule
-//! changes what the next connection is decided by, which is exactly what
-//! someone working on a client needs to be able to see.
+//! Only the connection is fabricated. Each one is run through the loaded
+//! ruleset the way [`crate::nfqueue`] runs a real one, so the verdict, the
+//! rule name and the hit counters are the engine's answers rather than a
+//! script's, and editing a rule changes what the next connection is decided
+//! by - which is what someone working on a client needs to see.
 //!
-//! The connections are still invented, so anything downstream of the bus sees
-//! invented data, including the syslog exporter. That is the reason this
-//! cannot exist in a shipped binary: a feature flag the operator has to opt
-//! into at compile time is the only version of this that cannot be turned on
-//! by accident on a real host.
+//! Everything downstream of the bus, the syslog exporter included, sees
+//! invented data. That is why this is a compile-time opt-in: it cannot be
+//! switched on by accident on a real host.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -134,7 +129,7 @@ pub fn spawn(
         let mut seen = crate::firstseen::Seen::new();
         loop {
             tokio::time::sleep(INTERVAL).await;
-            let s = &SCENARIOS[(n as usize) % SCENARIOS.len()];
+            let scenario = &SCENARIOS[(n as usize) % SCENARIOS.len()];
             // Vary the source port the way real flows do, so anything
             // keyed on the tuple sees distinct connections.
             let src_port = 40_000 + (n % 20_000) as u16;
@@ -145,18 +140,18 @@ pub fn spawn(
                     src: format!("10.0.0.2:{src_port}")
                         .parse()
                         .expect("static src addr"),
-                    dst: format!("93.184.216.{last_octet}:{}", s.port)
+                    dst: format!("93.184.216.{last_octet}:{}", scenario.port)
                         .parse()
                         .expect("static dst addr"),
                 },
                 uid: Some(1000),
                 pid: Some(1000 + (n % 50) as u32),
-                exe_path: Some(s.exe.into()),
-                cmdline: Some(s.cmdline.to_string()),
+                exe_path: Some(scenario.exe.into()),
+                cmdline: Some(scenario.cmdline.to_string()),
                 parent_exe: Some("/usr/bin/bash".into()),
-                domain: (!s.domain.is_empty()).then(|| s.domain.to_string()),
+                domain: (!scenario.domain.is_empty()).then(|| scenario.domain.to_string()),
                 iface: Some("eth0".to_string()),
-                app_id: (!s.app_id.is_empty()).then(|| s.app_id.to_string()),
+                app_id: (!scenario.app_id.is_empty()).then(|| scenario.app_id.to_string()),
                 first_seen: None,
             };
             conn.first_seen = seen.observe(&conn, &hallpass_types::unix_ms_now);

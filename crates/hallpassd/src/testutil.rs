@@ -60,7 +60,7 @@ pub fn write_trusted(path: &Path, contents: impl AsRef<[u8]>) {
 pub struct TestDir(PathBuf);
 
 impl TestDir {
-    pub fn new(tag: &str) -> TestDir {
+    pub fn new(tag: &str) -> Self {
         let dir = std::env::temp_dir().join(format!("hallpassd-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -68,7 +68,7 @@ impl TestDir {
         // group can write is the one thing every per-file check assumes away,
         // so fixtures must not model the state the daemon refuses.
         trust_mode(&dir);
-        TestDir(dir)
+        Self(dir)
     }
 
     pub fn path(&self) -> &Path {

@@ -29,12 +29,12 @@ fn main() {
     );
     let workspace = manifest.join("..").join("..");
     let target_dir = std::env::var_os("CARGO_TARGET_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| workspace.join("target"));
+        .map_or_else(|| workspace.join("target"), PathBuf::from);
+    let prebuilt = manifest.join("prebuilt").join(OBJ_NAME);
 
     let candidates = [
         std::env::var_os(OVERRIDE_VAR).map(PathBuf::from),
-        Some(manifest.join("prebuilt").join(OBJ_NAME)),
+        Some(prebuilt.clone()),
         Some(
             target_dir
                 .join("bpfel-unknown-none")
@@ -55,6 +55,6 @@ fn main() {
         "the `ebpf` feature needs a compiled eBPF object and none was found.\n\
          Build one with `cargo xtask build-ebpf` (needs nightly plus bpf-linker),\n\
          drop a prebuilt one at {}, or point {OVERRIDE_VAR} at it.",
-        manifest.join("prebuilt").join(OBJ_NAME).display()
+        prebuilt.display()
     );
 }

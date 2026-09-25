@@ -81,8 +81,8 @@ mod tests {
         // Every Linux system has "lo"; find its index in the scan and
         // confirm the map resolves it.
         let scanned = scan();
-        if let Some((idx, _)) = scanned.iter().find(|(_, n)| n.as_str() == "lo") {
-            assert_eq!(IfaceMap::default().name(*idx).as_deref(), Some("lo"));
+        if let Some((&idx, _)) = scanned.iter().find(|(_, n)| *n == "lo") {
+            assert_eq!(IfaceMap::default().name(idx).as_deref(), Some("lo"));
         }
     }
 }

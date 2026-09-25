@@ -52,16 +52,7 @@ pub fn parse(payload: &[u8], original_len: usize) -> Parsed {
         ),
         None => return Parsed::Malformed,
     };
-    let (proto, sport, dport) = match sliced.transport {
-        Some(TransportSlice::Tcp(t)) => (Proto::Tcp, t.source_port(), t.destination_port()),
-        Some(TransportSlice::Udp(u)) => (Proto::Udp, u.source_port(), u.destination_port()),
-        _ => return Parsed::OtherProto(ip_proto),
-    };
-    Parsed::Flow(FlowTuple {
-        proto,
-        src: SocketAddr::new(src_ip, sport),
-        dst: SocketAddr::new(dst_ip, dport),
-    })
+    flow_or_other(src_ip, dst_ip, ip_proto, sliced.transport)
 }
 
 /// Parse a payload the queue truncated, tolerating the missing tail.
@@ -85,19 +76,27 @@ fn parse_truncated(payload: &[u8]) -> Parsed {
         ),
         None => return Parsed::Malformed,
     };
-    match sliced.transport {
-        Some(TransportSlice::Tcp(t)) => Parsed::Flow(FlowTuple {
-            proto: Proto::Tcp,
-            src: SocketAddr::new(src_ip, t.source_port()),
-            dst: SocketAddr::new(dst_ip, t.destination_port()),
-        }),
-        Some(TransportSlice::Udp(u)) => Parsed::Flow(FlowTuple {
-            proto: Proto::Udp,
-            src: SocketAddr::new(src_ip, u.source_port()),
-            dst: SocketAddr::new(dst_ip, u.destination_port()),
-        }),
-        _ => Parsed::OtherProto(ip_proto),
-    }
+    flow_or_other(src_ip, dst_ip, ip_proto, sliced.transport)
+}
+
+/// The flow a TCP or UDP header completes, or the IP protocol number of
+/// anything else.
+fn flow_or_other(
+    src_ip: IpAddr,
+    dst_ip: IpAddr,
+    ip_proto: u8,
+    transport: Option<TransportSlice<'_>>,
+) -> Parsed {
+    let (proto, sport, dport) = match transport {
+        Some(TransportSlice::Tcp(t)) => (Proto::Tcp, t.source_port(), t.destination_port()),
+        Some(TransportSlice::Udp(u)) => (Proto::Udp, u.source_port(), u.destination_port()),
+        _ => return Parsed::OtherProto(ip_proto),
+    };
+    Parsed::Flow(FlowTuple {
+        proto,
+        src: SocketAddr::new(src_ip, sport),
+        dst: SocketAddr::new(dst_ip, dport),
+    })
 }
 
 /// IP protocol number of UDP-Lite (RFC 3828).
