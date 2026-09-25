@@ -1268,17 +1268,14 @@ impl HallpassApp {
     /// that fold the same iterator.
     fn filter_row(&mut self, ui: &mut egui::Ui, shown: usize, total: usize) {
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("\u{1f50d}").color(MUTED));
-            ui.add(
-                egui::TextEdit::singleline(&mut self.filter)
-                    .id(filter_id())
-                    .hint_text("app, domain, address or rule")
-                    .desired_width(240.0),
+            theme::search_field(
+                ui,
+                &mut self.filter,
+                filter_id(),
+                "app, domain, address or rule",
+                260.0,
             )
             .on_hover_text("Ctrl+F from anywhere; Ctrl+1 to Ctrl+5 switch tabs");
-            if !self.filter.is_empty() && ui.small_button("Clear").clicked() {
-                self.filter.clear();
-            }
             ui.add_space(6.0);
             // Each lens in the colour of what it keeps, like the pills in
             // the rows it narrows to.
@@ -1338,6 +1335,10 @@ impl HallpassApp {
         ui.add_space(8.0);
         let mut new_rule_from: Option<Connection> = None;
         let (header_h, row_h) = table_heights(ui);
+        // Where the rows are, so a row's action can light up while the
+        // pointer is anywhere on that row rather than only on the button.
+        let table_area = ui.available_rect_before_wrap();
+        let pointer = ui.ctx().pointer_hover_pos();
         // A table, not a Grid inside show_rows: show_rows assumed every
         // virtual row was exactly one body-text line, while the grid added
         // its own header row and button-height rows, so the estimated and
@@ -1345,7 +1346,7 @@ impl HallpassApp {
         // offset bounced as rows arrived. The table owns both its header
         // and its virtualization, so the two heights cannot drift, and
         // the remainder column keeps the grid tracking the window width.
-        data_table(ui, "events_table")
+        data_table(ui, "events_table", header_h)
             .stick_to_bottom(true)
             .column(Column::initial(72.0).at_least(64.0)) // Time
             .column(Column::initial(96.0).at_least(80.0)) // Verdict
@@ -1405,8 +1406,10 @@ impl HallpassApp {
                         }
                     });
                     row.col(|ui| {
-                        if ui
-                            .small_button("+ Rule")
+                        let on_row = pointer.is_some_and(|p| {
+                            table_area.contains(p) && ui.max_rect().y_range().contains(p.y)
+                        });
+                        if theme::ghost_button(ui, "+ Rule", theme::ACCENT, on_row)
                             .on_hover_text("Create a rule from this connection")
                             .clicked()
                         {
@@ -1516,7 +1519,7 @@ impl HallpassApp {
         ui.add_space(6.0);
         let rows = agg.top(TRAFFIC_ROWS, self.traffic_sort.0, self.traffic_sort.1);
         let (header_h, row_h) = table_heights(ui);
-        data_table(ui, "traffic_table")
+        data_table(ui, "traffic_table", header_h)
             .column(Column::remainder().clip(true).at_least(160.0)) // key
             .column(Column::initial(116.0).at_least(70.0)) // Mix
             .column(Column::initial(70.0).at_least(56.0)) // Total
@@ -1616,12 +1619,13 @@ impl HallpassApp {
     fn rules_tab(&mut self, ui: &mut egui::Ui) {
         let mut bulk: Option<(String, bool)> = None;
         ui.horizontal(|ui| {
-            if ui.button("+ Add rule").clicked() {
+            if ui.add(theme::primary_button("+ Add rule")).clicked() {
                 self.editor = Some(RuleEditor::add());
             }
-            if ui.button("Refresh").clicked() {
+            if theme::ghost_button(ui, "Refresh", theme::ACCENT, false).clicked() {
                 self.send(ClientMsg::RuleList);
             }
+            ui.add_space(4.0);
             let enabled = self.rules.iter().filter(|r| r.enabled).count();
             ui.label(theme::num(format!("{enabled}")));
             ui.label(
@@ -1666,6 +1670,8 @@ impl HallpassApp {
             None => Vec::new(),
         };
         let (header_h, row_h) = table_heights(ui);
+        let table_area = ui.available_rect_before_wrap();
+        let pointer = ui.ctx().pointer_hover_pos();
         let shown: Vec<&Rule> = match &self.rule_tag_filter {
             Some(tag) => self.rules.iter().filter(|r| r.has_tag(tag)).collect(),
             None => self.rules.iter().collect(),
@@ -1679,8 +1685,8 @@ impl HallpassApp {
         // Only once some rule carries one, as in the CLI listing: a column
         // of dashes costs width on a table that already has seven.
         let tagged = self.rules.iter().any(|r| !r.tags.is_empty());
-        let mut table = data_table(ui, "rules_table")
-            .column(Column::initial(46.0).at_least(40.0)) // On
+        let mut table = data_table(ui, "rules_table", header_h)
+            .column(Column::initial(50.0).at_least(44.0)) // On
             .column(Column::initial(200.0).clip(true).at_least(110.0)) // Name
             .column(Column::initial(80.0).at_least(70.0)); // Action
         if tagged {
@@ -1695,8 +1701,8 @@ impl HallpassApp {
         table
             .column(Column::remainder().clip(true).at_least(120.0)) // Match
             .column(Column::initial(76.0).at_least(64.0)) // Priority
-            .column(Column::initial(62.0).at_least(56.0)) // Edit
-            .column(Column::initial(76.0).at_least(64.0)) // Delete
+            .column(Column::initial(52.0).at_least(48.0)) // Edit
+            .column(Column::initial(66.0).at_least(60.0)) // Delete
             .header(header_h, |mut header| {
                 for title in titles {
                     header.col(|ui| {
@@ -1710,7 +1716,12 @@ impl HallpassApp {
                     let stopped = suppressed.iter().any(|n| n == &rule.name);
                     row.col(|ui| {
                         let mut enabled = rule.enabled;
-                        let changed = ui.checkbox(&mut enabled, "").changed();
+                        let changed = theme::switch_bare(
+                            ui,
+                            &mut enabled,
+                            &format!("Enable {}", prompt::ui_text(&rule.name)),
+                        )
+                        .changed();
                         // A rule the posture stops decides nothing, and the
                         // checkbox alone says the opposite: this is the view
                         // an operator opens to see what is in force, so the
@@ -1762,20 +1773,22 @@ impl HallpassApp {
                         ui.label(theme::num_muted(rule.priority.to_string()));
                     });
                     row.col(|ui| {
-                        if ui.button("Edit").clicked() {
+                        let on_row = pointer.is_some_and(|p| {
+                            table_area.contains(p) && ui.max_rect().y_range().contains(p.y)
+                        });
+                        if theme::ghost_button(ui, "Edit", theme::ACCENT, on_row).clicked() {
                             edit = Some(RuleEditor::edit(rule));
                         }
                     });
                     row.col(|ui| {
                         // The only destructive control in the window, and
-                        // the one row-level mistake nothing else undoes.
-                        if ui
-                            .add(
-                                egui::Button::new(egui::RichText::new("Delete").color(DENY_COLOR))
-                                    .fill(theme::tint(DENY_COLOR)),
-                            )
-                            .clicked()
-                        {
+                        // the one row-level mistake nothing else undoes: red
+                        // only once the pointer is on its row, so a column of
+                        // it does not shout over the rules themselves.
+                        let on_row = pointer.is_some_and(|p| {
+                            table_area.contains(p) && ui.max_rect().y_range().contains(p.y)
+                        });
+                        if theme::ghost_button(ui, "Delete", DENY_COLOR, on_row).clicked() {
                             delete = Some(rule.name.clone());
                         }
                     });
@@ -2229,7 +2242,7 @@ impl HallpassApp {
             ui.add_space(8.0);
         }
         ui.horizontal(|ui| {
-            if ui.button("Apply").clicked() {
+            if ui.add(theme::primary_button("Apply")).clicked() {
                 match self.settings_timeout.trim().parse::<u64>() {
                     Ok(prompt_timeout_secs) => {
                         self.settings_error = None;
@@ -2247,7 +2260,7 @@ impl HallpassApp {
                     }
                 }
             }
-            if ui.button("Revert").clicked() {
+            if theme::ghost_button(ui, "Revert", theme::ACCENT, true).clicked() {
                 self.settings_timeout = current.prompt_timeout_secs.to_string();
                 self.settings_verdict = current.default_verdict;
                 self.settings_error = None;
@@ -2347,7 +2360,20 @@ fn table_heights(ui: &egui::Ui) -> (f32, f32) {
 /// Sensed for hover, which egui_extras turns into a highlight across the
 /// whole row: these rows are dense and several columns wide, and the
 /// pointer is the only thing saying which one a click is about to act on.
-fn data_table<'a>(ui: &'a mut egui::Ui, salt: &'static str) -> TableBuilder<'a> {
+///
+/// Also draws the rule under the header row, and quiets the column
+/// dividers: they run the full height of the table, and at the stroke the
+/// rest of the window uses they turned a short table into a grid of empty
+/// lanes. They still light up under the pointer, where a drag resizes.
+/// The quieter stroke stays inside this panel's `Ui`, and the table is the
+/// last thing each tab draws.
+fn data_table<'a>(ui: &'a mut egui::Ui, salt: &'static str, header_h: f32) -> TableBuilder<'a> {
+    let area = ui.available_rect_before_wrap();
+    let y = area.top() + header_h + ui.spacing().item_spacing.y / 2.0;
+    ui.painter()
+        .hline(area.x_range(), y, egui::Stroke::new(1.0, theme::HAIRLINE));
+    ui.visuals_mut().widgets.noninteractive.bg_stroke =
+        egui::Stroke::new(1.0, theme::HAIRLINE.gamma_multiply(0.35));
     TableBuilder::new(ui)
         .id_salt(salt)
         .striped(true)

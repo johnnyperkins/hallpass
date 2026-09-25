@@ -412,13 +412,7 @@ impl RuleEditor {
             if ui
                 .add_enabled(
                     !self.awaiting,
-                    egui::Button::new(
-                        egui::RichText::new("Save")
-                            .color(egui::Color32::WHITE)
-                            .strong(),
-                    )
-                    .fill(crate::theme::ACCENT.gamma_multiply(0.85))
-                    .min_size(egui::vec2(90.0, 28.0)),
+                    crate::theme::primary_button("Save").min_size(egui::vec2(90.0, 28.0)),
                 )
                 .clicked()
             {
@@ -495,7 +489,7 @@ impl RuleEditor {
                 ui.end_row();
 
                 field_label(ui, "Enabled");
-                ui.checkbox(&mut self.enabled, "");
+                crate::theme::switch_bare(ui, &mut self.enabled, "Enabled");
                 ui.end_row();
 
                 // Above the separator, with the rest of the rule's own

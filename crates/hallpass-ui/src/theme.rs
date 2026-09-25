@@ -14,7 +14,7 @@
 //! table of small text; re-deriving that against an arbitrary system
 //! background is not something this window can promise.
 
-use eframe::egui::{self, Color32, CornerRadius, Margin, Response, Stroke, Ui, Vec2};
+use eframe::egui::{self, Color32, CornerRadius, Margin, Response, RichText, Stroke, Ui, Vec2};
 
 // ---- palette -------------------------------------------------------------
 
@@ -502,15 +502,30 @@ pub fn stat_tile(ui: &mut Ui, width: f32, label: &str, value: &str, color: Color
 /// Announced to accessibility as the checkbox it replaces, so the label is
 /// still what reaches a screen reader (and the widget tests).
 pub fn switch(ui: &mut Ui, on: &mut bool, label: &str) -> Response {
+    switch_impl(ui, on, label, true)
+}
+
+/// The same switch with no words beside it, for a table column whose
+/// heading already says what it switches. `label` still names it to a
+/// screen reader.
+pub fn switch_bare(ui: &mut Ui, on: &mut bool, label: &str) -> Response {
+    switch_impl(ui, on, label, false)
+}
+
+fn switch_impl(ui: &mut Ui, on: &mut bool, label: &str, visible_label: bool) -> Response {
     let font = egui::TextStyle::Body.resolve(ui.style());
     let galley = ui
         .painter()
         .layout_no_wrap(label.to_owned(), font, Color32::PLACEHOLDER);
     let track = Vec2::new(32.0, 17.0);
-    let size = Vec2::new(
-        track.x + 7.0 + galley.size().x,
-        track.y.max(galley.size().y),
-    );
+    let size = if visible_label {
+        Vec2::new(
+            track.x + 7.0 + galley.size().x,
+            track.y.max(galley.size().y),
+        )
+    } else {
+        track
+    };
     let (rect, mut response) = ui.allocate_exact_size(size, egui::Sense::click());
     if response.clicked() {
         *on = !*on;
@@ -547,11 +562,23 @@ pub fn switch(ui: &mut Ui, on: &mut bool, label: &str) -> Response {
             (track_rect.left() + track.y / 2.0)..=(track_rect.right() - track.y / 2.0),
             how_on,
         );
+        let knob = egui::pos2(knob_x, track_rect.center().y);
         ui.painter().circle_filled(
-            egui::pos2(knob_x, track_rect.center().y),
+            knob + Vec2::new(0.0, 1.0),
+            track.y / 2.0 - 2.0,
+            Color32::from_black_alpha(70),
+        );
+        ui.painter().circle_filled(
+            knob,
             track.y / 2.0 - 2.5,
             if enabled { Color32::WHITE } else { MUTED },
         );
+        if response.has_focus() {
+            focus_ring(ui, track_rect, (track.y / 2.0) as u8);
+        }
+        if !visible_label {
+            return response;
+        }
         let text_color = if enabled { TEXT } else { MUTED };
         let galley = ui.painter().layout_no_wrap(
             label.to_owned(),
@@ -789,6 +816,123 @@ fn focus_ring(ui: &Ui, rect: egui::Rect, radius: u8) {
         Stroke::new(1.5, ACCENT),
         egui::StrokeKind::Outside,
     );
+}
+
+/// A button that is text until the pointer reaches it: for actions
+/// repeated down every row of a table, where a column of framed buttons
+/// is louder than the data beside it.
+///
+/// `hot` lights the text at rest, for a row the pointer is already on.
+pub fn ghost_button(ui: &mut Ui, text: &str, color: Color32, hot: bool) -> Response {
+    let font = egui::TextStyle::Button.resolve(ui.style());
+    let galley = ui
+        .painter()
+        .layout_no_wrap(text.to_owned(), font, Color32::PLACEHOLDER);
+    let pad = Vec2::new(8.0, 3.0);
+    let (rect, response) = ui.allocate_exact_size(galley.size() + pad * 2.0, egui::Sense::click());
+    let label = text.to_owned();
+    response
+        .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label.clone()));
+    if ui.is_rect_visible(rect) {
+        let how_hot = ui
+            .ctx()
+            .animate_bool_responsive(response.id, response.hovered());
+        if how_hot > 0.0 {
+            ui.painter().rect(
+                rect,
+                CornerRadius::same(CONTROL_RADIUS - 1),
+                Color32::TRANSPARENT.lerp_to_gamma(tint(color), how_hot),
+                Stroke::new(1.0, color.gamma_multiply(0.45 * how_hot)),
+                egui::StrokeKind::Inside,
+            );
+        }
+        let rest = if hot {
+            color.gamma_multiply(0.85)
+        } else {
+            MUTED.gamma_multiply(0.8)
+        };
+        let text = rest.lerp_to_gamma(color, how_hot);
+        ui.painter().galley(rect.min + pad, galley, text);
+        if response.has_focus() {
+            focus_ring(ui, rect, CONTROL_RADIUS - 1);
+        }
+    }
+    response
+}
+
+/// The one button on a screen that does what the screen is for.
+pub fn primary_button(text: &str) -> egui::Button<'static> {
+    egui::Button::new(RichText::new(text).color(Color32::WHITE).strong())
+        .fill(ACCENT.gamma_multiply(0.85))
+        .stroke(Stroke::new(1.0, ACCENT))
+        .corner_radius(CornerRadius::same(CONTROL_RADIUS))
+        .min_size(Vec2::new(84.0, 28.0))
+}
+
+/// The search field: a magnifier inside it, and a clear control once
+/// there is something to clear.
+///
+/// Both painted into the field's own margins rather than placed beside it,
+/// so the whole thing is one target and lines up with the pickers next to
+/// it at their height.
+pub fn search_field(
+    ui: &mut Ui,
+    text: &mut String,
+    id: egui::Id,
+    hint: &str,
+    width: f32,
+) -> Response {
+    let response = ui.add(
+        egui::TextEdit::singleline(text)
+            .id(id)
+            .hint_text(hint)
+            .desired_width(width)
+            .min_size(Vec2::new(0.0, 26.0))
+            .vertical_align(egui::Align::Center)
+            .margin(Margin {
+                left: 28,
+                right: 24,
+                top: 3,
+                bottom: 3,
+            }),
+    );
+    let rect = response.rect;
+    let focused = response.has_focus();
+    let glass = if focused { ACCENT } else { MUTED };
+    let c = egui::pos2(rect.left() + 14.0, rect.center().y - 1.0);
+    let painter = ui.painter();
+    painter.circle_stroke(c, 4.5, Stroke::new(1.5, glass));
+    painter.line_segment(
+        [c + Vec2::splat(3.3), c + Vec2::splat(7.0)],
+        Stroke::new(1.8, glass),
+    );
+    if !text.is_empty() {
+        let hit = egui::Rect::from_center_size(
+            egui::pos2(rect.right() - 13.0, rect.center().y),
+            Vec2::splat(18.0),
+        );
+        let clear = ui.interact(hit, id.with("clear"), egui::Sense::click());
+        clear.widget_info(|| {
+            egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Clear filter")
+        });
+        let color = if clear.hovered() { TEXT } else { MUTED };
+        if clear.hovered() {
+            ui.painter()
+                .circle_filled(hit.center(), 8.0, SURFACE_CONTROL);
+        }
+        let (c, r) = (hit.center(), 3.5);
+        for (a, b) in [
+            (Vec2::new(-r, -r), Vec2::new(r, r)),
+            (Vec2::new(-r, r), Vec2::new(r, -r)),
+        ] {
+            ui.painter()
+                .line_segment([c + a, c + b], Stroke::new(1.5, color));
+        }
+        if clear.clicked() {
+            text.clear();
+        }
+    }
+    response
 }
 
 /// A sortable column heading: the title, plus an arrow when this is the
