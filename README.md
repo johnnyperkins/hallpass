@@ -932,4 +932,5 @@ startup ordering invariants and the debugging landmines.
 
 ## License
 
-GPL-3.0-only.
+GPL-3.0-only. The desktop UI bundles the Inter typeface, under the SIL Open
+Font License 1.1; see [crates/hallpass-ui/assets/fonts](crates/hallpass-ui/assets/fonts).

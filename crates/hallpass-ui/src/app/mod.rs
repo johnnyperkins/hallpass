@@ -364,6 +364,9 @@ impl HallpassApp {
         socket: PathBuf,
         raise: Option<crate::instance::Holder>,
     ) -> Self {
+        // Before the first frame, so it is not laid out once in egui's
+        // default font and then again in this window's.
+        theme::ensure_installed(&cc.egui_ctx);
         let (to_daemon, from_ui) = tokio::sync::mpsc::unbounded_channel();
         let (to_ui, from_net) = std::sync::mpsc::channel();
         // Nobody listens: this client never subscribes to prompts, so the
@@ -1492,6 +1495,7 @@ impl HallpassApp {
                     egui::RichText::new("ACTIVITY")
                         .small()
                         .strong()
+                        .variation("wght", theme::SEMIBOLD)
                         .color(MUTED),
                 );
                 ui.label(
@@ -2418,6 +2422,7 @@ fn column_title(title: &str) -> RichText {
     RichText::new(title.to_uppercase())
         .small()
         .strong()
+        .variation("wght", theme::SEMIBOLD)
         .color(MUTED)
 }
 

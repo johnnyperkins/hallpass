@@ -513,6 +513,7 @@ impl RuleEditor {
             egui::RichText::new("MATCH CRITERIA")
                 .small()
                 .strong()
+                .variation("wght", crate::theme::SEMIBOLD)
                 .color(crate::theme::MUTED),
         );
         ui.label(

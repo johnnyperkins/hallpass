@@ -142,8 +142,36 @@ pub fn ensure_installed(ctx: &egui::Context) {
     install(ctx);
 }
 
+/// The weight bold text is set in, on the variable interface face. egui's
+/// `strong` only brightens the colour; this is what makes a title a title.
+pub const SEMIBOLD: f32 = 600.0;
+
+/// Put Inter in front of egui's own proportional fonts.
+///
+/// egui's default face is a light weight that reads thin at the sizes a
+/// dense table uses, and has one weight only. Inter is drawn for small
+/// text on screens and is variable, so titles can be set heavier without
+/// a second file. The defaults stay behind it, for the glyphs the bundled
+/// subset leaves out (anything past Latin, and the symbols the banners
+/// use).
+fn install_fonts(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert(
+        "inter".to_owned(),
+        std::sync::Arc::new(egui::FontData::from_static(include_bytes!(
+            "../assets/fonts/InterUI.ttf"
+        ))),
+    );
+    if let Some(family) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
+        family.insert(0, "inter".to_owned());
+    }
+    ctx.set_fonts(fonts);
+}
+
 fn install(ctx: &egui::Context) {
     use egui::{FontFamily::Monospace, FontFamily::Proportional, FontId, TextStyle};
+
+    install_fonts(ctx);
 
     let mut style = (*ctx.style_of(egui::Theme::Dark)).clone();
 
@@ -273,6 +301,7 @@ pub fn card<R>(ui: &mut Ui, title: &str, add: impl FnOnce(&mut Ui) -> R) -> R {
                             .small()
                             .color(MUTED)
                             .strong()
+                            .variation("wght", SEMIBOLD)
                             .line_height(Some(16.0)),
                     );
                     ui.add_space(2.0);
@@ -356,8 +385,18 @@ pub fn banner(ui: &mut Ui, tone: Tone, glyph: &str, title: &str, body: &str) {
             ui.set_width(ui.available_width());
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing.x = 6.0;
-                ui.label(egui::RichText::new(glyph).color(color).strong());
-                ui.label(egui::RichText::new(title).color(color).strong());
+                ui.label(
+                    egui::RichText::new(glyph)
+                        .color(color)
+                        .strong()
+                        .variation("wght", SEMIBOLD),
+                );
+                ui.label(
+                    egui::RichText::new(title)
+                        .color(color)
+                        .strong()
+                        .variation("wght", SEMIBOLD),
+                );
                 if !body.is_empty() {
                     ui.label(egui::RichText::new(body).color(TEXT));
                 }
@@ -551,7 +590,13 @@ pub fn stat_tile(ui: &mut Ui, width: f32, label: &str, value: &str, color: Color
             ui.set_width(width);
             ui.vertical(|ui| {
                 ui.spacing_mut().item_spacing.y = 2.0;
-                ui.label(RichText::new(label).small().color(MUTED).strong());
+                ui.label(
+                    RichText::new(label)
+                        .small()
+                        .color(MUTED)
+                        .strong()
+                        .variation("wght", SEMIBOLD),
+                );
                 ui.label(
                     RichText::new(value)
                         .color(color)
@@ -936,11 +981,16 @@ pub fn ghost_button(ui: &mut Ui, text: &str, color: Color32, hot: bool) -> Respo
 
 /// The one button on a screen that does what the screen is for.
 pub fn primary_button(text: &str) -> egui::Button<'static> {
-    egui::Button::new(RichText::new(text).color(Color32::WHITE).strong())
-        .fill(ACCENT.gamma_multiply(0.85))
-        .stroke(Stroke::new(1.0, ACCENT))
-        .corner_radius(CornerRadius::same(CONTROL_RADIUS))
-        .min_size(Vec2::new(84.0, 28.0))
+    egui::Button::new(
+        RichText::new(text)
+            .color(Color32::WHITE)
+            .strong()
+            .variation("wght", SEMIBOLD),
+    )
+    .fill(ACCENT.gamma_multiply(0.85))
+    .stroke(Stroke::new(1.0, ACCENT))
+    .corner_radius(CornerRadius::same(CONTROL_RADIUS))
+    .min_size(Vec2::new(84.0, 28.0))
 }
 
 /// The search field: a magnifier inside it, and a clear control once
@@ -1080,6 +1130,7 @@ pub fn verdict_button(text: &str, color: Color32) -> egui::Button<'static> {
         egui::RichText::new(text)
             .color(Color32::WHITE)
             .strong()
+            .variation("wght", SEMIBOLD)
             .size(14.5),
     )
     .fill(color)
@@ -1294,6 +1345,7 @@ pub fn wordmark(ui: &mut Ui) {
         egui::RichText::new("H A L L P A S S")
             .color(TEXT)
             .strong()
+            .variation("wght", SEMIBOLD)
             .size(13.0),
     );
 }

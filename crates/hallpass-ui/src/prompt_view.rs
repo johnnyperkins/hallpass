@@ -94,6 +94,7 @@ fn prompt_info_ui(ui: &mut egui::Ui, p: &PromptState, rest: &[String]) {
             ui.label(
                 RichText::new(prompt::exe_name(conn))
                     .strong()
+                    .variation("wght", theme::SEMIBOLD)
                     .size(18.0)
                     .color(TEXT),
             );
@@ -139,6 +140,7 @@ fn prompt_info_ui(ui: &mut egui::Ui, p: &PromptState, rest: &[String]) {
         ui.label(
             RichText::new(format!("Warning: {}", prompt::sentence_text(&what)))
                 .strong()
+                .variation("wght", theme::SEMIBOLD)
                 .color(DENY_COLOR),
         );
     }
