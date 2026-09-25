@@ -31,21 +31,28 @@ fn main() {
     let target_dir = std::env::var_os("CARGO_TARGET_DIR")
         .map_or_else(|| workspace.join("target"), PathBuf::from);
     let prebuilt = manifest.join("prebuilt").join(OBJ_NAME);
+    let xtask_built = target_dir
+        .join("bpfel-unknown-none")
+        .join("release")
+        .join(OBJ_NAME);
 
     let candidates = [
         std::env::var_os(OVERRIDE_VAR).map(PathBuf::from),
         Some(prebuilt.clone()),
-        Some(
-            target_dir
-                .join("bpfel-unknown-none")
-                .join("release")
-                .join(OBJ_NAME),
-        ),
+        Some(xtask_built.clone()),
     ];
 
     for path in candidates.into_iter().flatten() {
         if path.is_file() {
             println!("cargo::rerun-if-changed={}", path.display());
+            // A prebuilt object outranks the xtask one, so one dropped in
+            // later must be noticed. Watching its path directly would not
+            // do: cargo treats a missing path as always stale and would rerun
+            // this script on every build. The crate directory holds it, and
+            // is what cargo watches anyway when a script names nothing.
+            if path == xtask_built {
+                println!("cargo::rerun-if-changed={}", manifest.display());
+            }
             println!("cargo::rustc-env={OVERRIDE_VAR}={}", path.display());
             return;
         }
