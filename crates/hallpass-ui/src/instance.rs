@@ -27,7 +27,7 @@ use std::io::{self, Read as _, Write as _};
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -61,17 +61,36 @@ pub enum Instance {
     Unanswered,
 }
 
+/// Where one raise request stands. The frame's answer and the socket
+/// thread's handover each claim it from [`WAITING`], so exactly one of them
+/// speaks to the launch: a launch told the window raised itself must never
+/// also have been handed the lock, or the window gives up its lock to a
+/// launch that exits.
+const WAITING: u8 = 0;
+/// The frame answered: the window asked for attention.
+const ANSWERED: u8 = 1;
+/// The launch has gone, or asked for the lock and got it.
+const OVER: u8 = 2;
+
 /// One raise request, answered once the window has acted on it.
 pub struct RaiseRequest {
     conn: UnixStream,
-    /// Set by the socket thread once the launch has gone or taken the lock.
-    over: Arc<AtomicBool>,
+    /// [`WAITING`], [`ANSWERED`] or [`OVER`], shared with the thread
+    /// watching the launch.
+    state: Arc<AtomicU8>,
 }
 
 impl RaiseRequest {
-    /// Tell the launch that asked that the window asked for attention.
+    /// Tell the launch that asked that the window asked for attention,
+    /// unless it has been handed the lock in the meantime.
     pub fn done(mut self) {
-        let _ = self.conn.write_all(&[RAISED]);
+        if self
+            .state
+            .compare_exchange(WAITING, ANSWERED, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            let _ = self.conn.write_all(&[RAISED]);
+        }
     }
 }
 
@@ -93,7 +112,7 @@ impl Raises {
         self.started.store(true, Ordering::Relaxed);
         self.rx
             .try_iter()
-            .filter(|r| !r.over.load(Ordering::Relaxed))
+            .filter(|r| r.state.load(Ordering::Acquire) == WAITING)
             .collect()
     }
 }
@@ -134,12 +153,35 @@ pub fn try_lock(path: &Path) -> io::Result<Option<File>> {
 /// display name. Read after `backend::settle`, which leaves
 /// `WAYLAND_DISPLAY` in place on Wayland.
 fn session_key() -> String {
-    ["WAYLAND_DISPLAY", "DISPLAY"]
-        .iter()
-        .filter_map(std::env::var_os)
-        .find(|v| !v.is_empty())
-        .map(|v| v.to_string_lossy().into_owned())
+    let set = |name| std::env::var_os(name).filter(|v| !v.is_empty());
+    if let Some(wayland) = set("WAYLAND_DISPLAY") {
+        return wayland_key(Path::new(&wayland), runtime_dir().ok().as_deref());
+    }
+    set("DISPLAY")
+        .map(|v| x11_key(&v.to_string_lossy()))
         .unwrap_or_default()
+}
+
+/// A Wayland socket as named relative to the runtime directory, where a
+/// relative name resolves: `wayland-0` and `/run/user/1000/wayland-0` are
+/// one session.
+fn wayland_key(display: &Path, runtime: Option<&Path>) -> String {
+    runtime
+        .and_then(|r| display.strip_prefix(r).ok())
+        .unwrap_or(display)
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// An X display without its screen number: `:0` and `:0.0` are one server.
+fn x11_key(display: &str) -> String {
+    let Some(colon) = display.rfind(':') else {
+        return display.to_owned();
+    };
+    match display[colon..].find('.') {
+        Some(dot) => display[..colon + dot].to_owned(),
+        None => display.to_owned(),
+    }
 }
 
 /// Claim the window for `daemon_socket` in this session.
@@ -162,8 +204,12 @@ fn claim_in(
     let daemon_socket =
         std::path::absolute(daemon_socket).unwrap_or_else(|_| daemon_socket.to_path_buf());
     let (lock_path, sock_path) = paths(dir, session, &daemon_socket);
-    // Twice at most: a window that hands over the lock is claimed again.
-    for _ in 0..2 {
+    // A window that hands over the lock is claimed again, and the lock is
+    // tried after every handover: one given up and never taken would leave
+    // the next launch to open yet another window. Twice at most, in case
+    // another launch took it first and went silent too.
+    let mut handovers = 0;
+    loop {
         if let Some(lock) = try_lock(&lock_path)? {
             // Whatever is at the path was left by a window that has exited
             // or handed over: the lock says no other is listening.
@@ -175,13 +221,15 @@ fn claim_in(
                 sock_path,
             }));
         }
+        if handovers == 2 {
+            return Ok(Instance::Unanswered);
+        }
         match ask(&sock_path, ack_timeout)? {
             Asked::Raised => return Ok(Instance::Raised),
-            Asked::HandedOver => continue,
+            Asked::HandedOver => handovers += 1,
             Asked::Unanswered => return Ok(Instance::Unanswered),
         }
     }
-    Ok(Instance::Unanswered)
 }
 
 enum Asked {
@@ -218,8 +266,9 @@ fn ask(sock_path: &Path, ack_timeout: Duration) -> io::Result<Asked> {
     conn.set_read_timeout(Some(HANDOVER_TIMEOUT))?;
     Ok(match read_byte(&mut conn) {
         Some(HANDED_OVER) => Asked::HandedOver,
-        // Its frame came round after all.
-        Some(RAISED) => Asked::Raised,
+        // Its frame came round after all, or it had not started answering
+        // when the first wait ran out and is still starting now.
+        Some(RAISED | STARTING) => Asked::Raised,
         _ => Asked::Unanswered,
     })
 }
@@ -259,9 +308,10 @@ struct Held {
 }
 
 impl Held {
-    /// Give up the lock so the launch that asked can take it. The path goes
-    /// first: once the lock is free the new window binds there, and removing
-    /// it after would take the new window's socket away.
+    /// Give up the lock so the launch that asked can take it, and say
+    /// whether this call gave it up (false: an earlier handover did). The
+    /// path goes first: once the lock is free the new window binds there,
+    /// and removing it after would take the new window's socket away.
     fn hand_over(&self) -> bool {
         let mut lock = self.lock.lock().unwrap();
         if lock.is_none() {
@@ -298,9 +348,9 @@ impl Holder {
                             let Ok(watch) = conn.try_clone() else {
                                 continue;
                             };
-                            let over = Arc::new(AtomicBool::new(false));
-                            watch_launch(watch, Arc::clone(&over), Arc::clone(&held));
-                            if tx.send(RaiseRequest { conn, over }).is_err() {
+                            let state = Arc::new(AtomicU8::new(WAITING));
+                            watch_launch(watch, Arc::clone(&state), Arc::clone(&held));
+                            if tx.send(RaiseRequest { conn, state }).is_err() {
                                 break;
                             }
                             wake();
@@ -323,16 +373,27 @@ impl Holder {
 
 /// Wait on one launch for as long as it can still say something: it hangs
 /// up once answered, or asks for the lock when no answer came in time.
-fn watch_launch(mut conn: UnixStream, over: Arc<AtomicBool>, held: Arc<Held>) {
+///
+/// The request is marked over before the launch is told anything, so a
+/// frame that takes it afterwards finds it over rather than raising the
+/// window for a launch that took the lock. A launch whose frame answer won
+/// the race gets that answer and no lock. One that asks after an earlier
+/// launch took the lock (two launches on a silent window) is told to claim
+/// again as well, and finds the new window rather than waiting out
+/// [`HANDOVER_TIMEOUT`] to open one of its own.
+fn watch_launch(mut conn: UnixStream, state: Arc<AtomicU8>, held: Arc<Held>) {
     let spawned = std::thread::Builder::new()
         .name("window-raise-launch".into())
         .spawn(move || {
             let _ = conn.set_read_timeout(Some(ACK_TIMEOUT + HANDOVER_TIMEOUT * 2));
-            if read_byte(&mut conn) == Some(HAND_OVER) && held.hand_over() {
-                tracing::info!("this window could not answer a launch; handed it the lock");
+            let said = read_byte(&mut conn);
+            let was = state.swap(OVER, Ordering::AcqRel);
+            if said == Some(HAND_OVER) && was == WAITING {
+                if held.hand_over() {
+                    tracing::info!("this window could not answer a launch; handed it the lock");
+                }
                 let _ = conn.write_all(&[HANDED_OVER]);
             }
-            over.store(true, Ordering::Relaxed);
         });
     if let Err(e) = spawned {
         tracing::debug!("watching a raise request: {e}");
@@ -377,10 +438,12 @@ mod tests {
     fn a_second_launch_raises_the_first() {
         let dir = scratch();
         let raises = first(&dir, SESSION, DAEMON);
-        // The window's frame, answering whatever arrives.
+        // The window's frame, answering the one launch and stopping there.
         std::thread::spawn(move || loop {
-            for req in raises.take() {
-                req.done();
+            let reqs = raises.take();
+            if !reqs.is_empty() {
+                reqs.into_iter().for_each(RaiseRequest::done);
+                break;
             }
             std::thread::sleep(Duration::from_millis(10));
         });
@@ -428,6 +491,80 @@ mod tests {
             Instance::Raised
         ));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Two launches that find the same window silent (a double-click on a
+    /// hidden window) end with one new window between them, not two.
+    #[test]
+    fn two_launches_on_a_silent_window_open_one() {
+        let dir = scratch();
+        let _silent = first(&dir, SESSION, DAEMON);
+        let launches: Vec<_> = (0..2)
+            .map(|_| {
+                let dir = dir.clone();
+                std::thread::spawn(move || match claim(&dir, SESSION, DAEMON, QUICK) {
+                    // Serving at once, as a window does, so the other
+                    // launch hears it is starting.
+                    Instance::First(holder) => Some(holder.serve(Arc::new(|| {}))),
+                    Instance::Raised => None,
+                    Instance::Unanswered => panic!("a launch opened a window without the lock"),
+                })
+            })
+            .collect();
+        let windows: Vec<_> = launches
+            .into_iter()
+            .filter_map(|l| l.join().unwrap())
+            .collect();
+        assert_eq!(windows.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A window that starts answering only once the launch has asked for
+    /// the lock is still starting, not silent.
+    #[test]
+    fn a_late_starting_answer_still_counts() {
+        let dir = scratch();
+        let Instance::First(holder) = claim(&dir, SESSION, DAEMON, QUICK) else {
+            panic!("the first launch must hold the window");
+        };
+        let late = std::thread::spawn(move || {
+            std::thread::sleep(QUICK + QUICK / 2);
+            holder.serve(Arc::new(|| {}))
+        });
+        assert!(matches!(
+            claim(&dir, SESSION, DAEMON, QUICK),
+            Instance::Raised
+        ));
+        drop(late.join());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A window that neither answers nor hands over (not serving at all)
+    /// leaves the launch to open a window of its own rather than nothing.
+    #[test]
+    fn a_window_that_cannot_hand_over_opens_a_second() {
+        let dir = scratch();
+        let Instance::First(_holder) = claim(&dir, SESSION, DAEMON, QUICK) else {
+            panic!("the first launch must hold the window");
+        };
+        assert!(matches!(
+            claim(&dir, SESSION, DAEMON, QUICK),
+            Instance::Unanswered
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Two spellings of one display are one session.
+    #[test]
+    fn a_display_is_keyed_by_what_it_names() {
+        let runtime = Path::new("/run/user/1000");
+        assert_eq!(
+            wayland_key(Path::new("/run/user/1000/wayland-0"), Some(runtime)),
+            wayland_key(Path::new("wayland-0"), Some(runtime)),
+        );
+        assert_eq!(x11_key(":0.0"), x11_key(":0"));
+        assert_eq!(x11_key("localhost:10.0"), "localhost:10");
+        assert_ne!(x11_key(":1"), x11_key(":0"));
     }
 
     /// Another session of the same user gets its own window.

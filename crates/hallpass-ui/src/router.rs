@@ -36,9 +36,10 @@ use crate::prompt::close_reply;
 /// context; past this, prompts for further applications wait for a window
 /// to close (their notifications still fire). One that times out still
 /// waiting, or is still waiting when the agent quits, takes the daemon's
-/// default verdict, like any prompt nobody answered: the one exception to
-/// the rules above, and deliberate, since denying it unseen would answer for
-/// a program the operator never saw.
+/// default verdict, like any prompt nobody answered: an exception to the
+/// rules above, and deliberate, since denying it unseen would answer for a
+/// program the operator never saw. The same holds on quit for one sent to a
+/// window that has not drawn it yet (see [`Router::quit`]).
 ///
 /// A window counts until [`Router::window_exited`] says it ended, retired
 /// or not, so the agent must see a window it told to close actually go

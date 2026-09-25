@@ -353,7 +353,6 @@ mod tests {
         );
     }
 
-    /// The keyboard route means what the close button means.
     /// The agent hears once what reached the screen: the front prompt and
     /// the ones the list under it names.
     #[test]
@@ -392,6 +391,7 @@ mod tests {
         );
     }
 
+    /// The keyboard route means what the close button means.
     #[test]
     fn escape_dismisses_like_closing() {
         let (mut harness, said) = window(vec![show(1)]);

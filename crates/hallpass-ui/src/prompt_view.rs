@@ -236,9 +236,9 @@ fn prompt_info_ui(ui: &mut egui::Ui, p: &PromptState, rest: &[String]) {
             for dest in rest.iter().take(REST_SHOWN) {
                 ui.label(RichText::new(dest).small().monospace().color(MUTED));
             }
-            if rest.len() > 5 {
+            if rest.len() > REST_SHOWN {
                 ui.label(
-                    RichText::new(format!("...and {} more", rest.len() - 5))
+                    RichText::new(format!("...and {} more", rest.len() - REST_SHOWN))
                         .small()
                         .color(MUTED),
                 );
