@@ -1,122 +1,81 @@
-# Hallpass daemon configuration.
+# Hallpass daemon configuration. See docs/guide.md.
 
-# "enforce" (default) applies every verdict. "observe" evaluates policy,
-# records what it decided, and lets every packet through anyway: nothing is
-# blocked while it is on.
-#
-# Observe mode answers "what would this policy break" without the outage,
-# and it is the fastest way to find out what a host talks to at all. Watch
-# it with `hallpass-cli top` or `hallpass-cli events`; a recorded block
-# shows up as WOULD-DENY, and `hallpass-cli status` reports the mode.
-# Unmatched connections are recorded as default_verdict and never prompt,
-# since answering a prompt that changes nothing would be misleading.
-#
-# This only decides the mode the daemon starts in: the GUI's Enforce
-# switch flips it at runtime, until the next restart returns to this file.
+# "enforce" applies verdicts. "observe" evaluates and records every verdict
+# but lets every packet through: nothing is blocked. Unmatched connections
+# record default_verdict and never prompt. This is only the starting mode;
+# `hallpass-cli config set` and the GUI's Enforce switch change it until the
+# next restart.
 mode = "enforce"
 
-# Verdict applied when no rule matches and no client answers the prompt
-# in time: "allow", "deny", or "reject".
+# Verdict when no rule matches and nobody answers the prompt in time:
+# "allow", "deny" or "reject".
 #
-# Deny covers more than an ignored prompt. It is also what happens with no
-# GUI and no `hallpass-cli watch` attached, between boot and login, and when
-# the held-packet budgets are spent, so anything that needs the network
-# before a human can answer needs a rule. The 20-system-*.toml files in
-# rules.d are that baseline; add to them rather than relaxing this.
-#
-# This is policy. A daemon that is dead rather than undecided is governed by
-# queue_bypass below, which still fails open.
+# This also covers a host with no GUI or `hallpass-cli watch` attached, the
+# time between boot and login, and a full prompt table, so anything that
+# needs the network before a human can answer needs a rule. The
+# 20-system-*.toml files in rules.d are that baseline; add to them rather
+# than relaxing this. A dead daemon is governed by queue_bypass instead.
 default_verdict = "deny"
 
-# Seconds to wait for an interactive prompt reply before applying the
-# default verdict. Long enough to read the connection and set the duration
-# and scope before answering; the packet is held for the whole wait, so
-# every prompt nobody answers costs this long.
+# Seconds a prompt waits before default_verdict applies. The packet is held
+# for the whole wait.
 prompt_timeout_secs = 30
 
-# NFQUEUE queue number the daemon binds to.
+# NFQUEUE number to bind. The DNS snoop queue uses the next one.
 queue_num = 0
 
-# Unix socket for CLI/UI clients.
+# Unix socket for CLI and GUI clients.
 socket_path = "/run/hallpass/hallpass.sock"
 
-# Maximum number of connections held waiting for a prompt reply. Beyond this
-# the default verdict is applied without raising a prompt, so under
-# default_verdict = "deny" an overflow is a silent block rather than the
-# silent pass it used to be. Keep it generous enough that a burst - a browser
-# starting with many tabs, a package update fanning out to mirrors - is not
-# denied without anyone being asked. The real ceiling on held packets is the
-# daemon's own budget, not this number.
+# Most connections held waiting for an answer. Beyond this, new ones get
+# default_verdict without a prompt. Keep it generous enough for a burst
+# (a browser restoring tabs, a package update).
 max_pending_prompts = 128
 
-# Verdict for packets whose transport the rule engine does not model
-# (SCTP, ICMP, ...) or that fail to parse: "allow", "deny", or "reject".
-# Rules never see these; they are only counted. "allow" keeps ping and
-# friends working.
+# Verdict for transports rules cannot model (ICMP, SCTP, ...) and packets
+# that fail to parse: "allow", "deny" or "reject". "allow" keeps ping
+# working.
 unhandled_proto_verdict = "allow"
 
-# Whether the verdict queue fails open (`true`: traffic flows when the
-# daemon is dead or the queue is full) or closed (`false`: those packets
-# are dropped). See etc/config.hardened.toml. Starting in observe mode
-# (`mode = "observe"` below) fails open on a full queue whatever this
-# says, since a dropped packet there would contradict the one thing that
-# mode promises; toggling to observe at runtime does not relax it, so a
-# measurement run on a fail-closed host wants the mode set here.
+# true: traffic flows when the daemon is dead or its queue is full.
+# false: those packets are dropped (see config.hardened.toml).
+# Starting in observe mode always fails open on a full queue; switching to
+# observe at runtime does not, so a measurement run on a fail-closed host
+# should set mode above.
 queue_bypass = true
 
-# When the ruleset changes, delete the conntrack entries of established
-# flows the new ruleset denies, so a deny rule applies to running
-# connections rather than only the next one. The flow's next packet is
-# then judged as a new connection by the same rules as any other. Off,
-# a long-lived connection (a VPN, a websocket) opened before a deny rule
-# keeps flowing until it ends on its own. Never active in observe mode.
+# Also cut established flows that a changed ruleset denies, so a new deny
+# rule stops a running VPN or websocket rather than only the next
+# connection. Never active in observe mode.
 kill_established = true
 
-# Tally per-flow byte and packet totals from conntrack teardown
-# notifications, so status can answer "how much did hallpass-governed
-# traffic move" and the journal names what each application sent. Only
-# flows matching a connection the daemon decided are counted, not every
-# host teardown. Off by default: it needs the kernel's nf_conntrack_acct
-# and nf_conntrack_events sysctls set to 1 and joins the conntrack destroy
-# multicast group. Observe-only; it never affects a verdict.
+# Count bytes and packets per flow from conntrack teardown events, for
+# `status` and the journal. Needs the sysctls
+# net.netfilter.nf_conntrack_acct=1 and nf_conntrack_events=1. Never
+# affects a verdict.
 flow_accounting = false
 
-# Flag connections from an application the daemon has never seen, and
-# familiar applications reaching a destination they never have. The flag
-# rides on every event and every prompt: `hallpass-cli events` prints
-# `new=app`, `new=dest` or `new=app,dest`, `watch` and the GUI prompt say
-# which in words, and syslog export carries a `first_seen` field.
-#
-# What this costs is one file: `first_seen_state` below is a record of which
-# applications on this host have connected and which destinations they
-# reached, by name and by address, rewritten whole at most once a minute and
-# root-only (0600). It is not an event log - no timestamps per connection, no
-# ports, no verdicts - but it is a list of what this host contacted, so a
-# host that wants no such record on disk turns this off. Deleting the file is
-# safe: every application reads as new once more. Never affects a verdict.
+# Flag programs, and destinations, the daemon has not seen before (NEW on
+# prompts, new=app/new=dest in events, first_seen in syslog export). The
+# state file lists which programs contacted which destinations, root-only,
+# rewritten at most once a minute. Deleting it is safe. Never affects a
+# verdict.
 first_seen = true
 first_seen_state = "/var/lib/hallpass/seen.toml"
 
-# Optional: export every decided connection to syslog. Omit the whole
-# [syslog] section for no export. Export is a plain event subscriber, so
-# a stalled collector costs events, never verdicts. Facility is auth, so
-# distro configs usually route these to auth.log; severity is warning for
-# deny/reject and info for allow.
+# Optional syslog export of every decided connection. Facility auth;
+# severity warning for deny/reject, info for allow. A slow collector loses
+# events, never verdicts.
 #
 # [syslog]
-# format = "rfc5424"          # rfc5424 (structured data) | json
+# format = "rfc5424"          # rfc5424 | json
 # [syslog.target]
 # kind = "local"              # local syslog datagram socket
 # path = "/dev/log"
 #
-# ...or a remote collector. The address must be a literal IP and port
-# (no hostnames: resolving one would run through the daemon's own DNS
-# path at startup). Export datagrams skip the verdict queue: the daemon
-# marks its own export socket and the ruleset accepts that mark, so no
-# rule is needed for the collector and a default-deny posture does not
-# block the daemon's own logs. That exemption is not a convenience - an
-# unanswered UDP flow never leaves `ct state new`, so without it every
-# exported event produced a datagram that produced another event.
+# ...or a remote collector, as a literal IP and port (hostnames would be
+# resolved through the daemon's own DNS path at startup). The daemon's
+# export traffic bypasses the verdict queue, so it needs no rule.
 # [syslog.target]
 # kind = "udp"
 # addr = "10.0.0.9:514"

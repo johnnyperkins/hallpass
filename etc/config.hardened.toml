@@ -1,57 +1,35 @@
-# Hallpass daemon configuration - hardened, enforce-by-default posture.
+# Hallpass daemon configuration: hardened posture. See docs/security.md.
 #
-# Use this instead of config.toml when you want unmatched and unanswered
-# connections blocked rather than allowed, and enforcement to survive a
-# dead or overloaded daemon (`queue_bypass = false`). The residual gap is
-# an attacker with root, who can delete the nftables table outright.
+# Denies what no rule allows, what nobody answers, and what the rule engine
+# cannot model, and keeps enforcing when the daemon is dead or overloaded.
+# The remaining gap is root, which can delete the nftables table. Keys not
+# set here take the defaults documented in config.toml.
 
-# Stated rather than left to the default, because this file is the one an
-# operator copies to declare a posture: "observe" here would evaluate every
-# rule below and block nothing, and a hardened config that silently does
-# not enforce is the worst outcome this project has.
-#
-# Socket clients (the GUI's Enforce switch) can flip the mode at runtime
-# until the next restart. That is not a wider grant - anything on the
-# socket can already delete every rule - but the socket's group is the
-# thing this posture trusts.
+# Stated explicitly: a hardened config that silently does not enforce is the
+# worst outcome. Socket clients can still switch to observe until the next
+# restart, which grants nothing new; the socket group can already delete
+# every rule.
 mode = "enforce"
 
-# Block when no rule matches and no client answers the prompt in time.
 default_verdict = "deny"
 
-# Seconds to wait for an interactive prompt reply before applying the
-# default verdict. Short, so a stalled prompt handler blocks quickly.
+# Short, so a stalled prompt handler blocks quickly.
 prompt_timeout_secs = 10
 
-# NFQUEUE queue number the daemon binds to.
 queue_num = 0
-
-# Unix socket for CLI/UI clients.
 socket_path = "/run/hallpass/hallpass.sock"
-
-# Maximum number of connections held waiting for a prompt reply. Beyond
-# this the default (deny) verdict is applied, so keep it generous enough
-# that a burst of new connections is not silently denied.
 max_pending_prompts = 128
 
-# Drop packets whose transport the rule engine does not model (SCTP,
-# ICMP, ...) or that fail to parse. Rules never see these; the default
-# ("allow") keeps ping and friends working, "deny" closes the channel.
+# Drop ICMP, SCTP and anything else rules cannot see.
 unhandled_proto_verdict = "deny"
 
-# Flag applications and destinations this host has not seen before, on
-# every event and every prompt. Stated rather than defaulted because this
-# posture denies what nobody answers: "NEW" on a prompt is the difference
-# between an operator approving a familiar program and approving one that
-# has never run here. See config.toml for what the state file records; set
-# to false on a host that wants no such record on disk.
+# Stated because this posture denies what nobody answers: NEW on a prompt
+# is the difference between approving a familiar program and one that has
+# never run here.
 first_seen = true
 
-# Drop the NFQUEUE `bypass` flag from the verdict queue, and with it the
-# queue's fail-open flag: new connections are dropped, not allowed, when
-# the daemon is dead or the queue is full.
-# Availability cost: a crashed daemon takes new outbound connections down
-# with it until it restarts (established flows keep working, and the
-# table is removed on clean shutdown). The DNS snoop queues always keep
-# `bypass`; they are observe-only.
+# Fail closed: new connections are dropped when the daemon is dead or its
+# queue is full. A crashed daemon takes new outbound connections down until
+# it restarts; established flows keep working, and a clean shutdown removes
+# the table. The DNS snoop queues always fail open.
 queue_bypass = false
