@@ -1903,7 +1903,9 @@ impl HallpassApp {
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                let tile_w = ((ui.available_width() - 3.0 * 8.0) / 4.0 - 26.0).max(90.0);
+                // Less each tile's margins and stroke, which the frame adds
+                // outside the width it is given.
+                let tile_w = ((ui.available_width() - 3.0 * 8.0) / 4.0 - 28.0).max(90.0);
                 ui.horizontal(|ui| {
                     theme::stat_tile(
                         ui,
@@ -1956,179 +1958,127 @@ impl HallpassApp {
                     // not running, or has quietly lost the prompt slot,
                     // looks exactly like a quiet machine.
                     theme::card(&mut cols[0], "PROMPTING", |ui| {
-                        egui::Grid::new("stats_prompt")
-                            .num_columns(2)
-                            .striped(false)
-                            .spacing([12.0, 4.0])
-                            .show(ui, |ui| {
-                                ui.label(egui::RichText::new("Prompt handler").color(MUTED));
-                                if s.prompt_handler_connected {
-                                    theme::pill(ui, "connected", ALLOW_COLOR);
-                                } else {
-                                    theme::pill(
-                                        ui,
-                                        "none - connections take the default",
-                                        DENY_COLOR,
-                                    );
-                                }
-                                ui.end_row();
-                                theme::kv(
-                                    ui,
-                                    "Unanswered prompts",
-                                    theme::num(s.prompts_unanswered.to_string()),
-                                );
-                                theme::kv(
-                                    ui,
-                                    "Prompt overflows",
-                                    theme::num(s.prompts_overflowed.to_string()),
-                                );
-                                theme::kv(
-                                    ui,
-                                    "Handlers evicted",
-                                    theme::num(s.prompt_handlers_evicted.to_string()),
-                                );
-                                theme::kv(
-                                    ui,
-                                    "Rules loaded",
-                                    theme::num(s.rules_loaded.to_string()),
-                                );
+                        theme::stat_row(ui, "Prompt handler", |ui| {
+                            if s.prompt_handler_connected {
+                                theme::pill(ui, "connected", ALLOW_COLOR);
+                            } else {
+                                theme::pill(ui, "none - connections take the default", DENY_COLOR);
+                            }
+                        });
+                        for (key, n) in [
+                            ("Unanswered prompts", s.prompts_unanswered),
+                            ("Prompt overflows", s.prompts_overflowed),
+                            ("Handlers evicted", s.prompt_handlers_evicted),
+                            ("Rules loaded", u64::from(s.rules_loaded)),
+                        ] {
+                            theme::stat_row(ui, key, |ui| {
+                                ui.label(theme::num(grouped(n)));
                             });
+                        }
                     });
                     // Volume from conntrack teardown accounting; zeros when
                     // flow_accounting is off, like any counter the host is
                     // not producing.
                     theme::card(&mut cols[1], "VOLUME", |ui| {
-                        egui::Grid::new("stats_volume")
-                            .num_columns(2)
-                            .striped(false)
-                            .spacing([12.0, 4.0])
-                            .show(ui, |ui| {
-                                theme::kv(
-                                    ui,
-                                    "Flows accounted",
-                                    theme::num(s.flows_accounted.to_string()),
-                                );
-                                theme::kv(
-                                    ui,
-                                    "Flow bytes",
-                                    theme::num(hallpass_types::human_bytes(s.flow_bytes)),
-                                );
-                                theme::kv(
-                                    ui,
-                                    "Flow packets",
-                                    theme::num(s.flow_packets.to_string()),
-                                );
-                                theme::kv(
-                                    ui,
-                                    "Daemon uptime",
-                                    theme::num(format_uptime(s.uptime_secs)),
-                                );
-                            });
+                        theme::stat_row(ui, "Flows accounted", |ui| {
+                            ui.label(theme::num(grouped(s.flows_accounted)));
+                        });
+                        theme::stat_row(ui, "Flow bytes", |ui| {
+                            ui.label(theme::num(hallpass_types::human_bytes(s.flow_bytes)));
+                        });
+                        theme::stat_row(ui, "Flow packets", |ui| {
+                            ui.label(theme::num(grouped(s.flow_packets)));
+                        });
+                        theme::stat_row(ui, "Daemon uptime", |ui| {
+                            ui.label(theme::num(format_uptime(s.uptime_secs)));
+                        });
                     });
                 });
                 ui.add_space(8.0);
 
                 ui.columns(2, |cols| {
                     theme::card(&mut cols[0], "KERNEL QUEUES", |ui| {
-                        egui::Grid::new("stats_queues")
-                            .num_columns(2)
-                            .striped(false)
-                            .spacing([12.0, 4.0])
-                            .show(ui, |ui| {
-                                // A packet dropped from a full verdict queue
-                                // never reached the daemon, so no counter
-                                // above moved for it. Painted when nonzero
-                                // because packets were dropped without policy
-                                // running; "unavailable" (never 0) when
-                                // nothing was read. Drops only: a working
-                                // fail-open queue passes its overflow through
-                                // unjudged and uncounted, which is what the
-                                // fail-open row is for reading this one.
-                                let missed =
-                                    match (s.verdict_queue_dropped, s.verdict_queue_user_dropped) {
-                                        // Saturating, as everywhere a stats reply
-                                        // is rendered: the sum must not be able to
-                                        // panic on socket input.
-                                        (Some(dropped), Some(undelivered)) => {
-                                            Some(dropped.saturating_add(undelivered))
-                                        }
-                                        _ => None,
-                                    };
-                                ui.label(egui::RichText::new("Verdict queue drops").color(MUTED));
-                                match missed {
-                                    Some(0) => {
-                                        ui.label(theme::num("0"));
-                                    }
-                                    Some(n) => {
-                                        theme::pill(
-                                            ui,
-                                            &format!("{n} dropped before policy saw them"),
-                                            DENY_COLOR,
-                                        );
-                                    }
-                                    None => {
-                                        ui.label(theme::num_muted("unavailable"));
-                                    }
-                                }
-                                ui.end_row();
-                                // Plain even when "no": that is the intended
-                                // state under a fail-closed posture, which
-                                // this panel cannot see.
-                                theme::kv(
+                        // A packet dropped from a full verdict queue never
+                        // reached the daemon, so no counter above moved for
+                        // it. Painted when nonzero because packets were
+                        // dropped without policy running; "unavailable"
+                        // (never 0) when nothing was read. Drops only: a
+                        // working fail-open queue passes its overflow through
+                        // unjudged and uncounted, which is what the fail-open
+                        // row is for reading this one.
+                        let missed = match (s.verdict_queue_dropped, s.verdict_queue_user_dropped) {
+                            // Saturating, as everywhere a stats reply is
+                            // rendered: the sum must not be able to panic on
+                            // socket input.
+                            (Some(dropped), Some(undelivered)) => {
+                                Some(dropped.saturating_add(undelivered))
+                            }
+                            _ => None,
+                        };
+                        theme::stat_row(ui, "Verdict queue drops", |ui| match missed {
+                            Some(0) => {
+                                ui.label(theme::num("0"));
+                            }
+                            Some(n) => {
+                                theme::pill(
                                     ui,
-                                    "Verdict queue fail-open",
-                                    theme::num(match s.verdict_queue_fail_open {
-                                        Some(true) => "yes",
-                                        Some(false) => "no",
-                                        None => "unavailable",
-                                    }),
+                                    &format!("{n} dropped before policy saw them"),
+                                    DENY_COLOR,
                                 );
-                                // Depth against the length the daemon set at
-                                // bind, because a depth only reads as pressure
-                                // against its ceiling. No ceiling means the
-                                // kernel refused the request and kept its own,
-                                // which the daemon logged and this panel will
-                                // not guess at.
-                                ui.label(egui::RichText::new("Verdict queue depth").color(MUTED));
-                                match (s.verdict_queue_depth, s.verdict_queue_max_len) {
-                                    (Some(n), Some(max)) => {
-                                        ui.horizontal(|ui| {
-                                            ui.label(theme::num(format!("{n} of {max}")));
-                                            theme::ratio_bar(
-                                                ui,
-                                                egui::vec2(60.0, 6.0),
-                                                &[
-                                                    (n, REJECT_COLOR),
-                                                    (
-                                                        u64::from(max).saturating_sub(n),
-                                                        theme::HAIRLINE,
-                                                    ),
-                                                ],
-                                            );
-                                        });
-                                    }
-                                    (Some(n), None) => {
-                                        ui.label(theme::num(n.to_string()));
-                                    }
-                                    (None, _) => {
-                                        ui.label(theme::num_muted("unavailable"));
-                                    }
-                                }
-                                ui.end_row();
-                                // Domain annotations, not verdicts, so never
-                                // painted; the userspace half of the same loss
-                                // is dns_snoop_dropped.
-                                theme::kv(
-                                    ui,
-                                    "Snoop queue drops",
-                                    match (s.snoop_queue_dropped, s.snoop_queue_user_dropped) {
-                                        (Some(dropped), Some(undelivered)) => theme::num(
-                                            dropped.saturating_add(undelivered).to_string(),
-                                        ),
-                                        _ => theme::num_muted("unavailable"),
-                                    },
-                                );
+                            }
+                            None => {
+                                ui.label(theme::num_muted("unavailable"));
+                            }
+                        });
+                        // Plain even when "no": that is the intended state
+                        // under a fail-closed posture, which this panel
+                        // cannot see.
+                        theme::stat_row(ui, "Verdict queue fail-open", |ui| {
+                            ui.label(match s.verdict_queue_fail_open {
+                                Some(true) => theme::num("yes"),
+                                Some(false) => theme::num("no"),
+                                None => theme::num_muted("unavailable"),
                             });
+                        });
+                        // Depth against the length the daemon set at bind,
+                        // because a depth only reads as pressure against its
+                        // ceiling. No ceiling means the kernel refused the
+                        // request and kept its own, which the daemon logged
+                        // and this panel will not guess at.
+                        theme::stat_row(ui, "Verdict queue depth", |ui| {
+                            match (s.verdict_queue_depth, s.verdict_queue_max_len) {
+                                (Some(n), Some(max)) => {
+                                    // Right to left: the bar sits at the
+                                    // edge, the count just inside it.
+                                    theme::ratio_bar(
+                                        ui,
+                                        egui::vec2(60.0, 6.0),
+                                        &[
+                                            (n, REJECT_COLOR),
+                                            (u64::from(max).saturating_sub(n), theme::HAIRLINE),
+                                        ],
+                                    );
+                                    ui.label(theme::num(format!("{n} of {max}")));
+                                }
+                                (Some(n), None) => {
+                                    ui.label(theme::num(n.to_string()));
+                                }
+                                (None, _) => {
+                                    ui.label(theme::num_muted("unavailable"));
+                                }
+                            }
+                        });
+                        // Domain annotations, not verdicts, so never painted;
+                        // the userspace half of the same loss is
+                        // dns_snoop_dropped.
+                        theme::stat_row(ui, "Snoop queue drops", |ui| {
+                            ui.label(match (s.snoop_queue_dropped, s.snoop_queue_user_dropped) {
+                                (Some(dropped), Some(undelivered)) => {
+                                    theme::num(grouped(dropped.saturating_add(undelivered)))
+                                }
+                                _ => theme::num_muted("unavailable"),
+                            });
+                        });
                     });
                     // Every detected flush is a window in which the host was
                     // unfiltered. The watchdog repairs each one; a failed
@@ -2137,6 +2087,7 @@ impl HallpassApp {
                     theme::card(&mut cols[1], "RULESET INTEGRITY", |ui| {
                         match (s.nft_flushes, s.nft_last_flush_ms) {
                             (0, _) => {
+                                ui.add_space(4.0);
                                 ui.horizontal(|ui| {
                                     theme::pill(ui, "intact", ALLOW_COLOR);
                                     ui.label(
@@ -2161,12 +2112,12 @@ impl HallpassApp {
                                 );
                             }
                         }
-                        ui.add_space(6.0);
-                        ui.horizontal(|ui| {
-                            if ui.button("Refresh counters").clicked() {
-                                self.send(ClientMsg::Stats);
-                            }
-                        });
+                        ui.add_space(10.0);
+                        if theme::ghost_button(ui, "Refresh counters", theme::ACCENT, true)
+                            .clicked()
+                        {
+                            self.send(ClientMsg::Stats);
+                        }
                     });
                 });
             });
@@ -2513,9 +2464,32 @@ fn format_time(unix_ms: u64) -> String {
     }
 }
 
+/// Uptime to the minute, in days once it runs to days.
+///
+/// No seconds: the figure is refreshed with the stats poll, every few
+/// seconds, and a seconds digit that jumps by three at a time looks broken
+/// rather than live.
 fn format_uptime(secs: u64) -> String {
-    let (h, m, s) = (secs / 3600, (secs % 3600) / 60, secs % 60);
-    format!("{h}h {m:02}m {s:02}s")
+    let (d, h, m) = (secs / 86_400, (secs % 86_400) / 3600, (secs % 3600) / 60);
+    match (d, h) {
+        (0, 0) => format!("{m}m"),
+        (0, _) => format!("{h}h {m:02}m"),
+        _ => format!("{d}d {h}h {m:02}m"),
+    }
+}
+
+/// An exact count with thousands separated, for the detail cards: 3900112
+/// becomes 3,900,112, which is read as "about four million" at a glance.
+fn grouped(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// Headless state tests: the app driven through its own channels, with no

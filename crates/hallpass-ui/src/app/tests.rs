@@ -1252,9 +1252,22 @@ fn unrequested_replies_are_ignored_rather_than_fatal() {
 
 #[test]
 fn uptime_formatting() {
-    assert_eq!(format_uptime(0), "0h 00m 00s");
-    assert_eq!(format_uptime(3661), "1h 01m 01s");
-    assert_eq!(format_uptime(86400), "24h 00m 00s");
+    assert_eq!(format_uptime(0), "0m");
+    assert_eq!(format_uptime(3661), "1h 01m");
+    assert_eq!(format_uptime(86400), "1d 0h 00m");
+    assert_eq!(
+        format_uptime(3 * 86400 + 4 * 3600 + 17 * 60 + 9),
+        "3d 4h 17m"
+    );
+}
+
+#[test]
+fn grouped_counts() {
+    assert_eq!(grouped(0), "0");
+    assert_eq!(grouped(999), "999");
+    assert_eq!(grouped(1000), "1,000");
+    assert_eq!(grouped(3_900_112), "3,900,112");
+    assert_eq!(grouped(u64::MAX), "18,446,744,073,709,551,615");
 }
 
 #[test]

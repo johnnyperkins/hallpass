@@ -480,19 +480,39 @@ pub fn activity_strip(ui: &mut Ui, height: f32, buckets: &[crate::traffic::Bucke
 }
 
 /// A headline number in a card: what the Stats tab leads with.
+///
+/// Washed faintly in its own colour, with a short bar of it along the top
+/// edge, so the four tiles are told apart by colour before their labels
+/// are read.
 pub fn stat_tile(ui: &mut Ui, width: f32, label: &str, value: &str, color: Color32, sub: &str) {
-    card_frame().show(ui, |ui| {
-        ui.set_width(width);
-        ui.vertical(|ui| {
-            ui.label(egui::RichText::new(label).small().color(MUTED).strong());
-            ui.label(
-                egui::RichText::new(value)
-                    .color(color)
-                    .font(egui::FontId::proportional(24.0)),
-            );
-            ui.label(egui::RichText::new(sub).small().color(MUTED));
-        });
-    });
+    let rect = card_frame()
+        .fill(SURFACE_RAISED.lerp_to_gamma(color, 0.05))
+        .inner_margin(Margin {
+            left: 14,
+            right: 12,
+            top: 12,
+            bottom: 10,
+        })
+        .show(ui, |ui| {
+            ui.set_width(width);
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 2.0;
+                ui.label(RichText::new(label).small().color(MUTED).strong());
+                ui.label(
+                    RichText::new(value)
+                        .color(color)
+                        .font(egui::FontId::proportional(28.0)),
+                );
+                ui.label(RichText::new(sub).small().color(MUTED));
+            });
+        })
+        .response
+        .rect;
+    ui.painter().rect_filled(
+        egui::Rect::from_min_size(rect.min + Vec2::new(14.0, 1.0), Vec2::new(28.0, 2.0)),
+        CornerRadius::same(1),
+        color,
+    );
 }
 
 /// A switch. Reads as on or off from across the room, which a tick in a
@@ -1217,11 +1237,31 @@ pub fn wordmark(ui: &mut Ui) {
     );
 }
 
-/// A key/value line in the dense detail panels: muted key, plain value.
-pub fn kv(ui: &mut Ui, key: &str, value: impl Into<egui::WidgetText>) {
-    ui.label(egui::RichText::new(key).color(MUTED));
-    ui.label(value);
-    ui.end_row();
+/// A key/value line in the detail cards: the key at the left, the value
+/// pinned to the right edge, and a hairline between it and the line above.
+///
+/// Right-aligned rather than in a grid column, so the values of every
+/// line in a card share one edge and a card twice as wide as its content
+/// reads as a list rather than as two lumps with a gap between them.
+pub fn stat_row(ui: &mut Ui, key: &str, value: impl FnOnce(&mut Ui)) {
+    let width = ui.available_width();
+    let rect = ui
+        .allocate_ui_with_layout(
+            Vec2::new(width, 26.0),
+            egui::Layout::left_to_right(egui::Align::Center),
+            |ui| {
+                ui.set_min_size(Vec2::new(width, 26.0));
+                ui.label(RichText::new(key).color(MUTED));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), value);
+            },
+        )
+        .response
+        .rect;
+    ui.painter().hline(
+        rect.x_range(),
+        rect.top() - ui.spacing().item_spacing.y / 2.0,
+        Stroke::new(1.0, HAIRLINE.gamma_multiply(0.6)),
+    );
 }
 
 /// The mono style every number here is written in, so columns of digits
