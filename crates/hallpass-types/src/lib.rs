@@ -8,114 +8,59 @@
 
 pub mod wire;
 
+use std::borrow::Cow;
 use std::fmt;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-/// Wire protocol version. Bump on incompatible changes to [`ClientMsg`] or
-/// [`DaemonMsg`].
+/// Wire protocol version, matched exactly by the handshake. Bump it on any
+/// change to what [`ClientMsg`] or [`DaemonMsg`] put on the wire.
 ///
-/// v2: added `RuleMatch::exe_sha256` (postcard encodes structs positionally,
-/// so new fields are incompatible).
+/// Postcard writes struct fields positionally and enum variants by index,
+/// with no names in the bytes, so a peer built before a layout change misreads
+/// the new layout rather than rejecting it. Appended variants bump too (since
+/// v5): a peer that cannot decode a frame fails the read and tears down the
+/// connection mid-session, possibly the one carrying a client's prompts,
+/// where the exact-match handshake would have refused it cleanly at connect.
 ///
-/// v3: observability. `ConnEvent::enforced`, three new [`Stats`] fields, and
-/// the [`ClientMsg::EventHistory`], [`ClientMsg::RuleStats`] and
-/// [`ClientMsg::Explain`] request/reply pairs. Appended enum variants alone
-/// would not need a bump; the struct fields do.
-///
-/// v4: prompt-handler liveness. Three more [`Stats`] fields
-/// (`prompt_handler_connected`, `prompts_unanswered`,
-/// `prompt_handlers_evicted`) and the [`DaemonMsg::PromptHandlerRevoked`]
-/// variant. Same split as v3: the appended variant would have been free, the
-/// struct fields are what forces the bump.
-///
-/// v5: runtime settings. [`ClientMsg::ConfigGet`], [`ClientMsg::ConfigSet`]
-/// and [`DaemonMsg::Config`], all appended variants. Bumped anyway, unlike
-/// the appended pairs in v3: a v4 daemon cannot decode a `ConfigGet` frame
-/// at all (an out-of-range variant index fails the read), which would tear
-/// down the connection carrying this client's prompts the first time the
-/// settings tab is opened. The exact-match handshake turns that mid-session
-/// break into a clean refusal at connect.
-///
-/// v6: runtime mode. [`RuntimeConfig::enforce`] turns observe mode into a
-/// runtime setting instead of a startup-only one; the struct field is what
-/// forces the bump, as in v2.
-///
-/// v7: kernel queue counters. Eight [`Stats`] fields
-/// (`verdict_queue_dropped` and friends) carrying what the kernel counted
-/// about the nfqueues, read from /proc/net/netfilter/nfnetlink_queue when a
-/// client asks, plus the effective fail-open flag per queue, known at bind.
-/// They close the one blind spot the daemon's own counters cannot see: a
-/// packet resolved because the queue was full never reached userspace, so
-/// no counter here moved. The struct fields force the bump, as in v2.
-///
-/// v8: [`Stats::nft_flushes`] and [`Stats::nft_last_flush_ms`]. Until now
-/// the only evidence that something flushed the nftables table (and that
-/// the watchdog repaired it) was a journal line; status and doctor could
-/// not surface it or say how recent it was. The struct fields force the
-/// bump, as in v2.
-///
-/// v9: [`Stats::flows_accounted`], [`Stats::flow_bytes`],
-/// [`Stats::flow_packets`]. The daemon decides a connection from its first
-/// packet and never saw its volume; with `flow_accounting` on it now tallies
-/// each flow's bytes and packets from conntrack teardown notifications. The
-/// struct fields force the bump, as in v2.
-///
-/// v10: packaged-application identity. [`Connection::app_id`] carries which
-/// packaged application a connection belongs to, read from the process's
-/// cgroup, and [`RuleMatch::app_id`] is the operand that matches it. A
-/// sandboxed application's executable path names its sandbox rather than
-/// itself, so until now those connections could only be scoped by a path
-/// that is neither on this host nor unique. The struct fields force the
-/// bump, as in v2.
-///
-/// v11: [`Connection::first_seen`]. Whether the daemon has ever seen this
-/// application connect before, and whether it has seen it reach this
-/// destination before, so a prompt can say which of the two is new rather
-/// than presenting a routine connection and a first-ever one identically.
-/// The struct field forces the bump, as in v2.
-///
-/// v12: [`PromptContext`] on [`DaemonMsg::PromptRequest`]. What launched the
-/// program, what its executable hashes to, whether a hash-pinned rule was
-/// looking for a different binary, and how often this program has been denied
-/// lately: the facts an operator needs to answer the question, none of which
-/// the connection itself carries. The struct field forces the bump, as in v2.
-///
-/// v13: session grants. [`ClientMsg::RunSessionStart`],
-/// [`ClientMsg::RunSessionList`], [`DaemonMsg::RunSessionStarted`] and
-/// [`DaemonMsg::RunSessions`], all appended variants carrying no new struct
-/// fields. Bumped for the v5 reason rather than the v3 one: the handshake is
-/// an exact match on this number, so it only separates builds that disagree
-/// about it. Two builds both calling themselves v12 while disagreeing about
-/// which frames exist is exactly what v5 was bumped to avoid - a wrapper
-/// sending a frame the daemon cannot decode tears down the connection the
-/// session lives on, mid-session, instead of being refused at connect.
-///
-/// v14: rule tags. [`Rule::tags`] plus [`ClientMsg::RuleToggleTag`] and
-/// [`DaemonMsg::RulesToggled`], so a set of rules can be enabled or disabled
-/// as one operation instead of one round trip per name. The struct field
-/// forces the bump, as in v2.
-///
-/// v15: the lockdown posture. [`Stats::lockdown`], [`TraceOutcome::Suppressed`]
-/// and the [`ClientMsg::LockdownGet`] / [`ClientMsg::LockdownSet`] pair with
-/// [`DaemonMsg::LockdownState`]. The struct field forces the bump, as in v2,
-/// and the new trace outcome would otherwise be a variant older clients
-/// cannot decode in a reply they already ask for.
-///
-/// v16: [`Stats::verdict_queue_max_len`]. The daemon now sets the kernel's
-/// queue depth rather than inheriting the 1024 default, and the depth in
-/// force is not in `/proc` for a client to read for itself. The struct field
-/// forces the bump, as in v2.
-///
-/// v17: [`ClientMsg::PromptReply::pin_exe`], so an operator answering a
-/// prompt can pin the rule to the binary they approved rather than to the
-/// path it happened to sit at. A field appended to an existing variant,
-/// which postcard writes positionally: a daemon built before it decoded the
-/// reply and ignored the new field's byte at the end of the frame, silently
-/// dropping the pin the operator asked for, so the bump is what turns that
-/// into the handshake's refusal.
+/// - v2: `RuleMatch::exe_sha256`.
+/// - v3: observability. `ConnEvent::enforced`, three [`Stats`] fields, and the
+///   [`ClientMsg::EventHistory`], [`ClientMsg::RuleStats`] and
+///   [`ClientMsg::Explain`] request/reply pairs.
+/// - v4: prompt-handler liveness. Three [`Stats`] fields
+///   (`prompt_handler_connected`, `prompts_unanswered`,
+///   `prompt_handlers_evicted`) and [`DaemonMsg::PromptHandlerRevoked`].
+/// - v5: runtime settings. [`ClientMsg::ConfigGet`], [`ClientMsg::ConfigSet`]
+///   and [`DaemonMsg::Config`]: appended variants only, and the first bump
+///   made for those alone, for the reason above.
+/// - v6: [`RuntimeConfig::enforce`], making observe mode a runtime setting.
+/// - v7: kernel queue counters. Eight [`Stats`] fields
+///   (`verdict_queue_dropped` and friends) read from
+///   /proc/net/netfilter/nfnetlink_queue, plus each queue's effective
+///   fail-open flag, known at bind.
+/// - v8: [`Stats::nft_flushes`] and [`Stats::nft_last_flush_ms`].
+/// - v9: flow accounting. [`Stats::flows_accounted`], [`Stats::flow_bytes`]
+///   and [`Stats::flow_packets`].
+/// - v10: packaged-application identity. [`Connection::app_id`] and the
+///   [`RuleMatch::app_id`] operand that matches it.
+/// - v11: [`Connection::first_seen`].
+/// - v12: [`PromptContext`] on [`DaemonMsg::PromptRequest`].
+/// - v13: session grants. [`ClientMsg::RunSessionStart`],
+///   [`ClientMsg::RunSessionList`], [`DaemonMsg::RunSessionStarted`] and
+///   [`DaemonMsg::RunSessions`]: appended variants, bumped as in v5.
+/// - v14: rule tags. [`Rule::tags`], [`ClientMsg::RuleToggleTag`] and
+///   [`DaemonMsg::RulesToggled`].
+/// - v15: the lockdown posture. [`Stats::lockdown`], the
+///   [`ClientMsg::LockdownGet`] / [`ClientMsg::LockdownSet`] pair with
+///   [`DaemonMsg::LockdownState`], and [`TraceOutcome::Suppressed`], a new
+///   variant inside a reply older clients already ask for.
+/// - v16: [`Stats::verdict_queue_max_len`].
+/// - v17: [`ClientMsg::PromptReply::pin_exe`], a field appended to an
+///   existing variant. A daemon built before it decoded the reply and
+///   ignored the trailing byte, silently dropping the pin the operator asked
+///   for; the bump turns that into the handshake's refusal.
 pub const PROTOCOL_VERSION: u32 = 17;
 
 /// Prefix reserved for the synthetic rule name a session grant reports.
@@ -178,10 +123,10 @@ pub enum Proto {
 
 impl fmt::Display for Proto {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Proto::Tcp => write!(f, "tcp"),
-            Proto::Udp => write!(f, "udp"),
-        }
+        f.write_str(match self {
+            Self::Tcp => "tcp",
+            Self::Udp => "udp",
+        })
     }
 }
 
@@ -423,6 +368,17 @@ pub enum Action {
     Reject,
 }
 
+impl Action {
+    /// Lowercase name, matching the serde/TOML representation.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Allow => "allow",
+            Self::Deny => "deny",
+            Self::Reject => "reject",
+        }
+    }
+}
+
 /// How long a rule remains in effect.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -441,6 +397,71 @@ pub enum RuleDuration {
         /// Expiry as Unix milliseconds.
         deadline_ms: u64,
     },
+}
+
+impl RuleDuration {
+    /// Lowercase name, matching the serde/TOML representation. The
+    /// `Until` deadline is not included; use [`RuleDuration::describe`]
+    /// where it matters.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Once => "once",
+            Self::Session => "session",
+            Self::Forever => "forever",
+            Self::Until { .. } => "until",
+        }
+    }
+
+    /// Human-readable form; `Until` shows the remaining time.
+    pub fn describe(self) -> String {
+        match self {
+            Self::Until { deadline_ms } => {
+                let now = unix_ms_now();
+                if deadline_ms <= now {
+                    "expired".to_string()
+                } else {
+                    format!("{}s left", (deadline_ms - now) / 1000)
+                }
+            }
+            other => other.as_str().to_string(),
+        }
+    }
+
+    /// Whether this duration has a deadline in the past.
+    pub fn expired(self, now_ms: u64) -> bool {
+        matches!(self, Self::Until { deadline_ms } if deadline_ms <= now_ms)
+    }
+
+    /// `Until` duration expiring one timespan (`30s`, `5m`, `2h`, `1d`)
+    /// from now. `None` when the timespan does not parse.
+    pub fn until_after(timespan: &str) -> Option<Self> {
+        // Saturating: an absurd timespan becomes "effectively forever"
+        // rather than wrapping into the past.
+        parse_timespan_secs(timespan).map(|secs| Self::Until {
+            deadline_ms: unix_ms_now().saturating_add(secs.saturating_mul(1000)),
+        })
+    }
+}
+
+/// Parse a human timespan like `30s`, `5m`, `2h`, or `1d` into seconds.
+/// Shared by the CLI (`--duration 5m`) and interactive prompt replies.
+pub fn parse_timespan_secs(s: &str) -> Option<u64> {
+    // Split off the unit by characters, not bytes: byte-indexed split_at
+    // panics mid-codepoint, and this parses free text typed into the UI.
+    let mut chars = s.chars();
+    let unit = chars.next_back()?;
+    let n: u64 = chars.as_str().parse().ok()?;
+    if n == 0 {
+        return None;
+    }
+    let mult = match unit {
+        's' => 1,
+        'm' => 60,
+        'h' => 3600,
+        'd' => 86_400,
+        _ => return None,
+    };
+    n.checked_mul(mult)
 }
 
 /// Match criteria for a rule. All fields are optional; every present field
@@ -523,6 +544,53 @@ pub struct RuleMatch {
     /// See [`Connection::app_id`] for why this scopes rather than enforces:
     /// pair an allow rule with `exe` or `exe_sha256` where that matters.
     pub app_id: Option<String>,
+}
+
+impl RuleMatch {
+    /// One-line "key=value" summary of the present criteria, or "(any)".
+    /// Shared by the CLI table and the UI rule list.
+    pub fn summary(&self) -> String {
+        let path = |p: &Option<PathBuf>| p.as_ref().map(|p| p.display().to_string());
+        // Full hashes overwhelm one-line summaries; show a prefix. Cut on a
+        // char boundary: hand-written rule files can carry arbitrary text
+        // here, and a byte slice would panic on it.
+        let hash_prefix = |h: &String| {
+            let cut = h.char_indices().nth(12).map_or(h.len(), |(i, _)| i);
+            format!("{}..", &h[..cut])
+        };
+        let criteria = [
+            ("exe", path(&self.exe)),
+            ("exe-glob", self.exe_glob.clone()),
+            ("sha256", self.exe_sha256.as_ref().map(hash_prefix)),
+            ("dest", self.dest.clone()),
+            ("port", self.port.map(|p| p.to_string())),
+            (
+                "ports",
+                self.port_range.map(|(lo, hi)| format!("{lo}-{hi}")),
+            ),
+            ("domain", self.domain.clone()),
+            ("user", self.user.map(|u| u.to_string())),
+            ("proto", self.proto.map(|p| p.to_string())),
+            ("domains-file", path(&self.domains_file)),
+            ("ips-file", path(&self.ips_file)),
+            ("hashes-file", path(&self.hashes_file)),
+            ("cmdline~", self.cmdline_contains.clone()),
+            ("parent", path(&self.parent_exe)),
+            ("src", self.src.clone()),
+            ("src-port", self.src_port.map(|p| p.to_string())),
+            ("iface", self.iface.clone()),
+            ("app", self.app_id.clone()),
+        ];
+        let parts: Vec<String> = criteria
+            .into_iter()
+            .filter_map(|(key, value)| Some(format!("{key}={}", value?)))
+            .collect();
+        if parts.is_empty() {
+            "(any)".to_string()
+        } else {
+            parts.join(" ")
+        }
+    }
 }
 
 /// A firewall rule.
@@ -620,32 +688,21 @@ pub enum Verdict {
 // Action and Verdict are deliberately distinct types (what a rule *does*
 // vs. what happened to a connection), but their variants correspond 1:1.
 impl From<Action> for Verdict {
-    fn from(a: Action) -> Verdict {
+    fn from(a: Action) -> Self {
         match a {
-            Action::Allow => Verdict::Allow,
-            Action::Deny => Verdict::Deny,
-            Action::Reject => Verdict::Reject,
+            Action::Allow => Self::Allow,
+            Action::Deny => Self::Deny,
+            Action::Reject => Self::Reject,
         }
     }
 }
 
 impl From<Verdict> for Action {
-    fn from(v: Verdict) -> Action {
+    fn from(v: Verdict) -> Self {
         match v {
-            Verdict::Allow => Action::Allow,
-            Verdict::Deny => Action::Deny,
-            Verdict::Reject => Action::Reject,
-        }
-    }
-}
-
-impl Action {
-    /// Lowercase name, matching the serde/TOML representation.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Action::Allow => "allow",
-            Action::Deny => "deny",
-            Action::Reject => "reject",
+            Verdict::Allow => Self::Allow,
+            Verdict::Deny => Self::Deny,
+            Verdict::Reject => Self::Reject,
         }
     }
 }
@@ -654,142 +711,6 @@ impl Verdict {
     /// Lowercase name, matching the serde/TOML representation.
     pub fn as_str(self) -> &'static str {
         Action::from(self).as_str()
-    }
-}
-
-impl RuleDuration {
-    /// Lowercase name, matching the serde/TOML representation. The
-    /// `Until` deadline is not included; use [`RuleDuration::describe`]
-    /// where it matters.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            RuleDuration::Once => "once",
-            RuleDuration::Session => "session",
-            RuleDuration::Forever => "forever",
-            RuleDuration::Until { .. } => "until",
-        }
-    }
-
-    /// Human-readable form; `Until` shows the remaining time.
-    pub fn describe(self) -> String {
-        match self {
-            RuleDuration::Until { deadline_ms } => {
-                let now = unix_ms_now();
-                if deadline_ms <= now {
-                    "expired".to_string()
-                } else {
-                    format!("{}s left", (deadline_ms - now) / 1000)
-                }
-            }
-            other => other.as_str().to_string(),
-        }
-    }
-
-    /// Whether this duration has a deadline in the past.
-    pub fn expired(self, now_ms: u64) -> bool {
-        matches!(self, RuleDuration::Until { deadline_ms } if deadline_ms <= now_ms)
-    }
-
-    /// `Until` duration expiring one timespan (`30s`, `5m`, `2h`, `1d`)
-    /// from now. `None` when the timespan does not parse.
-    pub fn until_after(timespan: &str) -> Option<RuleDuration> {
-        // Saturating: an absurd timespan becomes "effectively forever"
-        // rather than wrapping into the past.
-        parse_timespan_secs(timespan).map(|secs| RuleDuration::Until {
-            deadline_ms: unix_ms_now().saturating_add(secs.saturating_mul(1000)),
-        })
-    }
-}
-
-/// Parse a human timespan like `30s`, `5m`, `2h`, or `1d` into seconds.
-/// Shared by the CLI (`--duration 5m`) and interactive prompt replies.
-pub fn parse_timespan_secs(s: &str) -> Option<u64> {
-    // Split off the unit by characters, not bytes: byte-indexed split_at
-    // panics mid-codepoint, and this parses free text typed into the UI.
-    let mut chars = s.chars();
-    let unit = chars.next_back()?;
-    let n: u64 = chars.as_str().parse().ok()?;
-    if n == 0 {
-        return None;
-    }
-    let mult = match unit {
-        's' => 1,
-        'm' => 60,
-        'h' => 3600,
-        'd' => 86_400,
-        _ => return None,
-    };
-    n.checked_mul(mult)
-}
-
-impl RuleMatch {
-    /// One-line "key=value" summary of the present criteria, or "(any)".
-    /// Shared by the CLI table and the UI rule list.
-    pub fn summary(&self) -> String {
-        let mut parts: Vec<String> = Vec::new();
-        if let Some(exe) = &self.exe {
-            parts.push(format!("exe={}", exe.display()));
-        }
-        if let Some(g) = &self.exe_glob {
-            parts.push(format!("exe-glob={g}"));
-        }
-        if let Some(h) = &self.exe_sha256 {
-            // Full hashes overwhelm one-line summaries; show a prefix.
-            // Cut on a char boundary: hand-written rule files can carry
-            // arbitrary text here, and a byte slice would panic on it.
-            let cut = h.char_indices().nth(12).map_or(h.len(), |(i, _)| i);
-            parts.push(format!("sha256={}..", &h[..cut]));
-        }
-        if let Some(d) = &self.dest {
-            parts.push(format!("dest={d}"));
-        }
-        if let Some(p) = self.port {
-            parts.push(format!("port={p}"));
-        }
-        if let Some((lo, hi)) = self.port_range {
-            parts.push(format!("ports={lo}-{hi}"));
-        }
-        if let Some(d) = &self.domain {
-            parts.push(format!("domain={d}"));
-        }
-        if let Some(u) = self.user {
-            parts.push(format!("user={u}"));
-        }
-        if let Some(p) = self.proto {
-            parts.push(format!("proto={p}"));
-        }
-        if let Some(f) = &self.domains_file {
-            parts.push(format!("domains-file={}", f.display()));
-        }
-        if let Some(f) = &self.ips_file {
-            parts.push(format!("ips-file={}", f.display()));
-        }
-        if let Some(f) = &self.hashes_file {
-            parts.push(format!("hashes-file={}", f.display()));
-        }
-        if let Some(c) = &self.cmdline_contains {
-            parts.push(format!("cmdline~={c}"));
-        }
-        if let Some(p) = &self.parent_exe {
-            parts.push(format!("parent={}", p.display()));
-        }
-        if let Some(s) = &self.src {
-            parts.push(format!("src={s}"));
-        }
-        if let Some(p) = self.src_port {
-            parts.push(format!("src-port={p}"));
-        }
-        if let Some(i) = &self.iface {
-            parts.push(format!("iface={i}"));
-        }
-        if let Some(a) = &self.app_id {
-            parts.push(format!("app={a}"));
-        }
-        if parts.is_empty() {
-            "(any)".to_string()
-        } else {
-            parts.join(" ")
-        }
     }
 }
 
@@ -863,30 +784,26 @@ pub const MAX_TAGS_PER_RULE: usize = 8;
 /// [`MAX_TAG_BYTES`] of lowercase ASCII alphanumerics, `-` and `_`, starting
 /// with a letter or digit.
 ///
-/// Uppercase is refused rather than folded, for the reason the `snap:` half
-/// of [`valid_app_id`] is: a tag names a set, and two spellings that select
-/// the same set mean `rules toggle --tag Work` silently misses every rule
-/// tagged `work` - a bulk operation that reports success while leaving rules
-/// enforcing. An error naming the fix is the cheaper failure.
+/// Uppercase is refused rather than folded, as in the `snap:` half of
+/// [`valid_app_id`]: if `Work` and `work` could both exist,
+/// `rules toggle --tag Work` would silently miss every rule tagged `work`, a
+/// bulk operation reporting success while leaving rules enforcing. An error
+/// naming the fix is the cheaper failure.
 ///
-/// The leading character is constrained for two separate reasons, both about
-/// a tag being mistaken for something else. Every rule listing renders "this
-/// rule has no tags" as `-`, so a rule tagged `-` (or `_`, or `--`) displays
-/// exactly like an untagged one and the GUI's tag picker offers it directly
-/// under `(all)`: an operator auditing the table would read a rule as being
-/// in no set at all, and then a bulk toggle would disable it as part of one.
-/// And a `--tag` selector takes the next argument, so admitting a leading
-/// dash lets `rules --tag --stats` swallow the flag after it and report an
-/// empty set with a success exit code.
+/// The leading character is constrained so a tag cannot pass for something
+/// else. Listings render "no tags" as `-`, so a rule tagged `-`, `_` or `--`
+/// would read as untagged (and the GUI's tag picker would offer it right
+/// under `(all)`) while a bulk toggle still reached it. And a `--tag`
+/// selector takes the next argument, so a leading dash would let
+/// `rules --tag --stats` swallow the flag and report an empty set with a
+/// success exit code.
 pub fn valid_tag(tag: &str) -> bool {
+    let lower_alnum = |b: u8| b.is_ascii_lowercase() || b.is_ascii_digit();
     tag.len() <= MAX_TAG_BYTES
+        && tag.bytes().next().is_some_and(lower_alnum)
         && tag
             .bytes()
-            .next()
-            .is_some_and(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
-        && tag
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'-' | b'_'))
+            .all(|b| lower_alnum(b) || matches!(b, b'-' | b'_'))
 }
 
 /// Drop everything [`validate_tags`] would refuse, returning what was
@@ -899,8 +816,8 @@ pub fn valid_tag(tag: &str) -> bool {
 /// entrances still call [`validate_tags`] and refuse, because there the cost
 /// of being strict is an error message rather than an unenforced rule.
 pub fn retain_valid_tags(tags: &mut Vec<String>) -> Vec<String> {
+    let mut kept = Vec::new();
     let mut dropped = Vec::new();
-    let mut kept: Vec<String> = Vec::new();
     for tag in tags.drain(..) {
         if kept.len() < MAX_TAGS_PER_RULE && valid_tag(&tag) && !kept.contains(&tag) {
             kept.push(tag);
@@ -915,11 +832,9 @@ pub fn retain_valid_tags(tags: &mut Vec<String>) -> Vec<String> {
 /// Check a whole [`Rule::tags`] list: every tag well-formed, no repeats, at
 /// most [`MAX_TAGS_PER_RULE`] of them. `Err` is a message for the operator.
 ///
-/// The list rules live here, not only the per-tag grammar, because each
-/// entrance would otherwise implement its own subset: the first cut had the
-/// CLI checking repeats but not the count, so nine `--tag` flags passed local
-/// validation and were refused only by the daemon - which is the round trip
-/// the client-side check exists to avoid.
+/// The list rules live here, not only the per-tag grammar, so no entrance
+/// implements a subset of them: a client check that misses one passes input
+/// the daemon then refuses, the round trip the client check exists to avoid.
 ///
 /// For an interactive entrance, where refusing costs an error message.
 /// [`retain_valid_tags`] is the one for a rule that is already policy.
@@ -986,11 +901,11 @@ pub fn is_display_hazard(c: char) -> bool {
 ///
 /// Hazards become U+FFFD, which is visible rather than silent. Borrowing when
 /// there is nothing to replace keeps the common path allocation-free.
-pub fn sanitize_for_display(s: &str) -> std::borrow::Cow<'_, str> {
+pub fn sanitize_for_display(s: &str) -> Cow<'_, str> {
     if !s.chars().any(is_display_hazard) {
-        return std::borrow::Cow::Borrowed(s);
+        return Cow::Borrowed(s);
     }
-    std::borrow::Cow::Owned(
+    Cow::Owned(
         s.chars()
             .map(|c| if is_display_hazard(c) { '\u{fffd}' } else { c })
             .collect(),
@@ -1001,36 +916,13 @@ pub fn sanitize_for_display(s: &str) -> std::borrow::Cow<'_, str> {
 pub fn unix_ms_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+        .map_or(0, |d| d.as_millis() as u64)
 }
 
 /// Unix milliseconds as `YYYY-MM-DD HH:MM:SS` (UTC), for human output.
 pub fn format_ts(unix_ms: u64) -> String {
     let (y, m, d, h, min, s, _) = civil_from_unix_ms(unix_ms);
     format!("{y:04}-{m:02}-{d:02} {h:02}:{min:02}:{s:02}")
-}
-
-/// A byte count as a short human-readable size in binary units. Whole
-/// numbers of bytes stay whole; larger units get one decimal. Shared by the
-/// CLI and GUI, which both render the flow-accounting totals.
-pub fn human_bytes(bytes: u64) -> String {
-    const UNITS: [&str; 6] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
-    let mut value = bytes as f64;
-    let mut unit = 0;
-    // 1023.95 rather than 1024.0: the value is shown rounded to one
-    // decimal, and anything at or above 1023.95 rounds to "1024.0", which
-    // must roll to the next unit instead of printing a nonsensical
-    // "1024.0 KiB".
-    while value >= 1023.95 && unit < UNITS.len() - 1 {
-        value /= 1024.0;
-        unit += 1;
-    }
-    if unit == 0 {
-        format!("{bytes} B")
-    } else {
-        format!("{value:.1} {}", UNITS[unit])
-    }
 }
 
 /// Unix milliseconds as an RFC 3339 UTC timestamp with milliseconds.
@@ -1052,7 +944,7 @@ fn civil_from_unix_ms(unix_ms: u64) -> (i64, u32, u32, u64, u64, u64, u64) {
 /// Days-since-epoch to (year, month, day). Howard Hinnant's algorithm.
 fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let z = z + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let era = z.div_euclid(146_097);
     let doe = z - era * 146_097;
     let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
     let y = yoe + era * 400;
@@ -1063,270 +955,25 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
-#[cfg(test)]
-mod display_tests {
-    use super::*;
-
-    #[test]
-    fn clean_text_is_borrowed_unchanged() {
-        let s = "/usr/bin/curl https://example.org";
-        assert!(matches!(
-            sanitize_for_display(s),
-            std::borrow::Cow::Borrowed(_)
-        ));
-        assert_eq!(sanitize_for_display(s), s);
+/// A byte count as a short human-readable size in binary units. Whole
+/// numbers of bytes stay whole; larger units get one decimal. Shared by the
+/// CLI and GUI, which both render the flow-accounting totals.
+pub fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 6] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    // 1023.95 rather than 1024.0: the value is shown rounded to one
+    // decimal, and anything at or above 1023.95 rounds to "1024.0", which
+    // must roll to the next unit instead of printing a nonsensical
+    // "1024.0 KiB".
+    while value >= 1023.95 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
     }
-
-    /// The attack this exists for: a cmdline that erases the line above it and
-    /// prints a different executable path must not reach the terminal intact.
-    #[test]
-    fn terminal_escapes_are_neutralized() {
-        let hostile = "evil\r\x1b[A\x1b[2K/usr/bin/firefox";
-        let out = sanitize_for_display(hostile);
-        assert!(!out.contains('\r'), "{out:?}");
-        assert!(!out.contains('\x1b'), "{out:?}");
-        assert!(!out.contains('\n'), "{out:?}");
-        // The real text survives, just defanged.
-        assert!(out.contains("evil"), "{out:?}");
-        assert!(out.contains("firefox"), "{out:?}");
-    }
-
-    #[test]
-    fn bidi_and_zero_width_are_neutralized() {
-        for hostile in [
-            "gpj.\u{202e}exe.evil",  // RTL override
-            "curl\u{200b}\u{200b}x", // zero width space
-            "a\u{feff}b",            // BOM
-            "a\u{2066}b\u{2069}c",   // bidi isolates
-        ] {
-            let out = sanitize_for_display(hostile);
-            assert!(
-                out.chars().all(|c| !is_display_hazard(c)),
-                "{hostile:?} -> {out:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn c1_controls_and_del_are_neutralized() {
-        let out = sanitize_for_display("a\u{7f}b\u{9b}c");
-        assert_eq!(out, "a\u{fffd}b\u{fffd}c");
-    }
-}
-
-#[cfg(test)]
-mod event_tests {
-    use super::*;
-
-    /// An unenforced deny must never render as a deny: the connection went
-    /// out, and a reader shown "DENY" would believe the opposite.
-    #[test]
-    fn observe_mode_labels_say_would() {
-        let mk = |verdict, enforced| ConnEvent {
-            conn: Connection {
-                tuple: FlowTuple {
-                    proto: Proto::Tcp,
-                    src: "127.0.0.1:1".parse().unwrap(),
-                    dst: "127.0.0.1:2".parse().unwrap(),
-                },
-                uid: None,
-                pid: None,
-                exe_path: None,
-                cmdline: None,
-                parent_exe: None,
-                domain: None,
-                iface: None,
-                app_id: None,
-                first_seen: None,
-            },
-            verdict,
-            rule_name: None,
-            unix_ms: 0,
-            enforced,
-        };
-        assert_eq!(mk(Verdict::Deny, true).verdict_label(), "deny");
-        assert_eq!(mk(Verdict::Reject, true).verdict_label(), "reject");
-        assert_eq!(mk(Verdict::Deny, false).verdict_label(), "would-deny");
-        assert_eq!(mk(Verdict::Reject, false).verdict_label(), "would-reject");
-        // Allow is the same outcome either way, so it is never prefixed.
-        assert_eq!(mk(Verdict::Allow, true).verdict_label(), "allow");
-        assert_eq!(mk(Verdict::Allow, false).verdict_label(), "allow");
-    }
-}
-
-#[cfg(test)]
-mod time_tests {
-    use super::*;
-
-    #[test]
-    fn timestamp_formats() {
-        assert_eq!(format_ts(0), "1970-01-01 00:00:00");
-        assert_eq!(format_rfc3339(0), "1970-01-01T00:00:00.000Z");
-        // 2024-07-03 09:46:40.123 UTC.
-        assert_eq!(format_ts(1_720_000_000_123), "2024-07-03 09:46:40");
-        assert_eq!(
-            format_rfc3339(1_720_000_000_123),
-            "2024-07-03T09:46:40.123Z"
-        );
-    }
-
-    #[test]
-    fn human_bytes_scales_to_binary_units() {
-        assert_eq!(human_bytes(0), "0 B");
-        assert_eq!(human_bytes(512), "512 B");
-        assert_eq!(human_bytes(1024), "1.0 KiB");
-        assert_eq!(human_bytes(1_572_864), "1.5 MiB");
-        assert_eq!(human_bytes(9_000_000), "8.6 MiB");
-        // Just under a unit boundary must roll up, not print "1024.0".
-        assert_eq!(human_bytes(1_048_575), "1.0 MiB");
-        assert_eq!(human_bytes(1_073_741_823), "1.0 GiB");
-    }
-}
-
-#[cfg(test)]
-mod app_id_tests {
-    use super::*;
-
-    #[test]
-    fn well_formed_identities_are_accepted() {
-        for id in [
-            "flatpak:org.mozilla.firefox",
-            "snap:firefox",
-            "snap:zellij",
-            "flatpak:com.example.App-Name",
-            "flatpak:a",
-            "snap:firefox_beta",
-            "snap:lxd-4",
-        ] {
-            assert!(valid_app_id(id), "{id:?}");
-        }
-    }
-
-    /// Everything an operator can type that would load as a rule and then
-    /// never match, and everything a cgroup name could carry into a display.
-    #[test]
-    fn malformed_identities_are_rejected() {
-        for id in [
-            "firefox",                     // no scheme
-            "docker:nginx",                // not a scheme this reads
-            "flatpak:",                    // no name
-            ":firefox",                    // no scheme
-            "flatpak:..",                  // punctuation is not a name
-            "flatpak:org.mozilla/firefox", // a name is one path segment
-            "flatpak:org\u{1b}[2K.evil",   // terminal escape
-            "flatpak:org\\x1b[2K.evil",    // systemd's escaping of one
-            "snap:ev\u{202e}il",           // bidi override
-            "snap:a\u{feff}b",             // zero width
-            "snap:fire fox",               // whitespace
-            // A namespace's own charset: snap names have no capital letters
-            // and no dots, so the daemon can never produce these and a rule
-            // written with one would be inert.
-            "snap:Firefox",
-            "snap:org.mozilla.firefox",
-        ] {
-            assert!(!valid_app_id(id), "{id:?}");
-        }
-        let long = "a".repeat(MAX_APP_ID_NAME_BYTES);
-        assert!(valid_app_id(&format!("snap:{long}")));
-        assert!(!valid_app_id(&format!("snap:{long}a")));
-    }
-}
-
-#[cfg(test)]
-mod tag_tests {
-    use super::*;
-
-    #[test]
-    fn well_formed_tags_are_accepted() {
-        for tag in ["work", "vpn2", "home-lab", "ci_runner", "a", "0"] {
-            assert!(valid_tag(tag), "{tag:?}");
-        }
-        let long = "a".repeat(MAX_TAG_BYTES);
-        assert!(valid_tag(&long));
-        assert!(!valid_tag(&format!("{long}a")));
-    }
-
-    #[test]
-    fn malformed_tags_are_rejected() {
-        for tag in [
-            "",              // a tag names a set; nothing names nothing
-            "Work",          // case is refused, not folded
-            "work lab",      // whitespace would split one selector into two
-            "work,lab",      // the CLI's own separator
-            "work.lab",      // reserved for nothing, so not admitted for now
-            "work\u{1b}[2K", // terminal escape
-            "wörk",          // non-ASCII: two spellings of one word
-            // Every rule listing prints `-` for "no tags", so these render
-            // as untagged and the GUI picker offers them as "(all)"'s twin.
-            "-",
-            "--",
-            "_",
-            "___",
-            // A `--tag` selector eats the next argument: a tag that can look
-            // like a flag lets `rules --tag --stats` swallow the flag.
-            "--stats",
-            "-work",
-            "_work",
-        ] {
-            assert!(!valid_tag(tag), "{tag:?}");
-        }
-    }
-}
-
-#[cfg(test)]
-mod summary_tests {
-    use super::*;
-
-    /// The sha256 prefix cut must land on a char boundary: rule files can
-    /// carry arbitrary text here, and a byte slice would panic clients
-    /// rendering the rule list.
-    #[test]
-    fn summary_survives_multibyte_sha256() {
-        let m = RuleMatch {
-            exe_sha256: Some("\u{5206}\u{6790}\u{30cf}\u{30c3}\u{30b7}\u{30e5}".into()),
-            ..Default::default()
-        };
-        assert!(m.summary().starts_with("sha256="));
-
-        let m = RuleMatch {
-            exe_sha256: Some("aaaaaaaaaaaaaaaa".into()),
-            ..Default::default()
-        };
-        assert_eq!(m.summary(), "sha256=aaaaaaaaaaaa..");
-    }
-}
-
-#[cfg(test)]
-mod duration_tests {
-    use super::*;
-
-    #[test]
-    fn timespan_parsing() {
-        assert_eq!(parse_timespan_secs("30s"), Some(30));
-        assert_eq!(parse_timespan_secs("5m"), Some(300));
-        assert_eq!(parse_timespan_secs("2h"), Some(7200));
-        assert_eq!(parse_timespan_secs("1d"), Some(86_400));
-        assert_eq!(parse_timespan_secs("0s"), None);
-        assert_eq!(parse_timespan_secs("10"), None);
-        assert_eq!(parse_timespan_secs("s"), None);
-        // Multi-byte final characters must parse as None, not panic:
-        // this function sees free text typed into the UI.
-        assert_eq!(parse_timespan_secs("30\u{5206}"), None);
-        assert_eq!(parse_timespan_secs("5\u{3bc}"), None);
-        assert_eq!(parse_timespan_secs("\u{5206}"), None);
-        assert_eq!(parse_timespan_secs(""), None);
-        assert_eq!(parse_timespan_secs("-5m"), None);
-        assert_eq!(parse_timespan_secs("5w"), None);
-    }
-
-    #[test]
-    fn expiry() {
-        let until = RuleDuration::Until { deadline_ms: 1000 };
-        assert!(until.expired(1000));
-        assert!(until.expired(2000));
-        assert!(!until.expired(999));
-        assert!(!RuleDuration::Forever.expired(u64::MAX));
-        assert!(!RuleDuration::Session.expired(u64::MAX));
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
     }
 }
 
@@ -1360,7 +1007,7 @@ impl ConnEvent {
     /// so "would allow" would be a distinction without a difference.
     pub fn verdict_label(&self) -> &'static str {
         match (self.enforced, self.verdict) {
-            (true, Verdict::Allow) | (false, Verdict::Allow) => "allow",
+            (_, Verdict::Allow) => "allow",
             (true, Verdict::Deny) => "deny",
             (true, Verdict::Reject) => "reject",
             (false, Verdict::Deny) => "would-deny",
@@ -1900,4 +1547,303 @@ pub enum DaemonMsg {
     /// [`ClientMsg::LockdownSet`]: the posture now in force, None when there
     /// is none.
     LockdownState(Option<Lockdown>),
+}
+
+#[cfg(test)]
+mod display_tests {
+    use super::*;
+
+    #[test]
+    fn clean_text_is_borrowed_unchanged() {
+        let s = "/usr/bin/curl https://example.org";
+        assert!(matches!(sanitize_for_display(s), Cow::Borrowed(_)));
+        assert_eq!(sanitize_for_display(s), s);
+    }
+
+    /// The attack this exists for: a cmdline that erases the line above it and
+    /// prints a different executable path must not reach the terminal intact.
+    #[test]
+    fn terminal_escapes_are_neutralized() {
+        let hostile = "evil\r\x1b[A\x1b[2K/usr/bin/firefox";
+        let out = sanitize_for_display(hostile);
+        assert!(!out.contains('\r'), "{out:?}");
+        assert!(!out.contains('\x1b'), "{out:?}");
+        assert!(!out.contains('\n'), "{out:?}");
+        // The real text survives, just defanged.
+        assert!(out.contains("evil"), "{out:?}");
+        assert!(out.contains("firefox"), "{out:?}");
+    }
+
+    #[test]
+    fn bidi_and_zero_width_are_neutralized() {
+        for hostile in [
+            "gpj.\u{202e}exe.evil",  // RTL override
+            "curl\u{200b}\u{200b}x", // zero width space
+            "a\u{feff}b",            // BOM
+            "a\u{2066}b\u{2069}c",   // bidi isolates
+        ] {
+            let out = sanitize_for_display(hostile);
+            assert!(
+                out.chars().all(|c| !is_display_hazard(c)),
+                "{hostile:?} -> {out:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn c1_controls_and_del_are_neutralized() {
+        let out = sanitize_for_display("a\u{7f}b\u{9b}c");
+        assert_eq!(out, "a\u{fffd}b\u{fffd}c");
+    }
+}
+
+#[cfg(test)]
+mod event_tests {
+    use super::*;
+
+    /// An unenforced deny must never render as a deny: the connection went
+    /// out, and a reader shown "DENY" would believe the opposite.
+    #[test]
+    fn observe_mode_labels_say_would() {
+        let mk = |verdict, enforced| ConnEvent {
+            conn: Connection {
+                tuple: FlowTuple {
+                    proto: Proto::Tcp,
+                    src: "127.0.0.1:1".parse().unwrap(),
+                    dst: "127.0.0.1:2".parse().unwrap(),
+                },
+                uid: None,
+                pid: None,
+                exe_path: None,
+                cmdline: None,
+                parent_exe: None,
+                domain: None,
+                iface: None,
+                app_id: None,
+                first_seen: None,
+            },
+            verdict,
+            rule_name: None,
+            unix_ms: 0,
+            enforced,
+        };
+        assert_eq!(mk(Verdict::Deny, true).verdict_label(), "deny");
+        assert_eq!(mk(Verdict::Reject, true).verdict_label(), "reject");
+        assert_eq!(mk(Verdict::Deny, false).verdict_label(), "would-deny");
+        assert_eq!(mk(Verdict::Reject, false).verdict_label(), "would-reject");
+        // Allow is the same outcome either way, so it is never prefixed.
+        assert_eq!(mk(Verdict::Allow, true).verdict_label(), "allow");
+        assert_eq!(mk(Verdict::Allow, false).verdict_label(), "allow");
+    }
+}
+
+#[cfg(test)]
+mod time_tests {
+    use super::*;
+
+    #[test]
+    fn timestamp_formats() {
+        assert_eq!(format_ts(0), "1970-01-01 00:00:00");
+        assert_eq!(format_rfc3339(0), "1970-01-01T00:00:00.000Z");
+        // 2024-07-03 09:46:40.123 UTC.
+        assert_eq!(format_ts(1_720_000_000_123), "2024-07-03 09:46:40");
+        assert_eq!(
+            format_rfc3339(1_720_000_000_123),
+            "2024-07-03T09:46:40.123Z"
+        );
+    }
+
+    #[test]
+    fn human_bytes_scales_to_binary_units() {
+        assert_eq!(human_bytes(0), "0 B");
+        assert_eq!(human_bytes(512), "512 B");
+        assert_eq!(human_bytes(1024), "1.0 KiB");
+        assert_eq!(human_bytes(1_572_864), "1.5 MiB");
+        assert_eq!(human_bytes(9_000_000), "8.6 MiB");
+        // Just under a unit boundary must roll up, not print "1024.0".
+        assert_eq!(human_bytes(1_048_575), "1.0 MiB");
+        assert_eq!(human_bytes(1_073_741_823), "1.0 GiB");
+    }
+}
+
+#[cfg(test)]
+mod app_id_tests {
+    use super::*;
+
+    #[test]
+    fn well_formed_identities_are_accepted() {
+        for id in [
+            "flatpak:org.mozilla.firefox",
+            "snap:firefox",
+            "snap:zellij",
+            "flatpak:com.example.App-Name",
+            "flatpak:a",
+            "snap:firefox_beta",
+            "snap:lxd-4",
+        ] {
+            assert!(valid_app_id(id), "{id:?}");
+        }
+    }
+
+    /// Everything an operator can type that would load as a rule and then
+    /// never match, and everything a cgroup name could carry into a display.
+    #[test]
+    fn malformed_identities_are_rejected() {
+        for id in [
+            "firefox",                     // no scheme
+            "docker:nginx",                // not a scheme this reads
+            "flatpak:",                    // no name
+            ":firefox",                    // no scheme
+            "flatpak:..",                  // punctuation is not a name
+            "flatpak:org.mozilla/firefox", // a name is one path segment
+            "flatpak:org\u{1b}[2K.evil",   // terminal escape
+            "flatpak:org\\x1b[2K.evil",    // systemd's escaping of one
+            "snap:ev\u{202e}il",           // bidi override
+            "snap:a\u{feff}b",             // zero width
+            "snap:fire fox",               // whitespace
+            // A namespace's own charset: snap names have no capital letters
+            // and no dots, so the daemon can never produce these and a rule
+            // written with one would be inert.
+            "snap:Firefox",
+            "snap:org.mozilla.firefox",
+        ] {
+            assert!(!valid_app_id(id), "{id:?}");
+        }
+        let long = "a".repeat(MAX_APP_ID_NAME_BYTES);
+        assert!(valid_app_id(&format!("snap:{long}")));
+        assert!(!valid_app_id(&format!("snap:{long}a")));
+    }
+}
+
+#[cfg(test)]
+mod tag_tests {
+    use super::*;
+
+    #[test]
+    fn well_formed_tags_are_accepted() {
+        for tag in ["work", "vpn2", "home-lab", "ci_runner", "a", "0"] {
+            assert!(valid_tag(tag), "{tag:?}");
+        }
+        let long = "a".repeat(MAX_TAG_BYTES);
+        assert!(valid_tag(&long));
+        assert!(!valid_tag(&format!("{long}a")));
+    }
+
+    #[test]
+    fn malformed_tags_are_rejected() {
+        for tag in [
+            "",              // a tag names a set; nothing names nothing
+            "Work",          // case is refused, not folded
+            "work lab",      // whitespace would split one selector into two
+            "work,lab",      // the CLI's own separator
+            "work.lab",      // reserved for nothing, so not admitted for now
+            "work\u{1b}[2K", // terminal escape
+            "wörk",          // non-ASCII: two spellings of one word
+            // Every rule listing prints `-` for "no tags", so these render
+            // as untagged and the GUI picker offers them as "(all)"'s twin.
+            "-",
+            "--",
+            "_",
+            "___",
+            // A `--tag` selector eats the next argument: a tag that can look
+            // like a flag lets `rules --tag --stats` swallow the flag.
+            "--stats",
+            "-work",
+            "_work",
+        ] {
+            assert!(!valid_tag(tag), "{tag:?}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod summary_tests {
+    use super::*;
+
+    /// The sha256 prefix cut must land on a char boundary: rule files can
+    /// carry arbitrary text here, and a byte slice would panic clients
+    /// rendering the rule list.
+    #[test]
+    fn summary_survives_multibyte_sha256() {
+        let m = RuleMatch {
+            exe_sha256: Some("\u{5206}\u{6790}\u{30cf}\u{30c3}\u{30b7}\u{30e5}".into()),
+            ..Default::default()
+        };
+        assert!(m.summary().starts_with("sha256="));
+
+        let m = RuleMatch {
+            exe_sha256: Some("aaaaaaaaaaaaaaaa".into()),
+            ..Default::default()
+        };
+        assert_eq!(m.summary(), "sha256=aaaaaaaaaaaa..");
+    }
+
+    /// Every criterion, in field order, with the key spelling both clients
+    /// print.
+    #[test]
+    fn summary_lists_every_criterion_in_order() {
+        assert_eq!(RuleMatch::default().summary(), "(any)");
+        let m = RuleMatch {
+            exe: Some(PathBuf::from("/usr/bin/curl")),
+            exe_glob: Some("/usr/bin/*".into()),
+            exe_sha256: Some("a".repeat(64)),
+            dest: Some("10.0.0.0/8".into()),
+            port: Some(443),
+            port_range: Some((1024, 65535)),
+            domain: Some("*.example.org".into()),
+            user: Some(1000),
+            proto: Some(Proto::Udp),
+            domains_file: Some(PathBuf::from("/r/ads.list")),
+            ips_file: Some(PathBuf::from("/r/ips.list")),
+            hashes_file: Some(PathBuf::from("/r/bad.sha256")),
+            cmdline_contains: Some("script.py".into()),
+            parent_exe: Some(PathBuf::from("/usr/bin/bash")),
+            src: Some("192.168.1.0/24".into()),
+            src_port: Some(40_000),
+            iface: Some("eth0".into()),
+            app_id: Some("snap:firefox".into()),
+        };
+        assert_eq!(
+            m.summary(),
+            "exe=/usr/bin/curl exe-glob=/usr/bin/* sha256=aaaaaaaaaaaa.. dest=10.0.0.0/8 \
+             port=443 ports=1024-65535 domain=*.example.org user=1000 proto=udp \
+             domains-file=/r/ads.list ips-file=/r/ips.list hashes-file=/r/bad.sha256 \
+             cmdline~=script.py parent=/usr/bin/bash src=192.168.1.0/24 src-port=40000 \
+             iface=eth0 app=snap:firefox"
+        );
+    }
+}
+
+#[cfg(test)]
+mod duration_tests {
+    use super::*;
+
+    #[test]
+    fn timespan_parsing() {
+        assert_eq!(parse_timespan_secs("30s"), Some(30));
+        assert_eq!(parse_timespan_secs("5m"), Some(300));
+        assert_eq!(parse_timespan_secs("2h"), Some(7200));
+        assert_eq!(parse_timespan_secs("1d"), Some(86_400));
+        assert_eq!(parse_timespan_secs("0s"), None);
+        assert_eq!(parse_timespan_secs("10"), None);
+        assert_eq!(parse_timespan_secs("s"), None);
+        // Multi-byte final characters must parse as None, not panic:
+        // this function sees free text typed into the UI.
+        assert_eq!(parse_timespan_secs("30\u{5206}"), None);
+        assert_eq!(parse_timespan_secs("5\u{3bc}"), None);
+        assert_eq!(parse_timespan_secs("\u{5206}"), None);
+        assert_eq!(parse_timespan_secs(""), None);
+        assert_eq!(parse_timespan_secs("-5m"), None);
+        assert_eq!(parse_timespan_secs("5w"), None);
+    }
+
+    #[test]
+    fn expiry() {
+        let until = RuleDuration::Until { deadline_ms: 1000 };
+        assert!(until.expired(1000));
+        assert!(until.expired(2000));
+        assert!(!until.expired(999));
+        assert!(!RuleDuration::Forever.expired(u64::MAX));
+        assert!(!RuleDuration::Session.expired(u64::MAX));
+    }
 }
