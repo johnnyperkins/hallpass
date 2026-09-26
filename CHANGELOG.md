@@ -109,6 +109,8 @@ restarted together; a version mismatch is refused at connect.
 
 ### Changed
 
+- **Engaging a lockdown cuts established flows it denies**, as a new deny rule
+  does, where it used to leave them running. Governed by `kill_established`.
 - **The verdict queue's overflow policy follows the mode and lockdown live.**
   Observe mode fails open and a lockdown fails closed from the moment either
   is switched, rather than keeping the flag set at startup. The vendored

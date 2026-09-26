@@ -324,11 +324,9 @@ impl RuntimeSettings {
     /// Whether a lockdown posture is in force. Set only by
     /// [`crate::lockdown::apply`].
     ///
-    /// Deliberately does not wake the flow-kill sweeper, unlike an
-    /// observe-to-enforce flip. That sweeper kills flows an explicit *deny
-    /// rule* matches, and a posture denies by suppressing allows rather than
-    /// by adding one, so a wake would find nothing to kill. Flows already
-    /// established when a posture engages keep running; docs/rules.md says so.
+    /// Set before the ruleset is recompiled under the posture, so the
+    /// flow-kill sweeper that recompile wakes already sees an enforcing
+    /// daemon and kills the established flows the posture denies.
     pub fn set_locked_down(&self, on: bool) {
         self.locked_down.store(on, Ordering::Relaxed);
     }

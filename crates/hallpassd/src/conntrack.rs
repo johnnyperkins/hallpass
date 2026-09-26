@@ -16,10 +16,10 @@
 //! Which flows: after every ruleset change, the event history's most recent
 //! decision per flow tuple is re-evaluated against the new ruleset. A flow
 //! whose last decision was Allow and that an enabled deny/reject rule now
-//! matches gets its entry deleted. Flows the new ruleset leaves unmatched
-//! are left alone: unmatched means "prompt", and yanking established
-//! connections into prompts on every rule edit would turn a policy tweak
-//! into a popup storm. Hash-pinning rules cannot match here (the history
+//! matches gets its entry deleted, and so does one a lockdown posture now
+//! denies. Flows the new ruleset leaves unmatched are otherwise left alone:
+//! unmatched means "prompt", and yanking established connections into
+//! prompts on every rule edit would turn a policy tweak into a popup storm. Hash-pinning rules cannot match here (the history
 //! carries no executable hash), which costs a kill, never a wrong one.
 //!
 //! Deliberately best-effort, and the bounds are the history ring's: a flow
@@ -214,8 +214,21 @@ pub fn flows_to_kill(ruleset: &RuleSet, history: &[Arc<ConnEvent>]) -> Vec<(Flow
         if ruleset.wants_exe_hash_for(&ev.conn) {
             continue;
         }
-        if let Some((rule, Verdict::Deny | Verdict::Reject)) = ruleset.match_conn(&ev.conn, None) {
-            kills.push((ev.conn.tuple, rule.name.clone()));
+        match ruleset.match_conn(&ev.conn, None) {
+            Some((rule, Verdict::Deny | Verdict::Reject)) => {
+                kills.push((ev.conn.tuple, rule.name.clone()));
+            }
+            // Under a lockdown posture an unmatched connection is denied
+            // outright rather than prompted, so it is as denied as a deny
+            // rule makes it, and no prompt storm can follow the kill.
+            // Loopback is the posture's own exemption.
+            None if ruleset.locked_down() && !crate::nfqueue::stays_on_host(&ev.conn) => {
+                kills.push((
+                    ev.conn.tuple,
+                    hallpass_types::LOCKDOWN_DENIED_RULE.to_string(),
+                ));
+            }
+            _ => {}
         }
     }
     kills
@@ -466,6 +479,43 @@ mod tests {
         let t = tuple("10.0.0.1:1000", "1.1.1.1:443", Proto::Tcp);
         let history = vec![event(t, "/usr/bin/curl", Verdict::Allow, true)];
         assert!(flows_to_kill(&ruleset, &history).is_empty());
+    }
+
+    /// A lockdown denies what no pinned allow permits, so engaging one kills
+    /// those flows too: everything but loopback and what a pinned rule
+    /// still allows.
+    #[test]
+    fn flows_to_kill_includes_what_a_lockdown_denies() {
+        let pinned = Rule {
+            name: "core-git".into(),
+            action: Action::Allow,
+            duration: RuleDuration::Forever,
+            priority: 10,
+            enabled: true,
+            tags: vec!["core".into()],
+            matcher: RuleMatch {
+                exe: Some("/usr/bin/git".into()),
+                ..Default::default()
+            },
+        };
+        let mut unpinned = pinned.clone();
+        unpinned.name = "allow-curl".into();
+        unpinned.tags = Vec::new();
+        unpinned.matcher.exe = Some("/usr/bin/curl".into());
+        let ruleset =
+            RuleSet::compile_with_lockdown(&[pinned, unpinned], Some(&["core".to_string()]));
+        let t_git = tuple("10.0.0.1:1000", "1.1.1.1:443", Proto::Tcp);
+        let t_curl = tuple("10.0.0.1:1001", "1.1.1.1:443", Proto::Tcp);
+        let t_local = tuple("127.0.0.1:1002", "127.0.0.53:53", Proto::Udp);
+        let history = vec![
+            event(t_git, "/usr/bin/git", Verdict::Allow, true),
+            event(t_curl, "/usr/bin/curl", Verdict::Allow, true),
+            event(t_local, "/usr/bin/curl", Verdict::Allow, true),
+        ];
+        assert_eq!(
+            flows_to_kill(&ruleset, &history),
+            vec![(t_curl, hallpass_types::LOCKDOWN_DENIED_RULE.to_string())]
+        );
     }
 
     #[test]

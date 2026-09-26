@@ -287,8 +287,11 @@ values so clients' read-modify-write does not persist the forced ones.
 saves before enforcing: a posture in force but unrecorded would lift silently
 on restart. The file is read without following symlinks. Any read failure means
 "no posture", loudly, since refusing to start leaves no firewall and assuming
-the strictest posture leaves a host reaching nothing. Engaging a posture does
-not wake the flow-kill sweeper, which only acts on explicit deny rules.
+the strictest posture leaves a host reaching nothing. Engaging a posture
+recompiles the ruleset, which wakes the flow-kill sweeper; `flows_to_kill`
+treats an unmatched, non-loopback flow under a posture as `lockdown:denied`,
+so established flows the posture denies are cut like those a deny rule
+matches.
 
 ## The desktop GUI
 

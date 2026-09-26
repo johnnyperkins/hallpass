@@ -186,7 +186,9 @@ The posture survives restarts (`/var/lib/hallpass/posture.toml`) and shows in
 
 Before relying on it:
 
-- **Open connections keep running.** Only new connections are judged.
+- **Open connections are cut** the way a new deny rule cuts them, with the
+  same limits (see [above](#deny-rules-and-established-flows)), and only when
+  `kill_established` is on.
 - **DNS usually stops working** unless a pinned rule covers the resolver, and
   `domain` rules then stop matching. `lockdown on` warns about this, and
   refuses outright when no rule would survive unless you pass `--force`.
