@@ -130,10 +130,19 @@ fn spawn_dns_snoop(
                     continue;
                 };
                 if tracker.validate(tuple.dst, tuple.src, &resp) {
+                    // The path in the message rather than a field, so it can
+                    // be counted with grep: a reply from the stub answered a
+                    // program's own query, one from elsewhere the resolver's.
+                    let via = if tuple.src.ip().is_loopback() {
+                        "stub"
+                    } else {
+                        "upstream"
+                    };
                     tracing::debug!(
                         domain = %resp.query_name,
                         addrs = resp.addrs.len(),
-                        "dns response snooped"
+                        client = %tuple.dst,
+                        "dns cache insert (wire, {via})"
                     );
                     cache.absorb(&resp);
                 } else {
