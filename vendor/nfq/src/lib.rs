@@ -964,7 +964,12 @@ impl Queue {
                     if errno == 0 {
                         return Ok(true);
                     }
-                    if !skip_errors {
+                    // The ack echoes the header of the request it answers. A failed verdict is
+                    // never the answer a config call is waiting for, so it is counted like any
+                    // other verdict failure rather than returned as the config call's error,
+                    // which would also drop the rest of the batch.
+                    let echoed = unsafe { (*err).msg.nlmsg_type } & 0xff;
+                    if !skip_errors && echoed != NFQNL_MSG_VERDICT as u16 {
                         return Err(std::io::Error::from_raw_os_error(errno));
                     }
                     self.ack_errors = self.ack_errors.saturating_add(1);
@@ -988,8 +993,12 @@ impl Queue {
 
     // Receive the next error message. Returns Ok only if errno is 0 (which is a response to a
     // message with F_ACK set).
+    //
+    // On a live queue the ack can share a batch with queued packets. They are parsed into the
+    // receive queue for the next `recv`, not dropped: upstream discarded them, which left them
+    // unverdicted in the kernel and made every config call unsafe once packets were flowing.
     fn recv_error(&mut self) -> Result<()> {
-        while !self.recv_nlmsg(false, |_, _| ())? {}
+        while !self.recv_nlmsg(false, |this, nlh| unsafe { parse_msg(nlh, this) })? {}
         Ok(())
     }
 

@@ -10,6 +10,11 @@ The changes, all in `src/lib.rs`:
 - `set_copy_range` sizes the receive buffer for the largest range set on the
   socket, not the most recent one.
 - `set_recv_buffer_size_force` sets `SO_RCVBUFFORCE`.
+- Config calls (`set_fail_open` and friends) keep the packet messages that
+  arrive in the same batch as their ack, queued for the next `recv`, instead
+  of discarding them, and skip error acks that answer earlier verdicts
+  rather than taking them for their own. That makes them safe on a live
+  queue.
 - `get_hw_addr` spells out a borrow that current rustc denies as an implicit
   autoref when the crate builds as a path dependency (same semantics).
 
