@@ -1,0 +1,4 @@
+# libFuzzer instrumentation needs nightly; the same pin as crates/hallpass-ebpf,
+# so one nightly serves both.
+[toolchain]
+channel = "nightly-2026-07-11"

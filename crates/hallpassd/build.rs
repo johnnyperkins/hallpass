@@ -16,6 +16,8 @@ const OBJ_NAME: &str = "hallpass-ebpf";
 const OVERRIDE_VAR: &str = "HALLPASS_EBPF_OBJ";
 
 fn main() {
+    // Set by cargo-fuzz; gates the fuzz entry points (src/fuzz.rs).
+    println!("cargo::rustc-check-cfg=cfg(fuzzing)");
     println!("cargo::rerun-if-env-changed={OVERRIDE_VAR}");
     println!("cargo::rerun-if-env-changed=CARGO_TARGET_DIR");
     // Only the ebpf feature embeds the object; without it there is

@@ -1,0 +1,27 @@
+# Example rule: allow all outbound DNS queries over UDP.
+#
+# Shipped DISABLED on purpose. As written this matches only port and
+# protocol, so enabling it lets *every* local process send arbitrary UDP to
+# port 53 on *any* host, forever, without a prompt. Port 53 to a host the
+# process picks is a standard exfiltration and command-and-control channel,
+# and at priority 100 this rule also outranks the priority-50 rules that
+# answering a prompt creates.
+#
+# To use it, scope it to the resolver you actually talk to and then set
+# enabled = true. For example, add one of:
+#
+#     dest = "127.0.0.53"    # systemd-resolved stub
+#     dest = "192.168.1.1"   # your router
+#     exe = "/usr/lib/systemd/systemd-resolved"
+#
+# Drop files like this into /etc/hallpass/rules.d/ to load them at startup.
+
+name = "allow-dns"
+action = "allow"
+duration = "forever"
+priority = 100
+enabled = false
+
+[match]
+port = 53
+proto = "udp"

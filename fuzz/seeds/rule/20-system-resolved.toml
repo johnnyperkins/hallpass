@@ -1,0 +1,31 @@
+# systemd-resolved's upstream queries.
+#
+# Applications do not need this rule. They ask the stub listener on
+# 127.0.0.53, and loopback with a loopback source is exempt from filtering
+# before any rule is consulted. What this covers is resolved itself talking
+# to the real resolver, which is the one leg of desktop DNS that leaves the
+# host.
+#
+# Scoped to the binary rather than to port 53. A rule matching the port
+# alone would let every local process send arbitrary traffic to port 53 on
+# any host it picks, which is a standard exfiltration and command-and-
+# control channel; see example-allow-dns.toml for the longer version of
+# that warning.
+#
+# `proto` is deliberately absent so this covers both the UDP query and the
+# TCP retry a truncated answer forces. Port 853 (DNS-over-TLS) is not here:
+# it is off unless the operator turned it on, and a shipped rule should not
+# pre-authorize a channel this host is not using.
+#
+# Priority 20 sits below the 50 that answering a prompt writes, so a rule
+# you create later overrides this one rather than losing to it.
+
+name = "system-resolved"
+action = "allow"
+duration = "forever"
+priority = 20
+enabled = true
+
+[match]
+exe = "/usr/lib/systemd/systemd-resolved"
+port = 53

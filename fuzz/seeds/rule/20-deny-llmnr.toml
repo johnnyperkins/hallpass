@@ -1,0 +1,35 @@
+# Deny LLMNR, the fallback that resolves a bare hostname by shouting.
+#
+# When DNS has no answer for `printer`, systemd-resolved asks the local
+# network segment instead: UDP or TCP to 224.0.0.252:5355, or ff02::1:3 on
+# IPv6. Nothing authenticates the reply. Whoever answers first is believed,
+# so anyone sharing the network can claim to be the name you asked for and
+# receive the connection you meant for something else, which is the whole
+# basis of credential-relay tools that sit on a network and answer every
+# query. Turning it off is standard hardening.
+#
+# Not scoped to an executable, unlike the allow rules beside it. A deny that
+# names one binary stops covering the traffic the moment it comes from
+# another, and the direction a block should err in is broader; the same
+# argument governs why a prompt reply never pins a deny. `proto` is absent so
+# it covers the TCP leg as well as the UDP one.
+#
+# Shipped as a rule rather than left to prompt because the alternative is a
+# dialog that reappears for as long as resolved keeps trying, and a prompt
+# an operator dismisses daily is one they stop reading.
+#
+# This blocks the query; it does not stop resolved sending it. `LLMNR=no` in
+# /etc/systemd/resolved.conf stops it at the source, which is tidier. Delete
+# this file if you resolve local hostnames that only LLMNR knows.
+#
+# Priority 20 sits below the 50 that answering a prompt writes, so an allow
+# you create later overrides this one.
+
+name = "deny-llmnr"
+action = "deny"
+duration = "forever"
+priority = 20
+enabled = true
+
+[match]
+port = 5355

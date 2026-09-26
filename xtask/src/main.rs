@@ -21,6 +21,7 @@ fn main() -> ExitCode {
         Some("build") => build_ebpf().and_then(|()| build_workspace()),
         Some("e2e") => test_e2e(std::env::args().any(|a| a == "--ebpf")),
         Some("dev") => dev(),
+        Some("fuzz") => fuzz(&std::env::args().skip(2).collect::<Vec<_>>()),
         Some(other) => {
             eprintln!("unknown task: {other}");
             print_usage();
@@ -66,6 +67,10 @@ builds:
 running:
   dev           run hallpassd unprivileged against a scratch config, for
                 CLI/UI work; interception is off, IPC and rules work
+  fuzz [TARGET] [SECS]
+                fuzz one target, or every target in turn, for SECS each
+                (default 60); needs cargo-fuzz. Crashes land in
+                fuzz/artifacts/<target>/
 ";
 
 fn print_usage() {
@@ -79,6 +84,17 @@ fn cargo(args: &[&str]) -> Command {
     let bin = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
     let mut cmd = Command::new(bin);
     cmd.args(args).current_dir(workspace_root());
+    cmd
+}
+
+/// `cargo <args>` in fuzz/, which is its own workspace on its own nightly
+/// pin; the environment is cleared for the same reason as [`ebpf_cargo`].
+fn fuzz_cargo(args: &[&str]) -> Command {
+    let mut cmd = Command::new("cargo");
+    cmd.args(args)
+        .current_dir(workspace_root().join("fuzz"))
+        .env_remove("RUSTUP_TOOLCHAIN")
+        .env_remove("CARGO");
     cmd
 }
 
@@ -200,7 +216,68 @@ fn lint() -> Result<(), String> {
 /// the same gap [`clippy_ebpf`] exists to close.
 fn fmt_check() -> Result<(), String> {
     run(cargo(&["fmt", "--all", "--check"]))?;
-    run(ebpf_cargo(&["fmt", "--check"]))
+    run(ebpf_cargo(&["fmt", "--check"]))?;
+    run(fuzz_cargo(&["fmt", "--check"]))
+}
+
+/// Run the fuzz targets in fuzz/: `[TARGET] [SECS]`.
+///
+/// Each run reads and grows `fuzz/corpus/<target>` (ignored by git) and also
+/// reads the checked-in seeds in `fuzz/seeds/<target>`. A crash stops the run
+/// and leaves its input in `fuzz/artifacts/<target>/`; replay it with
+/// `cargo fuzz run -O <target> <file>` inside fuzz/.
+fn fuzz(args: &[String]) -> Result<(), String> {
+    if !Command::new("cargo")
+        .args(["fuzz", "--version"])
+        .output()
+        .is_ok_and(|o| o.status.success())
+    {
+        return Err("cargo-fuzz not found; install it with: cargo install cargo-fuzz".into());
+    }
+    let (targets, secs) = match args {
+        [] => (fuzz_targets()?, "60".to_string()),
+        [t] if t.parse::<u64>().is_ok() => (fuzz_targets()?, t.clone()),
+        [t] => (vec![t.clone()], "60".to_string()),
+        [t, n] if n.parse::<u64>().is_ok() => (vec![t.clone()], n.clone()),
+        _ => return Err("usage: cargo xtask fuzz [TARGET] [SECS]".into()),
+    };
+    let root = workspace_root().join("fuzz");
+    for t in &targets {
+        for dir in ["corpus", "seeds"] {
+            std::fs::create_dir_all(root.join(dir).join(t))
+                .map_err(|e| format!("create fuzz/{dir}/{t}: {e}"))?;
+        }
+        eprintln!("--- fuzz {t} for {secs}s");
+        let (corpus, seeds) = (format!("corpus/{t}"), format!("seeds/{t}"));
+        let max_time = format!("-max_total_time={secs}");
+        run(fuzz_cargo(&[
+            "fuzz",
+            "run",
+            "-O",
+            t,
+            &corpus,
+            &seeds,
+            "--",
+            &max_time,
+            "-timeout=5",
+            "-rss_limit_mb=2048",
+        ]))?;
+    }
+    Ok(())
+}
+
+/// The fuzz targets, as cargo-fuzz lists them.
+fn fuzz_targets() -> Result<Vec<String>, String> {
+    let out = fuzz_cargo(&["fuzz", "list"])
+        .output()
+        .map_err(|e| format!("cargo fuzz list: {e}"))?;
+    if !out.status.success() {
+        return Err("cargo fuzz list failed".into());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::to_owned)
+        .collect())
 }
 
 /// Build the rustdoc, treating warnings as errors.

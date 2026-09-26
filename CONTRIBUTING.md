@@ -51,6 +51,25 @@ focus order, a button actually reaching the state logic) use `egui_kittest`,
 which reads the AccessKit tree without a GPU. Snapshot testing is deliberately
 off.
 
+### Fuzzing
+
+Every parser that reads bytes an attacker chooses has a fuzz target in
+`fuzz/`: DNS messages, IP packets, netlink replies, `/proc` cgroup and
+cmdline text, `/proc/net` lines, rule TOML, syslog export and the wire
+protocol. The entry points and their oracles live in
+`crates/hallpassd/src/fuzz.rs`, which the normal test run also exercises.
+
+```sh
+cargo install cargo-fuzz
+cargo xtask fuzz              # every target, 60s each
+cargo xtask fuzz dns 600      # one target, ten minutes
+```
+
+A crash stops the run and leaves its input in `fuzz/artifacts/<target>/`.
+Replay it with `cargo fuzz run -O <target> <file>` inside `fuzz/`, fix it, and
+turn it into a unit test beside the parser. Seeds worth keeping go in
+`fuzz/seeds/<target>/`; the growing corpus in `fuzz/corpus/` is not committed.
+
 The tree was reformatted wholesale once; skip that commit in blame with:
 
 ```sh

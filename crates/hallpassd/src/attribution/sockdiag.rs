@@ -133,7 +133,7 @@ fn write_addr(slot: &mut [u8], ip: IpAddr) {
 /// malformed, which the caller treats like an errno it cannot use: no
 /// answer, fall back to the file read. Nothing here can misattribute; a
 /// bad reply costs the fast path, never a wrong entry.
-fn parse_reply(buf: &[u8]) -> Option<(u32, DiagReply)> {
+pub(crate) fn parse_reply(buf: &[u8]) -> Option<(u32, DiagReply)> {
     // struct nlmsghdr.
     let header = buf.get(..NLMSG_HDRLEN)?;
     let len = u32::from_ne_bytes(header[0..4].try_into().ok()?) as usize;

@@ -11,7 +11,8 @@ members = [
 # NOTE: crates/hallpass-ebpf is intentionally NOT a workspace member.
 # Following the aya convention, it is a separate no_std crate built via xtask.
 # vendor/nfq is a patched third-party crate, kept out of the workspace lints.
-exclude = ["vendor/nfq"]
+# fuzz/ needs nightly and libFuzzer; it is built through `cargo xtask fuzz`.
+exclude = ["vendor/nfq", "fuzz"]
 
 [workspace.package]
 version = "0.1.0"

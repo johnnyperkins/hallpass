@@ -93,7 +93,7 @@ fn build_delete(tuple: &FlowTuple, seq: u32) -> Vec<u8> {
 /// every acked request comes back as: errno 0 is the ack, negative is the
 /// failure. `None` for anything else (too short, not an error message, or
 /// a claimed length the buffer does not actually hold).
-fn parse_ack(buf: &[u8]) -> Option<(u32, i32)> {
+pub(crate) fn parse_ack(buf: &[u8]) -> Option<(u32, i32)> {
     if buf.len() < NLMSG_HDRLEN + 4 {
         return None;
     }

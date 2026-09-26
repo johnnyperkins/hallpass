@@ -740,7 +740,7 @@ const MAX_CGROUP_BYTES: usize = 8192;
 /// match it, so it falls through to the prompt or the default verdict. A
 /// launcher that changes how it names units therefore costs matches instead
 /// of handing out somebody else's.
-fn app_id_from_cgroup(contents: &str) -> Option<String> {
+pub(crate) fn app_id_from_cgroup(contents: &str) -> Option<String> {
     contents
         .lines()
         .filter_map(|line| line.splitn(3, ':').nth(2))
@@ -803,7 +803,7 @@ fn app_id_from_unit(segment: &str) -> Option<String> {
 /// already documented as a scoping convenience rather than a boundary,
 /// since a process that wants to dodge it simply does not put the string in
 /// its argv at all.
-pub(super) const MAX_CMDLINE_BYTES: usize = 4096;
+pub(crate) const MAX_CMDLINE_BYTES: usize = 4096;
 
 /// Best-effort read of exe symlink and cmdline for a PID. Also used by
 /// the eBPF attributor to snapshot details on exec events.
@@ -939,7 +939,7 @@ pub(super) fn host_exe_id(proc_root: &Path, pid: u32) -> Option<(PathBuf, Option
 ///
 /// Cuts on a character boundary: the source is `from_utf8_lossy` output, so
 /// it is valid UTF-8 with multi-byte characters a byte slice would split.
-fn truncate_cmdline(mut s: String) -> String {
+pub(crate) fn truncate_cmdline(mut s: String) -> String {
     if s.len() <= MAX_CMDLINE_BYTES {
         return s;
     }

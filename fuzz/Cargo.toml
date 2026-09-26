@@ -1,0 +1,92 @@
+# Coverage-guided fuzzing of every parser that reads attacker-chosen bytes.
+# Not a workspace member: it needs nightly and libFuzzer. Run through
+# `cargo xtask fuzz`, which see.
+[package]
+name = "hallpass-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+hallpassd = { path = "../crates/hallpassd" }
+hallpass-types = { path = "../crates/hallpass-types" }
+serde = "1"
+serde_json = "1"
+
+# Its own workspace, so the root one never builds it on stable.
+[workspace]
+members = ["."]
+
+# The same patched nfq the daemon builds with everywhere else.
+[patch.crates-io]
+nfq = { path = "../vendor/nfq" }
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "dns"
+path = "fuzz_targets/dns.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "packet"
+path = "fuzz_targets/packet.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "netlink"
+path = "fuzz_targets/netlink.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cgroup"
+path = "fuzz_targets/cgroup.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cmdline"
+path = "fuzz_targets/cmdline.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "proc_net_line"
+path = "fuzz_targets/proc_net_line.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rule"
+path = "fuzz_targets/rule.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "syslog"
+path = "fuzz_targets/syslog.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wire"
+path = "fuzz_targets/wire.rs"
+test = false
+doc = false
+bench = false

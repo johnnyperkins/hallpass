@@ -1,0 +1,33 @@
+# NetworkManager: address configuration and the connectivity check.
+#
+# The broadest rule shipped, and the only one not scoped to a port. What
+# NetworkManager sends depends on the distribution and the connection
+# profile: DHCP on 67/68 when it uses a socket rather than AF_PACKET, its
+# connectivity check over HTTP or HTTPS to whatever endpoint the vendor
+# configured, and sometimes DNS of its own. Pinning those ports here would
+# produce a rule that is right on one distribution and quietly wrong on the
+# next, and the failure mode of wrong is a host that boots without an
+# address.
+#
+# The grant is narrower than it looks. It names one binary, and that binary
+# already configures every interface on the host: an attacker who is
+# NetworkManager does not need this rule to reach the network. Being it is
+# the hard part: the path is checked against the file the host has there, so
+# a process cannot claim it by mounting its own binary over the path in a
+# namespace of its own.
+#
+# It is also the one baseline rule worth deleting if you can. A host with a
+# static address and no connectivity check does not need it, and dropping
+# it costs nothing there.
+#
+# Priority 20 sits below the 50 that answering a prompt writes, so a rule
+# you create later overrides this one rather than losing to it.
+
+name = "system-networkmanager"
+action = "allow"
+duration = "forever"
+priority = 20
+enabled = true
+
+[match]
+exe = "/usr/sbin/NetworkManager"

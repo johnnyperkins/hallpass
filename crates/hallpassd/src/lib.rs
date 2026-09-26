@@ -35,6 +35,12 @@ mod syslog;
 #[cfg(test)]
 mod testutil;
 
+/// Entry points for the fuzz targets in `fuzz/`. Compiled into tests too, so
+/// the workspace build keeps them honest.
+#[cfg(any(test, fuzzing))]
+#[doc(hidden)]
+pub mod fuzz;
+
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
