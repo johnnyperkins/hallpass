@@ -353,9 +353,8 @@ fn unique_name(key: &Key, used: &mut HashSet<String>) -> String {
             }
         })
         .collect::<String>();
-    // Comfortably under the daemon's 256-byte name cap, leaving room for
-    // the dedup suffix.
-    base.truncate(200);
+    // Under the daemon's name cap with room left for the dedup suffix.
+    base.truncate(hallpass_types::MAX_RULE_NAME_BYTES - 56);
     let mut name = base.clone();
     let mut n = 1;
     while !used.insert(name.clone()) {

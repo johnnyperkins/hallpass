@@ -98,18 +98,7 @@ impl Hit {
     }
 }
 
-/// Longest accepted rule name.
-///
-/// Names are echoed back in every rule listing, every hit report, every
-/// explain trace and every event that a rule decided, so their length is
-/// multiplied by the number of rules in a single reply. The wire codec
-/// refuses frames over 1 MiB and a refused frame breaks the client's
-/// connection instead of answering it, so an unbounded name let a
-/// `hallpass`-group client make the daemon unanswerable to every client,
-/// itself included. `Forever` rules were bounded incidentally by the
-/// filesystem's name limit; `Session` rules are never written to disk and
-/// had no bound at all.
-pub const MAX_RULE_NAME_BYTES: usize = 256;
+pub use hallpass_types::MAX_RULE_NAME_BYTES;
 
 /// Most rule names tracked at once.
 ///
