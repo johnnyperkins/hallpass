@@ -109,6 +109,10 @@ restarted together; a version mismatch is refused at connect.
 
 ### Changed
 
+- **Rule `exe` and `parent_exe` paths are resolved through symlinks** when
+  rules load. The kernel reports the resolved path, so a rule naming
+  `/usr/bin/python3`, an alternatives link or `/usr/sbin` on a merged-/usr
+  host used to match nothing.
 - **`rules add` and `rules import` refuse a name already in use** unless given
   `--replace`, instead of silently overwriting the rule (and re-enabling it or
   dropping its tags). Scripts that re-add rules to update them need the flag.

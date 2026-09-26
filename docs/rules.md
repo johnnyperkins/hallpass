@@ -59,7 +59,9 @@ takes a timespan (`30s`, `5m`, `2h`, `1d`) for a rule that expires.
 | `iface` | Outbound interface name, e.g. `wg0` |
 
 List files are reloaded with the directory, so keep them inside `rules.d`
-(any extension but `.toml`).
+(any extension but `.toml`). Symlinks in `exe` and `parent_exe` are resolved
+when rules load, because the kernel always reports the resolved path: a rule
+for `/usr/bin/python3` matches the `python3.12` it points to.
 
 Not every field is equally trustworthy. `cmdline_contains`, `parent_exe` and
 `app_id` are chosen by the process itself, `domain` depends on DNS the
@@ -235,10 +237,8 @@ carry the `system` tag, which lockdown pins by default:
 | `20-system-networkmanager.toml` | NetworkManager's address configuration and connectivity check |
 | `20-deny-llmnr.toml` | Denies LLMNR (port 5355), which resolves bare hostnames by asking the whole link |
 
-Check each `exe` against what `readlink -f /proc/<pid>/exe` reports on your
-host: the match is exact, and where `/usr/sbin` is a symlink to `/usr/bin` a
-shipped path can match nothing. A host running chrony, ntpd,
-systemd-networkd or dhcpcd needs its own rule on the same pattern.
+A host running chrony, ntpd, systemd-networkd or dhcpcd instead needs its own
+rule on the same pattern.
 
 The installer offers each shipped rule once. A rule you edit or delete stays
 that way across reinstalls; the record is `/var/lib/hallpass/offered-rules`,

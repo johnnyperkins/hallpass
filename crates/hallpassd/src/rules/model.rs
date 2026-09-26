@@ -1,6 +1,6 @@
 //! Compiled form of a rule: match fields pre-parsed for fast evaluation.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use globset::GlobMatcher;
@@ -151,6 +151,21 @@ fn compile_exe_glob(rule: &str, glob: &str) -> Result<GlobMatcher, String> {
         .compile_matcher())
 }
 
+/// A rule's executable path as the kernel will report it.
+///
+/// `/proc/<pid>/exe` names the binary with every symlink resolved, so a rule
+/// written against `/usr/bin/python3`, an alternatives link, or `/usr/sbin`
+/// on a merged-/usr host would otherwise never match anything. Resolved
+/// when the rule compiles, so it follows a link that changes at the next
+/// reload; a path that does not resolve (not installed yet, or relative) is
+/// kept as written.
+fn resolved_exe(path: &Path) -> PathBuf {
+    if !path.is_absolute() {
+        return path.to_path_buf();
+    }
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
 impl CompiledRule {
     /// Compile a rule, validating cidr/glob/range fields.
     ///
@@ -240,7 +255,7 @@ impl CompiledRule {
             // function is called from paths that have no posture to consult.
             // `RuleSet::compile_with_lockdown` sets it.
             suppressed: false,
-            exe: m.exe.clone(),
+            exe: m.exe.as_deref().map(resolved_exe),
             exe_glob,
             exe_sha256,
             dest,
@@ -258,7 +273,7 @@ impl CompiledRule {
             ips_file,
             hashes_file,
             cmdline_contains: m.cmdline_contains.clone(),
-            parent_exe: m.parent_exe.clone(),
+            parent_exe: m.parent_exe.as_deref().map(resolved_exe),
             src,
             src_port: m.src_port,
             iface: m.iface.clone(),
@@ -563,6 +578,49 @@ mod tests {
         assert!(!compiled.matches(&conn, Some(&"cd".repeat(32))));
         assert!(!compiled.matches(&conn, None));
         assert!(compiled.matches_ignoring_hash(&conn));
+    }
+
+    /// A rule naming a symlink matches the binary the kernel reports, which
+    /// is always the resolved path.
+    #[test]
+    fn exe_paths_match_through_symlinks() {
+        use crate::testutil::TestDir;
+        let dir = TestDir::new("model-exe-link");
+        let real = dir.write("python3.12", "");
+        let link = dir.path().join("python3");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let real = std::fs::canonicalize(&real).unwrap();
+
+        let conn = Connection {
+            exe_path: Some(real.clone()),
+            parent_exe: Some(real.clone()),
+            ..bare("10.0.0.1:40000", "1.2.3.4:443")
+        };
+        for matcher in [
+            RuleMatch {
+                exe: Some(link.clone()),
+                ..Default::default()
+            },
+            RuleMatch {
+                parent_exe: Some(link.clone()),
+                ..Default::default()
+            },
+        ] {
+            let compiled = CompiledRule::compile(&rule_with(matcher)).unwrap();
+            assert!(compiled.matches(&conn, None));
+        }
+        // A path that resolves nowhere is compared as written.
+        let missing = dir.path().join("not-installed");
+        let compiled = CompiledRule::compile(&rule_with(RuleMatch {
+            exe: Some(missing.clone()),
+            ..Default::default()
+        }))
+        .unwrap();
+        let conn = Connection {
+            exe_path: Some(missing),
+            ..bare("10.0.0.1:40000", "1.2.3.4:443")
+        };
+        assert!(compiled.matches(&conn, None));
     }
 
     #[test]
