@@ -19,7 +19,16 @@ fn main() -> ExitCode {
         Some("build-ebpf") => build_ebpf(),
         Some("clippy-ebpf") => clippy_ebpf(),
         Some("build") => build_ebpf().and_then(|()| build_workspace()),
-        Some("e2e") => test_e2e(std::env::args().any(|a| a == "--ebpf")),
+        Some("e2e") => {
+            let rest: Vec<String> = std::env::args().skip(2).collect();
+            let ebpf = rest.iter().any(|a| a == "--ebpf");
+            let extra: Vec<&str> = rest
+                .iter()
+                .map(String::as_str)
+                .filter(|a| *a != "--ebpf")
+                .collect();
+            test_e2e(ebpf, &extra)
+        }
         Some("dev") => dev(),
         Some("fuzz") => fuzz(&std::env::args().skip(2).collect::<Vec<_>>()),
         Some(other) => {
@@ -53,10 +62,12 @@ verification (cheapest first):
   doc           cargo doc --no-deps with -D warnings (broken links fail)
   ci            everything CI runs that does not need root, failing at
                 the first stage that breaks; cargo-deny if it is installed
-  e2e [--ebpf]  run the hallpassd e2e tests (compiles as you, runs the
+  e2e [--ebpf] [ARGS...]
+                run the hallpassd e2e tests (compiles as you, runs the
                 test binary under sudo -E; will prompt for your password).
                 --ebpf builds the object first and enables the feature, so
-                the tests that skip without it actually run
+                the tests that skip without it actually run. Other ARGS go
+                to the test binary: a name filter, --nocapture
 
 builds:
   build-ebpf    build the hallpass-ebpf kernel programs
@@ -354,7 +365,10 @@ fn ci() -> Result<(), String> {
 /// uprobes and the exec-after-connect race - so a run without this exercises
 /// neither, and a suite that skips the tests for a feature reports the same
 /// green as one that passed them.
-fn test_e2e(ebpf: bool) -> Result<(), String> {
+///
+/// `extra` goes to the test binary after the fixed flags: a name filter,
+/// `--nocapture`, and so on.
+fn test_e2e(ebpf: bool, extra: &[&str]) -> Result<(), String> {
     if ebpf {
         build_ebpf()?;
     }
@@ -369,6 +383,7 @@ fn test_e2e(ebpf: bool) -> Result<(), String> {
         "--ignored",
         "--test-threads=1",
     ]);
+    cmd.args(extra);
     run(cmd)
 }
 

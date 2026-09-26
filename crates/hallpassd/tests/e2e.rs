@@ -1926,7 +1926,7 @@ fn libc_resolver_uprobes_feed_the_domain_cache() {
     // This log line is emitted only by the uprobe ring reader.
     wait_until(Duration::from_secs(5), || {
         let log = env.daemon_log();
-        log.contains("libc resolver snooped a resolution") && log.contains(NAME)
+        log.contains("dns cache insert (uprobe)") && log.contains(NAME)
     })
     .unwrap_or_else(|| {
         panic!(
@@ -2513,6 +2513,128 @@ fn an_exec_after_connect_does_not_inherit_the_new_binarys_rule() {
 #[ignore = "requires root and network namespaces"]
 fn an_exec_after_sendto_does_not_inherit_the_new_binarys_rule() {
     assert_exec_race_refused("execrace-udp", EXEC_RACER_UDP, 19052);
+}
+
+/// Accepts TCP connections forever and closes each at once, for probes that
+/// need more than the one connection `nc -l` serves.
+const ACCEPT_SERVER: &str = r#"import socket, sys
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind((sys.argv[1], int(sys.argv[2])))
+s.listen(4096)
+while True:
+    c, _ = s.accept()
+    c.close()
+"#;
+
+/// Opens `threads * per_thread` TCP connections as fast as it can, closing
+/// each at once, and prints how many connected.
+const CONNECT_FLOOD: &str = r#"import socket, sys, threading
+host, port = sys.argv[1], int(sys.argv[2])
+threads, per = int(sys.argv[3]), int(sys.argv[4])
+ok = [0] * threads
+def run(i):
+    for _ in range(per):
+        try:
+            with socket.create_connection((host, port), timeout=5):
+                ok[i] += 1
+        except OSError:
+            pass
+ts = [threading.Thread(target=run, args=(i,)) for i in range(threads)]
+for t in ts: t.start()
+for t in ts: t.join()
+print(sum(ok))
+"#;
+
+/// A measurement, not an assertion: how often does the eBPF connect record
+/// arrive after the SYN it describes?
+///
+/// The record is written in the `tcp_v{4,6}_connect` kretprobe, which runs
+/// after the SYN was already handed to the verdict queue, so the verdict
+/// thread can look the flow up first. Procfs covers every such miss today;
+/// making eBPF's answer final for SYNs (to close the exec-race gap its LRU
+/// leaves) is only safe if this is rare. Prints one `PROBE` line; run with
+/// `cargo xtask e2e --ebpf probe_ --nocapture`.
+#[test]
+#[ignore = "requires root and network namespaces"]
+fn probe_ebpf_records_before_the_syn() {
+    const PORT: u16 = 19060;
+    const THREADS: u32 = 32;
+    const PER_THREAD: u32 = 150;
+    let tag = "synprobe";
+    if !cfg!(feature = "ebpf") {
+        eprintln!("SKIP e2e {tag}: built without the ebpf feature");
+        return;
+    }
+    let Some(mut env) = TestEnv::setup(tag) else {
+        return;
+    };
+    if !require_tool(tag, "python3", "--version") {
+        return;
+    }
+    let server = env.write_aux("accept_server.py", ACCEPT_SERVER);
+    env.helpers.push(ns_spawn(
+        &env.ns_srv,
+        &[
+            "python3",
+            &server.to_string_lossy(),
+            SRV_IP,
+            &PORT.to_string(),
+        ],
+        "accept server",
+    ));
+    assert!(
+        wait_until(Duration::from_secs(5), || port_bound(
+            &env.ns_srv,
+            "-ltnH",
+            PORT
+        ))
+        .is_some(),
+        "the accept server never bound port {PORT}"
+    );
+    env.start_daemon("allow", &[]);
+    assert!(
+        env.daemon_log().contains("eBPF attribution active"),
+        "eBPF attribution did not load, so there is nothing to measure; daemon log:\n{}",
+        env.daemon_log()
+    );
+
+    let flood = env.write_aux("connect_flood.py", CONNECT_FLOOD);
+    let out = ns_run(
+        &env.ns_cli,
+        &[
+            "python3",
+            &flood.to_string_lossy(),
+            SRV_IP,
+            &PORT.to_string(),
+            &THREADS.to_string(),
+            &PER_THREAD.to_string(),
+        ],
+    );
+    assert_ok(&out, "connect flood");
+    let connected: u64 = String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse()
+        .unwrap_or(0);
+    std::thread::sleep(Duration::from_millis(500));
+
+    let log = env.daemon_log();
+    let misses: Vec<&str> = log
+        .lines()
+        .filter(|l| l.contains("eBPF missed a fresh TCP connect"))
+        .collect();
+    let covered = misses.iter().filter(|l| l.contains("procfs")).count();
+    eprintln!(
+        "PROBE synprobe: {connected} of {} connects succeeded; eBPF missed {} fresh \
+         connects ({covered} answered by procfs, {} by nobody)",
+        THREADS * PER_THREAD,
+        misses.len(),
+        misses.len() - covered,
+    );
+    assert!(
+        connected > 0,
+        "no connection got through; daemon log:\n{log}"
+    );
 }
 
 /// Body of the exec-race tests: `racer_src` gets the destination host, port

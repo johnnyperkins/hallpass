@@ -85,7 +85,11 @@ root plus `ip`, `nft` and `nc` (and `python3` for DNS tests), so each is
 ```sh
 cargo xtask e2e           # compiles as you, runs only the test binary under sudo -E
 cargo xtask e2e --ebpf    # also builds the object and runs the eBPF-gated tests
+cargo xtask e2e --ebpf probe_ --nocapture   # just the probes, with their output
 ```
+
+Tests named `probe_` measure rather than assert: each prints one `PROBE` line
+for a question a design decision is waiting on.
 
 By hand:
 

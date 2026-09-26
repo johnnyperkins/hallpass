@@ -71,6 +71,12 @@ pub struct ProcInfo {
 pub trait Attributor: Send + Sync {
     /// Resolve the process behind `tuple`, if this source can.
     fn attribute(&self, tuple: &FlowTuple) -> Option<ProcInfo>;
+
+    /// Whether this source records every TCP connect as it happens, so that
+    /// missing one is a fact worth noting rather than an ordinary miss.
+    fn sees_every_connect(&self) -> bool {
+        false
+    }
 }
 
 /// Ordered chain of attributors behind a shared LRU cache.
@@ -122,7 +128,20 @@ impl AttributionChain {
 
     /// Resolve `tuple`, consulting the cache first. Misses (including
     /// negative results) are cached to avoid /proc scan storms.
+    #[cfg(test)]
     pub fn attribute(&self, tuple: &FlowTuple) -> Option<ProcInfo> {
+        self.resolve(tuple, false)
+    }
+
+    /// Resolve `tuple`, consulting the cache first, told whether the packet
+    /// is a TCP SYN.
+    ///
+    /// A source that sees every connect should never miss a SYN's flow, and
+    /// each time it does, a later source answered for a connection whose
+    /// executable nothing vouches for (the exec-after-connect guard lives in
+    /// the eBPF source only). Logged, at debug, to measure how often that
+    /// happens before anything is decided on it.
+    fn resolve(&self, tuple: &FlowTuple, syn: bool) -> Option<ProcInfo> {
         match self.cache.get(tuple) {
             Some(None) => return None,
             // Source ports are reused, so an entry outlives the flow it was
@@ -132,7 +151,20 @@ impl AttributionChain {
             Some(Some(info)) if cached_still_valid(&self.proc_root, &info) => return Some(info),
             _ => {}
         }
-        let info = self.sources.iter().find_map(|s| s.attribute(tuple));
+        let mut witness_missed = false;
+        let info = self.sources.iter().find_map(|s| {
+            let found = s.attribute(tuple);
+            witness_missed |= found.is_none() && s.sees_every_connect();
+            found
+        });
+        if syn && witness_missed {
+            tracing::debug!(
+                src = %tuple.src,
+                dst = %tuple.dst,
+                fallback = if info.is_some() { "procfs" } else { "none" },
+                "eBPF missed a fresh TCP connect"
+            );
+        }
         self.cache.put(*tuple, info.clone());
         info
     }
@@ -142,7 +174,7 @@ impl AttributionChain {
     ///
     /// Returned with the identity of the executable it names, which the wire
     /// type has no field for and hashing needs.
-    pub fn connection(&self, tuple: FlowTuple) -> (Connection, Option<ExeId>) {
+    pub fn connection(&self, tuple: FlowTuple, syn: bool) -> (Connection, Option<ExeId>) {
         // Fields move out of the attribution rather than being cloned: this
         // runs per packet. Assigned by name so a field added to either type
         // is one line here instead of a positional tuple to keep aligned.
@@ -162,7 +194,7 @@ impl AttributionChain {
             first_seen: None,
         };
         let mut exe_id = None;
-        if let Some(i) = self.attribute(&tuple) {
+        if let Some(i) = self.resolve(&tuple, syn) {
             conn.uid = Some(i.uid);
             conn.pid = i.pid;
             conn.exe_path = i.exe_path;
@@ -398,7 +430,7 @@ mod tests {
     #[test]
     fn connection_from_unattributed_tuple() {
         let chain = AttributionChain::new(vec![Box::new(Fixed::new(None))]);
-        let (conn, _) = chain.connection(tuple());
+        let (conn, _) = chain.connection(tuple(), false);
         assert_eq!(conn.uid, None);
         assert_eq!(conn.exe_path, None);
         assert_eq!(conn.tuple, tuple());

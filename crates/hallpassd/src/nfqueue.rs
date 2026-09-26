@@ -215,6 +215,8 @@ struct DecideCtx<'a> {
     dns_cache: &'a IpDomainCache,
     exe_hash: &'a ExeHashCache,
     sessions: &'a crate::session::SessionRegistry,
+    /// Whether the packet is a TCP SYN; see `AttributionChain::connection`.
+    syn: bool,
 }
 
 /// Decision logic, separated from nfq plumbing for testability. Reads
@@ -231,7 +233,7 @@ fn decide(
     ctx: &DecideCtx,
     seen: Option<&mut crate::firstseen::Tracker>,
 ) -> Decision {
-    let (mut conn, exe_id) = ctx.attribution.connection(tuple);
+    let (mut conn, exe_id) = ctx.attribution.connection(tuple, ctx.syn);
     conn.domain = ctx.dns_cache.lookup(&conn.tuple.dst.ip());
     conn.iface = iface;
     // One snapshot for both the enrichment decision and the match, so a
@@ -828,6 +830,7 @@ impl VerdictLoop {
             dns_cache: &self.deps.dns_cache,
             exe_hash: &self.deps.exe_hash,
             sessions: &self.deps.sessions,
+            syn: packet::is_tcp_syn(msg.get_payload()),
         };
         let decision = decide(tuple, iface, &ctx, self.seen.as_mut());
         match decision {
@@ -1269,6 +1272,7 @@ mod tests {
                 dns_cache: &self.dns,
                 exe_hash: &self.hash,
                 sessions: &self.sessions,
+                syn: false,
             }
         }
 

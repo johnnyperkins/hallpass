@@ -334,6 +334,10 @@ impl Drop for EbpfAttributor {
 }
 
 impl Attributor for EbpfAttributor {
+    fn sees_every_connect(&self) -> bool {
+        true
+    }
+
     fn attribute(&self, tuple: &FlowTuple) -> Option<ProcInfo> {
         let key = flow_key(tuple);
         let val = self.sock_map.get(&key, 0).ok().or_else(|| {
@@ -629,7 +633,7 @@ fn spawn_dns_reader(ring: RingBuf<MapData>, dns: Arc<IpDomainCache>, stop: StopR
         let Some(name) = normalize_domain(raw) else {
             return;
         };
-        tracing::debug!(domain = %name, %ip, "libc resolver snooped a resolution");
+        tracing::debug!(domain = %name, %ip, "dns cache insert (uprobe)");
         dns.absorb(&SnoopedResponse {
             id: 0,
             query_name: name,

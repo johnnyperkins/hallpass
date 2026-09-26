@@ -113,6 +113,16 @@ pub fn parse_tuple(payload: &[u8]) -> Option<FlowTuple> {
     }
 }
 
+/// True for a TCP SYN without ACK: the first packet of an outgoing connect,
+/// as opposed to a mid-stream packet conntrack picked up as new (after a
+/// flush, or a flow the daemon killed).
+pub fn is_tcp_syn(payload: &[u8]) -> bool {
+    matches!(
+        LaxSlicedPacket::from_ip(payload).ok().and_then(|p| p.transport),
+        Some(TransportSlice::Tcp(t)) if t.syn() && !t.ack()
+    )
+}
+
 /// True for packets that look like DNS replies (UDP from source port 53).
 /// These arrive via the input-chain snoop rule and must be accepted
 /// immediately; a separate consumer parses them.
@@ -138,6 +148,27 @@ pub fn udp_payload(packet: &[u8]) -> Option<&[u8]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn syn_is_the_first_packet_of_a_connect_only() {
+        let packet = |syn: bool, ack: bool| {
+            let mut buf = Vec::new();
+            let mut tcp = etherparse::PacketBuilder::ipv4([10, 0, 0, 1], [1, 1, 1, 1], 64)
+                .tcp(40000, 443, 1, 64240);
+            if syn {
+                tcp = tcp.syn();
+            }
+            if ack {
+                tcp = tcp.ack(1);
+            }
+            tcp.write(&mut buf, &[]).unwrap();
+            buf
+        };
+        assert!(is_tcp_syn(&packet(true, false)));
+        assert!(!is_tcp_syn(&packet(true, true)), "a SYN-ACK is a reply");
+        assert!(!is_tcp_syn(&packet(false, true)), "mid-stream");
+        assert!(!is_tcp_syn(&[0x45, 0, 0]));
+    }
     use etherparse::PacketBuilder;
 
     #[test]
