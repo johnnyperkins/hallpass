@@ -211,11 +211,12 @@ the queue's `NFQA_CFG_F_FAIL_OPEN`, consulted when it is bound but full
 (`-ENOSPC`). `nfqueue::bind` sets the second. Setting only one is how this was
 once wrong. The table is removed on shutdown and on panic.
 
-`NFQA_CFG_F_FAIL_OPEN` is set once at bind and not changed when the mode is
-toggled at runtime: re-issuing it means a netlink round trip whose ack read in
-`nfq` discards every message in the batch, losing queued packets and leaking
-their kernel slots. So starting in observe mode fails open on overflow, but
-toggling to observe at runtime under `queue_bypass = false` keeps dropping.
+`NFQA_CFG_F_FAIL_OPEN` follows the mode and posture live
+(`nfqueue::want_fail_open`): observe mode fails open, lockdown fails closed,
+and otherwise `queue_bypass` decides. The verdict loop re-issues it when the
+answer changes. That is only safe because the vendored `nfq` keeps packet
+messages that share a batch with the config ack; upstream discarded them,
+leaving them unverdicted with their kernel slots leaked.
 
 The queue length is set to `QUEUE_MAX_LEN` (4096) instead of the kernel's 1024,
 because held prompt packets occupy slots for whole prompt windows. It buys

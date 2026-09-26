@@ -21,14 +21,9 @@
 //!   security posture that silently lifts when it does is the wrong failure
 //!   direction. It is persisted, and re-read at startup.
 //!
-//! Two limits a posture does not overcome, both documented in docs/rules.md
-//! rather than worked around here. Only `ct state new` is judged, so flows
-//! already established when one engages keep running. And the verdict
-//! queue's fail-open flag is fixed at bind (`nfqueue::want_fail_open`; the
-//! flag cannot be re-issued on a live queue without discarding the packets
-//! already on it), so on a host configured `queue_bypass = true` - the
-//! shipped default - a kernel-side overflow still accepts packets the
-//! posture would have denied. `status` and `doctor` both report that flag.
+//! While a posture is on, the verdict queue fails closed on overflow whatever
+//! `queue_bypass` says (`nfqueue::want_fail_open`), so a flood cannot carry
+//! traffic through it unjudged.
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;

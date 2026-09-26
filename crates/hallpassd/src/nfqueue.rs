@@ -13,7 +13,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use hallpass_types::{Connection, FlowTuple, Verdict};
 use nfq::{Queue, Verdict as NfqVerdict};
@@ -136,24 +136,22 @@ fn applied_verdict(verdict: Verdict, enforcing: bool) -> Verdict {
 /// Whether the kernel should accept rather than drop when the verdict queue
 /// is full.
 ///
-/// Fail-closed is a deliberate trade of availability for enforcement, so it
-/// holds while the daemon is enforcing. Observe mode makes no such trade:
-/// its whole contract is that nothing this daemon does changes what reaches
-/// the wire, and a kernel-side overflow drop would break that with no event
-/// and no counter, so starting in observe mode forces the flag on whatever
-/// the posture says.
+/// Observe mode always fails open: its whole contract is that nothing this
+/// daemon does changes what reaches the wire, and a kernel-side overflow drop
+/// would break that with no event and no counter. A lockdown posture always
+/// fails closed: it exists to permit less, and an overflow that passes
+/// packets unjudged would let a flood carry traffic straight through it.
+/// Otherwise `queue_bypass` decides, the operator's availability trade.
 ///
-/// Read once, at bind, and deliberately not re-issued when the mode is
-/// toggled at runtime. Setting it is a netlink round trip on the queue's own
-/// socket, and the crate's ack read hands every message in the arriving
-/// batch to a callback that discards them: packets already queued would be
-/// thrown away without a verdict, holding kernel slots forever. Losing
-/// traffic to relax a flag that only matters while the queue is overflowing
-/// is a bad trade, so a runtime toggle to observe under a fail-closed
-/// posture keeps dropping on overflow. `mode = "observe"` in the config file
-/// gets the relaxed flag; a restart is what applies it.
-pub fn want_fail_open(queue_bypass: bool, enforcing: bool) -> bool {
-    queue_bypass || !enforcing
+/// Applied at bind and again by the verdict loop whenever the answer changes
+/// ([`VerdictLoop::sync_fail_open`]), so a runtime mode toggle or a lockdown
+/// takes effect on the next packet.
+pub fn want_fail_open(queue_bypass: bool, enforcing: bool, locked_down: bool) -> bool {
+    if locked_down {
+        false
+    } else {
+        queue_bypass || !enforcing
+    }
 }
 
 /// Hand the first query of a DNS flow to the snoop consumer, if it is about
@@ -368,7 +366,11 @@ fn session_grant(conn: &Connection, ctx: &DecideCtx) -> Option<u64> {
 /// verdict and no event. The snoop queue is fed by inbound traffic from other
 /// hosts, so sharing one socket let anyone who can send this host UDP from
 /// port 53 fill the buffer the verdict queue is delivered through.
-pub fn bind(queue_num: u16, fail_open: bool) -> std::io::Result<(Queues, BoundQueues)> {
+pub fn bind(
+    queue_num: u16,
+    queue_bypass: bool,
+    fail_open: bool,
+) -> std::io::Result<(Queues, BoundQueues)> {
     let snoop_queue = crate::nft::snoop_queue(queue_num);
     let mut verdict = Queue::open()?;
     verdict.bind(queue_num)?;
@@ -395,13 +397,19 @@ pub fn bind(queue_num: u16, fail_open: bool) -> std::io::Result<(Queues, BoundQu
     snoop.set_nonblocking(true);
 
     tracing::info!(queue_num, snoop_queue, fail_open, max_len, "nfqueues bound");
+    // Effective state, not the request: asked-for-off and failed-to-set both
+    // leave the kernel's default, off.
+    let verdict_fail_open = Arc::new(AtomicBool::new(fail_open && verdict_set));
     Ok((
-        Queues { verdict, snoop },
+        Queues {
+            verdict,
+            snoop,
+            verdict_fail_open: Arc::clone(&verdict_fail_open),
+            queue_bypass,
+        },
         BoundQueues {
             queue_num,
-            // Effective state, not the request: asked-for-off and
-            // failed-to-set both leave the kernel's default, off.
-            verdict_fail_open: fail_open && verdict_set,
+            verdict_fail_open,
             snoop_fail_open: snoop_set,
             verdict_max_len: max_len,
         },
@@ -412,6 +420,11 @@ pub fn bind(queue_num: u16, fail_open: bool) -> std::io::Result<(Queues, BoundQu
 pub struct Queues {
     pub verdict: Queue,
     pub snoop: Queue,
+    /// The verdict queue's effective fail-open flag, shared with
+    /// [`BoundQueues`]; the verdict loop keeps it current.
+    pub verdict_fail_open: Arc<AtomicBool>,
+    /// The configured posture [`want_fail_open`] falls back to.
+    pub queue_bypass: bool,
 }
 
 /// Bytes of each verdict-queue packet copied to the daemon.
@@ -476,19 +489,16 @@ fn force_recv_buffer(queue: &mut Queue, queue_num: u16, bytes: usize) {
 /// What [`bind`] established, for the stats snapshot: which queue numbers
 /// this daemon owns and the *effective* kernel fail-open state of each.
 ///
-/// Decided once at bind and never re-issued, so these stay authoritative
-/// for the process lifetime (the runtime mode toggle deliberately does not
-/// touch the flag; see [`set_fail_open`] on why a live queue is the wrong
-/// place to change it). They are what makes the kernel's drop counters
-/// readable: a fail-open queue resolves overflow by reinjecting with
-/// accept, unjudged and counted nowhere, so its drop counters can only
-/// move if the flag is off.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The fail-open flags are what makes the kernel's drop counters readable: a
+/// fail-open queue resolves overflow by reinjecting with accept, unjudged and
+/// counted nowhere, so its drop counters can only move if the flag is off.
+#[derive(Debug, Clone)]
 pub struct BoundQueues {
     /// The verdict queue number; the snoop queue is this plus one.
     pub queue_num: u16,
     /// Verdict queue: overflow passes unjudged (true) or drops (false).
-    pub verdict_fail_open: bool,
+    /// Live: the verdict loop updates it when the mode or posture changes.
+    pub verdict_fail_open: Arc<AtomicBool>,
     /// Snoop queue: wanted true in every posture, so false means the flag
     /// did not take and a reply flood can cost DNS replies.
     pub snoop_fail_open: bool,
@@ -523,11 +533,8 @@ const QUEUE_MAX_LEN: u32 = 4096;
 /// the depth in force, or `None` when the request failed and the queue kept
 /// the kernel's default.
 ///
-/// Safe to send here and nowhere else: this runs before the nftables rules
-/// that feed the queue exist, so the config message's ack cannot arrive in a
-/// batch alongside queued packets. On a live queue it could, and `nfq`
-/// discards every packet in that batch (see the same note on
-/// [`set_fail_open`]).
+/// Sent before the nftables rules that feed the queue exist, though the
+/// vendored `nfq` keeps any packets that share a batch with the ack.
 #[must_use]
 fn set_max_len(queue: &mut Queue, queue_num: u16) -> Option<u32> {
     match queue.set_queue_max_len(queue_num, QUEUE_MAX_LEN) {
@@ -606,10 +613,19 @@ const _: () = assert!(
     "the held-packet budget must leave most of the kernel queue for traffic that can still be judged"
 );
 
+/// How long to wait before retrying a fail-open change the kernel refused.
+const FAIL_OPEN_RETRY: Duration = Duration::from_secs(30);
+
 /// Run the verdict loop over the bound verdict queue until `shutdown` is
 /// set or the queue fails persistently. Blocking; [`spawn`] runs it on a
 /// dedicated thread.
-pub fn run(queue: Queue, queue_num: u16, mut deps: QueueDeps) -> std::io::Result<()> {
+fn run(
+    queue: Queue,
+    queue_num: u16,
+    fail_open: Arc<AtomicBool>,
+    queue_bypass: bool,
+    mut deps: QueueDeps,
+) -> std::io::Result<()> {
     // Out of `deps` so `decide` can take it mutably while the rest of the
     // deps are borrowed for the context it reads. Dropped when the loop
     // ends, which flushes what the run recorded and closes the channel the
@@ -622,6 +638,9 @@ pub fn run(queue: Queue, queue_num: u16, mut deps: QueueDeps) -> std::io::Result
         refused_verdicts: 0,
         prompt_send_failures: 0,
         iface_map: crate::iface::IfaceMap::default(),
+        fail_open,
+        queue_bypass,
+        fail_open_retry: None,
         deps,
         queue,
     }
@@ -642,6 +661,11 @@ struct VerdictLoop {
     refused_verdicts: u64,
     prompt_send_failures: u64,
     iface_map: crate::iface::IfaceMap,
+    /// The queue's effective fail-open flag, shared with the stats.
+    fail_open: Arc<AtomicBool>,
+    queue_bypass: bool,
+    /// After the kernel refuses a change: no retry before this.
+    fail_open_retry: Option<Instant>,
     deps: QueueDeps,
     queue: Queue,
 }
@@ -657,6 +681,7 @@ impl VerdictLoop {
             if let Some(seen) = self.seen.as_mut() {
                 seen.maybe_flush();
             }
+            self.sync_fail_open(queue_num);
             let mut busy = self.release_decided();
             match self.queue.recv() {
                 Ok(msg) => {
@@ -684,6 +709,34 @@ impl VerdictLoop {
         }
         self.release_all(queue_num);
         fatal.map_or(Ok(()), Err)
+    }
+
+    /// Bring the queue's fail-open flag in line with the mode and posture in
+    /// force, see [`want_fail_open`]. Two atomic loads when nothing changed,
+    /// which is every iteration but the one after a toggle.
+    fn sync_fail_open(&mut self, queue_num: u16) {
+        let settings = &self.deps.settings;
+        let want = want_fail_open(
+            self.queue_bypass,
+            settings.enforcing(),
+            settings.locked_down(),
+        );
+        if want == self.fail_open.load(Ordering::Relaxed)
+            || self.fail_open_retry.is_some_and(|t| Instant::now() < t)
+        {
+            return;
+        }
+        if set_fail_open(&mut self.queue, queue_num, want) {
+            self.fail_open.store(want, Ordering::Relaxed);
+            self.fail_open_retry = None;
+            tracing::info!(
+                queue_num,
+                fail_open = want,
+                "verdict queue overflow policy changed"
+            );
+        } else {
+            self.fail_open_retry = Some(Instant::now() + FAIL_OPEN_RETRY);
+        }
     }
 
     /// Apply the verdicts the async side decided for held packets. Returns
@@ -1005,7 +1058,8 @@ pub fn spawn(queues: Queues, queue_num: u16, deps: QueueDeps) -> std::thread::Jo
     std::thread::Builder::new()
         .name("nfqueue".into())
         .spawn(move || {
-            if let Err(e) = run(queues.verdict, queue_num, deps) {
+            let (fail_open, bypass) = (queues.verdict_fail_open, queues.queue_bypass);
+            if let Err(e) = run(queues.verdict, queue_num, fail_open, bypass, deps) {
                 tracing::error!("nfqueue loop failed, stopping the daemon: {e}");
                 let _ = fatal_tx.send(());
             }
@@ -1270,16 +1324,30 @@ mod tests {
     /// the one thing observe mode promises never to do.
     #[test]
     fn observe_mode_forces_fail_open_on_a_full_queue() {
-        assert!(want_fail_open(true, true), "fail-open posture, enforcing");
         assert!(
-            !want_fail_open(false, true),
+            want_fail_open(true, true, false),
+            "fail-open posture, enforcing"
+        );
+        assert!(
+            !want_fail_open(false, true, false),
             "fail-closed posture, enforcing"
         );
-        assert!(want_fail_open(true, false), "fail-open posture, observing");
         assert!(
-            want_fail_open(false, false),
+            want_fail_open(true, false, false),
+            "fail-open posture, observing"
+        );
+        assert!(
+            want_fail_open(false, false, false),
             "observe mode must not drop packets even under a fail-closed posture"
         );
+    }
+
+    /// A lockdown posture never lets an overflowing queue pass packets
+    /// unjudged, whatever `queue_bypass` says.
+    #[test]
+    fn lockdown_fails_closed_on_a_full_queue() {
+        assert!(!want_fail_open(true, true, true));
+        assert!(!want_fail_open(false, true, true));
     }
 
     /// Lockdown answers before a session grant does.

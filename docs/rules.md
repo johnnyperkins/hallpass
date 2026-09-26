@@ -190,8 +190,8 @@ Before relying on it:
 - **DNS usually stops working** unless a pinned rule covers the resolver, and
   `domain` rules then stop matching. `lockdown on` warns about this, and
   refuses outright when no rule would survive unless you pass `--force`.
-- **A full kernel queue still fails open** under `queue_bypass = true`; that
-  flag is fixed when the daemon starts.
+- **A full kernel queue drops** while the posture is on, even under
+  `queue_bypass = true`: a flood cannot carry traffic through it unjudged.
 
 ## Session grants
 

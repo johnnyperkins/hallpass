@@ -109,6 +109,11 @@ restarted together; a version mismatch is refused at connect.
 
 ### Changed
 
+- **The verdict queue's overflow policy follows the mode and lockdown live.**
+  Observe mode fails open and a lockdown fails closed from the moment either
+  is switched, rather than keeping the flag set at startup. The vendored
+  `nfq` now keeps packets that arrive alongside a config ack, which is what
+  made changing the flag on a live queue unsafe.
 - **The installer offers each shipped rule once.** A shipped rule you deleted
   is no longer reinstalled by `install.sh`; the record is
   `/var/lib/hallpass/offered-rules`. Upgrade: a rule deleted before this

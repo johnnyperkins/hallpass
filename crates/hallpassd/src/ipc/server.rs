@@ -810,12 +810,16 @@ impl Client<'_> {
         // Read on demand, here and nowhere else: one small /proc read per
         // status request, on the async side, so the verdict thread takes no
         // new dependency for observability. The fail-open flags ride along
-        // from bind, because they are what makes the drop counters readable
-        // and /proc does not carry them.
+        // from the queues, because they are what makes the drop counters
+        // readable and /proc does not carry them.
         let queues = deps
             .queues
+            .as_ref()
             .map_or_else(QueueStats::default, |q| QueueStats {
-                verdict_fail_open: Some(q.verdict_fail_open),
+                verdict_fail_open: Some(
+                    q.verdict_fail_open
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                ),
                 snoop_fail_open: Some(q.snoop_fail_open),
                 verdict_max_len: q.verdict_max_len,
                 ..crate::stats::read_queue_stats(q.queue_num)

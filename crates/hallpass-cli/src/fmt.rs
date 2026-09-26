@@ -327,7 +327,7 @@ fn queue_depth(depth: Option<u64>, max_len: Option<u32>) -> String {
     }
 }
 
-/// Render a queue's effective fail-open flag, known at bind rather than
+/// Render a queue's effective fail-open flag, as the daemon set it rather than
 /// read from /proc; "unavailable" when no queue is bound.
 fn kernel_flag(n: Option<bool>) -> String {
     match n {

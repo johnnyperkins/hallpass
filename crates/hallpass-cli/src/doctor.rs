@@ -381,8 +381,9 @@ struct QueueStats {
 /// `severity` is what a missing queue or a nonzero drop counter costs on this
 /// queue. The drop counters are the kernel's, so nonzero always means packets
 /// resolved (or lost) without policy running; on a queue configured fail-open
-/// it additionally means the flag did not take at bind, because a fail-open
-/// queue resolves overflow by accepting, which no counter records.
+/// it additionally means the flag did not take or a lockdown had it closed,
+/// because a fail-open queue resolves overflow by accepting, which no counter
+/// records.
 fn queue_check(
     checks: &mut Vec<Check>,
     name: &'static str,
@@ -424,7 +425,7 @@ fn queue_check(
             name,
             severity,
             format!("bound, {posture}, {depth}, but {lost} packets were dropped undecided"),
-            Some("the queue overflowed or delivery failed; if this host asked for fail-open, the flag did not take at bind".into()),
+            Some("the queue overflowed or delivery failed; if this host asked for fail-open, the flag did not take (or a lockdown was on, which fails closed)".into()),
         ));
     } else if dropped.is_none() {
         checks.push(Check::warn(

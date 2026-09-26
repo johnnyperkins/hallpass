@@ -307,12 +307,11 @@ pub async fn run() {
     // fail-open that silently allows what a rule would deny, for however
     // long the listener takes to arrive. Binding first means the moment
     // packets can be queued, something is there to judge them.
-    // Starting in observe mode forces the kernel's fail-open flag on
-    // regardless of posture, and it is not re-issued later; see
-    // nfqueue::want_fail_open for why a live queue is the wrong place to
-    // change it.
-    let fail_open = nfqueue::want_fail_open(cfg.queue_bypass, cfg.mode.enforcing());
-    let (queues, bound_queues) = match nfqueue::bind(cfg.queue_num, fail_open) {
+    // The overflow flag for the mode configured; no posture yet. A persisted
+    // lockdown is restored below, and the verdict loop moves the flag the
+    // moment it sees one (nfqueue::want_fail_open).
+    let fail_open = nfqueue::want_fail_open(cfg.queue_bypass, cfg.mode.enforcing(), false);
+    let (queues, bound_queues) = match nfqueue::bind(cfg.queue_num, cfg.queue_bypass, fail_open) {
         Ok((q, bound)) => (Some(q), Some(bound)),
         Err(e) if cfg.queue_bypass => {
             // Without privileges (development runs) the bind fails and

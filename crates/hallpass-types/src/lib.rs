@@ -1130,9 +1130,9 @@ pub struct Stats {
     pub snoop_queue_user_dropped: Option<u64>,
     /// Packets sitting in the DNS snoop queue right now.
     pub snoop_queue_depth: Option<u64>,
-    /// Whether the verdict queue's kernel fail-open flag is active, decided
-    /// once at bind and never re-issued (a runtime mode toggle does not
-    /// change it; see the architecture notes on `set_fail_open`).
+    /// Whether the verdict queue's kernel fail-open flag is active right now.
+    /// It follows the mode and any lockdown posture: observe fails open,
+    /// lockdown fails closed, otherwise `queue_bypass` decides.
     ///
     /// This is the key for reading the two drop counters above. True:
     /// overflow passes traffic through unjudged and uncounted, the

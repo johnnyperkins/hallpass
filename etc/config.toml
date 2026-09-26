@@ -39,9 +39,8 @@ unhandled_proto_verdict = "allow"
 
 # true: traffic flows when the daemon is dead or its queue is full.
 # false: those packets are dropped (see config.hardened.toml).
-# Starting in observe mode always fails open on a full queue; switching to
-# observe at runtime does not, so a measurement run on a fail-closed host
-# should set mode above.
+# Observe mode always passes a full queue's packets, and a lockdown always
+# drops them, whatever this says.
 queue_bypass = true
 
 # Also cut established flows that a changed ruleset denies, so a new deny
