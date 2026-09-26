@@ -221,8 +221,8 @@ for a build, an installer or a test suite.
 - **Lockdown wins over grants.**
 - Grants are capped at 8 per user and 64 per host. Events allowed by a grant
   name it (`run-session:7`) in place of a rule.
-- A grant-allowed connection counts as the program's first sighting, so its
-  **NEW** badge will not show on a later prompt.
+- A grant-allowed connection does not count as a sighting, so the program's
+  first prompt after the session still shows it as **NEW**.
 
 ## Baseline rules
 

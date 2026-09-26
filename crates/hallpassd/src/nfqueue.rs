@@ -191,6 +191,14 @@ enum Decision {
     Prompt(Connection, PromptExe),
 }
 
+impl Decision {
+    fn conn_mut(&mut self) -> &mut Connection {
+        match self {
+            Self::Verdict(_, _, conn) | Self::Prompt(conn, _) => conn,
+        }
+    }
+}
+
 /// The executable half of a prompt: its hash if deciding computed one, and
 /// the identity attribution named, which computing it later must match.
 #[cfg_attr(test, derive(Debug))]
@@ -226,9 +234,70 @@ fn decide(
     let (mut conn, exe_id) = ctx.attribution.connection(tuple);
     conn.domain = ctx.dns_cache.lookup(&conn.tuple.dst.ip());
     conn.iface = iface;
-    // After the domain and the interface: the destination half is keyed on
-    // the domain when one is known, so recording before enrichment would
-    // remember the address instead and report the name as new later.
+    // One snapshot for both the enrichment decision and the match, so a
+    // concurrent rule reload cannot split them. Hashing reads the binary
+    // off disk; only pay for it when a hash-pinning rule could apply.
+    let set = ctx.rules.ruleset();
+    let exe_sha256 = if set.wants_exe_hash_for(&conn) {
+        ctx.exe_hash.for_connection(&conn, exe_id)
+    } else {
+        None
+    };
+    let (mut decision, sighting) = match set.match_conn(&conn, exe_sha256.as_deref()) {
+        Some((rule, verdict)) => (Decision::Verdict(verdict, rule.name.clone(), conn), true),
+        // A lockdown posture answers before a session grant does. The grant
+        // is a prompt suppressor that allows, so consulting it first would
+        // let anything started under `hallpass run` walk straight through
+        // the posture - and a build script is exactly the sort of thing
+        // running when someone reaches for one.
+        //
+        // Read off the same snapshot that just failed to match, so a posture
+        // lifted between the two cannot deny a connection against a rule set
+        // that would have allowed it.
+        None if set.locked_down() => (lockdown_decision(conn), true),
+        // Only here, where the answer would otherwise be a prompt. A session
+        // grant suppresses the question; it never overrides a rule, so an
+        // explicit deny inside a session still denies and an explicit allow
+        // still reports its own rule name.
+        //
+        // Free while no session is open: the snapshot is loaded per
+        // unmatched connection, not per packet, and an empty one costs a
+        // length check. Everything that can go wrong on the way to coverage
+        // - no pid, no session, a uid that is not the session's, an
+        // unwalkable chain - leaves the prompt exactly as it would have been.
+        // A grant's allow does not spend the program's first sighting: it
+        // answered no question, so the next prompt for the program is still
+        // the first one anybody sees.
+        None => match session_grant(&conn, ctx) {
+            Some(id) => (
+                Decision::Verdict(Verdict::Allow, crate::session::rule_name(id), conn),
+                false,
+            ),
+            // Carries whatever a rule already asked to be hashed, and nothing
+            // more. A connection on its way to a prompt does need its
+            // executable hashed even when no rule wanted one - the operator
+            // may answer "allow, and pin this binary", and the value pinned
+            // has to be the value the prompt showed them - but only the arm
+            // that actually raises the prompt pays for that. Two of the three
+            // arms consuming `Decision::Prompt` never raise one, and hashing
+            // here charged them a whole-binary read on the verdict thread for
+            // a value they discard. See `VerdictLoop::hold_for_prompt`.
+            None => (
+                Decision::Prompt(
+                    conn,
+                    PromptExe {
+                        sha256: exe_sha256,
+                        id: exe_id,
+                    },
+                ),
+                true,
+            ),
+        },
+    };
+    // After the decision, so a session grant can leave the sighting alone,
+    // and so after the domain and the interface: the destination half is
+    // keyed on the domain when one is known, so recording before enrichment
+    // would remember the address instead and report the name as new later.
     //
     // Never for a resolver query, which is the subtle half. A DNS query is
     // `ct state new` and is judged like any other connection, so for a
@@ -243,60 +312,11 @@ fn decide(
     // tunnel, a resolver test) carries no annotation at all rather than a
     // new one; its prompt still appears, and `None` is the honest answer for
     // a connection the daemon deliberately did not record.
-    if let Some(seen) = seen.filter(|_| !packet::is_dns_query(&conn.tuple)) {
-        conn.first_seen = seen.observe(&conn);
+    if let Some(seen) = seen.filter(|_| sighting && !packet::is_dns_query(&tuple)) {
+        let conn = decision.conn_mut();
+        conn.first_seen = seen.observe(conn);
     }
-    // One snapshot for both the enrichment decision and the match, so a
-    // concurrent rule reload cannot split them. Hashing reads the binary
-    // off disk; only pay for it when a hash-pinning rule could apply.
-    let set = ctx.rules.ruleset();
-    let exe_sha256 = if set.wants_exe_hash_for(&conn) {
-        ctx.exe_hash.for_connection(&conn, exe_id)
-    } else {
-        None
-    };
-    match set.match_conn(&conn, exe_sha256.as_deref()) {
-        Some((rule, verdict)) => Decision::Verdict(verdict, rule.name.clone(), conn),
-        // A lockdown posture answers before a session grant does. The grant
-        // is a prompt suppressor that allows, so consulting it first would
-        // let anything started under `hallpass run` walk straight through
-        // the posture - and a build script is exactly the sort of thing
-        // running when someone reaches for one.
-        //
-        // Read off the same snapshot that just failed to match, so a posture
-        // lifted between the two cannot deny a connection against a rule set
-        // that would have allowed it.
-        None if set.locked_down() => lockdown_decision(conn),
-        // Only here, where the answer would otherwise be a prompt. A session
-        // grant suppresses the question; it never overrides a rule, so an
-        // explicit deny inside a session still denies and an explicit allow
-        // still reports its own rule name.
-        //
-        // Free while no session is open: the snapshot is loaded per
-        // unmatched connection, not per packet, and an empty one costs a
-        // length check. Everything that can go wrong on the way to coverage
-        // - no pid, no session, a uid that is not the session's, an
-        // unwalkable chain - leaves the prompt exactly as it would have been.
-        None => match session_grant(&conn, ctx) {
-            Some(id) => Decision::Verdict(Verdict::Allow, crate::session::rule_name(id), conn),
-            // Carries whatever a rule already asked to be hashed, and nothing
-            // more. A connection on its way to a prompt does need its
-            // executable hashed even when no rule wanted one - the operator
-            // may answer "allow, and pin this binary", and the value pinned
-            // has to be the value the prompt showed them - but only the arm
-            // that actually raises the prompt pays for that. Two of the three
-            // arms consuming `Decision::Prompt` never raise one, and hashing
-            // here charged them a whole-binary read on the verdict thread for
-            // a value they discard. See `VerdictLoop::hold_for_prompt`.
-            None => Decision::Prompt(
-                conn,
-                PromptExe {
-                    sha256: exe_sha256,
-                    id: exe_id,
-                },
-            ),
-        },
-    }
+    decision
 }
 
 /// What a lockdown posture answers for a connection no rule decided.
@@ -1561,6 +1581,32 @@ mod tests {
         );
         // Tracking off is not "seen before": the daemon has nothing to say.
         assert_eq!(first_seen(None), None);
+    }
+
+    /// A connection a session grant allowed answered no question, so it
+    /// leaves the program's first sighting for the next prompt to show.
+    #[tokio::test]
+    async fn a_session_grant_does_not_spend_the_first_sighting() {
+        let fx = Fixture::new("session-sighting", vec![], SelfProc);
+        let (mut seen, _writer) = crate::firstseen::start(fx.dir.path().join("seen.toml"));
+        let tuple = tuple_of(&tcp_packet([1, 1, 1, 1], 443));
+
+        let id = fx.open_session(crate::testutil::own_uid());
+        match decide(tuple, None, &fx.ctx(), Some(&mut seen)) {
+            Decision::Verdict(Verdict::Allow, _, conn) => assert_eq!(conn.first_seen, None),
+            other => panic!("expected the grant to allow, got {other:?}"),
+        }
+        fx.sessions.unregister(id);
+        match decide(tuple, None, &fx.ctx(), Some(&mut seen)) {
+            Decision::Prompt(conn, _) => assert_eq!(
+                conn.first_seen,
+                Some(FirstSeen {
+                    app: true,
+                    dest: true
+                })
+            ),
+            other => panic!("expected a prompt once the session ended, got {other:?}"),
+        }
     }
 
     /// A resolver query must not consume a program's first sighting.

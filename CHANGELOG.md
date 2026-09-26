@@ -113,6 +113,9 @@ restarted together; a version mismatch is refused at connect.
 
 ### Changed
 
+- **A session grant no longer spends a program's first sighting.** Connections
+  it allows carry no first-seen flag and record nothing, so the program's next
+  prompt still says it is new.
 - **An unanswered UDP flow is judged once**, not per datagram. The first
   decision (a rule, a prompt answer, or an unanswered prompt's default) holds
   for the flow for 30 seconds, so a silent peer no longer produces an event,

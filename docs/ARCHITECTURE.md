@@ -100,8 +100,9 @@ tuple-only rule model with its own default verdict.
 
 6. **Flagged if new.** The application (exe plus app id) and destination
    (domain if known, else address) are checked against the first-seen store.
-   This runs after naming, since a named destination is a different fact from
-   its address. DNS queries are skipped so a new program's first sighting is
+   This runs once the decision below is made, and after naming, since a named
+   destination is a different fact from its address. DNS queries and a
+   session grant's allows are skipped, so a new program's first sighting is
    not spent on a packet nobody is asked about. The store is owned by this
    thread, so it adds no lock; a snapshot goes to a writer task at most once a
    minute.
