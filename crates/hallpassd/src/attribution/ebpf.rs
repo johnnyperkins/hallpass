@@ -633,6 +633,11 @@ fn spawn_dns_reader(ring: RingBuf<MapData>, dns: Arc<IpDomainCache>, stop: StopR
         let Some(name) = normalize_domain(raw) else {
             return;
         };
+        // getaddrinfo on a numeric host "resolves" it; the cache refuses
+        // those, so they are not inserts worth logging either.
+        if name.parse::<std::net::IpAddr>().is_ok() {
+            return;
+        }
         tracing::debug!(domain = %name, %ip, "dns cache insert (uprobe)");
         dns.absorb(&SnoopedResponse {
             id: 0,
