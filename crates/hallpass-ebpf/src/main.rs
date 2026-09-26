@@ -399,6 +399,9 @@ fn take_captured_name(
     ev.name_len = scratch.name_len;
     ev.name = scratch.name;
     ev._pad = [0u8; 3];
+    // The low half is the uid. Read here, at return, on the resolving
+    // thread, which is the same one that called in.
+    ev.uid = bpf_get_current_uid_gid() as u32;
     let out = scratch.out;
     let _ = scratch_map.remove(id);
     Some((ev, out))

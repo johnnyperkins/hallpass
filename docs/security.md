@@ -178,10 +178,12 @@ domain cache when they match a recorded query (addresses, transaction id and
 name), so spoofed packets from port 53 cannot poison it. But a process chooses
 what it resolves: it can ask its own server, or point libc at one
 (`LOCALDOMAIN`, `RES_OPTIONS`, a search domain it controls), and have any name
-answered with any address. The cache keeps one name per address, and the last
-lookup wins for every process. Names containing control characters,
-whitespace or non-ASCII bytes are refused outright. Scope security-relevant
-rules with `exe`/`exe_sha256` or addresses, not domains alone.
+answered with any address. The cache is kept per user: a lookup names an
+address only for connections made by the same user, so one user cannot
+relabel addresses for another, but processes of one user can for each other.
+Names containing control characters, whitespace or non-ASCII bytes are refused
+outright. Scope security-relevant rules with `exe`/`exe_sha256` or addresses,
+not domains alone.
 
 **Encrypted DNS is invisible to the wire snooper**, which only sees plaintext
 port 53. With the `ebpf` feature, uprobes on the libc resolver entry points

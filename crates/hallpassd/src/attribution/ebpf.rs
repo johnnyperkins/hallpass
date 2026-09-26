@@ -620,14 +620,14 @@ const UPROBE_DNS_TTL_SECS: u32 = 120;
 /// buffer rewrite. The recorded mapping is still only as trustworthy as
 /// what the process resolved: like the wire snooper (and like any
 /// IP->domain cache), a process resolving a name it controls can map its
-/// own name to any address, and the single-value-per-IP cache means the
-/// last resolver of an address wins. Domain rules are therefore a
+/// own name to any address, and the last lookup of an address by a user
+/// names it for that user's connections. Domain rules are therefore a
 /// convenience over IP/exe rules, not a boundary against a local process
 /// that is choosing its own DNS - which is why this feeds the same cache
 /// the wire path does rather than a privileged one.
 fn spawn_dns_reader(ring: RingBuf<MapData>, dns: Arc<IpDomainCache>, stop: StopRx) {
     spawn_ring_reader("ebpf-dns", ring, stop, move |item| {
-        let Some((ip, raw)) = DnsEvent::parse(item) else {
+        let Some((ip, raw, uid)) = DnsEvent::parse(item) else {
             return;
         };
         let Some(name) = normalize_domain(raw) else {
@@ -639,11 +639,14 @@ fn spawn_dns_reader(ring: RingBuf<MapData>, dns: Arc<IpDomainCache>, stop: StopR
             return;
         }
         tracing::debug!(domain = %name, %ip, "dns cache insert (uprobe)");
-        dns.absorb(&SnoopedResponse {
-            id: 0,
-            query_name: name,
-            addrs: vec![(ip, UPROBE_DNS_TTL_SECS)],
-        });
+        dns.absorb(
+            &SnoopedResponse {
+                id: 0,
+                query_name: name,
+                addrs: vec![(ip, UPROBE_DNS_TTL_SECS)],
+            },
+            Some(uid),
+        );
     });
 }
 

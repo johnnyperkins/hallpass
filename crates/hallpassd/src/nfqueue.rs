@@ -32,6 +32,10 @@ mod udp_memo;
 /// Sleep between polls when both sources are idle.
 const IDLE_POLL: Duration = Duration::from_millis(2);
 
+/// A packet for the DNS snoop consumer: its flow, its bytes, and the user
+/// behind it when the verdict path attributed one.
+pub type SnoopedPacket = (FlowTuple, Vec<u8>, crate::dns::Requester);
+
 /// An unmatched connection handed to the async prompt path. `seq`
 /// identifies the packet held on the queue thread.
 pub struct PromptTask {
@@ -61,7 +65,7 @@ pub struct QueueDeps {
     /// queue must drop packets rather than grow. Dropping costs a domain
     /// annotation, never a verdict, since snoop packets are accepted
     /// immediately and the rule engine never waits on this.
-    pub dns_tx: Sender<(FlowTuple, Vec<u8>)>,
+    pub dns_tx: Sender<SnoopedPacket>,
     /// IP -> domain cache filled by the DNS snoop consumer.
     pub dns_cache: Arc<IpDomainCache>,
     /// Executable hash cache. Consulted when a rule pins a hash, and again
@@ -166,13 +170,19 @@ pub fn want_fail_open(queue_bypass: bool, enforcing: bool, locked_down: bool) ->
 /// and the server it was addressed to (on a routable host, anyone) could
 /// answer it anyway and have the answer accepted. Before the packet is
 /// released, so the record is queued ahead of any reply.
-fn snoop_released_query(deps: &QueueDeps, tuple: FlowTuple, msg: &nfq::Message, applied: Verdict) {
+fn snoop_released_query(
+    deps: &QueueDeps,
+    tuple: FlowTuple,
+    msg: &nfq::Message,
+    applied: Verdict,
+    by: crate::dns::Requester,
+) {
     if applied != Verdict::Allow {
         return;
     }
     if deps
         .dns_tx
-        .try_send((tuple, msg.get_payload().to_vec()))
+        .try_send((tuple, msg.get_payload().to_vec(), by))
         .is_err()
     {
         deps.stats.record_dns_snoop_dropped();
@@ -234,7 +244,8 @@ fn decide(
     seen: Option<&mut crate::firstseen::Tracker>,
 ) -> Decision {
     let (mut conn, exe_id) = ctx.attribution.connection(tuple, ctx.syn);
-    conn.domain = ctx.dns_cache.lookup(&conn.tuple.dst.ip());
+    // The connecting user's own lookups only; see IpDomainCache.
+    conn.domain = ctx.dns_cache.lookup(conn.uid, &conn.tuple.dst.ip());
     conn.iface = iface;
     // One snapshot for both the enrichment decision and the match, so a
     // concurrent rule reload cannot split them. Hashing reads the binary
@@ -678,7 +689,9 @@ struct VerdictLoop {
     /// First-seen tracking, taken out of [`QueueDeps`]; see [`run`].
     seen: Option<crate::firstseen::Tracker>,
     /// Packets held for a prompt reply, by hold sequence number.
-    held: HashMap<u64, nfq::Message>,
+    /// Each with the uid attribution named, for the DNS snoop when it is a
+    /// query released later.
+    held: HashMap<u64, (nfq::Message, crate::dns::Requester)>,
     /// Monotonic packet-hold sequence. u64 does not wrap in any real runtime
     /// (billions of held packets per second for centuries), so no reuse guard;
     /// do not "fix" this into a wrapping counter that could collide live keys.
@@ -772,7 +785,7 @@ impl VerdictLoop {
         let mut any = false;
         while let Ok((seq, verdict)) = self.deps.verdict_rx.try_recv() {
             any = true;
-            let Some(msg) = self.held.remove(&seq) else {
+            let Some((msg, by)) = self.held.remove(&seq) else {
                 continue;
             };
             // Through the helper like every other policy verdict, with the
@@ -785,7 +798,7 @@ impl VerdictLoop {
                 packet::parse(msg.get_payload(), msg.get_original_len())
             {
                 if packet::is_dns_query(&tuple) {
-                    snoop_released_query(&self.deps, tuple, &msg, applied);
+                    snoop_released_query(&self.deps, tuple, &msg, applied, by);
                 }
                 // An answer (or the default an unanswered prompt came to)
                 // covers the rest of an unanswered UDP flow, so `once` does
@@ -816,8 +829,10 @@ impl VerdictLoop {
         };
         if let Some(verdict) = self.remembered(&tuple, enforcing) {
             let applied = applied_verdict(verdict, enforcing);
+            // No attribution on this path; the consumer knows the flow's
+            // user from the query that was judged.
             if packet::is_dns_query(&tuple) {
-                snoop_released_query(&self.deps, tuple, &msg, applied);
+                snoop_released_query(&self.deps, tuple, &msg, applied, None);
             }
             apply_verdict(&mut self.queue, msg, applied);
             return;
@@ -982,6 +997,7 @@ impl VerdictLoop {
                 .then(|| self.deps.exe_hash.for_connection(&conn, exe.id))
                 .flatten()
         });
+        let by = conn.uid;
         let task = PromptTask {
             seq,
             conn,
@@ -989,7 +1005,7 @@ impl VerdictLoop {
         };
         match self.deps.prompt_tx.send(task) {
             Ok(()) => {
-                self.held.insert(seq, msg);
+                self.held.insert(seq, (msg, by));
             }
             Err(unsent) => {
                 // Prompt path gone. At shutdown that is expected; any other
@@ -1040,7 +1056,7 @@ impl VerdictLoop {
         }
         let applied = applied_verdict(verdict, enforcing);
         if packet::is_dns_query(&conn.tuple) {
-            snoop_released_query(deps, conn.tuple, &msg, applied);
+            snoop_released_query(deps, conn.tuple, &msg, applied, conn.uid);
         }
         if !enforcing && verdict != Verdict::Allow {
             deps.stats.record_observed_only();
@@ -1088,7 +1104,7 @@ impl VerdictLoop {
     fn release_all(&mut self, queue_num: u16) {
         let settings = &self.deps.settings;
         let on_exit = applied_verdict(settings.default_verdict(), settings.enforcing());
-        for (_, msg) in self.held.drain() {
+        for (_, (msg, _)) in self.held.drain() {
             apply_verdict(&mut self.queue, msg, on_exit);
         }
         if let Err(e) = self.queue.unbind(queue_num) {
@@ -1141,7 +1157,7 @@ pub fn spawn(queues: Queues, queue_num: u16, deps: QueueDeps) -> std::thread::Jo
 fn run_snoop(
     mut queue: Queue,
     snoop_queue: u16,
-    dns_tx: &Sender<(FlowTuple, Vec<u8>)>,
+    dns_tx: &Sender<SnoopedPacket>,
     stats: &Counters,
     shutdown: &AtomicBool,
 ) {
@@ -1155,7 +1171,10 @@ fn run_snoop(
                 {
                     // try_send: the consumer is async and must not be able to
                     // back this loop up into the kernel queue.
-                    if dns_tx.try_send((t, msg.get_payload().to_vec())).is_err() {
+                    if dns_tx
+                        .try_send((t, msg.get_payload().to_vec(), None))
+                        .is_err()
+                    {
                         stats.record_dns_snoop_dropped();
                     }
                 }
@@ -1651,17 +1670,36 @@ mod tests {
         );
     }
 
+    fn answer(name: &str) -> crate::dns::SnoopedResponse {
+        crate::dns::SnoopedResponse {
+            id: 1,
+            query_name: name.into(),
+            addrs: vec![("1.1.1.1".parse().unwrap(), 300)],
+        }
+    }
+
     #[test]
     fn domain_enrichment_from_dns_cache() {
         let fx = Fixture::new("domain", vec![], NoAttr);
-        fx.dns.absorb(&crate::dns::SnoopedResponse {
-            id: 1,
-            query_name: "example.com".into(),
-            addrs: vec![("1.1.1.1".parse().unwrap(), 300)],
-        });
+        fx.dns.absorb(&answer("example.com"), None);
         match fx.decide(tuple_of(&tcp_packet([1, 1, 1, 1], 443))) {
             Decision::Prompt(conn, _) => assert_eq!(conn.domain.as_deref(), Some("example.com")),
             _ => panic!("expected prompt"),
+        }
+    }
+
+    /// A connection is named by its own user's lookups, not by whoever
+    /// looked the address up last.
+    #[test]
+    fn domain_enrichment_reads_the_connecting_users_lookups() {
+        let fx = Fixture::new("domain-user", vec![], SelfProc);
+        let me = crate::testutil::own_uid();
+        fx.dns.absorb(&answer("mine.example"), Some(me));
+        fx.dns
+            .absorb(&answer("theirs.example"), Some(me.wrapping_add(1)));
+        match fx.decide(tuple_of(&tcp_packet([1, 1, 1, 1], 443))) {
+            Decision::Prompt(conn, _) => assert_eq!(conn.domain.as_deref(), Some("mine.example")),
+            other => panic!("expected prompt, got {other:?}"),
         }
     }
 }

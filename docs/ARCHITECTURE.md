@@ -98,10 +98,16 @@ tuple-only rule model with its own default verdict.
    `EbpfAttributor::details_for` also checks the exe link before serving its
    per-pid cache, because that cache is refreshed by a lossy async ring.
 
-5. **Named.** The destination IP is looked up in the IP-to-domain cache. The
-   wire snooper fills it from the snoop queue, accepting a reply only when its
-   addresses, transaction id and question match a recorded query. With eBPF,
-   libc resolver uprobes fill it too.
+5. **Named.** The destination IP is looked up in the IP-to-domain cache under
+   the connecting user's uid, so one user's lookups never name another user's
+   connections. The wire snooper fills it from the snoop queue, accepting a
+   reply only when its addresses, transaction id and question match a
+   recorded query, and keying it by the uid the verdict path attributed to
+   that query's flow (a flow's first query is judged; later ones inherit its
+   uid in the consumer). With eBPF, libc resolver uprobes fill it too, with
+   the caller's uid in the event. A live desktop sample was 72% stub queries
+   (a program's own socket) and 28% the resolver's upstream answers, which
+   repeat names the stub already reported.
 
 6. **Flagged if new.** The application (exe plus app id) and destination
    (domain if known, else address) are checked against the first-seen store.

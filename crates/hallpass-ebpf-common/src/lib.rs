@@ -158,22 +158,26 @@ pub struct DnsEvent {
     pub _pad: [u8; 3],
     /// Bytes of `name` actually used (no NUL).
     pub name_len: u32,
+    /// Uid of the process that made the lookup, which keys the domain cache
+    /// so one user's lookups name addresses for that user alone.
+    pub uid: u32,
     /// The queried hostname, UTF-8/ASCII bytes.
     pub name: [u8; DNS_NAME_CAP],
 }
 
 impl DnsEvent {
     /// Serialized size in bytes.
-    pub const SIZE: usize = 16 + 1 + 3 + 4 + DNS_NAME_CAP;
+    pub const SIZE: usize = 16 + 1 + 3 + 4 + 4 + DNS_NAME_CAP;
 
-    /// Decode from ring buffer bytes; None on short input, a bad length,
-    /// or an unknown family.
-    pub fn parse(bytes: &[u8]) -> Option<(core::net::IpAddr, &str)> {
+    /// Decode from ring buffer bytes into (address, name, uid); None on
+    /// short input, a bad length, or an unknown family.
+    pub fn parse(bytes: &[u8]) -> Option<(core::net::IpAddr, &str, u32)> {
         if bytes.len() < Self::SIZE {
             return None;
         }
         const FAMILY: usize = core::mem::offset_of!(DnsEvent, family);
         const NAME_LEN: usize = core::mem::offset_of!(DnsEvent, name_len);
+        const UID: usize = core::mem::offset_of!(DnsEvent, uid);
         const NAME: usize = core::mem::offset_of!(DnsEvent, name);
         let family = bytes[FAMILY];
         let name_len = u32::from_ne_bytes(bytes[NAME_LEN..NAME_LEN + 4].try_into().ok()?) as usize;
@@ -181,6 +185,7 @@ impl DnsEvent {
             return None;
         }
         let name = core::str::from_utf8(&bytes[NAME..NAME + name_len]).ok()?;
+        let uid = u32::from_ne_bytes(bytes[UID..UID + 4].try_into().ok()?);
         let ip: core::net::IpAddr = match family {
             AF_INET => {
                 let o: [u8; 4] = bytes[..4].try_into().ok()?;
@@ -192,7 +197,7 @@ impl DnsEvent {
             }
             _ => return None,
         };
-        Some((ip, name))
+        Some((ip, name, uid))
     }
 }
 
@@ -255,10 +260,12 @@ mod tests {
         raw[16] = AF_INET;
         let name = b"example.com";
         raw[20..24].copy_from_slice(&(name.len() as u32).to_ne_bytes());
-        raw[24..24 + name.len()].copy_from_slice(name);
-        let (ip, got) = DnsEvent::parse(&raw).unwrap();
+        raw[24..28].copy_from_slice(&1000u32.to_ne_bytes());
+        raw[28..28 + name.len()].copy_from_slice(name);
+        let (ip, got, uid) = DnsEvent::parse(&raw).unwrap();
         assert_eq!(ip, core::net::Ipv4Addr::new(1, 2, 3, 4));
         assert_eq!(got, "example.com");
+        assert_eq!(uid, 1000);
 
         // Short buffer, bad length, unknown family all reject.
         assert!(DnsEvent::parse(&raw[..DnsEvent::SIZE - 1]).is_none());

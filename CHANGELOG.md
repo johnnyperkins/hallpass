@@ -113,6 +113,11 @@ restarted together; a version mismatch is refused at connect.
 
 ### Changed
 
+- **The domain cache is kept per user.** A lookup names an address only for
+  connections made by the same uid, so one account resolving a name it
+  controls no longer relabels that address for every process on the host.
+  Upgrade: rebuild the eBPF object; its DNS event gained a uid, and an old
+  object's resolver events are ignored.
 - **With eBPF, a new TCP connection whose flow record is missing carries no
   executable**, where it used to fall back to the name `/proc` gave after the
   fact. Flushing the eBPF flow map no longer walks a connection around the

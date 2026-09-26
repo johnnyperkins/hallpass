@@ -45,7 +45,6 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use hallpass_types::FlowTuple;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::mpsc;
 
@@ -115,13 +114,20 @@ fn arm_panic_hook(shutdown: Arc<AtomicBool>, teardown: bool) {
 /// question name), so spoofed replies cannot poison the domain cache the
 /// queue thread reads when it builds a Connection.
 fn spawn_dns_snoop(
-    mut rx: mpsc::Receiver<(FlowTuple, Vec<u8>)>,
+    mut rx: mpsc::Receiver<nfqueue::SnoopedPacket>,
     cache: Arc<dns::IpDomainCache>,
     stats: Arc<Counters>,
 ) {
     tokio::spawn(async move {
         let tracker = dns::QueryTracker::new(dns::TRACKER_CAPACITY);
-        while let Some((tuple, pkt)) = rx.recv().await {
+        // DNS flow (client, server) -> the user its first query was judged
+        // as. Sized like the tracker: an evicted flow's later queries lose
+        // their user, which costs a domain annotation, never a verdict.
+        let mut flow_users: lru::LruCache<(std::net::SocketAddr, std::net::SocketAddr), u32> =
+            lru::LruCache::new(
+                std::num::NonZeroUsize::new(dns::TRACKER_CAPACITY).expect("nonzero capacity"),
+            );
+        while let Some((tuple, pkt, by)) = rx.recv().await {
             let Some(payload) = packet::udp_payload(&pkt) else {
                 continue;
             };
@@ -129,7 +135,7 @@ fn spawn_dns_snoop(
                 let Some(resp) = dns::parse_response(payload) else {
                     continue;
                 };
-                if tracker.validate(tuple.dst, tuple.src, &resp) {
+                if let Some(requester) = tracker.validate(tuple.dst, tuple.src, &resp) {
                     // The path in the message rather than a field, so it can
                     // be counted with grep: a reply from the stub answered a
                     // program's own query, one from elsewhere the resolver's.
@@ -144,7 +150,7 @@ fn spawn_dns_snoop(
                         client = %tuple.dst,
                         "dns cache insert (wire, {via})"
                     );
-                    cache.absorb(&resp);
+                    cache.absorb(&resp, requester);
                 } else {
                     stats.record_dns_spoof_rejected();
                     tracing::debug!(
@@ -155,7 +161,18 @@ fn spawn_dns_snoop(
                 }
             } else if packet::is_dns_query(&tuple) {
                 if let Some(q) = dns::parse_query(payload) {
-                    tracker.observe(tuple.src, tuple.dst, &q);
+                    // A flow's first query was judged, so it arrives with
+                    // its user; later ones on the same socket (snoop queue,
+                    // remembered UDP verdicts) do not, and inherit it.
+                    let flow = (tuple.src, tuple.dst);
+                    let by = match by {
+                        Some(uid) => {
+                            flow_users.put(flow, uid);
+                            Some(uid)
+                        }
+                        None => flow_users.get(&flow).copied(),
+                    };
+                    tracker.observe(tuple.src, tuple.dst, &q, by);
                 }
             }
         }

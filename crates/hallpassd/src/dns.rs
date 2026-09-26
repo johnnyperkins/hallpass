@@ -280,6 +280,11 @@ fn bounded_lru<K: std::hash::Hash + Eq, V>(capacity: usize) -> Mutex<LruCache<K,
     Mutex::new(LruCache::new(capacity))
 }
 
+/// The user a query was made by, when the daemon could tell: the uid its
+/// socket belongs to. Keys the domain cache, so one user's lookups name
+/// addresses for that user's connections only.
+pub type Requester = Option<u32>;
+
 /// Key identifying one outstanding query: who asked whom, with which
 /// transaction ID, for which name.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -295,7 +300,7 @@ struct QueryKey {
 /// source/destination, transaction ID, and question name all match an
 /// observed query; anything else is treated as spoofed and ignored.
 pub struct QueryTracker {
-    inner: Mutex<LruCache<QueryKey, Instant>>,
+    inner: Mutex<LruCache<QueryKey, (Instant, Requester)>>,
 }
 
 impl QueryTracker {
@@ -305,25 +310,38 @@ impl QueryTracker {
         }
     }
 
-    /// Record an outbound query from `client` to `server`.
-    pub fn observe(&self, client: SocketAddr, server: SocketAddr, q: &SnoopedQuery) {
-        self.observe_at(client, server, q, Instant::now());
+    /// Record an outbound query from `client` to `server`, made by `by`.
+    pub fn observe(&self, client: SocketAddr, server: SocketAddr, q: &SnoopedQuery, by: Requester) {
+        self.observe_at(client, server, q, by, Instant::now());
     }
 
-    fn observe_at(&self, client: SocketAddr, server: SocketAddr, q: &SnoopedQuery, now: Instant) {
+    fn observe_at(
+        &self,
+        client: SocketAddr,
+        server: SocketAddr,
+        q: &SnoopedQuery,
+        by: Requester,
+        now: Instant,
+    ) {
         let key = QueryKey {
             client,
             server,
             id: q.id,
             name: q.query_name.clone(),
         };
-        self.inner.lock().unwrap().put(key, now + QUERY_TTL);
+        self.inner.lock().unwrap().put(key, (now + QUERY_TTL, by));
     }
 
-    /// True when a response from `server` to `client` answers an observed
-    /// query. The matching entry is consumed so a duplicate (or raced
-    /// spoof) of the same response is not accepted twice.
-    pub fn validate(&self, client: SocketAddr, server: SocketAddr, resp: &SnoopedResponse) -> bool {
+    /// Who made the observed query a response from `server` to `client`
+    /// answers, or `None` when it answers none. The matching entry is
+    /// consumed so a duplicate (or raced spoof) of the same response is not
+    /// accepted twice.
+    pub fn validate(
+        &self,
+        client: SocketAddr,
+        server: SocketAddr,
+        resp: &SnoopedResponse,
+    ) -> Option<Requester> {
         self.validate_at(client, server, resp, Instant::now())
     }
 
@@ -333,7 +351,7 @@ impl QueryTracker {
         server: SocketAddr,
         resp: &SnoopedResponse,
         now: Instant,
-    ) -> bool {
+    ) -> Option<Requester> {
         let key = QueryKey {
             client,
             server,
@@ -344,7 +362,8 @@ impl QueryTracker {
             .lock()
             .unwrap()
             .pop(&key)
-            .is_some_and(|expires| expires > now)
+            .filter(|(expires, _)| *expires > now)
+            .map(|(_, by)| by)
     }
 }
 
@@ -353,11 +372,18 @@ struct Entry {
     expires: Instant,
 }
 
-/// Thread-safe LRU of IP -> (domain, expiry). Written by the DNS snoop
-/// consumer task, read on the packet decision path for NEW connections
-/// only, so a plain mutex is plenty.
+/// Thread-safe LRU of (requester, IP) -> (domain, expiry). Written by the
+/// DNS snoop consumer task, read on the packet decision path for NEW
+/// connections only, so a plain mutex is plenty.
+///
+/// Keyed by the user who looked the name up, so a process choosing its own
+/// DNS can only label addresses for its own user's connections: without the
+/// key the last lookup of an address named it for every process on the
+/// host. A connection only ever reads its own user's entries. An unknown
+/// requester is its own key and matches only unattributed connections,
+/// rather than standing in for everyone, which would be the old cache again.
 pub struct IpDomainCache {
-    inner: Mutex<LruCache<IpAddr, Entry>>,
+    inner: Mutex<LruCache<(Requester, IpAddr), Entry>>,
 }
 
 impl IpDomainCache {
@@ -379,20 +405,20 @@ impl IpDomainCache {
     /// numeric host "resolves" it, and caching the result labelled the
     /// address with its own text, overwriting the domain a real lookup had
     /// recorded for it.
-    pub fn absorb(&self, resp: &SnoopedResponse) {
+    pub fn absorb(&self, resp: &SnoopedResponse, by: Requester) {
         if resp.query_name.parse::<IpAddr>().is_ok() {
             return;
         }
         let now = Instant::now();
         for (ip, ttl) in resp.addrs.iter().take(MAX_ADDRS_PER_RESPONSE) {
-            self.insert_at(*ip, &resp.query_name, *ttl, now);
+            self.insert_at(by, *ip, &resp.query_name, *ttl, now);
         }
     }
 
-    fn insert_at(&self, ip: IpAddr, domain: &str, ttl_secs: u32, now: Instant) {
+    fn insert_at(&self, by: Requester, ip: IpAddr, domain: &str, ttl_secs: u32, now: Instant) {
         let ttl = Duration::from_secs(u64::from(ttl_secs)).clamp(MIN_TTL, MAX_TTL);
         self.inner.lock().unwrap().put(
-            ip,
+            (by, ip),
             Entry {
                 domain: domain.to_string(),
                 expires: now + ttl,
@@ -400,17 +426,18 @@ impl IpDomainCache {
         );
     }
 
-    /// Domain last seen resolving to `ip`, if the record is still live.
-    pub fn lookup(&self, ip: &IpAddr) -> Option<String> {
-        self.lookup_at(ip, Instant::now())
+    /// Domain `by` last saw resolving to `ip`, if the record is still live.
+    pub fn lookup(&self, by: Requester, ip: &IpAddr) -> Option<String> {
+        self.lookup_at(by, ip, Instant::now())
     }
 
-    fn lookup_at(&self, ip: &IpAddr, now: Instant) -> Option<String> {
+    fn lookup_at(&self, by: Requester, ip: &IpAddr, now: Instant) -> Option<String> {
         let mut cache = self.inner.lock().unwrap();
-        match cache.get(ip) {
+        let key = (by, *ip);
+        match cache.get(&key) {
             Some(e) if e.expires > now => Some(e.domain.clone()),
             Some(_) => {
-                cache.pop(ip);
+                cache.pop(&key);
                 None
             }
             None => None,
@@ -422,21 +449,53 @@ impl IpDomainCache {
 mod tests {
     use super::*;
 
+    /// The requester most tests look names up for.
+    const U: Requester = Some(1000);
+
+    /// One user's lookups name addresses for that user's connections only,
+    /// and an unknown requester stands in for nobody else.
+    #[test]
+    fn a_lookup_names_an_address_for_its_own_user_only() {
+        let cache = IpDomainCache::new(16);
+        let ip: IpAddr = "93.184.216.34".parse().unwrap();
+        let answer = |name: &str| SnoopedResponse {
+            id: 1,
+            query_name: name.into(),
+            addrs: vec![(ip, 300)],
+        };
+        cache.absorb(&answer("example.com"), Some(1000));
+        cache.absorb(&answer("bank.example"), Some(2000));
+        cache.absorb(&answer("unknown.example"), None);
+        assert_eq!(
+            cache.lookup(Some(1000), &ip).as_deref(),
+            Some("example.com")
+        );
+        assert_eq!(
+            cache.lookup(Some(2000), &ip).as_deref(),
+            Some("bank.example")
+        );
+        assert_eq!(cache.lookup(Some(3000), &ip), None);
+        assert_eq!(cache.lookup(None, &ip).as_deref(), Some("unknown.example"));
+    }
+
     #[test]
     fn absorb_takes_a_bounded_number_of_addresses() {
         let cache = IpDomainCache::new(1024);
         let addrs = (0..200u32)
             .map(|n| (IpAddr::from(std::net::Ipv4Addr::from(0x0a00_0000 + n)), 300))
             .collect();
-        cache.absorb(&SnoopedResponse {
-            id: 1,
-            query_name: "flood.example".into(),
-            addrs,
-        });
+        cache.absorb(
+            &SnoopedResponse {
+                id: 1,
+                query_name: "flood.example".into(),
+                addrs,
+            },
+            U,
+        );
         let cached = (0..200u32)
             .filter(|n| {
                 cache
-                    .lookup(&IpAddr::from(std::net::Ipv4Addr::from(0x0a00_0000 + n)))
+                    .lookup(U, &IpAddr::from(std::net::Ipv4Addr::from(0x0a00_0000 + n)))
                     .is_some()
             })
             .count();
@@ -447,17 +506,23 @@ mod tests {
     fn an_address_is_never_cached_as_its_own_name() {
         let cache = IpDomainCache::new(16);
         let ip: IpAddr = "140.82.112.3".parse().unwrap();
-        cache.absorb(&SnoopedResponse {
-            id: 1,
-            query_name: "github.com".into(),
-            addrs: vec![(ip, 300)],
-        });
-        cache.absorb(&SnoopedResponse {
-            id: 0,
-            query_name: "140.82.112.3".into(),
-            addrs: vec![(ip, 300)],
-        });
-        assert_eq!(cache.lookup(&ip).as_deref(), Some("github.com"));
+        cache.absorb(
+            &SnoopedResponse {
+                id: 1,
+                query_name: "github.com".into(),
+                addrs: vec![(ip, 300)],
+            },
+            U,
+        );
+        cache.absorb(
+            &SnoopedResponse {
+                id: 0,
+                query_name: "140.82.112.3".into(),
+                addrs: vec![(ip, 300)],
+            },
+            U,
+        );
+        assert_eq!(cache.lookup(U, &ip).as_deref(), Some("github.com"));
     }
 
     /// Encode a dotted name into uncompressed wire format.
@@ -589,20 +654,34 @@ mod tests {
         let client: SocketAddr = "10.0.0.1:51000".parse().unwrap();
         let server: SocketAddr = "9.9.9.9:53".parse().unwrap();
         let now = Instant::now();
-        tracker.observe_at(client, server, &parse_query(&simple_query()).unwrap(), now);
+        tracker.observe_at(
+            client,
+            server,
+            &parse_query(&simple_query()).unwrap(),
+            Some(1000),
+            now,
+        );
 
         let resp = parse_response(&simple_a_response()).unwrap();
         // Wrong server, wrong client, wrong id: all rejected.
         let other: SocketAddr = "8.8.8.8:53".parse().unwrap();
-        assert!(!tracker.validate_at(client, other, &resp, now));
-        assert!(!tracker.validate_at(server, client, &resp, now));
+        assert!(tracker.validate_at(client, other, &resp, now).is_none());
+        assert!(tracker.validate_at(server, client, &resp, now).is_none());
         let mut wrong_id = parse_response(&simple_a_response()).unwrap();
         wrong_id.id = 0x9999;
-        assert!(!tracker.validate_at(client, server, &wrong_id, now));
+        assert!(tracker
+            .validate_at(client, server, &wrong_id, now)
+            .is_none());
 
         // The genuine response matches exactly once.
-        assert!(tracker.validate_at(client, server, &resp, now));
-        assert!(!tracker.validate_at(client, server, &resp, now), "consumed");
+        assert_eq!(
+            tracker.validate_at(client, server, &resp, now),
+            Some(Some(1000))
+        );
+        assert!(
+            tracker.validate_at(client, server, &resp, now).is_none(),
+            "consumed"
+        );
     }
 
     #[test]
@@ -611,9 +690,17 @@ mod tests {
         let client: SocketAddr = "10.0.0.1:51000".parse().unwrap();
         let server: SocketAddr = "9.9.9.9:53".parse().unwrap();
         let now = Instant::now();
-        tracker.observe_at(client, server, &parse_query(&simple_query()).unwrap(), now);
+        tracker.observe_at(
+            client,
+            server,
+            &parse_query(&simple_query()).unwrap(),
+            Some(1000),
+            now,
+        );
         let resp = parse_response(&simple_a_response()).unwrap();
-        assert!(!tracker.validate_at(client, server, &resp, now + QUERY_TTL));
+        assert!(tracker
+            .validate_at(client, server, &resp, now + QUERY_TTL)
+            .is_none());
     }
 
     #[test]
@@ -623,9 +710,9 @@ mod tests {
         let server: SocketAddr = "9.9.9.9:53".parse().unwrap();
         let mut q = header(0x0100, 1, 0);
         q.extend(question("other.org"));
-        tracker.observe(client, server, &parse_query(&q).unwrap());
+        tracker.observe(client, server, &parse_query(&q).unwrap(), Some(1000));
         let resp = parse_response(&simple_a_response()).unwrap();
-        assert!(!tracker.validate(client, server, &resp));
+        assert!(tracker.validate(client, server, &resp).is_none());
     }
 
     #[test]
@@ -835,15 +922,15 @@ mod tests {
         let cache = IpDomainCache::new(16);
         let ip: IpAddr = "1.2.3.4".parse().unwrap();
         let now = Instant::now();
-        cache.insert_at(ip, "example.com", 5, now); // clamped up to 30s
-        assert_eq!(cache.lookup_at(&ip, now), Some("example.com".into()));
+        cache.insert_at(U, ip, "example.com", 5, now); // clamped up to 30s
+        assert_eq!(cache.lookup_at(U, &ip, now), Some("example.com".into()));
         assert_eq!(
-            cache.lookup_at(&ip, now + Duration::from_secs(29)),
+            cache.lookup_at(U, &ip, now + Duration::from_secs(29)),
             Some("example.com".into())
         );
-        assert_eq!(cache.lookup_at(&ip, now + Duration::from_secs(31)), None);
+        assert_eq!(cache.lookup_at(U, &ip, now + Duration::from_secs(31)), None);
         // Expired entries are evicted, not just hidden.
-        assert_eq!(cache.lookup_at(&ip, now), None);
+        assert_eq!(cache.lookup_at(U, &ip, now), None);
     }
 
     #[test]
@@ -851,28 +938,30 @@ mod tests {
         let cache = IpDomainCache::new(2);
         let now = Instant::now();
         let ip: IpAddr = "1.1.1.1".parse().unwrap();
-        cache.insert_at(ip, "long.example", u32::MAX, now);
+        cache.insert_at(U, ip, "long.example", u32::MAX, now);
         assert!(cache
-            .lookup_at(&ip, now + MAX_TTL - Duration::from_secs(1))
+            .lookup_at(U, &ip, now + MAX_TTL - Duration::from_secs(1))
             .is_some());
         // At exactly now + MAX_TTL the entry is expired (and evicted).
-        assert_eq!(cache.lookup_at(&ip, now + MAX_TTL), None);
-        cache.insert_at(ip, "long.example", u32::MAX, now);
+        assert_eq!(cache.lookup_at(U, &ip, now + MAX_TTL), None);
+        cache.insert_at(U, ip, "long.example", u32::MAX, now);
 
         // Capacity 2: inserting two more evicts the oldest.
-        cache.insert_at("2.2.2.2".parse().unwrap(), "b", 300, now);
-        cache.insert_at("3.3.3.3".parse().unwrap(), "c", 300, now);
-        assert_eq!(cache.lookup_at(&ip, now), None);
-        assert!(cache.lookup_at(&"3.3.3.3".parse().unwrap(), now).is_some());
+        cache.insert_at(U, "2.2.2.2".parse().unwrap(), "b", 300, now);
+        cache.insert_at(U, "3.3.3.3".parse().unwrap(), "c", 300, now);
+        assert_eq!(cache.lookup_at(U, &ip, now), None);
+        assert!(cache
+            .lookup_at(U, &"3.3.3.3".parse().unwrap(), now)
+            .is_some());
     }
 
     #[test]
     fn absorb_fills_cache_from_response() {
         let cache = IpDomainCache::new(16);
         let resp = parse_response(&simple_a_response()).unwrap();
-        cache.absorb(&resp);
+        cache.absorb(&resp, U);
         assert_eq!(
-            cache.lookup(&"93.184.216.34".parse().unwrap()),
+            cache.lookup(U, &"93.184.216.34".parse().unwrap()),
             Some("example.com".into())
         );
     }
