@@ -88,6 +88,45 @@ pub async fn write_msg<T: Serialize, W: AsyncWrite + Unpin>(w: &mut W, msg: &T) 
     Ok(())
 }
 
+/// Read one message from a blocking reader. `Ok(None)` is the peer closing
+/// between frames; closing inside one is an error like any other malformed
+/// input.
+///
+/// Blocking streams only: a timeout inside a frame would drop the bytes
+/// already read and leave the stream out of step.
+pub fn read_msg_blocking<T: DeserializeOwned>(r: &mut impl std::io::Read) -> Result<Option<T>> {
+    use std::io::ErrorKind;
+    let mut len_buf = [0u8; FRAME_PREFIX_BYTES];
+    let mut got = 0;
+    while got < len_buf.len() {
+        match r.read(&mut len_buf[got..]) {
+            Ok(0) if got == 0 => return Ok(None),
+            // A socket peer that exits with frames it never read is reported
+            // once as a reset, not as EOF. Between frames that is the same
+            // clean close.
+            Err(e) if got == 0 && e.kind() == ErrorKind::ConnectionReset => return Ok(None),
+            Ok(0) => return Err(std::io::Error::from(ErrorKind::UnexpectedEof).into()),
+            Ok(n) => got += n,
+            Err(e) if e.kind() == ErrorKind::Interrupted => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    let len = u32::from_le_bytes(len_buf) as usize;
+    if len > MAX_FRAME_SIZE {
+        return Err(WireError::FrameTooLarge(len));
+    }
+    let mut payload = vec![0u8; len];
+    r.read_exact(&mut payload)?;
+    decode(&payload).map(Some)
+}
+
+/// Write one message to a blocking writer and flush.
+pub fn write_msg_blocking<T: Serialize>(w: &mut impl std::io::Write, msg: &T) -> Result<()> {
+    w.write_all(&encode(msg)?)?;
+    w.flush()?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

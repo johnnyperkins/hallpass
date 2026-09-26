@@ -12,15 +12,13 @@
 //! from the agent's own image (`/proc/self/exe`), so both ends are one
 //! build and the messages below carry no version.
 
-use std::io::{self, Read, Write};
+use std::io;
 use std::os::fd::{AsFd as _, OwnedFd};
 use std::os::unix::fs::FileTypeExt as _;
 use std::os::unix::net::UnixStream;
 use std::process::{Child, Command, Stdio};
 
-use hallpass_types::wire::{self, WireError, FRAME_PREFIX_BYTES, MAX_FRAME_SIZE};
 use hallpass_types::{ClientMsg, Connection, PromptContext, PromptScope, RuleDuration, Verdict};
-use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 /// One prompt as the daemon raised it, handed to the window showing it.
@@ -92,43 +90,10 @@ impl FromWindow {
     }
 }
 
-/// Write one frame and flush.
-pub fn write_frame<T: Serialize>(w: &mut impl Write, msg: &T) -> wire::Result<()> {
-    w.write_all(&wire::encode(msg)?)?;
-    w.flush()?;
-    Ok(())
-}
-
-/// Read one frame. `Ok(None)` is the peer closing between frames; closing
-/// inside one is an error like any other malformed input.
-///
-/// Blocking streams only: a timeout inside a frame would drop the bytes
-/// already read and leave the stream out of step.
-pub fn read_frame<T: DeserializeOwned>(r: &mut impl Read) -> wire::Result<Option<T>> {
-    let mut len_buf = [0u8; FRAME_PREFIX_BYTES];
-    let mut got = 0;
-    while got < len_buf.len() {
-        match r.read(&mut len_buf[got..]) {
-            Ok(0) if got == 0 => return Ok(None),
-            // A socket peer that exits with frames it never read is reported
-            // once as a reset, not as EOF (a window closing with a Show that
-            // crossed its Dismissed, an agent killed with an Answer queued).
-            // Between frames that is the same clean close.
-            Err(e) if got == 0 && e.kind() == io::ErrorKind::ConnectionReset => return Ok(None),
-            Ok(0) => return Err(io::Error::from(io::ErrorKind::UnexpectedEof).into()),
-            Ok(n) => got += n,
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-            Err(e) => return Err(e.into()),
-        }
-    }
-    let len = u32::from_le_bytes(len_buf) as usize;
-    if len > MAX_FRAME_SIZE {
-        return Err(WireError::FrameTooLarge(len));
-    }
-    let mut payload = vec![0u8; len];
-    r.read_exact(&mut payload)?;
-    wire::decode(&payload).map(Some)
-}
+/// The blocking frame codec, shared with the daemon's test harness.
+pub use hallpass_types::wire::{
+    read_msg_blocking as read_frame, write_msg_blocking as write_frame,
+};
 
 /// Start `cmd` as a window on a fresh link, its end as the child's stdin,
 /// and return the agent's end.
@@ -168,6 +133,7 @@ pub fn from_stdin() -> io::Result<UnixStream> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hallpass_types::wire::{WireError, MAX_FRAME_SIZE};
 
     fn prompt() -> Prompt {
         Prompt {

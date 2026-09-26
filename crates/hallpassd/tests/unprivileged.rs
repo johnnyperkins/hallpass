@@ -16,7 +16,7 @@
 //! Unlike `e2e.rs` these need no root and no namespaces, so they are not
 //! `#[ignore]`-gated and run in the ordinary suite.
 
-use std::io::{Read, Write};
+use std::io::Write;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -123,9 +123,8 @@ fn set_mode_600(path: &Path) {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).expect("chmod config");
 }
 
-/// Length-prefixed postcard round trip over the control socket, the same
-/// framing `hallpass_types::wire` does, done synchronously so the test needs
-/// no runtime.
+/// Round trip over the control socket with the blocking codec, so the test
+/// needs no runtime.
 fn request(socket: &Path, msg: &ClientMsg) -> DaemonMsg {
     let mut stream = UnixStream::connect(socket).expect("connect to daemon socket");
     stream
@@ -141,9 +140,13 @@ fn request(socket: &Path, msg: &ClientMsg) -> DaemonMsg {
         stream.write_all(&frame).expect("write frame");
     }
     // First reply is the HelloAck, second answers `msg`.
-    read_frame(&mut stream);
-    let payload = read_frame(&mut stream);
-    wire::decode(&payload).expect("decode reply")
+    let reply = |stream: &mut UnixStream| {
+        wire::read_msg_blocking::<DaemonMsg>(stream)
+            .expect("read reply")
+            .expect("daemon closed the connection")
+    };
+    reply(&mut stream);
+    reply(&mut stream)
 }
 
 /// The daemon's counters, asked for over the control socket.
@@ -152,14 +155,6 @@ fn stats(env: &Scratch) -> Stats {
         DaemonMsg::Stats(stats) => stats,
         other => panic!("expected Stats, got {other:?}; log:\n{}", env.log()),
     }
-}
-
-fn read_frame(stream: &mut UnixStream) -> Vec<u8> {
-    let mut len = [0u8; 4];
-    stream.read_exact(&mut len).expect("read length prefix");
-    let mut payload = vec![0u8; u32::from_le_bytes(len) as usize];
-    stream.read_exact(&mut payload).expect("read payload");
-    payload
 }
 
 /// The regression: an unprivileged daemon used to exit the moment it
