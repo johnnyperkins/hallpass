@@ -149,10 +149,12 @@ fn ruleset(queue_num: u16, verdict_bypass: bool, drop_unjudgeable: bool) -> Stri
     // those flows: an inbound packet that arrived first would otherwise
     // re-create the conntrack entry from the inbound side, and the local
     // side's next packet would ride it as established instead of being
-    // judged. Outbound is left alone, so that next packet is judged like any
-    // new connection, and a reject rule still answers it. A match refreshes
-    // the element, so a peer that keeps sending keeps it; one quiet for
-    // `KILLED_TIMEOUT` lets it expire.
+    // judged. Only `ct state new`: that is the pickup, and it spares what is
+    // attached to a live entry, notably the RST a reject rule answers the
+    // re-judged packet with, which is addressed from the peer. Outbound is
+    // left alone, so the local side's next packet is judged like any new
+    // connection. A match refreshes the element, so a peer that keeps sending
+    // keeps it; one quiet for `KILLED_TIMEOUT` lets it expire.
     //
     // `hallpass-cli doctor` verifies the output chain by token-matching the
     // listed rules ("meta skuid 0" + "accept" before "ct state new" +
@@ -177,8 +179,8 @@ fn ruleset(queue_num: u16, verdict_bypass: bool, drop_unjudgeable: bool) -> Stri
          \t}}\n\
          \tchain input {{\n\
          \t\ttype filter hook input priority mangle; policy accept;\n\
-         \t\t{KILLED4_KEY} @killed4 update @killed4 {{ {KILLED4_KEY} }} drop\n\
-         \t\t{KILLED6_KEY} @killed6 update @killed6 {{ {KILLED6_KEY} }} drop\n\
+         \t\tct state new {KILLED4_KEY} @killed4 update @killed4 {{ {KILLED4_KEY} }} drop\n\
+         \t\tct state new {KILLED6_KEY} @killed6 update @killed6 {{ {KILLED6_KEY} }} drop\n\
          \t\tudp sport 53 ct state established queue num {snoop} bypass\n\
          \t}}\n\
          }}\n"
