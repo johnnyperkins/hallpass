@@ -2,7 +2,7 @@
 .\"
 .\" Hand-maintained alongside crates/hallpass-cli/src/args.rs, which parses
 .\" arguments by hand and is the authority on every command and flag below.
-.TH HALLPASS\-CLI 1 2026\-07\-30 "hallpass 0.1.0" "User Commands"
+.TH HALLPASS\-CLI 1 2026\-09\-26 "hallpass 0.1.0" "User Commands"
 .SH NAME
 hallpass\-cli \- client for the hallpass application firewall
 .SH SYNOPSIS
@@ -33,11 +33,37 @@ and are stripped before the command's own options are parsed.
 Show daemon statistics, including whether the daemon is enforcing policy or
 only observing it.
 .TP
-.BR rules " [" \-\-stats ]
+.B doctor
+Check the install: whether the daemon answers, its queues, the socket, group
+membership, the nftables table (as root) and kernel BTF. Every check is
+read-only, and one that needs privileges this run does not have is skipped
+with the reason. Exits non-zero if any check failed, including when the daemon
+cannot be reached.
+.TP
+.B config
+Show the runtime settings: prompt timeout, default action and whether the
+daemon is enforcing or observing. Under a lockdown it also notes that the
+posture is holding the mode and default action.
+.TP
+.BR "config set " [ OPTIONS ]
+Change the runtime settings. See
+.B CONFIG SET OPTIONS
+below. A change lasts until the daemon restarts;
+.I config.toml
+is never written. Settings not named keep their current values, but the whole
+set is written back in one request, so when two clients change settings at
+once the last write wins.
+.TP
+\fBrules\fR [\fB\-\-stats\fR] [\fB\-\-tag\fR \fITAG\fR]
 List the rules the daemon has loaded.
 .B \-\-stats
 adds a per-rule hit count, which the daemon accounts for at runtime and which
 is not part of a rule.
+.B \-\-tag
+lists only the rules carrying
+.IR TAG ,
+and may be given once. A tag no rule carries is an error rather than an empty
+list, since it is nearly always a typo.
 .TP
 .BR "rules add " [ OPTIONS ]
 Add a rule. See
@@ -57,6 +83,11 @@ Enable or disable the rule called
 .IR NAME .
 A disabled rule stays loaded but is skipped when policy is evaluated.
 .TP
+.BI "rules toggle \-\-tag " "TAG " on | off
+Enable or disable every rule carrying
+.IR TAG ,
+as one change. A tag no rule carries is an error.
+.TP
 .B rules export
 Write the whole ruleset to standard output as one TOML document. This output
 is always TOML, never JSON, because it exists to be saved, diffed and fed back
@@ -66,10 +97,24 @@ to
 covers the "pipe it into a program" case through
 .BR rules .
 .TP
-.BI "rules import " PATH
+\fBrules import\fR [\fB\-\-replace\fR] \fIPATH\fR
 Add every rule in such a document, reporting each one as it goes. A rule the
 daemon rejects does not stop the import, so one run reports every problem
 rather than only the first, but the command exits non-zero if any rule failed.
+A rule whose name is already in use fails unless
+.B \-\-replace
+is given, which overwrites it.
+.TP
+.BR suggest " [" OPTIONS ]
+Propose allow rules from the daemon's recent decisions: one rule per
+executable, protocol, port and destination, with a domain wildcard where
+enough hosts share a suffix. The output is a
+.B rules export
+document to review, trim and feed to
+.BR "rules import" ;
+nothing is applied. Connections allowed by a session grant are left out. See
+.B SUGGEST OPTIONS
+below.
 .TP
 .BR events " [" OPTIONS ]
 Stream connection events until interrupted with Ctrl\-C, optionally replaying
@@ -118,6 +163,18 @@ List the session grants that are open right now: id, the wrapper's pid, its
 user, how long it has been open, how many connections it has allowed, and
 what it is running.
 .TP
+.BR lockdown " [" on | off "] [" OPTIONS ]
+With no argument, show the lockdown posture.
+.B on
+enters it: only the allow rules carrying a pinned tag can allow, deny rules
+always apply, and everything else is denied without a prompt. The daemon
+enforces with a default action of deny while it is on, and loopback traffic is
+exempt. The posture survives a daemon restart.
+.B off
+lifts it and takes no options. See
+.B LOCKDOWN OPTIONS
+below.
+.TP
 .B watch
 Interactively answer connection prompts as the daemon raises them. This is the
 terminal equivalent of the desktop prompt window. A prompt for an application
@@ -135,6 +192,64 @@ is a claim rather than a lookup. See
 .B EXPLAIN OPTIONS
 below.
 .SH OPTIONS
+.SS CONFIG SET OPTIONS
+At least one of
+.BR \-\-timeout ", " \-\-default ", " \-\-enforce " or " \-\-observe
+is required.
+.TP
+.BI \-\-timeout " SECS"
+Seconds a prompt waits before the default action applies. The daemon checks
+the range, with the same bounds as the configuration file.
+.TP
+.BI \-\-default " allow" | deny | reject
+Action when no rule matches and nobody answers the prompt.
+.TP
+.B \-\-enforce
+Apply verdicts to packets.
+.TP
+.B \-\-observe
+Evaluate and record only, blocking nothing host-wide. Requires
+.BR \-\-yes .
+At most one of
+.B \-\-enforce
+and
+.B \-\-observe
+may be given.
+.TP
+.B \-\-yes
+Confirm
+.BR \-\-observe .
+.SS LOCKDOWN OPTIONS
+These apply only to
+.BR "lockdown on" .
+.TP
+.BI \-\-tag " TAG"
+Pin a tag: its allow rules keep deciding while the posture is on. Repeatable.
+Deny rules are never suppressed.
+.TP
+.B \-\-no\-system
+Do not pin the
+.B system
+tag. It is pinned by default, so the shipped baseline rules (DNS, time, DHCP)
+keep working.
+.TP
+.B \-\-force
+Enter the posture even when no rule at all survives it, which leaves the host
+reaching nothing but loopback.
+.SS SUGGEST OPTIONS
+.TP
+.BI \-\-exe " SUBSTR"
+Only executables whose path contains
+.IR SUBSTR .
+Repeatable; any of them matching is enough.
+.TP
+.BI \-\-domain " SUBSTR"
+Only destinations whose domain contains
+.IR SUBSTR .
+Repeatable; any of them matching is enough.
+.TP
+.BI \-\-last " N"
+How many recent decisions to fold. Default and maximum: 10000.
 .SS EVENTS OPTIONS
 .TP
 .BI \-\-last " N"
@@ -205,10 +320,10 @@ Its full command line.
 Executable path of its parent.
 .TP
 .BI \-\-exe\-sha256 " HEX"
-SHA\-256 to use for hash operands, as 64 hex digits. Without it the daemon
-hashes whatever
-.B \-\-exe
-names.
+SHA\-256 to use for hash operands, as 64 hex digits. Without it, rules that
+pin a hash report
+.B exe_sha256
+as unmatched: the daemon will not hash a path a client named.
 .TP
 .BI \-\-domain " NAME"
 Destination domain, as DNS snooping would have annotated it.
@@ -324,6 +439,23 @@ daemon and nowhere else.
 .TP
 .BI \-\-priority " N"
 Priority. Higher wins. Default: 0.
+.TP
+.BI \-\-tag " TAG"
+Label for selecting this rule in bulk. Repeatable. Lowercase letters, digits,
+.B \-
+and
+.BR _ ,
+starting with a letter or digit. Tags never affect matching.
+.TP
+.BI \-\-enabled " true" | false
+Whether the rule is active. Default:
+.BR true .
+.TP
+.B \-\-replace
+Overwrite the rule of the same name. Without it, a name already in use fails.
+Every field is restated: pass
+.B "\-\-enabled false"
+to keep a disabled rule disabled, and repeat its tags.
 .SS GLOBAL OPTIONS
 .TP
 .BI \-\-socket " PATH"
@@ -332,7 +464,8 @@ Daemon socket. Default:
 .TP
 .B \-\-json
 Emit machine-readable JSON for
-.BR status ", " rules ", " events
+.BR status ", " doctor ", " config ", " rules ", " suggest ", " sessions ,
+.BR lockdown ", " events
 (one object per line),
 .B top
 and
@@ -358,7 +491,9 @@ Success.
 A usage error, an unreadable or unparsable file, or an error reported by the
 daemon. A
 .B rules import
-in which any rule was rejected also exits 1.
+in which any rule was rejected also exits 1, and so does a
+.B doctor
+run in which any check failed, even when the daemon was unreachable.
 .TP
 .B 2
 The daemon could not be reached: the socket is missing, unreachable, or the
@@ -376,6 +511,10 @@ Rule files loaded by the daemon, where
 writes a
 .B \-\-duration forever
 rule, and the only directory the match-list options may name a file in.
+.TP
+.I /var/lib/hallpass/posture.toml
+The lockdown posture, kept so it survives a restart. Written by
+.BR hallpassd .
 .TP
 .I /var/lib/hallpass/seen.toml
 The applications and destinations the daemon has already seen, which is what
@@ -429,6 +568,26 @@ Save the ruleset, then restore it on another machine:
 .EX
 hallpass\-cli rules export > rules.toml
 hallpass\-cli rules import rules.toml
+.EE
+.RE
+.PP
+Turn what one program has been doing into rules, review them, then load them:
+.PP
+.RS 4
+.EX
+hallpass\-cli suggest \-\-exe firefox > proposed.toml
+hallpass\-cli rules import proposed.toml
+.EE
+.RE
+.PP
+Keep only the allow rules tagged
+.B core
+and the baseline, then lift the posture again:
+.PP
+.RS 4
+.EX
+hallpass\-cli lockdown on \-\-tag core
+hallpass\-cli lockdown off
 .EE
 .RE
 .SH SEE ALSO

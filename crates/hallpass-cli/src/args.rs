@@ -182,7 +182,8 @@ RULES ADD OPTIONS:
 
 GLOBAL OPTIONS:
     --socket PATH                Daemon socket (default: /run/hallpass/hallpass.sock)
-    --json                       Machine-readable JSON for status, rules,
+    --json                       Machine-readable JSON for status, doctor,
+                                 config, rules, suggest, sessions, lockdown,
                                  events (one object per line), top and
                                  explain
     --color auto|always|never    Colorize output (default: auto, meaning only

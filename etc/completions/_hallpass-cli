@@ -16,8 +16,10 @@ _hallpass-cli_commands() {
     commands=(
         'status:show daemon statistics'
         'doctor:check the install and exit non-zero if anything failed'
+        'config:show or change the runtime settings'
         'run:run a command under a one-off session grant'
         'sessions:list the session grants open right now'
+        'lockdown:show, enter or leave the lockdown posture'
         'suggest:propose allow rules from the daemon recent decisions'
         'rules:list, add, remove, toggle, export or import rules'
         'events:stream connection events until Ctrl-C'
@@ -33,11 +35,28 @@ _hallpass-cli_rules_commands() {
     subcommands=(
         'add:add a rule'
         'rm:delete a rule'
-        'toggle:enable or disable a rule'
+        'toggle:enable or disable a rule, or every rule carrying a tag'
         'export:write the ruleset to stdout as one TOML document'
         'import:add every rule in such a document'
     )
     _describe -t rules-commands 'rules subcommand' subcommands
+}
+
+_hallpass-cli_config_commands() {
+    local -a subcommands
+    subcommands=(
+        'set:change runtime settings until the daemon restarts'
+    )
+    _describe -t config-commands 'config subcommand' subcommands
+}
+
+_hallpass-cli_lockdown_states() {
+    local -a states
+    states=(
+        'on:enter the lockdown posture'
+        'off:leave the lockdown posture'
+    )
+    _describe -t lockdown-states 'lockdown state' states
 }
 
 _hallpass-cli() {
@@ -69,6 +88,57 @@ _hallpass-cli() {
     # The words after `run` are the wrapped command's, not this CLI's.
     run)
         _normal && ret=0
+        ;;
+    config)
+        _arguments -C -s $global_args \
+            '1: :_hallpass-cli_config_commands' \
+            '*::config-arg:->config-arg' && ret=0
+
+        if [[ $state != config-arg ]]; then
+            return $ret
+        fi
+
+        case $words[1] in
+        set)
+            _arguments -s $global_args \
+                '--timeout[seconds a prompt waits before the default action applies]:seconds:' \
+                '--default[action when no rule matches and nobody answers]:action:(allow deny reject)' \
+                '(--observe)--enforce[apply verdicts to packets]' \
+                '(--enforce)--observe[evaluate and record only, blocking nothing; needs --yes]' \
+                '--yes[confirm --observe]' \
+                && ret=0
+            ;;
+        esac
+        ;;
+    lockdown)
+        _arguments -C -s $global_args \
+            '1: :_hallpass-cli_lockdown_states' \
+            '*::lockdown-arg:->lockdown-arg' && ret=0
+
+        if [[ $state != lockdown-arg ]]; then
+            return $ret
+        fi
+
+        # 'lockdown off' takes no options; only 'on' does.
+        case $words[1] in
+        on)
+            _arguments -s $global_args \
+                '*--tag[pin a tag whose allow rules keep deciding]:tag:' \
+                '--no-system[do not pin the system tag]' \
+                '--force[enter even when no rule survives]' \
+                && ret=0
+            ;;
+        off)
+            _arguments -s $global_args && ret=0
+            ;;
+        esac
+        ;;
+    suggest)
+        _arguments -s $global_args \
+            '*--exe[only executables whose path contains this substring]:substring:' \
+            '*--domain[only destinations whose domain contains this substring]:substring:' \
+            '--last[how many recent decisions to fold]:count:' \
+            && ret=0
         ;;
     events)
         _arguments -s $global_args \
@@ -106,6 +176,7 @@ _hallpass-cli() {
     rules)
         _arguments -C -s $global_args \
             '--stats[add per-rule hit counts to the listing]' \
+            '--tag[list only rules carrying this tag]:tag:' \
             '1: :_hallpass-cli_rules_commands' \
             '*::rules-arg:->rules-arg' && ret=0
 
@@ -137,19 +208,34 @@ _hallpass-cli() {
                 '--hashes-file[file of executable SHA-256 hashes, one per line]:file:_files' \
                 '--duration[rule lifetime, or a timespan such as 30s, 5m, 2h, 1d]:duration:(session forever)' \
                 '--priority[priority, higher wins]:priority:' \
+                '*--tag[label for selecting this rule in bulk]:tag:' \
+                '--enabled[whether the rule is active]:enabled:(true false)' \
+                '--replace[overwrite the rule of the same name]' \
                 && ret=0
             ;;
         rm)
             _arguments -s $global_args '1:rule name:' && ret=0
             ;;
         toggle)
-            _arguments -s $global_args \
-                '1:rule name:' \
-                '2:state:(on off)' \
-                && ret=0
+            # 'toggle NAME on|off' or 'toggle --tag TAG on|off'.
+            if [[ $words[2] == --tag ]]; then
+                _arguments -s $global_args \
+                    '--tag[toggle every rule carrying this tag]:tag:' \
+                    '1:state:(on off)' \
+                    && ret=0
+            else
+                _arguments -s $global_args \
+                    '--tag[toggle every rule carrying this tag]:tag:' \
+                    '1:rule name:' \
+                    '2:state:(on off)' \
+                    && ret=0
+            fi
             ;;
         import)
-            _arguments -s $global_args '1:rule document:_files' && ret=0
+            _arguments -s $global_args \
+                '--replace[overwrite rules whose name is already in use]' \
+                '1:rule document:_files' \
+                && ret=0
             ;;
         export)
             _arguments -s $global_args && ret=0

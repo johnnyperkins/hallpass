@@ -17,7 +17,7 @@ _hallpass_cli_files() {
 }
 
 _hallpass_cli() {
-    local cur prev cmd sub opts i word nargs
+    local cur prev cmd sub arg3 opts i word nargs
     COMPREPLY=()
     cur=${COMP_WORDS[COMP_CWORD]}
     prev=${COMP_WORDS[COMP_CWORD - 1]}
@@ -30,10 +30,13 @@ _hallpass_cli() {
     # than by assuming it sits at a fixed position.
     #
     # nargs counts every remaining word, not just positional ones, so it is
-    # only trusted under 'rules import' and 'rules toggle', which take no flags
-    # of their own and therefore cannot have a flag value inflate the count.
+    # only trusted under 'rules import' and 'rules toggle', whose fixed shapes
+    # ('import [--replace] PATH', 'toggle [--tag] NAME|TAG on|off') say where
+    # a flag can sit. arg3 is the word after the subcommand, which tells
+    # those shapes apart.
     cmd=""
     sub=""
+    arg3=""
     nargs=0
     i=1
     while ((i < COMP_CWORD)); do
@@ -52,6 +55,7 @@ _hallpass_cli() {
         case $nargs in
         1) cmd=$word ;;
         2) sub=$word ;;
+        3) arg3=$word ;;
         esac
         ((i += 1))
     done
@@ -67,8 +71,12 @@ _hallpass_cli() {
         COMPREPLY=($(compgen -W 'auto always never' -- "$cur"))
         return
         ;;
-    --action)
+    --action | --default)
         COMPREPLY=($(compgen -W 'allow deny reject' -- "$cur"))
+        return
+        ;;
+    --enabled)
+        COMPREPLY=($(compgen -W 'true false' -- "$cur"))
         return
         ;;
     --proto)
@@ -94,13 +102,17 @@ _hallpass_cli() {
         ;;
     --exe)
         # A path under 'rules add' and 'explain', but a substring to search for
-        # under 'events', where a filesystem listing would be misleading.
-        [ "$cmd" = events ] || _hallpass_cli_files "$cur"
+        # under 'events' and 'suggest', where a filesystem listing would be
+        # misleading.
+        case $cmd in
+        events | suggest) ;;
+        *) _hallpass_cli_files "$cur" ;;
+        esac
         return
         ;;
     --last | --domain | --top | --interval | --name | --exe-glob | --exe-sha256 | \
         --dest | --port | --cmdline | --cmdline-contains | --src | --src-port | \
-        --iface | --app-id | --user | --priority)
+        --iface | --app-id | --user | --priority | --tag | --timeout)
         # Free-form values with nothing sensible to suggest.
         return
         ;;
@@ -108,11 +120,28 @@ _hallpass_cli() {
 
     opts=""
     case $cmd in
-    "") opts="status doctor sessions run config rules suggest events top watch explain" ;;
+    "")
+        opts="status doctor config rules suggest events top run sessions lockdown"
+        opts="$opts watch explain"
+        ;;
     status | doctor | sessions | watch) ;;
     # Everything after `run` belongs to the wrapped command, so completing
     # this CLI's own words there would be wrong.
     run) ;;
+    config)
+        case $sub in
+        "") opts="set" ;;
+        set) opts="--timeout --default --enforce --observe --yes" ;;
+        esac
+        ;;
+    lockdown)
+        # 'lockdown off' takes no options; only 'on' does.
+        case $sub in
+        "") opts="on off" ;;
+        on) opts="--tag --no-system --force" ;;
+        esac
+        ;;
+    suggest) opts="--exe --domain --last" ;;
     events) opts="--last --no-follow --exe --domain --verdict" ;;
     top) opts="--group-by --interval --top" ;;
     explain)
@@ -121,23 +150,43 @@ _hallpass_cli() {
         ;;
     rules)
         case $sub in
-        "") opts="--stats add rm toggle export import" ;;
+        "") opts="--stats --tag add rm toggle export import" ;;
+        # 'rules --stats', 'rules --tag TAG': the listing's own flags.
+        -*) opts="--stats --tag" ;;
         add)
             opts="--name --action --exe --exe-glob --exe-sha256 --dest --port"
             opts="$opts --domain --user --proto --cmdline-contains --parent-exe"
             opts="$opts --src --src-port --iface --app-id --domains-file --ips-file"
-            opts="$opts --hashes-file --duration --priority"
+            opts="$opts --hashes-file --duration --priority --tag --enabled"
+            opts="$opts --replace"
             ;;
         import)
+            # 'rules import [--replace] PATH', the flag on either side.
             if ((nargs == 2)); then
-                _hallpass_cli_files "$cur"
-                return
+                if [[ $cur == -* ]]; then
+                    opts="--replace"
+                else
+                    _hallpass_cli_files "$cur"
+                    return
+                fi
+            elif ((nargs == 3)); then
+                if [ "$arg3" = --replace ]; then
+                    _hallpass_cli_files "$cur"
+                    return
+                fi
+                opts="--replace"
             fi
             ;;
         toggle)
-            # 'rules toggle NAME on|off': the name is left alone, the state is
-            # a fixed pair.
-            if ((nargs == 3)); then opts="on off"; fi
+            # 'rules toggle NAME on|off' or 'rules toggle --tag TAG on|off':
+            # the name or tag is left alone, the state is a fixed pair.
+            if ((nargs == 2)); then
+                opts="--tag"
+            elif ((nargs == 3)) && [ "$arg3" != --tag ]; then
+                opts="on off"
+            elif ((nargs == 4)) && [ "$arg3" = --tag ]; then
+                opts="on off"
+            fi
             ;;
         esac
         ;;

@@ -15,7 +15,8 @@
 # one, so that "hallpass-cli --socket /tmp/x.sock <TAB>" still knows no command
 # has been given. Values of per-command flags are not dropped, so only the
 # first two words may be read as command and subcommand; the third is only read
-# under 'rules toggle' and 'rules import', which take no flags of their own.
+# under 'rules toggle' and 'rules import'. Their flags fit that: '--replace'
+# takes no value, and the value of 'toggle --tag TAG' sits where NAME would.
 function __hallpass_cli_words
     set -l skip 0
     set -l tokens (commandline -opc)
@@ -69,6 +70,8 @@ complete -c hallpass-cli -n '__hallpass_cli_is' -a top -d 'Live aggregate view o
 complete -c hallpass-cli -n '__hallpass_cli_is' -a watch -d 'Interactively answer connection prompts'
 complete -c hallpass-cli -n '__hallpass_cli_is' -a explain -d 'Say what policy would do with a hypothetical connection'
 complete -c hallpass-cli -n '__hallpass_cli_is' -a doctor -d 'Check the install; exits non-zero if anything failed'
+complete -c hallpass-cli -n '__hallpass_cli_is' -a config -d 'Show or change the runtime settings'
+complete -c hallpass-cli -n '__hallpass_cli_is' -a lockdown -d 'Show, enter or leave the lockdown posture'
 complete -c hallpass-cli -n '__hallpass_cli_is' -a suggest -d 'Propose allow rules from recent decisions'
 complete -c hallpass-cli -n '__hallpass_cli_is' -a run -d 'Run a command under a one-off session grant'
 complete -c hallpass-cli -n '__hallpass_cli_is' -a sessions -d 'List the session grants open right now'
@@ -83,19 +86,44 @@ complete -c hallpass-cli -l json -d 'Machine-readable JSON output'
 complete -c hallpass-cli -l color -x -a 'auto always never' -d 'When to colorize output'
 complete -c hallpass-cli -s h -l help -d 'Show usage and exit'
 
+# config
+complete -c hallpass-cli -n '__hallpass_cli_is config' -a set -d 'Change runtime settings until the daemon restarts'
+complete -c hallpass-cli -n '__hallpass_cli_in config set' -l timeout -x -d 'Seconds a prompt waits before the default action applies'
+complete -c hallpass-cli -n '__hallpass_cli_in config set' -l default -x -a 'allow deny reject' -d 'Action when no rule matches and nobody answers'
+complete -c hallpass-cli -n '__hallpass_cli_in config set' -l enforce -d 'Apply verdicts to packets'
+complete -c hallpass-cli -n '__hallpass_cli_in config set' -l observe -d 'Evaluate and record only, blocking nothing; needs --yes'
+complete -c hallpass-cli -n '__hallpass_cli_in config set' -l yes -d 'Confirm --observe'
+
+# lockdown [on|off]; only 'on' takes options.
+complete -c hallpass-cli -n '__hallpass_cli_is lockdown' -a on -d 'Enter the lockdown posture'
+complete -c hallpass-cli -n '__hallpass_cli_is lockdown' -a off -d 'Leave the lockdown posture'
+complete -c hallpass-cli -n '__hallpass_cli_in lockdown on' -l tag -x -d 'Pin a tag whose allow rules keep deciding'
+complete -c hallpass-cli -n '__hallpass_cli_in lockdown on' -l no-system -d 'Do not pin the system tag'
+complete -c hallpass-cli -n '__hallpass_cli_in lockdown on' -l force -d 'Enter even when no rule survives'
+
+# suggest
+# Substrings to search for, not paths, so no file completion here.
+complete -c hallpass-cli -n '__hallpass_cli_in suggest' -l exe -x -d 'Only executables whose path contains this substring'
+complete -c hallpass-cli -n '__hallpass_cli_in suggest' -l domain -x -d 'Only destinations whose domain contains this substring'
+complete -c hallpass-cli -n '__hallpass_cli_in suggest' -l last -x -d 'How many recent decisions to fold'
+
 # rules
 complete -c hallpass-cli -n '__hallpass_cli_is rules' -l stats -d 'Add per-rule hit counts to the listing'
+complete -c hallpass-cli -n '__hallpass_cli_is rules' -l tag -x -d 'List only rules carrying this tag'
 complete -c hallpass-cli -n '__hallpass_cli_is rules' -a add -d 'Add a rule'
 complete -c hallpass-cli -n '__hallpass_cli_is rules' -a rm -d 'Delete a rule'
-complete -c hallpass-cli -n '__hallpass_cli_is rules' -a toggle -d 'Enable or disable a rule'
+complete -c hallpass-cli -n '__hallpass_cli_is rules' -a toggle -d 'Enable or disable a rule, or every rule carrying a tag'
 complete -c hallpass-cli -n '__hallpass_cli_is rules' -a export -d 'Write the ruleset to stdout as one TOML document'
 complete -c hallpass-cli -n '__hallpass_cli_is rules' -a import -d 'Add every rule in such a document'
 
-# rules toggle NAME on|off: the name is left alone, the state is a fixed pair.
+# rules toggle NAME on|off, or rules toggle --tag TAG on|off: the name or tag
+# is left alone, the state is a fixed pair.
+complete -c hallpass-cli -n '__hallpass_cli_is rules toggle' -l tag -x -d 'Toggle every rule carrying this tag'
 complete -c hallpass-cli -n '__hallpass_cli_in rules toggle; and test (count (__hallpass_cli_words)) -eq 3' -a 'on off' -d 'New enabled state'
 
-# rules import PATH
+# rules import [--replace] PATH
 complete -c hallpass-cli -n '__hallpass_cli_is rules import' -F -d 'Rule document'
+complete -c hallpass-cli -n '__hallpass_cli_in rules import' -l replace -d 'Overwrite rules whose name is already in use'
 
 # rules add
 complete -c hallpass-cli -n '__hallpass_cli_in rules add' -l name -x -d 'Rule name (required)'
@@ -120,6 +148,9 @@ complete -c hallpass-cli -n '__hallpass_cli_in rules add' -l hashes-file -r -F -
 # --duration also takes a timespan such as 30s, 5m, 2h or 1d.
 complete -c hallpass-cli -n '__hallpass_cli_in rules add' -l duration -x -a 'session forever' -d 'Rule lifetime'
 complete -c hallpass-cli -n '__hallpass_cli_in rules add' -l priority -x -d 'Priority, higher wins'
+complete -c hallpass-cli -n '__hallpass_cli_in rules add' -l tag -x -d 'Label for selecting this rule in bulk (repeatable)'
+complete -c hallpass-cli -n '__hallpass_cli_in rules add' -l enabled -x -a 'true false' -d 'Whether the rule is active'
+complete -c hallpass-cli -n '__hallpass_cli_in rules add' -l replace -d 'Overwrite the rule of the same name'
 
 # events
 complete -c hallpass-cli -n '__hallpass_cli_in events' -l last -x -d 'Replay the last N decided connections before streaming'
