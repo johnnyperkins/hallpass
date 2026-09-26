@@ -113,6 +113,10 @@ restarted together; a version mismatch is refused at connect.
 
 ### Changed
 
+- **A killed flow stays dead while its peer keeps sending.** The peer's next
+  packet used to re-create the conntrack entry from the inbound side, and the
+  flow carried on. Killed flows now go into an nftables set whose input rule
+  drops the peer's packets for them until they have been quiet for 5 minutes.
 - **A session grant no longer spends a program's first sighting.** Connections
   it allows carry no first-seen flag and record nothing, so the program's next
   prompt still says it is new.

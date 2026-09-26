@@ -1977,6 +1977,123 @@ fn a_rule_added_mid_flow_kills_the_established_flow() {
     );
 }
 
+/// Sends to its one client forever, 1 KiB every 20ms, and never reads.
+const STREAM_SERVER: &str = r#"import socket, sys, time
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind((sys.argv[1], int(sys.argv[2])))
+s.listen(1)
+c, _ = s.accept()
+while True:
+    try:
+        c.send(b"x" * 1024)
+    except OSError:
+        time.sleep(0.02)
+    time.sleep(0.02)
+"#;
+
+/// Connects, never sends, and publishes how many bytes it has read so far,
+/// atomically, every 50ms.
+const STREAM_READER: &str = r#"import os, socket, sys, time
+path = sys.argv[3]
+s = socket.create_connection((sys.argv[1], int(sys.argv[2])))
+s.setblocking(False)
+n, last = 0, 0.0
+while True:
+    try:
+        data = s.recv(65536)
+        if not data:
+            break
+        n += len(data)
+    except BlockingIOError:
+        time.sleep(0.01)
+    except OSError:
+        break
+    now = time.monotonic()
+    if now - last >= 0.05:
+        last = now
+        with open(path + ".tmp", "w") as f:
+            f.write(str(n))
+        os.replace(path + ".tmp", path)
+"#;
+
+/// A killed flow stays dead while its peer keeps sending.
+///
+/// The client here never sends, so after the kill the only traffic is the
+/// server's. Without the `killed` set, the server's next segment re-creates
+/// the conntrack entry from the inbound side, the client's ACKs ride it as
+/// established, and the stream carries on as if nothing was killed.
+#[test]
+#[ignore = "requires root and network namespaces"]
+fn a_killed_flow_stays_dead_while_the_peer_keeps_sending() {
+    const PORT: u16 = 19061;
+    /// Bytes that may still arrive after the kill: what was in flight.
+    const SLACK: u64 = 16 * 1024;
+    let tag = "killhold";
+    let Some(mut env) = TestEnv::setup(tag) else {
+        return;
+    };
+    if !require_tool(tag, "python3", "--version") {
+        return;
+    }
+    let server = env.write_aux("stream_server.py", STREAM_SERVER);
+    env.helpers.push(ns_spawn(
+        &env.ns_srv,
+        &[
+            "python3",
+            &server.to_string_lossy(),
+            SRV_IP,
+            &PORT.to_string(),
+        ],
+        "stream server",
+    ));
+    assert!(
+        wait_until(Duration::from_secs(5), || port_bound(
+            &env.ns_srv,
+            "-ltnH",
+            PORT
+        ))
+        .is_some(),
+        "the stream server never bound port {PORT}"
+    );
+    env.start_daemon("allow", &[]);
+
+    let reader = env.write_aux("stream_reader.py", STREAM_READER);
+    let count = env.tmp.join("stream.count");
+    env.start_helper(&[
+        "python3",
+        &reader.to_string_lossy(),
+        SRV_IP,
+        &PORT.to_string(),
+        &count.to_string_lossy(),
+    ]);
+    let read = || sink_count(&count);
+    assert!(
+        wait_until(Duration::from_secs(10), || read() > 4096).is_some(),
+        "the stream never started; daemon log:\n{}",
+        env.daemon_log()
+    );
+
+    std::fs::write(env.rule_path(0), rule("e2e-killhold", Action::Deny, PORT)).expect("write rule");
+    assert!(
+        env.wait_for_log("killed an established flow", Duration::from_secs(15)),
+        "the ruleset change should have swept the live flow; daemon log:\n{}",
+        env.daemon_log()
+    );
+    // Whatever was in flight at the kill lands; after that, nothing.
+    std::thread::sleep(Duration::from_millis(500));
+    let before = read();
+    std::thread::sleep(Duration::from_secs(3));
+    let after = read();
+    assert!(
+        after - before <= SLACK,
+        "a killed flow must stay dead while its peer keeps sending, but {} more bytes \
+         arrived in 3s; daemon log:\n{}",
+        after - before,
+        env.daemon_log()
+    );
+}
+
 /// The negative control for the sweep: a rule that denies the same port
 /// but only for a different binary matches nothing that is running, so it
 /// kills nothing.

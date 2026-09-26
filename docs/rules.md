@@ -145,11 +145,11 @@ changes, the daemon deletes the conntrack entries of recent flows the new rules
 deny, so their next packet is judged as a new connection. Flows the change
 leaves unmatched are never touched, so a rule edit cannot cause a prompt storm.
 
-This is best effort. Only the newest 1024 decisions are candidates, a rule
-matching only on the executable hash cannot identify flows, and a peer that
-keeps sending can re-create the entry from the inbound side until it goes
-quiet. Set `kill_established = false` to apply deny rules to new connections
-only.
+This is best effort. Only the newest 1024 decisions are candidates, and a rule
+matching only on the executable hash cannot identify flows. A peer that keeps
+sending cannot revive a killed flow: its packets for that flow are dropped
+until it has been quiet for 5 minutes. Set `kill_established = false` to apply
+deny rules to new connections only.
 
 ## Tags
 

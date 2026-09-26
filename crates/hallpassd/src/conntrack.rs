@@ -32,13 +32,13 @@
 //! before this module existed. The operator-facing docs state these
 //! limits.
 //!
-//! Two more accepted bounds. First, the kill races the peer: the input
-//! hook is unfiltered by design, so an inbound packet arriving between the
-//! delete and the flow's next outbound packet re-creates the entry from
-//! the inbound side (loose conntrack pickup) and the outbound side rides
-//! it as established. A flow whose peer transmits continuously can win
-//! that race; the deterministic fix is event-driven re-deletion off the
-//! conntrack event stream. Second, re-judgment runs fresh attribution: if enrichment
+//! The kill would race the peer: an inbound packet arriving between the
+//! delete and the flow's next outbound packet re-creates the entry from the
+//! inbound side (loose conntrack pickup), and the outbound side then rides
+//! it as established. So each killed tuple is first put in the table's
+//! `killed` set, whose input rule drops the peer's packets for that flow
+//! until it has been quiet for a while (see `nft::ruleset`). One accepted
+//! bound: re-judgment runs fresh attribution: if enrichment
 //! drifted since the original decision (domain cache aged out, executable
 //! replaced), the re-entered flow can prompt or take the default rather
 //! than match the deny - once per flow, never a storm.
@@ -246,6 +246,16 @@ fn sweep(
         return Ok(());
     }
     let mut sock = CtSocket::open()?;
+    // Before the deletes, so there is no moment between a delete and the
+    // hold in which the peer's next packet can re-create the entry from the
+    // inbound side and let the local side ride it as established. See
+    // nft::ruleset.
+    let tuples: Vec<FlowTuple> = targets.iter().map(|(t, _)| *t).collect();
+    if let Err(e) = crate::nft::mark_killed(&tuples) {
+        tracing::warn!(
+            "could not hold killed flows down; a peer still sending can revive them: {e}"
+        );
+    }
     for (tuple, rule) in targets {
         // Re-read the mode before every delete: an enforce-to-observe flip
         // fires no wake signal (there is nothing new to kill), and "observe

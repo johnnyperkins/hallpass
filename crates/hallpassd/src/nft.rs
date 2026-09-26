@@ -45,6 +45,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::Duration;
 
+use hallpass_types::FlowTuple;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::stats::Counters;
@@ -142,11 +143,26 @@ fn ruleset(queue_num: u16, verdict_bypass: bool, drop_unjudgeable: bool) -> Stri
     // rate. Queueing that as well made every such sender a load on the
     // daemon, for packets the snoop validation would have discarded anyway.
     //
+    // The `killed` sets hold flows the kill sweeper tore down, keyed as the
+    // local side sees them (local address, protocol, local port, remote
+    // address, remote port). The input rules drop the peer's packets for
+    // those flows: an inbound packet that arrived first would otherwise
+    // re-create the conntrack entry from the inbound side, and the local
+    // side's next packet would ride it as established instead of being
+    // judged. Outbound is left alone, so that next packet is judged like any
+    // new connection, and a reject rule still answers it. A match refreshes
+    // the element, so a peer that keeps sending keeps it; one quiet for
+    // `KILLED_TIMEOUT` lets it expire.
+    //
     // `hallpass-cli doctor` verifies the output chain by token-matching the
     // listed rules ("meta skuid 0" + "accept" before "ct state new" +
     // "queue num"); reshaping those rules means updating its chain_order.
     format!(
         "table inet hallpass {{\n\
+         \tset killed4 {{ type ipv4_addr . inet_proto . inet_service . ipv4_addr . inet_service; \
+         flags dynamic, timeout; timeout {KILLED_TIMEOUT}; }}\n\
+         \tset killed6 {{ type ipv6_addr . inet_proto . inet_service . ipv6_addr . inet_service; \
+         flags dynamic, timeout; timeout {KILLED_TIMEOUT}; }}\n\
          \tchain output {{\n\
          \t\ttype filter hook output priority mangle; policy accept;\n\
          \t\tmeta skuid 0 meta mark {export} accept\n\
@@ -161,10 +177,58 @@ fn ruleset(queue_num: u16, verdict_bypass: bool, drop_unjudgeable: bool) -> Stri
          \t}}\n\
          \tchain input {{\n\
          \t\ttype filter hook input priority mangle; policy accept;\n\
+         \t\t{KILLED4_KEY} @killed4 update @killed4 {{ {KILLED4_KEY} }} drop\n\
+         \t\t{KILLED6_KEY} @killed6 update @killed6 {{ {KILLED6_KEY} }} drop\n\
          \t\tudp sport 53 ct state established queue num {snoop} bypass\n\
          \t}}\n\
          }}\n"
     )
+}
+
+/// How long a killed flow's inbound packets stay dropped after the last one;
+/// see [`ruleset`].
+const KILLED_TIMEOUT: &str = "5m";
+
+/// An inbound packet's flow as the `killed` sets key it: the local side
+/// first, as the sweeper records it.
+const KILLED4_KEY: &str = "ip daddr . meta l4proto . th dport . ip saddr . th sport";
+const KILLED6_KEY: &str = "ip6 daddr . meta l4proto . th dport . ip6 saddr . th sport";
+
+/// Record killed flows so their peer cannot revive them; see [`ruleset`].
+pub fn mark_killed(flows: &[FlowTuple]) -> std::io::Result<()> {
+    if flows.is_empty() {
+        return Ok(());
+    }
+    let _table = lock_table();
+    run_nft(&["-f", "-"], Some(&killed_elements(flows)))
+}
+
+/// The `add element` commands for [`mark_killed`], one per flow.
+fn killed_elements(flows: &[FlowTuple]) -> String {
+    use std::fmt::Write as _;
+    let mut script = String::new();
+    for t in flows {
+        let (set, proto) = (
+            if t.src.is_ipv4() {
+                "killed4"
+            } else {
+                "killed6"
+            },
+            match t.proto {
+                hallpass_types::Proto::Tcp => "tcp",
+                hallpass_types::Proto::Udp => "udp",
+            },
+        );
+        let _ = writeln!(
+            script,
+            "add element inet hallpass {set} {{ {} . {proto} . {} . {} . {} }}",
+            t.src.ip(),
+            t.src.port(),
+            t.dst.ip(),
+            t.dst.port()
+        );
+    }
+    script
 }
 
 /// Install the hallpass table, replacing any stale one from a previous run.
@@ -510,8 +574,20 @@ mod tests {
             return;
         };
 
+        let killed = [
+            FlowTuple {
+                proto: hallpass_types::Proto::Tcp,
+                src: "10.0.0.1:40000".parse().unwrap(),
+                dst: "1.1.1.1:443".parse().unwrap(),
+            },
+            FlowTuple {
+                proto: hallpass_types::Proto::Udp,
+                src: "[fd00::1]:40000".parse().unwrap(),
+                dst: "[fd00::2]:53".parse().unwrap(),
+            },
+        ];
         for (bypass, strict) in [(true, false), (false, true)] {
-            let text = install_script(3, bypass, strict);
+            let text = install_script(3, bypass, strict) + &killed_elements(&killed);
             let mut child = Command::new(nft)
                 .args(["-c", "-f", "-"])
                 .stdin(Stdio::piped())
@@ -527,8 +603,14 @@ mod tests {
                 .expect("write ruleset");
             let out = child.wait_with_output().expect("wait for nft");
             let stderr = String::from_utf8_lossy(&out.stderr);
+            // Unprivileged, the one error expected is netlink refusing the
+            // cache; anything else is the text (a syntax error, an unknown
+            // type in a set) and would stop the install.
+            let refused = stderr
+                .lines()
+                .any(|l| l.contains("Error:") && !l.contains("cache initialization failed"));
             assert!(
-                !stderr.contains("syntax error"),
+                !refused,
                 "nft rejected the ruleset (queue_bypass={bypass}):\n{stderr}\n\
                  --- ruleset ---\n{text}"
             );
