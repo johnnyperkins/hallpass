@@ -257,12 +257,14 @@ fn raw_key(ev: &ConnEvent, group_by: GroupBy) -> String {
 /// operator typed the substring they expect to find, and sanitizing first
 /// would make a hostile name unmatchable by the very filter written to hunt
 /// for it. Only the display path sanitizes.
+///
+/// `needle` must already be lowercase: the caller lowercases it once for the
+/// whole feed rather than once per event.
 pub fn matches_filter(ev: &ConnEvent, needle: &str) -> bool {
     if needle.is_empty() {
         return true;
     }
-    let needle = needle.to_lowercase();
-    let hay = |s: &str| s.to_lowercase().contains(&needle);
+    let hay = |s: &str| s.to_lowercase().contains(needle);
     ev.conn
         .exe_path
         .as_ref()
@@ -354,12 +356,12 @@ mod tests {
     #[test]
     fn filter_matches_across_fields() {
         let mut e = ev("/usr/bin/curl", "93.184.216.34:443", Verdict::Allow, true);
-        e.conn.domain = Some("example.org".into());
+        e.conn.domain = Some("Example.org".into());
         e.rule_name = Some("allow-web".into());
         assert!(matches_filter(&e, ""), "empty filter keeps everything");
         assert!(matches_filter(&e, "curl"));
         assert!(
-            matches_filter(&e, "EXAMPLE"),
+            matches_filter(&e, "example"),
             "filtering is case-insensitive"
         );
         assert!(matches_filter(&e, "allow-web"));

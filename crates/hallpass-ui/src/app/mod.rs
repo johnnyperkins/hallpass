@@ -711,9 +711,10 @@ impl HallpassApp {
     /// count in the traffic header and the rows in the list cannot disagree
     /// about what the filter selected.
     fn filtered(&self) -> impl Iterator<Item = &ConnEvent> + '_ {
+        let needle = self.filter.to_lowercase();
         self.events
             .iter()
-            .filter(|ev| self.lens.admits(ev) && traffic::matches_filter(ev, &self.filter))
+            .filter(move |ev| self.lens.admits(ev) && traffic::matches_filter(ev, &needle))
     }
 
     /// Whether anything may be claimed about what this host is enforcing.
