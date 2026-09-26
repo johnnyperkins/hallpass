@@ -109,6 +109,10 @@ restarted together; a version mismatch is refused at connect.
 
 ### Changed
 
+- **An unanswered UDP flow is judged once**, not per datagram. The first
+  decision (a rule, a prompt answer, or an unanswered prompt's default) holds
+  for the flow for 30 seconds, so a silent peer no longer produces an event,
+  or a fresh prompt after `once`, for every datagram.
 - **Rule `exe` and `parent_exe` paths are resolved through symlinks** when
   rules load. The kernel reports the resolved path, so a rule naming
   `/usr/bin/python3`, an alternatives link or `/usr/sbin` on a merged-/usr

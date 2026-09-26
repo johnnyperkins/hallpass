@@ -123,17 +123,15 @@ Export is an ordinary event subscriber, so a slow or unreachable collector
 loses events, never verdicts. Values are escaped and capped, so a process
 cannot forge log records through its command line.
 
-The daemon's own export traffic bypasses the verdict queue and needs no rule.
-This matters: an unanswered UDP flow never leaves conntrack's `new` state, so
-without the exemption every exported event would be judged, emitting another
-event to export.
+The daemon's own export traffic bypasses the verdict queue and needs no rule,
+so a deny default cannot block the daemon's own logs.
 
 That exemption only covers the daemon's own socket. If you export with
 `kind = "local"` and your syslog daemon forwards to a collector over UDP, the
-forwarded datagrams are judged like any other connection, and each decision is
-logged and forwarded again: the same loop, one hop longer. Point
-`[syslog.target]` at the collector directly, or keep hallpassd's messages out
-of what the local syslog daemon forwards.
+forwarded traffic is judged like any other connection and needs a rule for the
+syslog daemon. Its decision is logged and forwarded too, once per 30 seconds
+at most, since an unanswered UDP flow is judged once. Pointing
+`[syslog.target]` at the collector directly avoids both.
 
 ## The desktop app
 

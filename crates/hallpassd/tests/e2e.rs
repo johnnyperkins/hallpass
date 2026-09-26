@@ -215,28 +215,31 @@ s.sendto(b"x", (host, port))
 os.execv(become, [become, "3"])
 "#;
 
-/// Counting UDP collector for the syslog export tests. Publishes its
-/// running total by writing it to a file, replaced atomically so a reader
-/// polling the file never sees a half-written number, and at most every
-/// 50ms so that publishing does not become the bottleneck the test is
-/// trying to measure.
+/// Counting UDP collector for the syslog export tests. Publishes two
+/// running totals, every record and the records about a connection to the
+/// collector itself (export traffic that was judged), as "total self" in a
+/// file replaced atomically so a reader polling it never sees a half-written
+/// line, and at most every 50ms so that publishing does not become the
+/// bottleneck the test is trying to measure.
 const SYSLOG_SINK: &str = r#"import os, socket, sys, time
 
 path, port = sys.argv[1], int(sys.argv[2])
+own = ('"dst":"127.0.0.1:%d"' % port).encode()
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-# A generous receive buffer: the negative control deliberately produces a
-# flood, and datagrams dropped for want of buffer would understate it.
+# A generous receive buffer: were export to feed itself it would flood, and
+# datagrams dropped for want of buffer would understate that.
 s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 22)
 s.bind(("127.0.0.1", port))
-n, last = 0, 0.0
+n, own_n, last = 0, 0, 0.0
 while True:
-    s.recvfrom(65535)
+    data, _ = s.recvfrom(65535)
     n += 1
+    own_n += own in data
     now = time.monotonic()
     if now - last >= 0.05:
         last = now
         with open(path + ".tmp", "w") as f:
-            f.write(str(n))
+            f.write("%d %d" % (n, own_n))
         os.replace(path + ".tmp", path)
 "#;
 
@@ -927,10 +930,15 @@ fn probe_in_background(ns_cli: &str, port: u16) {
 /// Running total published by [`TestEnv::start_syslog_sink`]. Zero until
 /// the first datagram arrives.
 fn sink_count(path: &Path) -> u64 {
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|s| s.trim().parse().ok())
-        .unwrap_or(0)
+    sink_counts(path).0
+}
+
+/// The syslog sink's totals: every record, and those about export traffic
+/// itself; see [`SYSLOG_SINK`].
+fn sink_counts(path: &Path) -> (u64, u64) {
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    let mut fields = text.split_whitespace().map(|f| f.parse().unwrap_or(0));
+    (fields.next().unwrap_or(0), fields.next().unwrap_or(0))
 }
 
 impl Drop for TestEnv {
@@ -2115,10 +2123,12 @@ fn flow_accounting_reports_a_finished_flows_volume() {
     );
 }
 
-/// UDP syslog export is exempt from the daemon's own verdict queue, and
-/// the negative control shows what the exemption prevents: a self-feeding
-/// loop where each exported datagram is itself a new connection, judged,
-/// recorded, and exported again.
+/// UDP syslog export is exempt from the daemon's own verdict queue: no export
+/// datagram is ever judged. The negative control removes the exemption and
+/// shows the export being judged, and that the loop it used to start (each
+/// exported datagram a new connection, judged, recorded, exported again) now
+/// stops after one decision, because the verdict for an unanswered UDP flow
+/// is remembered.
 ///
 /// Nothing else in this suite configures a UDP collector, so `SO_MARK` on
 /// the export socket and the `meta skuid 0 meta mark` rule that reads it
@@ -2133,8 +2143,6 @@ fn udp_syslog_export_is_exempt_from_its_own_verdict_queue() {
     const COLLECTOR_PORT: u16 = 5514;
     /// Records a single judged connection may reasonably produce.
     const QUIET_BUDGET: u64 = 30;
-    /// Records that only a loop can produce in the same kind of window.
-    const LOOP_FLOOR: u64 = 100;
 
     let Some(mut env) = TestEnv::setup("syslogudp") else {
         return;
@@ -2193,35 +2201,44 @@ fn udp_syslog_export_is_exempt_from_its_own_verdict_queue() {
         env.daemon_log()
     );
 
-    let before = sink_count(&counts);
+    let (before, _) = sink_counts(&counts);
     std::thread::sleep(Duration::from_secs(3));
-    let after = sink_count(&counts);
+    let (after, judged) = sink_counts(&counts);
     assert!(
         after - before <= QUIET_BUDGET,
         "export must not feed itself: {} records in 3 idle seconds",
         after - before
     );
+    assert_eq!(
+        judged, 0,
+        "with the exemption no export datagram may reach the verdict queue"
+    );
 
     // Negative control. Without the exemption the export datagrams are
-    // themselves `ct state new` and get queued, so judging one produces
-    // the next. Seed it with a single connection, measure, and stop the
-    // daemon immediately: the loop has no other end.
+    // themselves `ct state new` and get queued, so they are judged and
+    // their decision exported in turn. The first decision is remembered for
+    // the unanswered flow, so this happens once rather than feeding itself.
     env.delete_export_exemption();
     assert!(
         env.connect(PORT_AGAIN),
         "sanity: the seed connection should be allowed; daemon log:\n{}",
         env.daemon_log()
     );
-    let loop_before = sink_count(&counts);
-    std::thread::sleep(Duration::from_secs(2));
-    let loop_after = sink_count(&counts);
+    assert!(
+        wait_until(Duration::from_secs(10), || sink_counts(&counts).1 > 0).is_some(),
+        "without the exemption export traffic should be judged; this test proves \
+         nothing about the exemption if it never is; daemon log:\n{}",
+        env.daemon_log()
+    );
+    let (loop_before, _) = sink_counts(&counts);
+    std::thread::sleep(Duration::from_secs(3));
+    let (loop_after, judged) = sink_counts(&counts);
     env.kill_daemon_hard();
     assert!(
-        loop_after - loop_before >= LOOP_FLOOR,
-        "removing the exemption should let export feed itself, saw only {} records in 2s \
-         (quiet window was {}); this test proves nothing if the loop does not appear",
-        loop_after - loop_before,
-        after - before
+        loop_after - loop_before <= QUIET_BUDGET,
+        "a judged export flow must be decided once, not feed itself: {} records in 3s \
+         ({judged} about export itself)",
+        loop_after - loop_before
     );
 }
 

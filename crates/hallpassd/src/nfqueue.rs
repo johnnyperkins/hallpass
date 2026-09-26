@@ -27,6 +27,8 @@ use crate::packet;
 use crate::rules::store::RuleStore;
 use crate::stats::Counters;
 
+mod udp_memo;
+
 /// Sleep between polls when both sources are idle.
 const IDLE_POLL: Duration = Duration::from_millis(2);
 
@@ -641,6 +643,7 @@ fn run(
         fail_open,
         queue_bypass,
         fail_open_retry: None,
+        udp_memo: udp_memo::UdpMemo::default(),
         deps,
         queue,
     }
@@ -666,6 +669,8 @@ struct VerdictLoop {
     queue_bypass: bool,
     /// After the kernel refuses a change: no retry before this.
     fail_open_retry: Option<Instant>,
+    /// Verdicts for UDP flows the peer has not answered yet.
+    udp_memo: udp_memo::UdpMemo,
     deps: QueueDeps,
     queue: Queue,
 }
@@ -760,6 +765,10 @@ impl VerdictLoop {
                 if packet::is_dns_query(&tuple) {
                     snoop_released_query(&self.deps, tuple, &msg, applied);
                 }
+                // An answer (or the default an unanswered prompt came to)
+                // covers the rest of an unanswered UDP flow, so `once` does
+                // not ask again on the next datagram.
+                self.udp_memo.put(tuple, verdict, Instant::now());
             }
             apply_verdict(&mut self.queue, msg, applied);
         }
@@ -783,6 +792,14 @@ impl VerdictLoop {
             self.resolve_unhandled(msg, parsed, enforcing);
             return;
         };
+        if let Some(verdict) = self.remembered(&tuple, enforcing) {
+            let applied = applied_verdict(verdict, enforcing);
+            if packet::is_dns_query(&tuple) {
+                snoop_released_query(&self.deps, tuple, &msg, applied);
+            }
+            apply_verdict(&mut self.queue, msg, applied);
+            return;
+        }
 
         let iface = self.iface_map.name(msg.get_outdev());
         let ctx = DecideCtx {
@@ -822,6 +839,22 @@ impl VerdictLoop {
             }
             Decision::Prompt(conn, exe) => self.hold_for_prompt(msg, conn, exe, enforcing),
         }
+    }
+
+    /// The verdict already decided for this unanswered UDP flow, if any; see
+    /// `udp_memo`. TCP never asks: its flows are established after one
+    /// packet each way, and only the first is queued.
+    fn remembered(&mut self, tuple: &FlowTuple, enforcing: bool) -> Option<Verdict> {
+        if tuple.proto != hallpass_types::Proto::Udp {
+            return None;
+        }
+        self.udp_memo.get(
+            tuple,
+            self.deps.rules.ruleset(),
+            enforcing,
+            self.deps.settings.default_verdict(),
+            Instant::now(),
+        )
     }
 
     /// Resolve a packet the rule engine does not model: a transport other
@@ -988,6 +1021,12 @@ impl VerdictLoop {
         }
         if !enforcing && verdict != Verdict::Allow {
             deps.stats.record_observed_only();
+        }
+        // A rule's decision covers the rest of an unanswered UDP flow. The
+        // defaults this path also applies (observe mode, a spent budget) are
+        // not remembered: they stand in for a decision nobody made.
+        if rule_name.is_some() {
+            self.udp_memo.put(conn.tuple, verdict, Instant::now());
         }
         deps.events.emit(conn, verdict, rule_name, enforcing);
         apply_verdict(&mut self.queue, msg, applied);

@@ -43,14 +43,17 @@ Only the first packet of a connection (`ct state new`) is judged, on the
   drops them outright; otherwise a process with `CAP_NET_RAW` could hold a
   whole conversation in them. IPv6 neighbour discovery and MLD are let
   through.
-- **UDP is judged per datagram until the peer replies.** An unanswered UDP
-  flow stays `new`, so each datagram is decided and logged. After the first
-  reply the verdict covers the rest of the flow, so a `once` answer means
-  "this flow".
+- **A UDP flow is judged once, answered or not.** An unanswered UDP flow
+  stays `new` in conntrack, so each datagram reaches the daemon, which
+  remembers the flow's first decision for 30 seconds (the kernel's timeout
+  for an unreplied entry) and applies it to the rest. A `once` answer means
+  "this flow" for UDP as for TCP. A flow that keeps sending is re-judged
+  every 30 seconds, and a ruleset or mode change forgets every remembered
+  verdict.
 - **An allowed UDP flow can be borrowed.** Once a process closes its socket,
   another can bind the same local port and keep sending inside the allowed
-  conntrack entry. This matters most for broad allows such as port 53 to
-  anywhere.
+  conntrack entry, or the verdict remembered for it. This matters most for
+  broad allows such as port 53 to anywhere.
 
 ## Who can do what
 
