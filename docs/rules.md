@@ -232,6 +232,7 @@ carry the `system` tag, which lockdown pins by default:
 
 | File | Allows |
 | --- | --- |
+| `20-resolver-stub.toml` | Every program's lookups through systemd-resolved's stub (127.0.0.53) |
 | `20-system-resolved.toml` | systemd-resolved's upstream DNS |
 | `20-system-timesyncd.toml`, `20-system-timesyncd-dns.toml` | systemd-timesyncd's NTP and lookups |
 | `20-system-networkmanager.toml` | NetworkManager's address configuration and connectivity check |

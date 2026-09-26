@@ -1,0 +1,30 @@
+# Every program's lookups through systemd-resolved's stub listener.
+#
+# Loopback is judged like any other traffic, so without this each program's
+# first name lookup, a query to 127.0.0.53, is a prompt of its own, and under
+# a deny default everything that resolves a name before anyone can answer
+# (boot, timers, a session with no prompt agent) is denied DNS outright.
+#
+# Judging these queries buys nothing: whatever a program asks the stub, the
+# stub forwards upstream as systemd-resolved, which 20-system-resolved.toml
+# allows. The question worth asking is the connection that follows the
+# lookup, and that is still judged.
+#
+# Not scoped to an executable, unlike the rules beside it, because every
+# program uses the stub. Scoped to the stub's address and port instead, so it
+# does not become the port-53-anywhere rule example-allow-dns.toml warns
+# about. Installed only on a host that has systemd-resolved.
+#
+# Priority 20 sits below the 50 that answering a prompt writes, so a rule
+# you create later overrides this one rather than losing to it.
+
+name = "resolver-stub"
+action = "allow"
+duration = "forever"
+priority = 20
+enabled = true
+tags = ["system"]
+
+[match]
+dest = "127.0.0.53"
+port = 53

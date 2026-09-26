@@ -1,10 +1,9 @@
 # systemd-resolved's upstream queries.
 #
 # Applications do not need this rule. They ask the stub listener on
-# 127.0.0.53, and loopback with a loopback source is exempt from filtering
-# before any rule is consulted. What this covers is resolved itself talking
-# to the real resolver, which is the one leg of desktop DNS that leaves the
-# host.
+# 127.0.0.53, which 20-resolver-stub.toml allows. What this covers is
+# resolved itself talking to the real resolver, which is the one leg of
+# desktop DNS that leaves the host.
 #
 # Scoped to the binary rather than to port 53. A rule matching the port
 # alone would let every local process send arbitrary traffic to port 53 on

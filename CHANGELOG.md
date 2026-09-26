@@ -9,6 +9,10 @@ restarted together; a version mismatch is refused at connect.
 
 ### Added
 
+- **A baseline rule for the resolver stub** (`20-resolver-stub.toml`). Loopback
+  is judged like other traffic, so each program's first lookup to 127.0.0.53
+  used to be a prompt of its own, and was denied before login. Upgrade:
+  re-run `install.sh` on a host with systemd-resolved to get it.
 - **Read-only socket.** `/run/hallpass/observe.sock` (`0660
   root:hallpass-observer`) serves stats, events, history, rules and hit
   counts, `explain`, and config and lockdown state, and refuses every change.

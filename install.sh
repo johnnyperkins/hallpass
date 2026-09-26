@@ -127,6 +127,14 @@ already_offered example-allow-dns.toml \
 already_offered 20-deny-llmnr.toml \
 	|| offer 20-deny-llmnr.toml etc/rules.d/20-deny-llmnr.toml
 
+# The resolver stub, for every program's lookups. Names no executable either
+# (every program uses the stub), so it is gated on the host having the
+# resolver it points at rather than on a binary in the rule.
+if [ -x /usr/lib/systemd/systemd-resolved ]; then
+	already_offered 20-resolver-stub.toml \
+		|| offer 20-resolver-stub.toml etc/rules.d/20-resolver-stub.toml
+fi
+
 # Baseline rules for the daemons that run before anyone can answer a prompt.
 # Installed only when the binary the rule names is actually on this host: a
 # rule pointing at a systemd-timesyncd that a chrony machine does not have
