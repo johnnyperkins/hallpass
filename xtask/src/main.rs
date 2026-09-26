@@ -374,7 +374,10 @@ fn test_e2e(ebpf: bool, extra: &[&str]) -> Result<(), String> {
     }
     let mut cmd = cargo(&["test", "-p", "hallpassd", "--test", "e2e"]);
     if ebpf {
-        cmd.args(["--features", "ebpf"]);
+        // Asked for explicitly, so an eBPF test that cannot load it fails
+        // instead of skipping into a pass.
+        cmd.args(["--features", "ebpf"])
+            .env("HALLPASS_E2E_REQUIRE_EBPF", "1");
     }
     cmd.args([
         "--config",

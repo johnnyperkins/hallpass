@@ -387,8 +387,19 @@ impl TestEnv {
         // in this file's failure messages blank.
         let log = std::fs::File::create(self.tmp.join("hallpassd.log")).expect("log file");
         let log_err = log.try_clone().expect("clone log handle");
+        // `ip netns exec` gives the command a private mount namespace with a
+        // fresh sysfs, which hides the tracefs mounted under the host's
+        // /sys/kernel/tracing. eBPF attribution attaches tracepoints through
+        // it, so without this mount it never loads here and every eBPF test
+        // skips. Mounted inside that namespace only; a kernel without
+        // tracefs just carries on without it.
         let child = Command::new("ip")
             .args(["netns", "exec", &self.ns_cli])
+            .args([
+                "sh",
+                "-c",
+                "mount -t tracefs tracefs /sys/kernel/tracing 2>/dev/null; exec \"$0\" \"$@\"",
+            ])
             .arg(env!("CARGO_BIN_EXE_hallpassd"))
             .arg("--config")
             .arg(&config_path)
@@ -929,6 +940,17 @@ fn probe_in_background(ns_cli: &str, port: u16) {
 
 /// Running total published by [`TestEnv::start_syslog_sink`]. Zero until
 /// the first datagram arrives.
+/// Skip a test that needs eBPF attribution, which did not load, or fail it
+/// when the run asked for eBPF explicitly (`cargo xtask e2e --ebpf` sets
+/// `HALLPASS_E2E_REQUIRE_EBPF`): there a skip would read as a pass for code
+/// that never ran.
+fn skip_without_ebpf(tag: &str, why: &str, log: &str) {
+    if std::env::var_os("HALLPASS_E2E_REQUIRE_EBPF").is_some() {
+        panic!("e2e {tag}: {why}, and this run requires eBPF; daemon log:\n{log}");
+    }
+    eprintln!("SKIP e2e {tag}: {why}; daemon log:\n{log}");
+}
+
 fn sink_count(path: &Path) -> u64 {
     sink_counts(path).0
 }
@@ -1903,10 +1925,7 @@ fn libc_resolver_uprobes_feed_the_domain_cache() {
     })
     .is_none()
     {
-        eprintln!(
-            "SKIP e2e uprobe: libc DNS snoop never came up; daemon log:\n{}",
-            env.daemon_log()
-        );
+        skip_without_ebpf("uprobe", "libc DNS snoop never came up", &env.daemon_log());
         return;
     }
 
@@ -2790,10 +2809,7 @@ fn assert_exec_race_refused(tag: &str, racer_src: &str, port: u16) {
     // Without eBPF attribution there is no exec generation to compare, and
     // the procfs path resolves the executable after the fact by design.
     if !env.wait_for_log("eBPF attribution active", Duration::from_secs(5)) {
-        eprintln!(
-            "SKIP e2e {tag}: eBPF attribution never came up; daemon log:\n{}",
-            env.daemon_log()
-        );
+        skip_without_ebpf(tag, "eBPF attribution never came up", &env.daemon_log());
         return;
     }
 

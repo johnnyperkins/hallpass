@@ -103,7 +103,8 @@ sudo -E ./target/debug/deps/e2e-<hash> --ignored --test-threads=1
   it because its runner is throwaway.
 - **`--test-threads=1` is required**: the tests share namespace names.
 - **A green run may have skipped.** Tests pass when the environment cannot run
-  them. CI fails the job if the output contains `SKIP e2e`.
+  them. CI fails the job if the output contains `SKIP e2e`, and under `--ebpf`
+  an eBPF test that cannot load eBPF fails rather than skips.
 
 ## Running without root
 
