@@ -199,11 +199,14 @@ binary, and retry until it wins the race.
   record at connect time, and the daemon refuses to name an executable whose
   generation has moved. A process that wins the race gets no executable at all
   and falls to the prompt or default verdict, rather than inheriting another
-  binary's allow rule. It can still dodge an `exe`-keyed *deny* this way. One
-  gap remains: attribution falls back to procfs when the flow record is gone,
-  and the record lives in a fixed-size LRU that a process can try to flush.
-  (Evicting the generation instead does not help; generations are unique
-  timestamps, so any loss reads as a mismatch.)
+  binary's allow rule. It can still dodge an `exe`-keyed *deny* this way.
+  For a new TCP connection, a lost flow record (its map is a fixed-size LRU a
+  process can try to flush) is refused the same way rather than falling back
+  to a name read from `/proc`: the record is written before the connection's
+  first packet reaches the daemon (probed: none missing in 4800 parallel
+  connects), so a missing one means it was lost. UDP, which has no handshake
+  to anchor on, keeps the fallback. (Evicting the generation does not help
+  either; generations are unique timestamps, so any loss reads as a mismatch.)
 - With **procfs only**, nothing closes the race. `exe`, `exe_glob` and
   `exe_sha256` are then scoping conveniences rather than a boundary.
 - `cmdline_contains` and `parent_exe` are controlled by the process outright.

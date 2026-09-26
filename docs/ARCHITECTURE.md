@@ -87,8 +87,13 @@ tuple-only rule model with its own default verdict.
    the ambiguous ones from LRU eviction or pid exit, refuses the executable and
    command line: refusing costs a prompt, vouching costs the rule. Generations
    are unique nonzero timestamps, so a lost and recreated entry cannot land on
-   an old value. The known gap is losing the *flow* record, which puts the
-   connection back on the procfs path with nothing to compare.
+   an old value. Losing the *flow* record would put the connection back on
+   the procfs path with nothing to compare, so for a TCP SYN (`is_tcp_syn`)
+   the chain treats the eBPF source as final: a later source's answer keeps
+   uid, pid and launcher but not the executable or command line. The record
+   is written in the connect kretprobe, which a probe
+   (`probe_ebpf_records_before_the_syn`) showed always lands before the
+   daemon reads the SYN. UDP keeps the fallback.
 
    `EbpfAttributor::details_for` also checks the exe link before serving its
    per-pid cache, because that cache is refreshed by a lossy async ring.

@@ -136,11 +136,16 @@ impl AttributionChain {
     /// Resolve `tuple`, consulting the cache first, told whether the packet
     /// is a TCP SYN.
     ///
-    /// A source that sees every connect should never miss a SYN's flow, and
-    /// each time it does, a later source answered for a connection whose
-    /// executable nothing vouches for (the exec-after-connect guard lives in
-    /// the eBPF source only). Logged, at debug, to measure how often that
-    /// happens before anything is decided on it.
+    /// A source that sees every connect is final for a SYN. It records the
+    /// flow before the SYN reaches the daemon (probed: 0 misses in 4800
+    /// parallel connects), so missing one means the record was lost, most
+    /// likely flushed from its LRU, and a later source can only name the
+    /// executable after the fact, which is exactly the exec-after-connect
+    /// race the eBPF source's generation check exists to refuse. So a later
+    /// source's answer keeps its uid, pid and launcher but not the image: no
+    /// executable and no command line, as when that check fails. A refusal
+    /// costs a prompt; a name from `/proc` could hand out another binary's
+    /// allow rule.
     fn resolve(&self, tuple: &FlowTuple, syn: bool) -> Option<ProcInfo> {
         match self.cache.get(tuple) {
             Some(None) => return None,
@@ -157,14 +162,22 @@ impl AttributionChain {
             witness_missed |= found.is_none() && s.sees_every_connect();
             found
         });
-        if syn && witness_missed {
+        let info = if syn && witness_missed {
             tracing::debug!(
                 src = %tuple.src,
                 dst = %tuple.dst,
                 fallback = if info.is_some() { "procfs" } else { "none" },
                 "eBPF missed a fresh TCP connect"
             );
-        }
+            info.map(|i| ProcInfo {
+                exe_path: None,
+                exe_id: None,
+                cmdline: None,
+                ..i
+            })
+        } else {
+            info
+        };
         self.cache.put(*tuple, info.clone());
         info
     }
@@ -291,6 +304,44 @@ mod tests {
             self.0 .1.fetch_add(1, Ordering::SeqCst);
             self.0 .0.clone()
         }
+    }
+
+    /// A source that sees every connect and has lost this one.
+    struct WitnessMiss;
+
+    impl Attributor for WitnessMiss {
+        fn attribute(&self, _tuple: &FlowTuple) -> Option<ProcInfo> {
+            None
+        }
+        fn sees_every_connect(&self) -> bool {
+            true
+        }
+    }
+
+    /// When the source that sees every connect missed a SYN, the fallback's
+    /// answer keeps who the process is but not which image it runs: that is
+    /// what an exec after the connect would have changed.
+    #[test]
+    fn a_syn_the_witness_missed_carries_no_executable() {
+        let fallback = Fixed::new(Some(ProcInfo {
+            cmdline: Some("curl example.org".into()),
+            parent_exe: Some(PathBuf::from("/usr/bin/bash")),
+            ..info()
+        }));
+        let chain = AttributionChain::new(vec![Box::new(WitnessMiss), Box::new(fallback)]);
+        let (conn, exe_id) = chain.connection(tuple(), true);
+        assert_eq!(conn.uid, Some(1000));
+        assert_eq!(conn.pid, Some(PID));
+        assert_eq!(conn.exe_path, None);
+        assert_eq!(exe_id, None);
+        assert_eq!(conn.cmdline, None);
+        assert_eq!(conn.parent_exe, Some(PathBuf::from("/usr/bin/bash")));
+
+        // A mid-stream packet (not a SYN) keeps the fallback's full answer.
+        let fallback = Fixed::new(Some(info()));
+        let chain = AttributionChain::new(vec![Box::new(WitnessMiss), Box::new(fallback)]);
+        let (conn, _) = chain.connection(tuple(), false);
+        assert_eq!(conn.exe_path, Some(PathBuf::from(EXE)));
     }
 
     const PID: u32 = 4242;

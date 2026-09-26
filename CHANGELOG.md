@@ -113,6 +113,11 @@ restarted together; a version mismatch is refused at connect.
 
 ### Changed
 
+- **With eBPF, a new TCP connection whose flow record is missing carries no
+  executable**, where it used to fall back to the name `/proc` gave after the
+  fact. Flushing the eBPF flow map no longer walks a connection around the
+  exec-after-connect guard; the cost is a prompt when a record is genuinely
+  lost.
 - **A killed flow stays dead while its peer keeps sending.** The peer's next
   packet used to re-create the conntrack entry from the inbound side, and the
   flow carried on. Killed flows now go into an nftables set whose input rule
