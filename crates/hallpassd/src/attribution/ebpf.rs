@@ -638,8 +638,8 @@ fn spawn_dns_reader(ring: RingBuf<MapData>, dns: Arc<IpDomainCache>, stop: StopR
     });
 }
 
-/// Lowercase, strip a trailing dot, and reject a name with control or
-/// whitespace characters or an implausible length, by the same test the
+/// Lowercase, strip a trailing dot, and reject a name with control,
+/// whitespace or non-ASCII characters or an implausible length, by the same test the
 /// wire snooper applies (see [`is_hostile_name_byte`]), so a cached domain
 /// is the exact name a rule would carry whichever path recorded it.
 fn normalize_domain(raw: &str) -> Option<String> {
@@ -787,6 +787,8 @@ mod tests {
         // Control char / whitespace / injection guard.
         assert_eq!(normalize_domain("bad\nname.com"), None);
         assert_eq!(normalize_domain("has space.com"), None);
+        assert_eq!(normalize_domain("\u{202e}moc.example.com"), None);
+        assert_eq!(normalize_domain("caf\u{e9}.example"), None);
         assert_eq!(normalize_domain(&"a".repeat(254)), None);
     }
 }

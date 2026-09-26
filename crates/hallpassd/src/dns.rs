@@ -40,7 +40,8 @@ const TYPE_AAAA: u16 = 28;
 /// Longest dotted name either snooper will cache.
 pub(crate) const MAX_NAME_LEN: usize = 253;
 
-/// A byte no cached domain may contain: control characters and whitespace.
+/// A byte no cached domain may contain: control characters, whitespace, and
+/// anything outside ASCII.
 ///
 /// Shared by both snoopers, the wire parser here and the libc uprobe path,
 /// so they agree on what a cached domain may contain. No real hostname
@@ -49,8 +50,14 @@ pub(crate) const MAX_NAME_LEN: usize = 253;
 /// allow/deny buttons out of view, and an escape sequence rewrites a
 /// terminal line. Refusing the name keeps it out of the cache entirely,
 /// which is safer than escaping it at every consumer.
+///
+/// Non-ASCII too, because a byte above 0x7f is how the rest arrive: the wire
+/// parser read one as a Latin-1 character, so 0x85 cached a NEL and 0x90 a C1
+/// control, and the uprobe path reads UTF-8, which carries bidi overrides.
+/// Real names are ASCII on the wire (IDNs arrive punycoded) and a rule's
+/// domain must be too, so refusing these costs no match.
 pub(crate) fn is_hostile_name_byte(b: u8) -> bool {
-    b <= b' ' || b == 0x7f
+    b <= b' ' || b >= 0x7f
 }
 
 /// One parsed DNS response: the original query name and every A/AAAA
@@ -116,10 +123,9 @@ fn read_name(buf: &[u8], mut pos: usize) -> Option<(String, usize)> {
         if !name.is_empty() {
             name.push('.');
         }
-        // DNS names on the wire are ASCII (IDNs arrive punycoded);
-        // non-ASCII bytes map byte-for-byte, which keeps comparisons
-        // consistent even for out-of-spec labels. Control and whitespace
-        // bytes reject the whole name; see is_hostile_name_byte.
+        // DNS names on the wire are ASCII (IDNs arrive punycoded). Control,
+        // whitespace and non-ASCII bytes reject the whole name; see
+        // is_hostile_name_byte.
         for &b in label {
             if is_hostile_name_byte(b) {
                 return None;
@@ -514,13 +520,17 @@ mod tests {
             "ev\nil.example.com",
             "ev\x1b[2Kil.example.com",
             "a\rb.example.com",
+            // Non-ASCII: the wire parser read each byte as Latin-1, so these
+            // cached a NEL and a bidi override.
+            "ev\u{85}il.example.com",
+            "\u{202e}moc.example.com",
         ] {
             let mut msg = header(0x8180, 1, 1);
             msg.extend(question(hostile));
             msg.extend(record(ptr_to_question(), TYPE_A, 300, &[93, 184, 216, 34]));
             assert!(
                 parse_response(&msg).is_none(),
-                "control bytes must reject the name: {hostile:?}"
+                "hostile bytes must reject the name: {hostile:?}"
             );
 
             let mut q = header(0x0100, 1, 0);

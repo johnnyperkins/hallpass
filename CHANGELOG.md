@@ -186,6 +186,10 @@ restarted together; a version mismatch is refused at connect.
 
 ### Fixed
 
+- **A snooped DNS name could carry control characters.** Bytes above 0x7f
+  were read as Latin-1, so a name could cache C1 controls such as NEL, and
+  the libc resolver path accepted bidi overrides. Names with any non-ASCII
+  byte are now refused by both snoopers, as rule domains already were.
 - **Concurrent rule changes could leave a stale ruleset enforced.** Two
   overlapping rebuilds could store the older one last, so a just-added deny
   was missing, or a just-deleted rule still applied, until the next change.
