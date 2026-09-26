@@ -83,10 +83,10 @@ hallpass-cli rules export > policy.toml     # the whole ruleset, rules.d field n
 hallpass-cli rules import policy.toml       # add each rule; non-zero exit if any failed
 ```
 
-**Adding a rule under an existing name replaces it entirely.** Everything must
-be restated: a disabled rule comes back enabled unless you pass
-`--enabled false`, and tags you leave out are dropped. The GUI editor loads the
-whole rule first, so saving from it keeps both.
+**`rules add` and `rules import` refuse a name already in use** unless you pass
+`--replace`. Replacing restates everything: a disabled rule comes back enabled
+unless you pass `--enabled false`, and tags you leave out are dropped. The GUI
+editor loads the whole rule first, so saving from it keeps both.
 
 Hit counts are per rule name, survive a reload, and reset when the daemon
 restarts. A rule that never counts anything is a rule worth questioning.

@@ -448,7 +448,7 @@ fn rules_add_enabled_flag() {
         let mut argv: Vec<&str> = base.to_vec();
         argv.extend_from_slice(extra);
         match parse_ok(&argv).cmd {
-            Cmd::RulesAdd(rule) => rule,
+            Cmd::RulesAdd { rule, .. } => rule,
             other => panic!("expected RulesAdd, got {other:?}"),
         }
     };
@@ -512,7 +512,7 @@ fn rules_add_tags() {
         "rules", "add", "--name", "r", "--action", "deny", "--port", "443", "--tag", "work",
         "--tag", "vpn",
     ]);
-    let Cmd::RulesAdd(rule) = cli.cmd else {
+    let Cmd::RulesAdd { rule, .. } = cli.cmd else {
         panic!("expected RulesAdd");
     };
     assert_eq!(rule.tags, vec!["work".to_string(), "vpn".to_string()]);
@@ -549,11 +549,33 @@ fn rules_list_stats_export_import() {
     assert_eq!(
         parse_ok(&["rules", "import", "/tmp/r.toml"]).cmd,
         Cmd::RulesImport {
-            path: PathBuf::from("/tmp/r.toml")
+            path: PathBuf::from("/tmp/r.toml"),
+            replace: false
         }
     );
-    assert!(parse_err(&["rules", "import"]).contains("rules import PATH"));
-    assert!(parse_err(&["rules", "import", "a", "b"]).contains("rules import PATH"));
+    assert_eq!(
+        parse_ok(&["rules", "import", "--replace", "/tmp/r.toml"]).cmd,
+        Cmd::RulesImport {
+            path: PathBuf::from("/tmp/r.toml"),
+            replace: true
+        }
+    );
+    assert!(parse_err(&["rules", "import"]).contains("rules import [--replace] PATH"));
+    assert!(parse_err(&["rules", "import", "a", "b"]).contains("rules import [--replace] PATH"));
+    let Cmd::RulesAdd { replace, .. } = parse_ok(&[
+        "rules",
+        "add",
+        "--name",
+        "r",
+        "--action",
+        "deny",
+        "--replace",
+    ])
+    .cmd
+    else {
+        panic!("not an add");
+    };
+    assert!(replace);
     assert!(parse_err(&["rules", "export", "now"]).contains("rules export"));
     assert!(parse_err(&["rules", "--stats", "x"]).contains("unknown flag"));
 }
@@ -714,7 +736,7 @@ fn rules_add_full() {
         "--priority",
         "7",
     ]);
-    let Cmd::RulesAdd(rule) = cli.cmd else {
+    let Cmd::RulesAdd { rule, .. } = cli.cmd else {
         panic!("expected RulesAdd");
     };
     assert_eq!(rule.name, "curl-https");
@@ -743,7 +765,7 @@ fn rules_add_timed_duration() {
         "--duration",
         "5m",
     ]);
-    let Cmd::RulesAdd(rule) = timed.cmd else {
+    let Cmd::RulesAdd { rule, .. } = timed.cmd else {
         panic!("expected RulesAdd")
     };
     let RuleDuration::Until { deadline_ms } = rule.duration else {
@@ -767,7 +789,7 @@ fn rules_add_timed_duration() {
 #[test]
 fn rules_add_defaults() {
     let cli = parse_ok(&["rules", "add", "--name", "n", "--action", "deny"]);
-    let Cmd::RulesAdd(rule) = cli.cmd else {
+    let Cmd::RulesAdd { rule, .. } = cli.cmd else {
         panic!("expected RulesAdd");
     };
     assert_eq!(rule.action, Action::Deny);

@@ -51,8 +51,10 @@ COMMANDS:
                                  as one change
     rules export                 Write the ruleset to stdout as one TOML
                                  document (always TOML, never JSON)
-    rules import PATH            Add every rule in such a document, reporting
-                                 each one; exits non-zero if any failed
+    rules import [--replace] PATH
+                                 Add every rule in such a document, reporting
+                                 each one; exits non-zero if any failed. A
+                                 name already in use fails unless --replace
     suggest [OPTIONS]            Propose allow rules from the daemon's recent
                                  decisions, as a TOML document for review and
                                  `rules import`. Nothing is applied
@@ -172,10 +174,11 @@ RULES ADD OPTIONS:
     --tag TAG                    Label for selecting this rule in bulk;
                                  repeatable. Lowercase letters, digits, '-'
                                  and '_', starting with a letter or digit
-    --enabled true|false         Whether the rule is active (default: true).
-                                 An add replaces any rule of the same name
-                                 outright, so pass false to keep a disabled
-                                 rule disabled
+    --enabled true|false         Whether the rule is active (default: true)
+    --replace                    Overwrite the rule of the same name. Every
+                                 field is restated: pass --enabled false to
+                                 keep a disabled rule disabled, and repeat
+                                 its tags. Without it, a name in use fails
 
 GLOBAL OPTIONS:
     --socket PATH                Daemon socket (default: /run/hallpass/hallpass.sock)
@@ -337,7 +340,12 @@ pub enum Cmd {
         tag: Option<String>,
     },
     /// `rules add ...`
-    RulesAdd(Rule),
+    RulesAdd {
+        /// The rule to add.
+        rule: Rule,
+        /// Overwrite a rule of the same name instead of refusing.
+        replace: bool,
+    },
     /// `rules rm NAME`
     RulesRm {
         /// Rule name.
@@ -359,10 +367,12 @@ pub enum Cmd {
     },
     /// `rules export`
     RulesExport,
-    /// `rules import PATH`
+    /// `rules import [--replace] PATH`
     RulesImport {
         /// Path of the TOML document to read.
         path: PathBuf,
+        /// Overwrite rules of the same name instead of refusing them.
+        replace: bool,
     },
     /// `suggest [OPTIONS]`
     Suggest(SuggestOpts),
@@ -865,13 +875,29 @@ fn parse_rules(sub: &[&str]) -> Result<Cmd, String> {
     match sub.split_first() {
         None => parse_rules_list(&[]),
         Some((flag, _)) if flag.starts_with("--") => parse_rules_list(sub),
-        Some((&"add", flags)) => Ok(Cmd::RulesAdd(parse_rule_add(flags)?)),
+        Some((&"add", flags)) => {
+            let replace = flags.contains(&"--replace");
+            let flags: Vec<&str> = flags
+                .iter()
+                .copied()
+                .filter(|f| *f != "--replace")
+                .collect();
+            Ok(Cmd::RulesAdd {
+                rule: parse_rule_add(&flags)?,
+                replace,
+            })
+        }
         Some((&"export", [])) => Ok(Cmd::RulesExport),
         Some((&"export", _)) => Err("usage: rules export".into()),
         Some((&"import", [path])) => Ok(Cmd::RulesImport {
             path: PathBuf::from(*path),
+            replace: false,
         }),
-        Some((&"import", _)) => Err("usage: rules import PATH".into()),
+        Some((&"import", ["--replace", path] | [path, "--replace"])) => Ok(Cmd::RulesImport {
+            path: PathBuf::from(*path),
+            replace: true,
+        }),
+        Some((&"import", _)) => Err("usage: rules import [--replace] PATH".into()),
         Some((&"rm", [name])) => Ok(Cmd::RulesRm {
             name: (*name).to_string(),
         }),
@@ -943,9 +969,9 @@ fn parse_rule_add(flags: &[&str]) -> Result<Rule, String> {
     let mut duration = RuleDuration::Forever;
     let mut priority: u32 = 0;
     let mut tags: Vec<String> = Vec::new();
-    // An add replaces any rule of the same name outright, so re-adding a
-    // rule that was toggled off would silently start enforcing it again -
-    // and re-adding is how tags are changed from here.
+    // An add with --replace overwrites the rule of the same name outright,
+    // so re-adding a rule that was toggled off would silently start
+    // enforcing it again - and replacing is how tags are changed from here.
     let mut enabled = true;
     let mut matcher = RuleMatch::default();
 

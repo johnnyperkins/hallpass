@@ -109,6 +109,9 @@ restarted together; a version mismatch is refused at connect.
 
 ### Changed
 
+- **`rules add` and `rules import` refuse a name already in use** unless given
+  `--replace`, instead of silently overwriting the rule (and re-enabling it or
+  dropping its tags). Scripts that re-add rules to update them need the flag.
 - **`lockdown on` pins the `system` tag unless given `--no-system`**, and the
   shipped `20-system-*.toml` baseline rules carry it, so a locked-down host
   keeps DNS, time and its address. Upgrade: installed baseline files keep

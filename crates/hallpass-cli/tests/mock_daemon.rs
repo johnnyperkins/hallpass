@@ -336,6 +336,9 @@ async fn import_reports_each_rule_and_exits_non_zero() {
     .expect("write doc");
 
     let daemon = MockDaemon::spawn("import", |mut stream| async move {
+        // Asked for the names in use first, so an overwrite can be refused.
+        expect(&mut stream, ClientMsg::RuleList).await;
+        reply(&mut stream, DaemonMsg::Rules(Vec::new())).await;
         // The first is refused; the second must still be offered.
         let msg = recv(&mut stream).await;
         let ClientMsg::RuleAdd(rule) = msg else {
@@ -362,6 +365,53 @@ async fn import_reports_each_rule_and_exits_non_zero() {
 
     daemon.finish().await;
     let _ = std::fs::remove_file(&doc);
+}
+
+/// Adding a rule under a name in use is refused without `--replace`, and the
+/// daemon never sees the add: its replace would re-enable a disabled rule
+/// and drop its tags without a word.
+#[tokio::test]
+async fn add_refuses_a_name_in_use_without_replace() {
+    let existing = hallpass_types::Rule {
+        name: "block-smtp".into(),
+        action: hallpass_types::Action::Deny,
+        duration: hallpass_types::RuleDuration::Forever,
+        priority: 0,
+        enabled: false,
+        tags: vec!["mail".into()],
+        matcher: hallpass_types::RuleMatch::default(),
+    };
+    let add = [
+        "rules",
+        "add",
+        "--name",
+        "block-smtp",
+        "--action",
+        "deny",
+        "--port",
+        "25",
+    ];
+
+    let listed = existing.clone();
+    let daemon = MockDaemon::spawn("add-refused", |mut stream| async move {
+        expect(&mut stream, ClientMsg::RuleList).await;
+        reply(&mut stream, DaemonMsg::Rules(vec![listed])).await;
+    });
+    assert_eq!(daemon.run(&add).await, hallpass_cli::EXIT_ERR);
+    daemon.finish().await;
+
+    let daemon = MockDaemon::spawn("add-replace", |mut stream| async move {
+        let msg = recv(&mut stream).await;
+        let ClientMsg::RuleAdd(rule) = msg else {
+            panic!("expected RuleAdd, got {msg:?}");
+        };
+        assert_eq!(rule.name, "block-smtp");
+        reply(&mut stream, DaemonMsg::Ok).await;
+    });
+    let mut replace = add.to_vec();
+    replace.push("--replace");
+    assert_eq!(daemon.run(&replace).await, hallpass_cli::EXIT_OK);
+    daemon.finish().await;
 }
 
 #[tokio::test]

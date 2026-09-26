@@ -93,14 +93,14 @@ pub async fn run(argv: &[String]) -> i32 {
         Cmd::ConfigShow => config_show(&mut client, out).await,
         Cmd::ConfigSet(opts) => config_set(&mut client, opts, out).await,
         Cmd::RulesList { stats, tag } => rules_list(&mut client, stats, tag, out).await,
-        Cmd::RulesAdd(rule) => print_ok(&mut client, ClientMsg::RuleAdd(rule)).await,
+        Cmd::RulesAdd { rule, replace } => rules_add(&mut client, rule, replace).await,
         Cmd::RulesRm { name } => print_ok(&mut client, ClientMsg::RuleDelete { name }).await,
         Cmd::RulesToggle { name, enabled } => {
             print_ok(&mut client, ClientMsg::RuleToggle { name, enabled }).await
         }
         Cmd::RulesToggleTag { tag, enabled } => rules_toggle_tag(&mut client, tag, enabled).await,
         Cmd::RulesExport => rules_export(&mut client).await,
-        Cmd::RulesImport { path } => rules_import(&mut client, &path).await,
+        Cmd::RulesImport { path, replace } => rules_import(&mut client, &path, replace).await,
         Cmd::Suggest(opts) => suggest::run(&mut client, opts, out).await,
         Cmd::Events(opts) => events(client, opts, out).await,
         Cmd::Top(opts) => top::top(client, opts, out).await,
@@ -397,11 +397,43 @@ async fn rules_export(client: &mut Client) -> Result<(), CliError> {
 /// on; aborting on the first failure leaves them re-running the whole file to
 /// discover the next problem. Only a broken connection stops it, because
 /// after that there is nobody left to ask.
-async fn rules_import(client: &mut Client, path: &Path) -> Result<(), CliError> {
+/// The names of the rules the daemon holds, for refusing an add that would
+/// silently overwrite one.
+async fn rule_names(client: &mut Client) -> Result<std::collections::HashSet<String>, CliError> {
+    Ok(client.rules().await?.into_iter().map(|r| r.name).collect())
+}
+
+/// Why an add that would overwrite a rule is refused.
+fn name_in_use(name: &str) -> String {
+    format!(
+        "a rule named '{}' exists; pass --replace to overwrite it (every field, \
+         including enabled and tags, is replaced)",
+        sanitize_for_display(name)
+    )
+}
+
+/// `rules add`. The daemon replaces a rule of the same name outright, which
+/// silently re-enables a disabled rule and drops its tags, so an add of a
+/// name in use is refused unless `--replace` asked for exactly that. Checked
+/// here rather than by the daemon, so it is a guard against a slip, not a
+/// lock: two clients can still race.
+async fn rules_add(client: &mut Client, rule: Rule, replace: bool) -> Result<(), CliError> {
+    if !replace && rule_names(client).await?.contains(&rule.name) {
+        return Err(CliError::Input(name_in_use(&rule.name)));
+    }
+    print_ok(client, ClientMsg::RuleAdd(rule)).await
+}
+
+async fn rules_import(client: &mut Client, path: &Path, replace: bool) -> Result<(), CliError> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| CliError::Input(format!("cannot read {}: {e}", path.display())))?;
     let rules = rules_file::import(&text)
         .map_err(|e| CliError::Input(format!("cannot parse {}: {e}", path.display())))?;
+    let existing = if replace {
+        Default::default()
+    } else {
+        rule_names(client).await?
+    };
 
     let total = rules.len();
     let mut failed = 0usize;
@@ -409,6 +441,11 @@ async fn rules_import(client: &mut Client, path: &Path) -> Result<(), CliError> 
         // The document was not necessarily written on this machine, and this
         // name is about to be printed either way.
         let name = sanitize_for_display(&rule.name).into_owned();
+        if existing.contains(&rule.name) {
+            failed += 1;
+            eprintln!("error: rule '{name}': {}", name_in_use(&rule.name));
+            continue;
+        }
         match client.request(ClientMsg::RuleAdd(rule)).await {
             Ok(DaemonMsg::Ok) => println!("added {name}"),
             Ok(other) => return Err(CliError::unexpected(&other)),
