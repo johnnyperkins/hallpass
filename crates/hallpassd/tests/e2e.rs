@@ -230,14 +230,20 @@ s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 # datagrams dropped for want of buffer would understate that.
 s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 22)
 s.bind(("127.0.0.1", port))
-n, own_n, last = 0, 0, 0.0
+# Publishing only on arrival would strand the last counts whenever nothing
+# follows them, so a quiet socket flushes too.
+s.settimeout(0.05)
+n, own_n, last, published = 0, 0, 0.0, None
 while True:
-    data, _ = s.recvfrom(65535)
-    n += 1
-    own_n += own in data
+    try:
+        data, _ = s.recvfrom(65535)
+        n += 1
+        own_n += own in data
+    except socket.timeout:
+        pass
     now = time.monotonic()
-    if now - last >= 0.05:
-        last = now
+    if now - last >= 0.05 and published != (n, own_n):
+        last, published = now, (n, own_n)
         with open(path + ".tmp", "w") as f:
             f.write("%d %d" % (n, own_n))
         os.replace(path + ".tmp", path)
