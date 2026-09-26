@@ -28,6 +28,7 @@ action = "allow"
 duration = "forever"
 priority = 20
 enabled = true
+tags = ["system"]
 
 [match]
 exe = "/usr/sbin/NetworkManager"

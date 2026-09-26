@@ -467,17 +467,26 @@ fn lockdown_parsing() {
     assert_eq!(
         parse_ok(&["lockdown", "on", "--tag", "core", "--tag", "vpn"]).cmd,
         Cmd::LockdownSet {
-            tags: vec!["core".into(), "vpn".into()],
+            tags: vec!["core".into(), "vpn".into(), "system".into()],
             on: true,
             force: false
         }
     );
     assert_eq!(
-        parse_ok(&["lockdown", "on", "--force"]).cmd,
+        parse_ok(&["lockdown", "on", "--force", "--no-system"]).cmd,
         Cmd::LockdownSet {
             tags: Vec::new(),
             on: true,
             force: true
+        }
+    );
+    // Named explicitly, it is not pinned twice.
+    assert_eq!(
+        parse_ok(&["lockdown", "on", "--tag", "system"]).cmd,
+        Cmd::LockdownSet {
+            tags: vec!["system".into()],
+            on: true,
+            force: false
         }
     );
     assert_eq!(
@@ -491,6 +500,7 @@ fn lockdown_parsing() {
     // Lifting takes no options: `lockdown off --tag work` would read as
     // "unpin this one", which is not a thing this has.
     assert!(parse_err(&["lockdown", "off", "--tag", "work"]).contains("no options"));
+    assert!(parse_err(&["lockdown", "off", "--no-system"]).contains("no options"));
     assert!(parse_err(&["lockdown", "maybe"]).contains("on"));
     assert!(parse_err(&["lockdown", "on", "--tag", "Core"]).contains("bad tag"));
     assert!(parse_err(&["lockdown", "on", "--tag"]).contains("requires a value"));

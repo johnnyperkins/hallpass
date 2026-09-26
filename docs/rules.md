@@ -171,7 +171,10 @@ enforcement. The CLI, IPC and GUI refuse a bad tag outright instead.
 ## Lockdown
 
 `hallpass-cli lockdown on --tag core` narrows the host to the allow rules
-carrying a pinned tag. While it is on:
+carrying a pinned tag. The `system` tag, which the shipped
+[baseline rules](#baseline-rules) carry, is pinned too unless you pass
+`--no-system`, so the host keeps resolving names and keeping time. While it
+is on:
 
 - only allow rules with a pinned tag can allow;
 - **deny rules always apply**, tagged or not;
@@ -189,9 +192,10 @@ Before relying on it:
 - **Open connections are cut** the way a new deny rule cuts them, with the
   same limits (see [above](#deny-rules-and-established-flows)), and only when
   `kill_established` is on.
-- **DNS usually stops working** unless a pinned rule covers the resolver, and
-  `domain` rules then stop matching. `lockdown on` warns about this, and
-  refuses outright when no rule would survive unless you pass `--force`.
+- **DNS stops working** if no pinned rule covers the resolver (with
+  `--no-system`, or a resolver the baseline does not cover), and `domain`
+  rules then stop matching. `lockdown on` warns about this, and refuses
+  outright when no rule would survive unless you pass `--force`.
 - **A full kernel queue drops** while the posture is on, even under
   `queue_bypass = true`: a flood cannot carry traffic through it unjudged.
 
@@ -221,7 +225,8 @@ for a build, an installer or a test suite.
 ## Baseline rules
 
 Both shipped configs deny what no rule matches, so the host's own services need
-rules before anyone logs in. The installer puts these in `rules.d`:
+rules before anyone logs in. The installer puts these in `rules.d`; the allows
+carry the `system` tag, which lockdown pins by default:
 
 | File | Allows |
 | --- | --- |

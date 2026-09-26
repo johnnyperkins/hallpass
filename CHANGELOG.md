@@ -109,6 +109,10 @@ restarted together; a version mismatch is refused at connect.
 
 ### Changed
 
+- **`lockdown on` pins the `system` tag unless given `--no-system`**, and the
+  shipped `20-system-*.toml` baseline rules carry it, so a locked-down host
+  keeps DNS, time and its address. Upgrade: installed baseline files keep
+  their old contents; add `tags = ["system"]` to each to have them pinned.
 - **Engaging a lockdown cuts established flows it denies**, as a new deny rule
   does, where it used to leave them running. Governed by `kill_established`.
 - **The verdict queue's overflow policy follows the mode and lockdown live.**

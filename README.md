@@ -116,7 +116,7 @@ hallpass-cli rules --stats                 # rules with hit counts
 hallpass-cli rules add --name block-smtp --action deny --port 25 --duration forever
 hallpass-cli explain --exe /usr/bin/curl --dest 1.1.1.1 --port 443
 hallpass-cli run -- ./build.sh             # allow one command and its children, once
-hallpass-cli lockdown on --tag core        # only rules tagged `core` may allow
+hallpass-cli lockdown on --tag core        # only `core` (and baseline) rules may allow
 ```
 
 `man hallpass-cli` documents every command.

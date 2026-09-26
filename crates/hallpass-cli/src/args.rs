@@ -89,6 +89,9 @@ LOCKDOWN OPTIONS:
     --tag TAG                    Pin a tag: its allow rules keep deciding
                                  while the posture is on (repeatable). Deny
                                  rules are never suppressed
+    --no-system                  Do not pin the `system` tag. It is pinned by
+                                 default, so the shipped baseline rules (DNS,
+                                 time, DHCP) keep working
     --force                      Enter the posture even when no rule at all
                                  survives it, which leaves this host reaching
                                  nothing but loopback
@@ -817,7 +820,11 @@ fn parse_sha256(value: &str) -> Result<String, String> {
     Ok(value.to_string())
 }
 
-/// `lockdown [on|off] [--tag TAG]... [--force]`
+/// Tag carried by the shipped baseline rules (the host's resolver, clock and
+/// address), pinned by every `lockdown on` unless `--no-system` says not to.
+pub const SYSTEM_TAG: &str = "system";
+
+/// `lockdown [on|off] [--tag TAG]... [--no-system] [--force]`
 fn parse_lockdown(sub: &[&str]) -> Result<Cmd, String> {
     let (on, flags) = match sub.split_first() {
         None => return Ok(Cmd::LockdownShow),
@@ -829,20 +836,28 @@ fn parse_lockdown(sub: &[&str]) -> Result<Cmd, String> {
     };
     let mut tags: Vec<String> = Vec::new();
     let mut force = false;
+    let mut no_system = false;
     let mut it = flags.iter();
     while let Some(flag) = it.next() {
         match *flag {
             "--tag" => tags.push(next_value(&mut it, flag)?.to_string()),
             "--force" => force = true,
+            "--no-system" => no_system = true,
             other => return Err(format!("unknown flag '{other}'")),
         }
     }
-    hallpass_types::validate_tags(&tags)?;
     // Leaving takes no tags, and quietly ignoring them would let `lockdown
     // off --tag work` read as "unpin this one", which is not a thing.
-    if !on && (!tags.is_empty() || force) {
+    if !on && (!tags.is_empty() || force || no_system) {
         return Err("lockdown off takes no options".into());
     }
+    // The baseline keeps the host resolving, keeping time and holding an
+    // address. A posture without it usually cannot resolve a single name,
+    // which is rarely what someone reaching for a lockdown means.
+    if on && !no_system && !tags.iter().any(|t| t == SYSTEM_TAG) {
+        tags.push(SYSTEM_TAG.to_string());
+    }
+    hallpass_types::validate_tags(&tags)?;
     Ok(Cmd::LockdownSet { tags, on, force })
 }
 

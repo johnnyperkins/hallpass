@@ -23,6 +23,7 @@ action = "allow"
 duration = "forever"
 priority = 20
 enabled = true
+tags = ["system"]
 
 [match]
 exe = "/usr/lib/systemd/systemd-timesyncd"
