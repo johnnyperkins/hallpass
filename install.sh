@@ -6,6 +6,9 @@
 #   HALLPASS_EBPF=0 ./install.sh          # force the procfs-only build
 #   HALLPASS_POSTURE=desktop ./install.sh # permissive config instead of the hardened one
 #
+# Run from an unpacked release tarball, it installs the prebuilt binaries in
+# bin/ (built with eBPF attribution) and builds nothing.
+#
 # eBPF attribution is recommended and built by default when the toolchain
 # (nightly Rust + bpf-linker) is available; otherwise the build falls back
 # to procfs-only attribution with a note.
@@ -22,28 +25,34 @@ cd "$root"
 # the capability probe: rustup auto-installs the nightly pinned by
 # crates/hallpass-ebpf/rust-toolchain.toml, and xtask reports a missing
 # bpf-linker with install instructions. No toolchain knowledge here.
-echo ">> Building release binaries..."
-case ${HALLPASS_EBPF:-auto} in
-auto)
-	if ! cargo xtask build; then
-		echo ">> eBPF build failed (see above); building procfs-only."
-		echo "   eBPF attribution is recommended; fix the build and re-run,"
-		echo "   or silence this fallback with HALLPASS_EBPF=0."
+if [ ! -f Cargo.toml ] && [ -x bin/hallpassd ]; then
+	echo ">> Release tarball: installing the prebuilt binaries in bin/."
+	bindir=bin
+else
+	bindir=target/release
+	echo ">> Building release binaries..."
+	case ${HALLPASS_EBPF:-auto} in
+	auto)
+		if ! cargo xtask build; then
+			echo ">> eBPF build failed (see above); building procfs-only."
+			echo "   eBPF attribution is recommended; fix the build and re-run,"
+			echo "   or silence this fallback with HALLPASS_EBPF=0."
+			cargo build --release
+		fi
+		;;
+	1)
+		cargo xtask build # fail the install if the eBPF build fails
+		;;
+	0)
+		echo ">> HALLPASS_EBPF=0: procfs-only build."
 		cargo build --release
-	fi
-	;;
-1)
-	cargo xtask build # fail the install if the eBPF build fails
-	;;
-0)
-	echo ">> HALLPASS_EBPF=0: procfs-only build."
-	cargo build --release
-	;;
-*)
-	echo "HALLPASS_EBPF must be 1, 0, or unset; got '${HALLPASS_EBPF}'" >&2
-	exit 1
-	;;
-esac
+		;;
+	*)
+		echo "HALLPASS_EBPF must be 1, 0, or unset; got '${HALLPASS_EBPF}'" >&2
+		exit 1
+		;;
+	esac
+fi
 
 # Which config a *fresh* install starts from. Hardened by default: it denies
 # every unmatched connection and every unanswered prompt, denies every
@@ -74,12 +83,13 @@ echo ">> Installing (sudo)..."
 # unprivileged shell before being piped into a root one, so a value like
 # SUDO_USER (which sudo does not set when the script is run directly, and which
 # nothing validates) would be interpolated straight into root's input.
-sudo sh -eus -- "$target_user" "$posture_file" <<'INSTALL'
+sudo sh -eus -- "$target_user" "$posture_file" "$bindir" <<'INSTALL'
 target_user=$1
 posture_file=$2
-install -Dm755 target/release/hallpassd   /usr/bin/hallpassd
-install -Dm755 target/release/hallpass-cli /usr/bin/hallpass-cli
-install -Dm755 target/release/hallpass-ui  /usr/bin/hallpass-ui
+bindir=$3
+install -Dm755 "$bindir/hallpassd"    /usr/bin/hallpassd
+install -Dm755 "$bindir/hallpass-cli" /usr/bin/hallpass-cli
+install -Dm755 "$bindir/hallpass-ui"  /usr/bin/hallpass-ui
 
 # Config and shipped rules: never clobber admin-edited policy. An existing
 # config or rule file is left as it is, and a shipped rule is only ever
