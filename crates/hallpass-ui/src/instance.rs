@@ -32,8 +32,9 @@ use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-/// How long a later launch waits for the first window to start listening:
-/// it takes the lock before it binds, so the two can cross.
+/// How long a later launch waits for the lock and the socket to agree: a
+/// window takes the lock before it binds, and a lock handed over can stay
+/// held for a moment by a descriptor a fork in the old window copied.
 const CONNECT_TRIES: u32 = 20;
 const CONNECT_PAUSE: Duration = Duration::from_millis(50);
 
@@ -210,21 +211,41 @@ fn claim_in(
     // another launch took it first and went silent too.
     let mut handovers = 0;
     loop {
-        if let Some(lock) = try_lock(&lock_path)? {
-            // Whatever is at the path was left by a window that has exited
-            // or handed over: the lock says no other is listening.
-            let _ = std::fs::remove_file(&sock_path);
-            let listener = UnixListener::bind(&sock_path)?;
-            return Ok(Instance::First(Holder {
-                lock,
-                listener,
-                sock_path,
-            }));
+        // The lock is tried on every pass, not once before connecting: the
+        // window that just handed it over removed its socket first, and its
+        // lock can outlive the handover by as long as a child it was
+        // forking takes to exec. Checked once, that moment sends the launch
+        // to a socket nobody will bind again.
+        let mut conn = None;
+        for _ in 0..CONNECT_TRIES {
+            if let Some(lock) = try_lock(&lock_path)? {
+                // Whatever is at the path was left by a window that has
+                // exited or handed over: the lock says no other is listening.
+                let _ = std::fs::remove_file(&sock_path);
+                let listener = UnixListener::bind(&sock_path)?;
+                return Ok(Instance::First(Holder {
+                    lock,
+                    listener,
+                    sock_path,
+                }));
+            }
+            if handovers < 2 {
+                if let Ok(c) = UnixStream::connect(&sock_path) {
+                    conn = Some(c);
+                    break;
+                }
+            }
+            std::thread::sleep(CONNECT_PAUSE);
         }
         if handovers == 2 {
             return Ok(Instance::Unanswered);
         }
-        match ask(&sock_path, ack_timeout)? {
+        let Some(conn) = conn else {
+            return Err(io::Error::other(
+                "another management window holds the lock but does not listen",
+            ));
+        };
+        match ask(conn, ack_timeout)? {
             Asked::Raised => return Ok(Instance::Raised),
             Asked::HandedOver => handovers += 1,
             Asked::Unanswered => return Ok(Instance::Unanswered),
@@ -238,22 +259,9 @@ enum Asked {
     Unanswered,
 }
 
-/// Ask the window holding the lock to raise itself, and to hand the lock
-/// over if it cannot.
-fn ask(sock_path: &Path, ack_timeout: Duration) -> io::Result<Asked> {
-    let mut conn = None;
-    for _ in 0..CONNECT_TRIES {
-        if let Ok(c) = UnixStream::connect(sock_path) {
-            conn = Some(c);
-            break;
-        }
-        std::thread::sleep(CONNECT_PAUSE);
-    }
-    let Some(mut conn) = conn else {
-        return Err(io::Error::other(
-            "another management window holds the lock but does not listen",
-        ));
-    };
+/// Ask the window holding the lock, over `conn`, to raise itself, and to
+/// hand the lock over if it cannot.
+fn ask(mut conn: UnixStream, ack_timeout: Duration) -> io::Result<Asked> {
     conn.set_read_timeout(Some(ack_timeout))?;
     match read_byte(&mut conn) {
         Some(RAISED | STARTING) => return Ok(Asked::Raised),
