@@ -16,7 +16,7 @@ rustix = { version = "1", features = ["process", "stdio"] }
 eframe = "0.35"
 # Table only (virtualized rows with a fixed header, width-filling columns);
 # every optional feature stays off.
-egui_extras = { version = "0.35", default-features = false }
+egui_extras = { version = "0.36", default-features = false }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 tokio = { workspace = true, features = [
     "rt",
