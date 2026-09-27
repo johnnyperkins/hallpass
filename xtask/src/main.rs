@@ -19,6 +19,7 @@ fn main() -> ExitCode {
         Some("build-ebpf") => build_ebpf(),
         Some("clippy-ebpf") => clippy_ebpf(),
         Some("build") => build_ebpf().and_then(|()| build_workspace()),
+        Some("dist") => dist(),
         Some("e2e") => {
             let rest: Vec<String> = std::env::args().skip(2).collect();
             let ebpf = rest.iter().any(|a| a == "--ebpf");
@@ -74,6 +75,9 @@ builds:
   clippy-ebpf   lint the hallpass-ebpf kernel programs (-D warnings)
   build         build-ebpf, then a release build of the whole workspace
                 (with the ebpf feature); what install.sh runs
+  dist          build, then package target/dist/: the release tarball
+                (binaries, etc/, install.sh), the eBPF object on its own,
+                and SHA256SUMS; what the release workflow publishes
 
 running:
   dev           run hallpassd unprivileged against a scratch config, for
@@ -608,6 +612,103 @@ fn set_mode(path: &Path, mode: u32) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
         .map_err(|e| format!("failed to chmod {} to {mode:o}: {e}", path.display()))
+}
+
+/// Build and package a release into target/dist.
+///
+/// The tarball unpacks to one directory that install.sh can install from
+/// without a toolchain: the binaries under bin/, beside the same etc/ and
+/// scripts a checkout has. The eBPF object ships on its own as well, for a
+/// source build that wants eBPF attribution without nightly and bpf-linker
+/// (point HALLPASS_EBPF_OBJ at it). It only fits the source of the same
+/// version, since the maps and structs it shares with the daemon are not a
+/// stable interface.
+///
+/// Archive metadata is normalized (owner, mode, order, mtime from
+/// SOURCE_DATE_EPOCH or the last commit) so it depends on the files alone,
+/// not on the umask or clock of whoever built it.
+fn dist() -> Result<(), String> {
+    build_ebpf()?;
+    build_workspace()?;
+    let root = workspace_root();
+    let version = env!("CARGO_PKG_VERSION");
+    let name = format!("hallpass-{version}-{}-linux", std::env::consts::ARCH);
+    let out = root.join("target/dist");
+    let stage = out.join(&name);
+    if out.exists() {
+        std::fs::remove_dir_all(&out).map_err(|e| format!("clear {}: {e}", out.display()))?;
+    }
+    let bin = stage.join("bin");
+    std::fs::create_dir_all(&bin).map_err(|e| format!("create {}: {e}", bin.display()))?;
+    for b in ["hallpassd", "hallpass-cli", "hallpass-ui"] {
+        copy(&root.join("target/release").join(b), &bin.join(b))?;
+    }
+    for f in [
+        "install.sh",
+        "uninstall.sh",
+        "README.md",
+        "CHANGELOG.md",
+        "LICENSE",
+    ] {
+        copy(&root.join(f), &stage.join(f))?;
+    }
+    let mut cp = Command::new("cp");
+    cp.arg("-R").arg(root.join("etc")).arg(&stage);
+    run(cp)?;
+
+    let object = format!("hallpass-ebpf-{version}.o");
+    copy(
+        &root.join("target/bpfel-unknown-none/release/hallpass-ebpf"),
+        &out.join(&object),
+    )?;
+
+    let epoch = match std::env::var("SOURCE_DATE_EPOCH") {
+        Ok(e) => e,
+        Err(_) => {
+            let o = Command::new("git")
+                .args(["log", "-1", "--format=%ct"])
+                .current_dir(&root)
+                .output()
+                .map_err(|e| format!("git log: {e}"))?;
+            String::from_utf8_lossy(&o.stdout).trim().to_string()
+        }
+    };
+    let tarball = format!("{name}.tar.gz");
+    let mut tar = Command::new("tar");
+    tar.args([
+        "--sort=name",
+        "--owner=0",
+        "--group=0",
+        "--numeric-owner",
+        "--mode=u+rwX,go+rX,go-w",
+        &format!("--mtime=@{epoch}"),
+        "--use-compress-program=gzip -n",
+        "-cf",
+        &tarball,
+        &name,
+    ])
+    .current_dir(&out);
+    run(tar)?;
+    std::fs::remove_dir_all(&stage).map_err(|e| format!("clear {}: {e}", stage.display()))?;
+
+    let sums = Command::new("sha256sum")
+        .args([&tarball, &object])
+        .current_dir(&out)
+        .output()
+        .map_err(|e| format!("sha256sum: {e}"))?;
+    if !sums.status.success() {
+        return Err("sha256sum failed".to_string());
+    }
+    std::fs::write(out.join("SHA256SUMS"), &sums.stdout)
+        .map_err(|e| format!("write SHA256SUMS: {e}"))?;
+    eprintln!("dist: {}", out.display());
+    Ok(())
+}
+
+fn copy(from: &Path, to: &Path) -> Result<(), String> {
+    std::fs::copy(from, to)
+        .map(|_| ())
+        .map_err(|e| format!("copy {} to {}: {e}", from.display(), to.display()))
 }
 
 fn run(mut cmd: Command) -> Result<(), String> {
