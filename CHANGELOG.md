@@ -2,13 +2,18 @@
 
 What an upgrade changes on a running host; commit bodies carry the reasoning.
 
-## Unreleased
+## 0.1.0 - 2026-09-27
 
 The wire protocol is now v17. Daemon, CLI and UI must be upgraded and
 restarted together; a version mismatch is refused at connect.
 
 ### Added
 
+- **Release tarballs.** Each release ships an x86_64 tarball built with eBPF
+  attribution (glibc 2.35 or newer) that `install.sh` installs without a Rust
+  toolchain, the eBPF object on its own for source builds, `SHA256SUMS`, and
+  signed build provenance.
+- **`hallpass-cli --version`**, with the wire protocol it speaks.
 - **A baseline rule for the resolver stub** (`20-resolver-stub.toml`). Loopback
   is judged like other traffic, so each program's first lookup to 127.0.0.53
   used to be a prompt of its own, and was denied before login. Upgrade:
@@ -229,6 +234,11 @@ restarted together; a version mismatch is refused at connect.
 
 ### Fixed
 
+- **Exec after connect could still inherit a rule.** `/proc/<pid>/exe` names
+  the new binary partway through an exec, before the exec generation moved,
+  so a connection made just before the exec could be named after, and
+  allowed as, the binary it exec'd into. The generation is now marked when
+  the image starts changing.
 - **A snooped DNS name could carry control characters.** Bytes above 0x7f
   were read as Latin-1, so a name could cache C1 controls such as NEL, and
   the libc resolver path accepted bidi overrides. Names with any non-ASCII
