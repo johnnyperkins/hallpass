@@ -14,7 +14,7 @@ description = "Build tasks for the hallpass workspace"
 # loop looking broken for no visible reason.
 [dev-dependencies]
 hallpass-types = { path = "../crates/hallpass-types" }
-toml = "0.8"
+toml = "1.1"
 
 [lints]
 workspace = true
