@@ -43,7 +43,7 @@ sha2 = { workspace = true }
 # AF_NETLINK socket for the sock_diag attribution path; the daemon denies
 # unsafe_code and std has no netlink socket. Chosen over neli (proc-macro
 # subtree) for pulling only bytes, libc and log, all already in the tree.
-netlink-sys = { version = "0.8", default-features = false }
+netlink-sys = { version = "0.9", default-features = false }
 # SO_MARK on the syslog export socket, so the daemon's own log traffic can
 # be exempted from its own verdict queue (see nft::EXPORT_MARK). std cannot
 # set it and this crate denies unsafe_code, so the raw setsockopt has to come
