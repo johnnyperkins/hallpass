@@ -4,8 +4,6 @@ An interactive application firewall for Linux, written in Rust. Hallpass
 catches every new outbound connection, works out which program made it, and
 asks you (or your rules) whether it may go.
 
-*"Hallpass" is a working title.*
-
 - **Per-program rules** keyed on executable path, glob or SHA-256, packaged app
   id, user, destination, domain, port and more.
 - **Prompts** in a desktop app or in the terminal, remembered once, for the

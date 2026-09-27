@@ -1,6 +1,6 @@
 [Unit]
 Description=Hallpass interactive application firewall daemon
-Documentation=https://github.com/hallpass/hallpass
+Documentation=https://github.com/johnnyperkins/hallpass
 After=network-pre.target
 Wants=network-pre.target
 # Never stop retrying. The default start limit gives up after 5 attempts in
