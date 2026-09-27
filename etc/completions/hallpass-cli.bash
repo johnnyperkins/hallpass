@@ -22,7 +22,7 @@ _hallpass_cli() {
     cur=${COMP_WORDS[COMP_CWORD]}
     prev=${COMP_WORDS[COMP_CWORD - 1]}
 
-    local global='--socket --json --color -h --help'
+    local global='--socket --json --color -h --help -V --version'
 
     # The parser strips the global flags wherever they appear, so a command may
     # be preceded by any number of them. Find it by walking the line and
@@ -46,7 +46,7 @@ _hallpass_cli() {
             ((i += 2))
             continue
             ;;
-        --json | -h | --help)
+        --json | -h | --help | -V | --version)
             ((i += 1))
             continue
             ;;

@@ -71,6 +71,8 @@ _hallpass-cli() {
         '--color[when to colorize output]:when:(auto always never)'
         '(- *)-h[show usage and exit]'
         '(- *)--help[show usage and exit]'
+        '(- *)-V[show the version and exit]'
+        '(- *)--version[show the version and exit]'
     )
 
     _arguments -C -s $global_args \

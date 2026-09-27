@@ -5,7 +5,7 @@ fn parse_ok(args: &[&str]) -> Cli {
     let argv: Vec<String> = args.iter().map(ToString::to_string).collect();
     match parse(&argv).unwrap() {
         Parsed::Cli(cli) => cli,
-        Parsed::Help => panic!("unexpected help"),
+        other => panic!("unexpected {other:?}"),
     }
 }
 
@@ -42,6 +42,9 @@ fn run_takes_its_command_verbatim() {
     );
 
     assert!(parse_err(&["run"]).contains("needs a command"));
+    for flag in ["-V", "--version"] {
+        assert_eq!(parse(&[flag.to_string()]).unwrap(), Parsed::Version);
+    }
     // `run --help` is a question about `run`, not a program to execute.
     assert_eq!(
         parse(&["run".to_string(), "--help".to_string()]).unwrap(),

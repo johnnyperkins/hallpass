@@ -188,7 +188,8 @@ GLOBAL OPTIONS:
                                  explain
     --color auto|always|never    Colorize output (default: auto, meaning only
                                  on a terminal with NO_COLOR unset)
-    -h, --help                   Show this help";
+    -h, --help                   Show this help
+    -V, --version                Show the version and wire protocol";
 
 /// When to emit ANSI color.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -434,6 +435,8 @@ pub enum Parsed {
     Cli(Cli),
     /// `-h` / `--help` was given.
     Help,
+    /// `-V` / `--version` was given.
+    Version,
 }
 
 /// Parse arguments (excluding `argv[0]`).
@@ -484,6 +487,7 @@ pub fn parse(argv: &[String]) -> Result<Parsed, String> {
         }
         match a.as_str() {
             "-h" | "--help" => return Ok(Parsed::Help),
+            "-V" | "--version" => return Ok(Parsed::Version),
             "--json" => json = true,
             "--socket" => {
                 socket = PathBuf::from(

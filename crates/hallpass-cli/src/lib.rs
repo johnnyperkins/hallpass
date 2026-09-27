@@ -46,6 +46,16 @@ pub async fn run(argv: &[String]) -> i32 {
             println!("{}", args::USAGE);
             return EXIT_OK;
         }
+        // The protocol too: it is what has to match between this binary and
+        // the daemon, and the version alone does not say which one it is.
+        Ok(args::Parsed::Version) => {
+            println!(
+                "hallpass-cli {} (protocol v{})",
+                env!("CARGO_PKG_VERSION"),
+                hallpass_types::PROTOCOL_VERSION
+            );
+            return EXIT_OK;
+        }
         Err(e) => {
             eprintln!("error: {e}");
             eprintln!("{}", args::USAGE);

@@ -85,6 +85,7 @@ complete -c hallpass-cli -l socket -r -F -d 'Daemon socket path'
 complete -c hallpass-cli -l json -d 'Machine-readable JSON output'
 complete -c hallpass-cli -l color -x -a 'auto always never' -d 'When to colorize output'
 complete -c hallpass-cli -s h -l help -d 'Show usage and exit'
+complete -c hallpass-cli -s V -l version -d 'Show the version and exit'
 
 # config
 complete -c hallpass-cli -n '__hallpass_cli_is config' -a set -d 'Change runtime settings until the daemon restarts'
