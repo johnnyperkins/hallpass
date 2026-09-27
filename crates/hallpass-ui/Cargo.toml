@@ -13,7 +13,7 @@ serde = { workspace = true }
 # for killing a stuck prompt window (src/agent.rs); already in the tree
 # through hallpass-cli.
 rustix = { version = "1", features = ["process", "stdio"] }
-eframe = "0.35"
+eframe = "0.36"
 # Table only (virtualized rows with a fixed header, width-filling columns);
 # every optional feature stays off.
 egui_extras = { version = "0.35", default-features = false }
