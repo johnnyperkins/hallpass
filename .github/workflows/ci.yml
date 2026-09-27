@@ -45,7 +45,11 @@ jobs:
       # The e2e tests are #[ignore]-gated (need root + netns) and run in
       # the e2e job; the nightly-only hallpass-ebpf build has its own job.
       - name: Test
-        run: cargo test --workspace
+        shell: bash
+        run: cargo test --workspace 2>&1 | tee test.log
+      - name: Annotate test failures
+        if: failure()
+        run: .github/annotate-failures.sh test.log
       # `cargo xtask lint` runs this plus the two clippy invocations in the
       # ebpf job below, so one local command covers every lint gate here.
       - name: Clippy
@@ -149,6 +153,9 @@ jobs:
         run: |
           sudo -E "$(command -v cargo)" test -p hallpassd --test e2e --features ebpf -- --ignored --test-threads=1 --nocapture 2>&1 | tee e2e.log
           ! grep -q 'SKIP e2e' e2e.log
+      - name: Annotate e2e failures
+        if: failure()
+        run: .github/annotate-failures.sh e2e.log
 
   deny:
     name: cargo-deny
