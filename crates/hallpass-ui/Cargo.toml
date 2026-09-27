@@ -13,10 +13,10 @@ serde = { workspace = true }
 # for killing a stuck prompt window (src/agent.rs); already in the tree
 # through hallpass-cli.
 rustix = { version = "1", features = ["process", "stdio"] }
-eframe = "0.35"
+eframe = "0.36"
 # Table only (virtualized rows with a fixed header, width-filling columns);
 # every optional feature stays off.
-egui_extras = { version = "0.35", default-features = false }
+egui_extras = { version = "0.36", default-features = false }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 tokio = { workspace = true, features = [
     "rt",
@@ -43,4 +43,4 @@ winit = { version = "0.30", default-features = false, features = ["wayland", "x1
 workspace = true
 
 [dev-dependencies]
-egui_kittest = { version = "0.35.0", default-features = false }
+egui_kittest = { version = "0.36.2", default-features = false }
