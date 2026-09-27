@@ -12,6 +12,7 @@ fn main() -> ExitCode {
     let result = match task.as_deref() {
         Some("check") => check(),
         Some("fmt") => fmt_check(),
+        Some("fuzz-lock") => fuzz_lock(),
         Some("test") => test_workspace(),
         Some("lint") => lint(),
         Some("doc") => doc(),
@@ -56,6 +57,8 @@ usage: cargo xtask <task>
 
 verification (cheapest first):
   fmt           cargo fmt --check over the workspace and hallpass-ebpf
+  fuzz-lock     check fuzz/Cargo.lock still resolves as committed; it
+                shares crates with the workspace and nothing else updates it
   check         cargo check over the workspace and the ebpf feature
   test          run the workspace unit/integration tests (no privileges)
   lint          clippy in both feature configurations, plus clippy-ebpf;
@@ -301,6 +304,25 @@ fn fuzz_targets() -> Result<Vec<String>, String> {
 /// keep the prose pointing at the right code. Without `-D warnings` a link that
 /// stops resolving is a silent downgrade to plain text, so the convention rots
 /// without anything failing.
+/// Fail when fuzz/Cargo.lock no longer satisfies its manifest.
+///
+/// The harness depends on hallpassd by path, so a workspace dependency bump
+/// moves its requirements too, and Dependabot does not watch this lockfile.
+/// Only resolution is checked, so the workspace toolchain does: nothing is
+/// built on the harness's nightly. The fix is `cargo update` in fuzz/.
+fn fuzz_lock() -> Result<(), String> {
+    let mut cmd = cargo(&[
+        "metadata",
+        "--locked",
+        "--format-version",
+        "1",
+        "--manifest-path",
+        "fuzz/Cargo.toml",
+    ]);
+    cmd.stdout(std::process::Stdio::null());
+    run(cmd).map_err(|e| format!("{e}; fuzz/Cargo.lock is stale, run `cargo update` in fuzz/"))
+}
+
 fn doc() -> Result<(), String> {
     let mut cmd = cargo(&["doc", "--workspace", "--no-deps"]);
     cmd.env("RUSTDOCFLAGS", "-D warnings");
@@ -329,8 +351,9 @@ fn ci() -> Result<(), String> {
     // build-ebpf comes next because every later stage that enables the
     // `ebpf` feature needs an object to embed, and without one the failure
     // surfaces from a build script deep inside a long compile.
-    let stages: [Stage; 7] = [
+    let stages: [Stage; 8] = [
         ("fmt", fmt_check),
+        ("fuzz-lock", fuzz_lock),
         ("build-ebpf", build_ebpf),
         ("check", check),
         ("test", test_workspace),

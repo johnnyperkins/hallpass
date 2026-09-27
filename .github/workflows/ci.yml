@@ -42,6 +42,10 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      # fuzz/ has its own lockfile that Dependabot does not update, and it
+      # shares crates with the workspace, so a bump here can leave it stale.
+      - name: Fuzz lockfile
+        run: cargo xtask fuzz-lock
       # The e2e tests are #[ignore]-gated (need root + netns) and run in
       # the e2e job; the nightly-only hallpass-ebpf build has its own job.
       - name: Test

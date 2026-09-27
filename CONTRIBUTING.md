@@ -32,6 +32,7 @@ first. Each stage also runs on its own:
 | Task | Runs | Covers |
 | --- | --- | --- |
 | `cargo xtask fmt` | `cargo fmt --check`, workspace and `hallpass-ebpf` | Formatting (rustfmt defaults, no config) |
+| `cargo xtask fuzz-lock` | `cargo metadata --locked` on `fuzz/` | `fuzz/Cargo.lock` still matches the crates it shares with the workspace |
 | `cargo xtask check` | `cargo check`, plain and with `ebpf,dev-fixtures` | Compiles in both feature sets |
 | `cargo xtask test` | `cargo test --workspace` | The unprivileged suite |
 | (in `ci`) | `cargo test -p hallpassd --features ebpf` | eBPF attribution tests, which are feature-gated |

@@ -12,6 +12,11 @@ updates:
       interval: weekly
     commit-message:
       prefix: "chore(ci)"
+    # Actions follow semver, so a minor bump is safe to batch. A major one
+    # still gets a pull request of its own.
+    groups:
+      actions:
+        update-types: [minor, patch]
 
   # The workspace lockfile is committed and `cargo deny check` gates licences
   # and advisories in CI, so a dependency bump gets reviewed the same way any
@@ -22,6 +27,17 @@ updates:
       interval: weekly
     commit-message:
       prefix: "chore(deps)"
+    # A dependency joins the first group that matches it.
+    groups:
+      # eframe, egui_extras and egui_kittest share one egui, so a bump to
+      # any one of them alone does not compile.
+      egui:
+        patterns: ["eframe", "egui*"]
+      # Patch releases only. Most of the crates here are 0.x, where a
+      # "minor" bump such as 0.35 to 0.36 is a breaking release, and those
+      # deserve a pull request of their own.
+      patch:
+        update-types: [patch]
 
   # crates/hallpass-ebpf is deliberately not a workspace member (it builds for
   # bpfel-unknown-none on nightly), so it has its own lockfile that the entry
@@ -32,3 +48,6 @@ updates:
       interval: weekly
     commit-message:
       prefix: "chore(deps)"
+    groups:
+      patch:
+        update-types: [patch]
