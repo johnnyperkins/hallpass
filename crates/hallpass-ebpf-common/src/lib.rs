@@ -98,13 +98,24 @@ pub struct FlowVal {
     /// the two apart, because a pid survives exec exactly as the socket
     /// does, and so does the process start time that guards pid reuse.
     ///
-    /// The generation is bumped by the exec tracepoint and stamped here at
-    /// connect. Userspace compares it with the pid's current generation and
-    /// refuses the executable when they differ. Zero means the process had
-    /// not exec'd since the programs loaded, which is the ordinary state of
-    /// anything that started before the daemon.
+    /// The generation is replaced twice per exec (see [`EXEC_IN_PROGRESS`])
+    /// and stamped here at connect. Userspace compares it with the pid's
+    /// current generation and refuses the executable when they differ or
+    /// an exec is underway. Zero means no entry, which never agrees.
     pub exec_gen: u64,
 }
+
+/// Set in an exec generation issued when an exec starts replacing the
+/// process image, and clear in one issued once it has finished.
+///
+/// `/proc/<pid>/exe` names the new binary from partway through the exec,
+/// well before the `sched_process_exec` tracepoint fires. A generation
+/// bumped only there leaves a window in which the old stamp still agrees
+/// while the executable read already names the new image. Marking the
+/// generation at `begin_new_exec` entry, before the image is swapped,
+/// closes it: any read that can see the new image sees this bit, or the
+/// final generation that follows it, and both refuse.
+pub const EXEC_IN_PROGRESS: u64 = 1 << 1;
 
 /// Process lifecycle event kinds carried over the ring buffer.
 pub const EVENT_EXEC: u32 = 0;

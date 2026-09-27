@@ -199,9 +199,11 @@ binary, and retry until it wins the race.
 
 - With **eBPF**, the kernel stamps the process's exec generation into the flow
   record at connect time, and the daemon refuses to name an executable whose
-  generation has moved. A process that wins the race gets no executable at all
-  and falls to the prompt or default verdict, rather than inheriting another
-  binary's allow rule. It can still dodge an `exe`-keyed *deny* this way.
+  generation has moved or whose exec is still underway (the generation is
+  marked before the image is replaced, not only after). A process that wins
+  the race gets no executable at all and falls to the prompt or default
+  verdict, rather than inheriting another binary's allow rule. It can still
+  dodge an `exe`-keyed *deny* this way.
   For a new TCP connection, a lost flow record (its map is a fixed-size LRU a
   process can try to flush) is refused the same way rather than falling back
   to a name read from `/proc`: the record is written before the connection's

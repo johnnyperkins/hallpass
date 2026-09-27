@@ -83,7 +83,9 @@ tuple-only rule model with its own default verdict.
    pid and start time all survive `execve`. The eBPF path adds a fact the
    process does not control: a per-pid exec generation, stamped into the flow
    at connect and compared when the executable is resolved
-   (`FlowVal::exec_gen`, `EbpfAttributor::exec_raced`). Any mismatch, including
+   (`FlowVal::exec_gen`, `EbpfAttributor::exec_raced`). An exec marks it at
+   `begin_new_exec`, before `/proc/<pid>/exe` changes, and replaces it again
+   once finished (`EXEC_IN_PROGRESS`). Any mismatch or mark, including
    the ambiguous ones from LRU eviction or pid exit, refuses the executable and
    command line: refusing costs a prompt, vouching costs the rule. Generations
    are unique nonzero timestamps, so a lost and recreated entry cannot land on

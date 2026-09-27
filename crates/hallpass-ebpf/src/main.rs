@@ -6,6 +6,8 @@
 //! - tracepoints on sched_process_exec / sched_process_exit stream
 //!   process lifecycle events over a ring buffer so userspace can keep
 //!   a fresh pid -> exe/cmdline cache.
+//! - a kprobe on begin_new_exec marks an exec in progress in EXEC_GEN
+//!   before the process image is replaced.
 //!
 //! Byte order convention (shared with hallpass-ebpf-common): addresses
 //! are raw network-order bytes, ports are host order.
@@ -32,7 +34,7 @@ use aya_ebpf::{
 };
 use hallpass_ebpf_common::{
     DnsEvent, ExecEvent, FlowKey, FlowVal, AF_INET, AF_INET6, DNS_NAME_CAP, EVENT_EXEC, EVENT_EXIT,
-    PROTO_TCP, PROTO_UDP,
+    EXEC_IN_PROGRESS, PROTO_TCP, PROTO_UDP,
 };
 
 // struct sock_common / msghdr field offsets, patched by symbol name by the
@@ -188,9 +190,10 @@ fn exec_gen_of(pid: u32) -> u64 {
 }
 
 /// A generation nothing else will be issued: the monotonic clock, forced
-/// nonzero so it can never collide with the "no entry" reading.
+/// nonzero so it can never collide with the "no entry" reading, with
+/// [`EXEC_IN_PROGRESS`] clear.
 fn new_generation() -> u64 {
-    unsafe { bpf_ktime_get_ns() | 1 }
+    unsafe { (bpf_ktime_get_ns() | 1) & !EXEC_IN_PROGRESS }
 }
 
 /// Build the FlowKey for a connected socket. `proto` is PROTO_TCP or
@@ -642,13 +645,30 @@ fn emit_event(kind: u32) {
     let _ = EVENTS.output::<ExecEvent>(&ev, 0);
 }
 
+/// Attached by userspace to begin_new_exec, which replaces the process
+/// image, on entry: before `/proc/<pid>/exe` can name the new binary.
+///
+/// Marks the generation in progress rather than final. A sibling thread can
+/// still connect between here and `de_thread()` killing it, and would stamp
+/// whatever this writes; a final value here would then agree with the new
+/// image. The in-progress bit refuses until `sched_process_exec` replaces
+/// it with a generation no such flow carries.
+///
+/// A failure before the point of no return leaves the process on its old
+/// image with the bit set, so its flows are refused until it execs again.
+/// That costs prompts, never a wrong name.
+#[kprobe]
+pub fn exec_begin(_ctx: ProbeContext) -> u32 {
+    let pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+    let _ = EXEC_GEN.insert(pid, new_generation() | EXEC_IN_PROGRESS, 0);
+    0
+}
+
 #[tracepoint]
 pub fn sched_process_exec(_ctx: TracePointContext) -> u32 {
-    // Replaced before the event is emitted, so a connect racing this
-    // handler either reads the old generation (and is judged against the
-    // executable that was current when it connected) or the new one (and is
-    // judged against the one it exec'd into). Neither leaves a flow stamped
-    // with a generation no lookup can match.
+    // The final generation for the new image. exec_begin already moved it
+    // on before the image changed, so no flow stamped under the old image
+    // agrees with this, and neither does one stamped mid-exec.
     //
     // Overwritten rather than incremented: the value only has to differ
     // from every other one ever issued, and a fresh timestamp does that

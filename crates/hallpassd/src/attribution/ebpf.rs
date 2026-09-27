@@ -20,7 +20,7 @@ use aya::programs::uprobe::UProbeScope;
 use aya::programs::{KProbe, Program, ProgramError, TracePoint, UProbe};
 use aya::{Ebpf, EbpfLoader};
 use hallpass_ebpf_common::{
-    DnsEvent, ExecEvent, FlowKey, FlowVal, EVENT_EXEC, PROTO_TCP, PROTO_UDP,
+    DnsEvent, ExecEvent, FlowKey, FlowVal, EVENT_EXEC, EXEC_IN_PROGRESS, PROTO_TCP, PROTO_UDP,
 };
 use hallpass_types::{FlowTuple, Proto};
 use lru::LruCache;
@@ -128,6 +128,14 @@ impl EbpfAttributor {
         )?;
         attach_kprobe(&mut ebpf, "udp_sendmsg", &["udp_sendmsg"])?;
         attach_kprobe(&mut ebpf, "udpv6_sendmsg", &["udpv6_sendmsg"])?;
+        // Required rather than best effort: without it the exec-race guard
+        // has a window (see EXEC_IN_PROGRESS). flush_old_exec is the same
+        // function before Linux 5.8.
+        attach_kprobe_any(
+            &mut ebpf,
+            "exec_begin",
+            &["begin_new_exec", "flush_old_exec"],
+        )?;
         attach_tracepoint(&mut ebpf, "sched_process_exec")?;
         attach_tracepoint(&mut ebpf, "sched_process_exit")?;
 
@@ -199,8 +207,9 @@ impl EbpfAttributor {
     /// rather than a stale flow stamp. Both are needed.)
     ///
     /// The kernel side stamps [`FlowVal::exec_gen`] at connect from a map
-    /// its exec tracepoint replaces, so the comparison is between two facts
-    /// the process cannot forge. Generations are timestamps rather than
+    /// its exec probes replace, once as the image starts changing and once
+    /// when it is done (see [`EXEC_IN_PROGRESS`]), so the comparison is
+    /// between two facts the process cannot forge. Generations are timestamps rather than
     /// counts and are never zero, which is what makes every way the entry
     /// can be lost - LRU eviction, the exit handler, a reload - produce a
     /// disagreement rather than an accidental agreement; see `EXEC_GEN` in
@@ -220,7 +229,9 @@ impl EbpfAttributor {
         // it claims a generation at connect for a process that has none, so
         // an absent entry here always disagrees.
         let now = self.exec_gen.get(&val.pid, 0).unwrap_or(0);
-        if now == val.exec_gen {
+        // Mid-exec, `/proc/<pid>/exe` may already name the new image, so an
+        // unchanged generation vouches for nothing until the exec finishes.
+        if now == val.exec_gen && now & EXEC_IN_PROGRESS == 0 {
             return false;
         }
         // Logged once per pid, not once per (pid, generation): the attack
@@ -537,6 +548,21 @@ fn attach_kprobe(ebpf: &mut Ebpf, prog: &str, fns: &[&str]) -> Result<(), String
             .map_err(|e| format!("attach {prog} to {f}: {e}"))?;
     }
     Ok(())
+}
+
+/// Attach `prog` to the first of `fns` the kernel has: alternative names
+/// for one function across kernel versions.
+fn attach_kprobe_any(ebpf: &mut Ebpf, prog: &str, fns: &[&str]) -> Result<(), String> {
+    let p: &mut KProbe = program_mut(ebpf, prog)?;
+    p.load().map_err(|e| format!("load {prog}: {e}"))?;
+    let mut errs = Vec::new();
+    for f in fns {
+        match p.attach(f, 0) {
+            Ok(_) => return Ok(()),
+            Err(e) => errs.push(format!("{f}: {e}")),
+        }
+    }
+    Err(format!("attach {prog}: {}", errs.join("; ")))
 }
 
 /// Attach the DNS-snooping uprobes to the system libc, for every process.
