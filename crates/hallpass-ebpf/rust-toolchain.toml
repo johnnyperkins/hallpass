@@ -8,4 +8,4 @@
 # with `--ebpf` when you do.
 [toolchain]
 channel = "nightly-2026-07-11"
-components = ["rust-src"]
+components = ["rust-src", "clippy", "rustfmt"]
