@@ -20,7 +20,9 @@ the toolchain that invoked xtask. It needs
 
 The `ebpf` feature embeds an object rather than building one, looking in
 `HALLPASS_EBPF_OBJ`, `crates/hallpassd/prebuilt/hallpass-ebpf`, then
-`target/bpfel-unknown-none/release/hallpass-ebpf`.
+`target/bpfel-unknown-none/release/hallpass-ebpf`. Each release publishes its
+object as `hallpass-ebpf-<version>.o`, which fits the source of that version
+only: point `HALLPASS_EBPF_OBJ` at it to skip nightly and bpf-linker.
 
 ## Verifying a change
 
@@ -165,3 +167,15 @@ choice would cost.
 **Prefer tests that exercise the real thing.** The rendered nftables ruleset is
 checked by the real `nft` parser, because substring assertions cannot catch a
 ruleset `nft` rejects, and a rejected ruleset means nothing is filtered.
+
+## Releasing
+
+1. Move the changelog's `## Unreleased` entries under `## <version> -
+   <date>` and set `version` in the workspace `Cargo.toml` to match.
+2. Commit, then tag and push: `git tag -a v<version> -m v<version>` and
+   `git push origin v<version>`.
+3. `.github/workflows/release.yml` checks the tag against the version and the
+   changelog, runs `cargo xtask dist`, attests the files and publishes the
+   release with the changelog section as its notes.
+
+`cargo xtask dist` builds the same files locally in `target/dist/`.

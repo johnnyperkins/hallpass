@@ -56,6 +56,20 @@ rule matches becomes a prompt; your answer can be saved as a rule.
 
 ## Install
 
+From a [release](https://github.com/johnnyperkins/hallpass/releases), no
+toolchain needed (x86_64, glibc 2.35 or newer; built with eBPF attribution):
+
+```sh
+tar xzf hallpass-<version>-x86_64-linux.tar.gz
+cd hallpass-<version>-x86_64-linux
+./install.sh
+```
+
+`SHA256SUMS` covers every file, and each carries a build provenance
+attestation (`gh attestation verify <file> --repo johnnyperkins/hallpass`).
+
+From a checkout, `install.sh` builds first:
+
 ```sh
 ./install.sh                          # eBPF attribution if the toolchain is present
 HALLPASS_EBPF=1 ./install.sh          # require eBPF
@@ -63,9 +77,9 @@ HALLPASS_EBPF=0 ./install.sh          # procfs only, stable Rust
 HALLPASS_POSTURE=desktop ./install.sh # fail open if the daemon crashes
 ```
 
-The script builds as you, then uses `sudo` once to install the binaries,
-config, baseline rules, systemd unit and desktop entries, add you to the
-`hallpass` group, and start `hallpassd`. Log out and back in once after the
+From a checkout the script builds as you; either way it then uses `sudo`
+once to install the binaries, config, baseline rules, systemd unit and desktop
+entries, add you to the `hallpass` group, and start `hallpassd`. Log out and back in once after the
 first install so the group takes effect. Never run it as `sudo ./install.sh`:
 that runs cargo and every build script as root.
 
