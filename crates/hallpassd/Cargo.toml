@@ -31,7 +31,7 @@ tokio = { workspace = true, features = [
 ] }
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-toml = "0.8"
+toml = "1.1"
 nfq = "0.2"
 etherparse = "0.16"
 ipnet = "2"

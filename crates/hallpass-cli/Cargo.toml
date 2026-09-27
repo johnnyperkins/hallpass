@@ -11,7 +11,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 # Same version the daemon reads rule files with, so `rules export` cannot
 # emit a document the daemon's own parser would reject.
-toml = "0.8"
+toml = "1.1"
 # prctl (PR_SET_CHILD_SUBREAPER), wait and kill for `run`: the workspace
 # denies unsafe code, so the syscalls come from a wrapper crate rather than
 # raw libc. rustix over nix because it is already in the dependency tree.
