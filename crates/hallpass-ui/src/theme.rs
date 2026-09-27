@@ -1426,7 +1426,7 @@ mod tests {
     #[test]
     fn installing_twice_is_the_same_as_once() {
         let ctx = egui::Context::default();
-        let _ = ctx.run_ui(Default::default(), |ui| {
+        let mut out = ctx.run_ui(Default::default(), |ui| {
             let ctx = ui.ctx();
             ensure_installed(ctx);
             let first = ctx.style_of(egui::Theme::Dark).visuals.panel_fill;
@@ -1434,5 +1434,8 @@ mod tests {
             assert_eq!(first, ctx.style_of(egui::Theme::Dark).visuals.panel_fill);
             assert_eq!(first, BG);
         });
+        // No renderer here to upload the font atlas to, and epaint asserts
+        // that texture updates are not dropped unapplied.
+        out.textures_delta.clear();
     }
 }
