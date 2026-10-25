@@ -41,7 +41,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable branch
         with:
           components: clippy
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       # fuzz/ has its own lockfile that Dependabot does not update, and it
       # shares crates with the workspace, so a bump here can leave it stale.
       - name: Fuzz lockfile
@@ -69,7 +69,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable branch
         with:
           components: clippy
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       # rustup auto-installs the nightly + rust-src pinned by
       # crates/hallpass-ebpf/rust-toolchain.toml on first use.
       - name: Install bpf-linker
@@ -100,7 +100,7 @@ jobs:
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable branch
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       # RUSTDOCFLAGS=-D warnings (set inside the task) is the point: the doc
       # comments carry the security reasoning and lean on intra-doc links, and
       # a link that stops resolving degrades to plain text with no other
@@ -117,7 +117,7 @@ jobs:
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable branch
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Install tools
         # iproute2 and python3 ship with the runner image; the suite also
         # needs nft and nc.
